@@ -4,10 +4,11 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { CustomScrollArea } from "@/components/ui/custom-scroll-area";
 import { Input } from "@/components/ui/input";
-import { Share2, Trash2, Plus, Copy, Pencil, ArrowDown, BookOpen, ArrowUp } from "lucide-react";
+import { Share2, Trash2, Plus, Copy, Pencil, ArrowDown, BookOpen, ArrowUp, Clipboard } from "lucide-react";
 import { api } from "@/services/api";
 import type { StoryEntry } from "@/types/story";
-// import helpers removed since the highlight-import feature is currently disabled
+import { useToast } from "@/components/ui/toast";
+import { useBackHandler } from "@/hooks/useBackHandler";
 import { Collapsible } from "@/components/ui/collapsible";
 
 interface ClueSetsPanelProps {
@@ -20,13 +21,28 @@ export function ClueSetsPanel({ onOpenStoryJump, onReadSet }: ClueSetsPanelProps
   const [importCode, setImportCode] = useState("");
   const [busySetId, setBusySetId] = useState<string | null>(null);
   const [storyCache, setStoryCache] = useState<Record<string, StoryEntry | null>>({});
-  const [message, setMessage] = useState<string | null>(null);
   const [renameOpen, setRenameOpen] = useState(false);
   const [renameSetId, setRenameSetId] = useState<string | null>(null);
   const [renameTitle, setRenameTitle] = useState<string>("");
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteSetId, setDeleteSetId] = useState<string | null>(null);
   const [deleteTitle, setDeleteTitle] = useState<string>("");
+  const [importOpen, setImportOpen] = useState(false);
+  const toast = useToast();
+
+  // Dialogs handle back-button to close instead of bubbling up.
+  useBackHandler(renameOpen, () => {
+    setRenameOpen(false);
+    return true;
+  });
+  useBackHandler(deleteOpen, () => {
+    setDeleteOpen(false);
+    return true;
+  });
+  useBackHandler(importOpen, () => {
+    setImportOpen(false);
+    return true;
+  });
 
   const allStoryIds = useMemo(() => {
     const ids = new Set<string>();
@@ -53,7 +69,6 @@ export function ClueSetsPanel({ onOpenStoryJump, onReadSet }: ClueSetsPanelProps
   }, [allStoryIds, storyCache]);
 
   const handleCreate = () => {
-    // 避免某些环境 window.prompt 不可用，直接快速创建默认名称
     const base = "我的线索集";
     const titles = new Set(Object.values(sets).map((s) => s.title));
     let name = base;
@@ -64,21 +79,72 @@ export function ClueSetsPanel({ onOpenStoryJump, onReadSet }: ClueSetsPanelProps
       if (i > 99) break;
     }
     createSet(name);
-    setMessage(`已创建：${name}`);
-    setTimeout(() => setMessage(null), 1200);
+    toast.success(`已创建：${name}`);
+  };
+
+  const shareCodeText = async (title: string, code: string) => {
+    // Prefer the native share sheet (Android / iOS) so users can fling the
+    // code directly into IM apps without needing a clipboard detour.
+    const shareAny = (navigator as unknown as { share?: (data: ShareData) => Promise<void> }).share;
+    if (typeof shareAny === "function") {
+      try {
+        await shareAny({ title, text: code });
+        return "shared" as const;
+      } catch (err) {
+        // The user dismissed the share sheet or it's not really supported.
+        if ((err as { name?: string })?.name !== "AbortError") {
+          console.warn("[ClueSets] navigator.share failed, falling back to clipboard", err);
+        }
+      }
+    }
+    await navigator.clipboard.writeText(code);
+    return "copied" as const;
   };
 
   const handleExport = async (setId: string) => {
     try {
       setBusySetId(setId);
       const code = await exportShareCode(setId);
-      await navigator.clipboard.writeText(code);
-      setMessage("分享码已复制到剪贴板");
-      setTimeout(() => setMessage(null), 1200);
+      const target = sets[setId];
+      const how = await shareCodeText(target?.title ?? "线索集", code);
+      toast.success(how === "shared" ? "已通过系统分享" : "分享码已复制到剪贴板");
     } catch (err) {
       console.error(err);
-      setMessage("导出失败");
-      setTimeout(() => setMessage(null), 1500);
+      toast.error("导出失败");
+    } finally {
+      setBusySetId(null);
+    }
+  };
+
+  const pasteFromClipboard = async () => {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text) {
+        setImportCode(text.trim());
+        toast.success("已从剪贴板粘贴");
+      }
+    } catch (err) {
+      console.warn("[ClueSets] readText failed", err);
+      toast.warn("粘贴失败，请在输入框手动粘贴");
+    }
+  };
+
+  const performImport = async (targetSetId: string | undefined) => {
+    const code = importCode.trim();
+    if (!code) return;
+    try {
+      setBusySetId("__import__");
+      const res = await importShareCode(code, {
+        createIfMissing: true,
+        titleIfCreate: "导入的线索集",
+        targetSetId,
+      });
+      setImportCode("");
+      setImportOpen(false);
+      toast.success(res.created ? "已创建并导入线索集" : `已导入 ${res.itemsAdded} 条`);
+    } catch (err) {
+      console.error(err);
+      toast.error("导入失败，分享码无效或不兼容");
     } finally {
       setBusySetId(null);
     }
@@ -87,28 +153,14 @@ export function ClueSetsPanel({ onOpenStoryJump, onReadSet }: ClueSetsPanelProps
   const handleImport = async () => {
     const code = importCode.trim();
     if (!code) return;
-    try {
-      setBusySetId("__import__");
-      let targetSetId: string | undefined = undefined;
-      const entries = Object.values(sets).sort((a, b) => b.updatedAt - a.updatedAt);
-      if (entries.length > 0) {
-        const listing = entries.map((s, i) => `${i + 1}. ${s.title}（${s.items.length}）`).join("\n");
-        const input = window.prompt(`输入导入目标线索集序号，留空则新建：\n${listing}`) || "";
-        const n = Number(input);
-        if (Number.isFinite(n) && n >= 1 && n <= entries.length) {
-          targetSetId = entries[n - 1].id;
-        }
-      }
-      const res = await importShareCode(code, { createIfMissing: true, titleIfCreate: "导入的线索集", targetSetId });
-      setImportCode("");
-      setMessage(res.created ? "已创建并导入线索集" : `已导入 ${res.itemsAdded} 条`);
-      setTimeout(() => setMessage(null), 1500);
-    } catch (err) {
-      console.error(err);
-      setMessage("导入失败，分享码无效或不兼容");
-      setTimeout(() => setMessage(null), 2000);
-    } finally {
-      setBusySetId(null);
+    // If there are existing sets, open the target picker dialog. Otherwise
+    // import directly into a new set. (Replaces window.prompt, which is
+    // unreliable on Android WebView.)
+    const existing = Object.values(sets);
+    if (existing.length === 0) {
+      await performImport(undefined);
+    } else {
+      setImportOpen(true);
     }
   };
 
@@ -119,8 +171,7 @@ export function ClueSetsPanel({ onOpenStoryJump, onReadSet }: ClueSetsPanelProps
       onOpenStoryJump(story, { segmentIndex, digestHex, preview });
     } catch (err) {
       console.error(err);
-      setMessage("打开剧情失败");
-      setTimeout(() => setMessage(null), 1500);
+      toast.error("打开剧情失败");
     }
   };
 
@@ -222,16 +273,25 @@ export function ClueSetsPanel({ onOpenStoryJump, onReadSet }: ClueSetsPanelProps
             <Button onClick={handleCreate}>
               <Plus className="h-4 w-4 mr-2" /> 新建线索集
             </Button>
-            <div className="flex-1" />
-            {message && <div className="text-xs text-[hsl(var(--color-muted-foreground))]">{message}</div>}
           </div>
           <div className="flex items-center gap-2">
-            <Input
-              placeholder="粘贴分享码导入 (AKC1-...)"
-              value={importCode}
-              onChange={(e) => setImportCode(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") handleImport(); }}
-            />
+            <div className="relative flex-1">
+              <Input
+                placeholder="粘贴分享码导入 (AKC1-...)"
+                value={importCode}
+                onChange={(e) => setImportCode(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") handleImport(); }}
+                className="pr-10"
+              />
+              <button
+                type="button"
+                aria-label="从剪贴板粘贴"
+                onClick={pasteFromClipboard}
+                className="absolute right-1.5 top-1/2 -translate-y-1/2 inline-flex h-7 w-7 items-center justify-center rounded-md text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-foreground))] hover:bg-[hsl(var(--color-accent))]"
+              >
+                <Clipboard className="h-4 w-4" />
+              </button>
+            </div>
             <Button onClick={handleImport} disabled={!importCode.trim() || busySetId === "__import__"}>
               <Share2 className="h-4 w-4 mr-2" /> 导入
             </Button>
@@ -408,8 +468,8 @@ export function ClueSetsPanel({ onOpenStoryJump, onReadSet }: ClueSetsPanelProps
       {renameOpen && (
         <>
           <div className="fixed inset-0 z-40 bg-black/40" onClick={() => setRenameOpen(false)} />
-          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-            <Card className="w-full max-w-md">
+          <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-4">
+            <Card className="w-full max-w-md sm:rounded-2xl rounded-t-2xl">
               <CardHeader className="pb-2">
                 <CardTitle className="text-base">重命名线索集</CardTitle>
               </CardHeader>
@@ -436,8 +496,8 @@ export function ClueSetsPanel({ onOpenStoryJump, onReadSet }: ClueSetsPanelProps
       {deleteOpen && (
         <>
           <div className="fixed inset-0 z-40 bg-black/40" onClick={() => setDeleteOpen(false)} />
-          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-            <Card className="w-full max-w-md">
+          <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-4">
+            <Card className="w-full max-w-md sm:rounded-2xl rounded-t-2xl">
               <CardHeader className="pb-2">
                 <CardTitle className="text-base">确认删除</CardTitle>
               </CardHeader>
@@ -451,9 +511,55 @@ export function ClueSetsPanel({ onOpenStoryJump, onReadSet }: ClueSetsPanelProps
                     setDeleteOpen(false);
                     setDeleteSetId(null);
                     setDeleteTitle("");
-                    setMessage("已删除线索集");
-                    setTimeout(() => setMessage(null), 1200);
+                    toast.success("已删除线索集");
                   }}>删除</Button>
+                </div>
+              </CardContent>
+            </Card>
+          </div>
+        </>
+      )}
+
+      {importOpen && (
+        <>
+          <div className="fixed inset-0 z-40 bg-black/40" onClick={() => setImportOpen(false)} />
+          <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-4">
+            <Card className="w-full max-w-md sm:rounded-2xl rounded-t-2xl sm:rounded-b-2xl">
+              <CardHeader className="pb-2">
+                <CardTitle className="text-base">选择导入目标</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                <div className="max-h-64 overflow-auto rounded-lg border">
+                  <button
+                    type="button"
+                    className="w-full px-3 py-3 text-left hover:bg-[hsl(var(--color-accent))] border-b"
+                    onClick={() => performImport(undefined)}
+                  >
+                    <div className="text-sm font-medium">新建线索集</div>
+                    <div className="text-[11px] text-[hsl(var(--color-muted-foreground))]">
+                      把分享码内容导入到一个新建的集合
+                    </div>
+                  </button>
+                  {Object.values(sets)
+                    .sort((a, b) => b.updatedAt - a.updatedAt)
+                    .map((s) => (
+                      <button
+                        key={s.id}
+                        type="button"
+                        className="w-full px-3 py-3 text-left hover:bg-[hsl(var(--color-accent))] border-b last:border-b-0"
+                        onClick={() => performImport(s.id)}
+                      >
+                        <div className="text-sm font-medium">{s.title}</div>
+                        <div className="text-[11px] text-[hsl(var(--color-muted-foreground))]">
+                          现有 {s.items.length} 条 · {new Date(s.updatedAt).toLocaleString()}
+                        </div>
+                      </button>
+                    ))}
+                </div>
+                <div className="flex justify-end">
+                  <Button variant="outline" onClick={() => setImportOpen(false)}>
+                    取消
+                  </Button>
                 </div>
               </CardContent>
             </Card>

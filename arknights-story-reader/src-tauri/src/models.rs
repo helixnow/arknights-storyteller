@@ -152,6 +152,21 @@ pub struct SearchResult {
     pub category: String,
 }
 
+/// Extended search response with facet counts and truncation info. Used by
+/// `search_stories_ex` so that the frontend can render category filters and
+/// a "showing 500 / N" notice.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchResultsPage {
+    pub results: Vec<SearchResult>,
+    #[serde(rename = "totalMatched")]
+    pub total_matched: usize,
+    pub truncated: bool,
+    /// Categories → count map (FTS-only path populates, linear scan contributes
+    /// whatever it can).
+    #[serde(default)]
+    pub facets: std::collections::BTreeMap<String, usize>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchDebugResponse {
     pub results: Vec<SearchResult>,

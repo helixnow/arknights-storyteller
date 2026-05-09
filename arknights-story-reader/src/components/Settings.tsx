@@ -17,6 +17,7 @@ import {
   openAndroidInstallPermissionSettings,
   type UpdateAvailability,
 } from "@/hooks/useAppUpdater";
+import { useToast } from "@/components/ui/toast";
 
 const THEME_COLOR_OPTIONS = [
   {
@@ -116,17 +117,21 @@ export function Settings() {
     await importFromFile(file);
   };
 
+  const toast = useToast();
+
   const handleRebuildIndex = useCallback(() => {
     setStatusMessage("已请求重新建立全文索引");
     setError(null);
+    toast.show("已请求重新建立全文索引");
     window.dispatchEvent(new Event("app:rebuild-story-index"));
-  }, []);
+  }, [setError, toast]);
 
   const handleRefreshCharacters = useCallback(() => {
     setStatusMessage("已请求刷新人物统计");
     setError(null);
+    toast.show("已请求刷新人物统计");
     window.dispatchEvent(new Event("app:refresh-character-stats"));
-  }, []);
+  }, [setError, toast]);
 
   useEffect(() => {
     if (runtimePlatform === "unknown") return;
@@ -231,7 +236,7 @@ export function Settings() {
     }
     if (status === "up-to-date") {
       return (
-        <span className="inline-flex items-center gap-1 rounded-full bg-green-100 px-2 py-1 text-xs font-medium text-green-600 dark:bg-green-900/30 dark:text-green-300">
+        <span className="inline-flex items-center gap-1 rounded-full bg-[hsl(var(--color-success)/0.15)] px-2 py-1 text-xs font-medium text-[hsl(var(--color-success))]">
           <CheckCircle className="h-3 w-3" />
           最新
         </span>
@@ -259,7 +264,9 @@ export function Settings() {
                 <div className="flex items-center justify-between">
                   <div>
                     <div className="font-medium">主题</div>
-                    <div className="text-sm text-[hsl(var(--color-muted-foreground))]">切换亮色/暗色模式</div>
+                    <div className="text-sm text-[hsl(var(--color-muted-foreground))]">
+                      浅色 / 深色 / 跟随系统
+                    </div>
                   </div>
                   <ThemeToggle />
                 </div>
@@ -400,7 +407,7 @@ export function Settings() {
                 )}
 
                 {statusMessage && !error && (
-                  <div className="text-xs text-green-600 dark:text-green-400">{statusMessage}</div>
+                  <div className="text-xs text-[hsl(var(--color-success))]">{statusMessage}</div>
                 )}
 
                 <div className="flex flex-wrap gap-3">
@@ -588,7 +595,7 @@ export function Settings() {
               <CardContent className="space-y-2">
                 <div className="flex justify-between">
                   <span className="text-[hsl(var(--color-muted-foreground))]">版本</span>
-                  <span>1.10</span>
+                  <span>1.11</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-[hsl(var(--color-muted-foreground))]">作者</span>

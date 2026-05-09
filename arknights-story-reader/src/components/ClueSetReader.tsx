@@ -9,6 +9,8 @@ import { digestToHex64, fnv1a64, normalizeForDigest } from "@/lib/clueCodecs";
 import { cn } from "@/lib/utils";
 import { useReaderSettings } from "@/hooks/useReaderSettings";
 import { ReaderSettingsPanel } from "@/components/ReaderSettings";
+import { useEdgeSwipeBack } from "@/hooks/useEdgeSwipeBack";
+import { useBackHandler } from "@/hooks/useBackHandler";
 
 interface ClueSetReaderProps {
   setId: string;
@@ -96,6 +98,13 @@ export function ClueSetReader({ setId, onClose, onOpenStoryJump }: ClueSetReader
   const { settings, updateSettings, resetSettings } = useReaderSettings();
   const [progressValue, setProgressValue] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+
+  useBackHandler(settingsOpen, () => {
+    setSettingsOpen(false);
+    return true;
+  });
+  useEdgeSwipeBack(rootRef, { enabled: !settingsOpen, onBack: onClose });
   const [chapterMap, setChapterMap] = useState<Record<string, string>>({}); // chapterId -> chapterName
   const [chapterNameByStoryId, setChapterNameByStoryId] = useState<Record<string, string>>({}); // storyId -> chapterName
   const [chapterNameByStoryGroup, setChapterNameByStoryGroup] = useState<Record<string, string>>({}); // storyGroup -> chapterName
@@ -253,7 +262,11 @@ export function ClueSetReader({ setId, onClose, onOpenStoryJump }: ClueSetReader
   }, [items.length]);
 
   return (
-    <div className="h-full flex flex-col overflow-hidden reader-surface" data-reader-theme={settings.theme}>
+    <div
+      ref={rootRef}
+      className="h-full flex flex-col overflow-hidden reader-surface"
+      data-reader-theme={settings.theme}
+    >
       <header className="flex-shrink-0 z-10 bg-[hsl(var(--color-background)/0.95)] backdrop-blur border-b">
         <div className="container flex items-center justify-between gap-2 h-16">
           <div className="flex items-center gap-2">
@@ -284,15 +297,29 @@ export function ClueSetReader({ setId, onClose, onOpenStoryJump }: ClueSetReader
             {(!set || set.items.length === 0) && (
               <div className="text-center text-[hsl(var(--color-muted-foreground))]">该线索集暂无条目</div>
             )}
-            <div className="reader-content" style={{
-              fontFamily: settings.fontFamily === 'system' ? undefined : settings.fontFamily,
-              fontSize: `${settings.fontSize}px`,
-              lineHeight: settings.lineHeight,
-              letterSpacing: `${settings.letterSpacing}px`,
-              textAlign: settings.textAlign,
-              maxWidth: `${Math.round((settings.pageWidth / 100) * 768)}px`,
-              width: '100%'
-            }}>
+            <div
+              className="reader-content"
+              style={{
+                fontFamily: settings.fontFamily === 'system' ? undefined : settings.fontFamily,
+                fontSize: `${settings.fontSize}px`,
+                lineHeight: settings.lineHeight,
+                letterSpacing: `${settings.letterSpacing}px`,
+                textAlign: settings.textAlign,
+                // Use CSS var so the stylesheet's max-width fallback kicks in.
+                // (Removes the double max-width clamp from the old code.)
+                ["--reader-max-width" as unknown as string]: `${Math.round(
+                  (settings.pageWidth / 100) * 768
+                )}px`,
+                width: "100%",
+                // Apply paragraph spacing as a CSS var the children pick up via
+                // their own marginBottom — keeps parity with StoryReader.
+                ["--reader-paragraph-spacing" as unknown as string]: `${Math.max(
+                  settings.paragraphSpacing,
+                  0.5
+                )}rem`,
+                ...(settings.paragraphIndent ? { textIndent: "2em" } : {}),
+              } as React.CSSProperties}
+            >
               {groups.map((group) => {
                 // 按原文顺序渲染：优先用 resolvedIndex，否则用 segmentIndex
                 const sortedItems = [...group.items].sort((a, b) => {
@@ -353,7 +380,7 @@ export function ClueSetReader({ setId, onClose, onOpenStoryJump }: ClueSetReader
                       return (
                         <div key={it.key} ref={(el) => { anchorRefs.current[it.key] = el; }}>
                           {discontinuous && (
-                            <div className="reader-subtitle reader-segment text-center select-none">…</div>
+                            <div className="reader-ellipsis">…</div>
                           )}
                           {!it.segment ? (
                             <div className="text-xs text-[hsl(var(--color-muted-foreground))] mb-4">未能定位该段，建议打开原文查看</div>

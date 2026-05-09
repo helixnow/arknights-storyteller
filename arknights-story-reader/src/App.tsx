@@ -14,6 +14,8 @@ import { ClueSetReader } from "@/components/ClueSetReader";
 import { KeepAlive } from "@/components/KeepAlive";
 import { CharactersPanel } from "@/components/CharactersPanel";
 import { useAppUpdater } from "@/hooks/useAppUpdater";
+import { useBackHandler } from "@/hooks/useBackHandler";
+import { ToastProvider } from "@/components/ui/toast";
 
 type Tab = "stories" | "characters" | "search" | "clues" | "settings";
 
@@ -111,6 +113,17 @@ function App() {
     setClueReaderSetId(setId);
   }, []);
 
+  // Android/Browser back-button: close open full-screen layers before falling
+  // back to the system default. Priority: clue reader > story reader > ...
+  useBackHandler(Boolean(clueReaderSetId), () => {
+    setClueReaderSetId(null);
+    return true;
+  });
+  useBackHandler(readerActive, () => {
+    setReaderVisible(false);
+    return true;
+  });
+
   const storyListView = useMemo(
     () => <StoryList onSelectStory={handleSelectStory} />,
     [handleSelectStory]
@@ -196,14 +209,16 @@ function App() {
   );
 
   return (
-    <ThemeProvider defaultTheme="dark" storageKey="story-teller-theme">
-      <FavoritesProvider>
-        <AppPreferencesProvider>
-          <ClueSetsProvider>
-            {appContent}
-          </ClueSetsProvider>
-        </AppPreferencesProvider>
-      </FavoritesProvider>
+    <ThemeProvider defaultTheme="system" storageKey="story-teller-theme">
+      <ToastProvider>
+        <FavoritesProvider>
+          <AppPreferencesProvider>
+            <ClueSetsProvider>
+              {appContent}
+            </ClueSetsProvider>
+          </AppPreferencesProvider>
+        </FavoritesProvider>
+      </ToastProvider>
     </ThemeProvider>
   );
 }

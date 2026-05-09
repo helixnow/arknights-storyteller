@@ -123,6 +123,14 @@ export interface SearchResult {
   category: string;
 }
 
+/** 带 facet 与总数的扩展搜索响应 */
+export interface SearchResultsPage {
+  results: SearchResult[];
+  totalMatched: number;
+  truncated: boolean;
+  facets: Record<string, number>;
+}
+
 export interface SearchDebugResponse {
   results: SearchResult[];
   logs: string[];

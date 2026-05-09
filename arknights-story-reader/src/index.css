@@ -44,6 +44,10 @@
   --color-accent-foreground: 0 0% 12%;
   --color-destructive: 0 84.2% 60.2%;
   --color-destructive-foreground: 0 0% 100%;
+  --color-success: 142 72% 35%;
+  --color-success-foreground: 0 0% 100%;
+  --color-warning: 38 92% 50%;
+  --color-warning-foreground: 0 0% 100%;
   --color-border: 0 0% 88%;
   --color-input: 0 0% 88%;
   --color-ring: 0 0% 12%;
@@ -134,6 +138,10 @@
   --color-accent-foreground: 0 0% 96%;
   --color-destructive: 0 62.8% 30.6%;
   --color-destructive-foreground: 0 0% 96%;
+  --color-success: 142 58% 55%;
+  --color-success-foreground: 0 0% 12%;
+  --color-warning: 40 85% 62%;
+  --color-warning-foreground: 0 0% 12%;
   --color-border: 0 0% 24%;
   --color-input: 0 0% 24%;
   --color-ring: 0 0% 65%;
@@ -237,25 +245,78 @@ body {
   max-width: 68rem; /* ~1088px，阅读更舒适 */
   margin-left: auto;
   margin-right: auto;
-  padding-left: 1rem;  /* 16px */
-  padding-right: 1rem; /* 16px */
+  padding-left: max(1rem, env(safe-area-inset-left, 0px));
+  padding-right: max(1rem, env(safe-area-inset-right, 0px));
 }
 
 @media (min-width: 768px) {
-  .container { padding-left: 1.25rem; padding-right: 1.25rem; }
+  .container {
+    padding-left: max(1.25rem, env(safe-area-inset-left, 0px));
+    padding-right: max(1.25rem, env(safe-area-inset-right, 0px));
+  }
 }
 @media (min-width: 1024px) {
-  .container { padding-left: 1.5rem; padding-right: 1.5rem; }
+  .container {
+    padding-left: max(1.5rem, env(safe-area-inset-left, 0px));
+    padding-right: max(1.5rem, env(safe-area-inset-right, 0px));
+  }
 }
 
 /* 阅读器主题与排版优化 */
 .reader-surface {
-  background: hsl(var(--color-background));
-  color: hsl(var(--color-foreground));
+  --reader-bg: hsl(var(--color-background));
+  --reader-fg: hsl(var(--color-foreground));
+  --reader-accent: hsl(var(--color-primary));
+  background: var(--reader-bg);
+  color: var(--reader-fg);
+  transition: background-color 0.3s ease, color 0.3s ease;
+}
+
+.reader-surface[data-reader-theme="sepia"] {
+  --reader-bg: #f5ecd7;
+  --reader-fg: #4a3a20;
+  --reader-accent: #8c5a2e;
+}
+
+.reader-surface[data-reader-theme="green"] {
+  --reader-bg: #d7ebd2;
+  --reader-fg: #22301d;
+  --reader-accent: #2f6f33;
+}
+
+.reader-surface[data-reader-theme="dark"] {
+  --reader-bg: #0e1014;
+  --reader-fg: #d9d9d9;
+  --reader-accent: #6aa6ff;
+}
+
+.reader-surface[data-reader-theme="paper"] {
+  --reader-bg: #fafafa;
+  --reader-fg: #1a1a1a;
+  --reader-accent: #1f4fa8;
+}
+
+/* Aligned foreground for bits that used to pull from the global theme. */
+.reader-surface[data-reader-theme="sepia"] .reader-text,
+.reader-surface[data-reader-theme="green"] .reader-text,
+.reader-surface[data-reader-theme="dark"] .reader-text,
+.reader-surface[data-reader-theme="paper"] .reader-text {
+  color: var(--reader-fg);
+}
+
+.reader-surface[data-reader-theme="sepia"] .reader-character-name,
+.reader-surface[data-reader-theme="green"] .reader-character-name,
+.reader-surface[data-reader-theme="dark"] .reader-character-name,
+.reader-surface[data-reader-theme="paper"] .reader-character-name,
+.reader-surface[data-reader-theme="sepia"] .reader-header,
+.reader-surface[data-reader-theme="green"] .reader-header,
+.reader-surface[data-reader-theme="dark"] .reader-header,
+.reader-surface[data-reader-theme="paper"] .reader-header {
+  color: var(--reader-accent);
 }
 
 .reader-content {
-  max-width: 48rem;
+  max-width: var(--reader-max-width, 48rem);
   margin-left: auto;
   margin-right: auto;
   padding: 2rem 1.5rem;
@@ -294,10 +355,10 @@ body {
 }
 
 .reader-narration {
-  font-style: italic;
-  color: hsl(var(--color-muted-foreground) / 0.8);
+  color: hsl(var(--color-muted-foreground) / 0.9);
   padding-left: 1rem;
-  border-left: 3px solid hsl(var(--color-muted) / 0.3);
+  border-left: 3px solid hsl(var(--color-muted) / 0.45);
+  letter-spacing: 0.02em;
 }
 
 .reader-summary {
@@ -370,6 +431,10 @@ body {
   gap: 0.5rem;
   margin-bottom: 0.35rem;
   color: hsl(var(--color-foreground) / 0.9);
+}
+
+.reader-decision-option > span:nth-child(2) {
+  flex: 1;
 }
 
 .reader-decision-option:last-child {
@@ -475,9 +540,18 @@ body {
 
 .reader-subtitle {
   margin-bottom: 1.5rem;
-  font-style: italic;
-  color: hsl(var(--color-foreground));
+  color: hsl(var(--color-foreground) / 0.9);
   text-align: center;
+  letter-spacing: 0.12em;
+  font-weight: 500;
+}
+
+.reader-ellipsis {
+  margin-bottom: 1.5rem;
+  text-align: center;
+  color: hsl(var(--color-muted-foreground) / 0.6);
+  letter-spacing: 0.5em;
+  user-select: none;
 }
 
 .reader-sticker {
@@ -487,6 +561,9 @@ body {
   background: hsl(var(--color-accent) / 0.15);
   color: hsl(var(--color-foreground) / 0.95);
   white-space: pre-line;
+  font-family: "JetBrains Mono", "Sarasa Mono SC", ui-monospace, monospace;
+  letter-spacing: 0.04em;
+  border: 1px solid hsl(var(--color-primary) / 0.18);
 }
 
 .reader-header {
@@ -496,6 +573,24 @@ body {
   letter-spacing: 0.04em;
   text-align: center;
   color: hsl(var(--color-primary));
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 1rem;
+}
+
+.reader-header::before,
+.reader-header::after {
+  content: "";
+  display: block;
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    hsl(var(--color-border)) 40%,
+    hsl(var(--color-border)) 60%,
+    transparent
+  );
 }
 
 .reader-scroll {
@@ -641,12 +736,53 @@ input[type="range"]::-moz-range-thumb {
   box-shadow: 0 10px 24px rgba(8, 47, 73, 0.35);
 }
 
+/*
+ * On touch devices, auto-hide the thumb but don't hide entirely — the user
+ * should still see a transient position indicator while scrolling, and the
+ * drag area is disabled by `pointer-events: none` in the default style.
+ */
 @media (pointer: coarse) {
-  .scroll-area__track {
-    display: none;
+  .scroll-area__thumb {
+    cursor: default;
+    width: 0.3rem;
   }
 }
 
 .touch-action-none {
   touch-action: none;
+}
+
+/* ===== 性能优化：视口外段落跳过布局 ===== */
+.reader-segment {
+  content-visibility: auto;
+  contain-intrinsic-size: 1px 120px;
+}
+
+/* ===== 三种段落高亮的互斥优先级 ===== */
+/* 搜索命中 > 角色高亮 > 划线收藏，避免渐变与边框叠加造成视觉糊 */
+.reader-search-highlight.reader-character-highlight {
+  /* 搜索命中时抑制角色高亮的左边框 */
+  border-left: none;
+  background: none;
+}
+.reader-search-highlight.reader-highlighted {
+  background: none;
+  box-shadow: 0 0 0 2px hsl(var(--color-primary) / 0.45);
+}
+.reader-character-highlight.reader-highlighted:not(.reader-search-highlight) {
+  /* 角色高亮优先于划线收藏背景 */
+  background: linear-gradient(135deg, hsl(var(--color-primary) / 0.18), transparent 65%);
+}
+
+/* ===== 尊重 prefers-reduced-motion ===== */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+  .reader-scroll {
+    scroll-behavior: auto;
+  }
 }

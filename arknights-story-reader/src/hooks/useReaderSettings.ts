@@ -26,8 +26,14 @@ export interface ReaderSettings {
   paragraphSpacing: number; // 段落间距
   pageWidth: number; // 页面宽度（百分比）
   textAlign: 'left' | 'justify'; // 文本对齐方式
-  theme: 'default' | 'sepia' | 'green' | 'dark'; // 阅读主题
+  /**
+   * 阅读专用主题，映射到 `.reader-surface[data-reader-theme="..."]` 的 CSS。
+   * `default` 表示跟随全局主题色，其余为阅读器专属配色。
+   */
+  theme: 'default' | 'sepia' | 'green' | 'dark' | 'paper';
   readingMode: 'paged' | 'scroll'; // 阅读模式：分页/滚动
+  /** 段落首行缩进两个汉字宽（中文小说惯例） */
+  paragraphIndent: boolean;
 }
 
 const DEFAULT_SETTINGS: ReaderSettings = {
@@ -40,6 +46,7 @@ const DEFAULT_SETTINGS: ReaderSettings = {
   textAlign: 'justify',
   theme: 'default',
   readingMode: 'scroll',
+  paragraphIndent: false,
 };
 
 const STORAGE_KEY = "reader-settings";

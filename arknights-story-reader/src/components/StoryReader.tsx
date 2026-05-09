@@ -28,10 +28,12 @@ import { useReadingProgress } from "@/hooks/useReadingProgress";
 import { useFavorites } from "@/hooks/useFavorites";
 import { useHighlights } from "@/hooks/useHighlights";
 import { useClueSets } from "@/hooks/useClueSets";
+import { useBackHandler } from "@/hooks/useBackHandler";
+import { useEdgeSwipeBack } from "@/hooks/useEdgeSwipeBack";
+import { useToast } from "@/components/ui/toast";
 import { cn } from "@/lib/utils";
 import { CustomScrollArea } from "@/components/ui/custom-scroll-area";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
 import { useAppPreferences } from "@/hooks/useAppPreferences";
 import type { StoryEntry } from "@/types/story";
 import { fnv1a64, normalizeForDigest, digestToHex64 } from "@/lib/clueCodecs";
@@ -58,8 +60,8 @@ interface RenderableSegment {
   index: number;
 }
 
-const SEGMENTS_PER_PAGE = 12;
 const BASE_MAX_WIDTH = 768; // px
+const TARGET_CHARS_PER_PAGE = 900; // approximate characters we aim to fit per page
 
 function isSegmentHighlightable(segment: StorySegment): boolean {
   switch (segment.type) {
@@ -71,6 +73,24 @@ function isSegmentHighlightable(segment: StorySegment): boolean {
       return true;
     default:
       return false;
+  }
+}
+
+function approximateSegmentLength(segment: StorySegment): number {
+  switch (segment.type) {
+    case "dialogue":
+      return segment.characterName.length + segment.text.length + 2;
+    case "narration":
+    case "system":
+    case "subtitle":
+    case "sticker":
+      return segment.text.length;
+    case "decision":
+      return segment.options.reduce((acc, opt) => acc + opt.length + 2, 0);
+    case "header":
+      return segment.title.length + 8;
+    default:
+      return 0;
   }
 }
 
@@ -94,15 +114,37 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
   const characterAppliedRef = useRef<string | null>(null);
   const pendingScrollIndexRef = useRef<number | null>(null);
   const jumpAppliedRef = useRef<number | null>(null);
-  const [cluePickerOpen, setCluePickerOpen] = useState(false);
-  const [cluePickerTitle, setCluePickerTitle] = useState<string>("");
 
   const { settings, updateSettings, resetSettings } = useReaderSettings();
   const { showSummaries } = useAppPreferences();
   const { progress, updateProgress } = useReadingProgress(storyPath);
   const { highlights, toggleHighlight, isHighlighted, clearHighlights } = useHighlights(storyPath);
   const { isFavorite, toggleFavorite } = useFavorites();
-  const { sets: clueSets, addItem, createSet, removeItem, ensureDefaultSetId } = useClueSets();
+  const toast = useToast();
+  const { addItem, removeItem, ensureDefaultSetId } = useClueSets();
+
+  // Back-button priority inside the reader: insights drawer > settings
+  // panel > bookmark mode > fall through to outer handler (App closes reader).
+  useBackHandler(insightsOpen, () => {
+    setInsightsOpen(false);
+    return true;
+  });
+  useBackHandler(settingsOpen, () => {
+    setSettingsOpen(false);
+    return true;
+  });
+  useBackHandler(bookmarkMode, () => {
+    setBookmarkMode(false);
+    return true;
+  });
+
+  // iOS-style edge swipe back — close the reader when the user swipes from
+  // the left edge. Only active when none of the inner modals are open so the
+  // gesture doesn't accidentally fight the in-modal close animation.
+  useEdgeSwipeBack(readerRootRef, {
+    enabled: !settingsOpen && !insightsOpen,
+    onBack,
+  });
 
   const processedSegments = useMemo<StorySegment[]>(() => {
     if (!content) return [];
@@ -196,10 +238,43 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
     [highlights, processedSegments]
   );
 
+  /**
+   * Compute dynamic page boundaries for paged reading mode based on an
+   * approximate character budget (scaled by font size so bigger type gives
+   * fewer segments per page). Returns the starting segment index for each
+   * page. Bug fix: replaces the hardcoded SEGMENTS_PER_PAGE = 12 which made
+   * pages wildly unbalanced at extreme font sizes.
+   */
+  const pageBoundaries = useMemo<number[]>(() => {
+    if (!processedSegments.length) return [0];
+    // Scale budget inversely by font size: at 18px we want ~900 chars/page;
+    // at 28px we scale down proportionally so the visual page size stays similar.
+    const scaleFactor = 18 / Math.max(settings.fontSize, 14);
+    const budget = Math.max(200, Math.round(TARGET_CHARS_PER_PAGE * scaleFactor));
+
+    const boundaries: number[] = [0];
+    let acc = 0;
+    processedSegments.forEach((seg, idx) => {
+      const len = approximateSegmentLength(seg);
+      // Always break before a Header — chapters/sections open a new page.
+      const isHeader = seg.type === "header";
+      if (idx > 0 && isHeader && boundaries[boundaries.length - 1] !== idx) {
+        boundaries.push(idx);
+        acc = 0;
+      }
+      acc += len;
+      if (acc >= budget && idx + 1 < processedSegments.length) {
+        boundaries.push(idx + 1);
+        acc = 0;
+      }
+    });
+    return boundaries;
+  }, [processedSegments, settings.fontSize]);
+
   const totalPages = useMemo(() => {
     if (!processedSegments.length) return 0;
-    return Math.max(1, Math.ceil(processedSegments.length / SEGMENTS_PER_PAGE));
-  }, [processedSegments]);
+    return Math.max(1, pageBoundaries.length);
+  }, [pageBoundaries, processedSegments]);
 
   const progressPercentage = useMemo(() => {
     const clamped = Math.max(0, Math.min(1, progressValue));
@@ -214,9 +289,14 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
       lineHeight: settings.lineHeight,
       letterSpacing: `${settings.letterSpacing}px`,
       textAlign: settings.textAlign,
-      maxWidth: `${maxWidthPx}px`,
+      // Drive max-width via CSS var so it composes with the stylesheet
+      // default instead of double-clipping to 48rem. (bug: double max-width)
+      ["--reader-max-width" as unknown as string]: `${maxWidthPx}px`,
       width: "100%",
-    };
+      ...(settings.paragraphIndent
+        ? { textIndent: "2em" }
+        : {}),
+    } as CSSProperties;
     return style;
   }, [
     settings.fontFamily,
@@ -226,6 +306,7 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
     settings.pageWidth,
     settings.paragraphSpacing,
     settings.textAlign,
+    settings.paragraphIndent,
   ]);
 
   const readerSpacing = useMemo(
@@ -282,6 +363,14 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
     const d = fnv1a64(normalized);
     return digestToHex64(d);
   }, [getSegmentSearchText]);
+
+  // Pre-compute the digest for every segment once per story load so cross-
+  // version jump logic (initialJump from a share code) doesn't redo the hash
+  // for every render.
+  const segmentDigestMap = useMemo<string[]>(() => {
+    if (!processedSegments.length) return [];
+    return processedSegments.map((seg) => getSegmentDigestHex(seg));
+  }, [processedSegments, getSegmentDigestHex]);
 
   const findFocusSegmentIndex = useCallback(
     (focus: ReaderSearchFocus): number | null => {
@@ -379,23 +468,32 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
   const renderableSegments = useMemo<RenderableSegment[]>(() => {
     if (!processedSegments.length) return [];
     if (settings.readingMode === "paged") {
-      const start = currentPage * SEGMENTS_PER_PAGE;
-      const end = Math.min(start + SEGMENTS_PER_PAGE, processedSegments.length);
+      const safePage = Math.max(0, Math.min(currentPage, pageBoundaries.length - 1));
+      const start = pageBoundaries[safePage] ?? 0;
+      const end =
+        safePage + 1 < pageBoundaries.length
+          ? pageBoundaries[safePage + 1]
+          : processedSegments.length;
       return processedSegments.slice(start, end).map((segment, offset) => ({
         segment,
         index: start + offset,
       }));
     }
     return processedSegments.map((segment, index) => ({ segment, index }));
-  }, [processedSegments, currentPage, settings.readingMode]);
+  }, [processedSegments, currentPage, settings.readingMode, pageBoundaries]);
 
   const insights = useMemo(() => {
     if (!processedSegments.length) {
-      return { characters: [] as Array<{ name: string; count: number; firstIndex: number }>, decisions: [] as Array<{ index: number; options: string[] }> };
+      return {
+        characters: [] as Array<{ name: string; count: number; firstIndex: number }>,
+        decisions: [] as Array<{ index: number; options: string[]; values?: string[] }>,
+        headers: [] as Array<{ index: number; title: string }>,
+      };
     }
 
     const characterMap = new Map<string, { count: number; firstIndex: number }>();
-    const decisions: Array<{ index: number; options: string[] }> = [];
+    const decisions: Array<{ index: number; options: string[]; values?: string[] }> = [];
+    const headers: Array<{ index: number; title: string }> = [];
 
     processedSegments.forEach((segment, index) => {
       if (segment.type === "dialogue") {
@@ -406,7 +504,13 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
           characterMap.set(segment.characterName, { count: 1, firstIndex: index });
         }
       } else if (segment.type === "decision") {
-        decisions.push({ index, options: segment.options });
+        decisions.push({
+          index,
+          options: segment.options,
+          values: segment.values && segment.values.length > 0 ? segment.values : undefined,
+        });
+      } else if (segment.type === "header") {
+        headers.push({ index, title: segment.title });
       }
     });
 
@@ -414,7 +518,7 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
       .map(([name, meta]) => ({ name, ...meta }))
       .sort((a, b) => b.count - a.count);
 
-    return { characters, decisions };
+    return { characters, decisions, headers };
   }, [processedSegments]);
 
   const loadStory = useCallback(async () => {
@@ -624,11 +728,18 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
         // 直接尝试一次，若元素未渲染，layout effect 会再次兜底
         scrollToSegment(index);
       } else {
-        const targetPage = Math.min(Math.floor(index / SEGMENTS_PER_PAGE), totalPages - 1);
-        setCurrentPage(targetPage);
+        // Binary search the dynamic page boundaries to land on the right page.
+        let targetPage = 0;
+        for (let i = pageBoundaries.length - 1; i >= 0; i -= 1) {
+          if (index >= pageBoundaries[i]) {
+            targetPage = i;
+            break;
+          }
+        }
+        setCurrentPage(Math.min(targetPage, totalPages - 1));
       }
     },
-    [processedSegments, scrollToSegment, settings.readingMode, totalPages]
+    [processedSegments, scrollToSegment, settings.readingMode, totalPages, pageBoundaries]
   );
 
   // 优先处理 share code 跳转（initialJump）
@@ -641,8 +752,7 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
     const hex = (initialJump.digestHex || "").toLowerCase();
     const hasDigest = hex !== "" && !/^0+$/.test(hex);
     if (hasDigest && target >= 0 && target < processedSegments.length) {
-      const seg = processedSegments[target];
-      const digest = getSegmentDigestHex(seg).toLowerCase();
+      const digest = (segmentDigestMap[target] || "").toLowerCase();
       if (digest !== hex) {
         const want = hex;
         const range = 12;
@@ -652,8 +762,7 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
           i <= Math.min(processedSegments.length - 1, target + range);
           i++
         ) {
-          const d = getSegmentDigestHex(processedSegments[i]).toLowerCase();
-          if (d === want) {
+          if ((segmentDigestMap[i] || "").toLowerCase() === want) {
             found = i;
             break;
           }
@@ -675,7 +784,7 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
   }, [
     initialJump,
     processedSegments,
-    getSegmentDigestHex,
+    segmentDigestMap,
     findFocusSegmentIndex,
     jumpToSegment,
     storyId,
@@ -746,20 +855,15 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
     [activeCharacter, jumpToSegment]
   );
 
-  const confirmAddToSet = useCallback(() => {
-    setCluePickerOpen(false);
-    setCluePickerTitle("");
-  }, []);
-
   // Auto-sync highlight <-> default clue set
   const addSegmentToDefault = useCallback((index: number) => {
     const seg = processedSegments[index];
     if (!seg) return;
     const setId = ensureDefaultSetId();
     const preview = getSegmentPreview(seg);
-    const digestHex = getSegmentDigestHex(seg);
+    const digestHex = segmentDigestMap[index] ?? getSegmentDigestHex(seg);
     addItem(setId, { storyId, segmentIndex: index, preview, digestHex });
-  }, [addItem, ensureDefaultSetId, getSegmentDigestHex, getSegmentPreview, processedSegments, storyId]);
+  }, [addItem, ensureDefaultSetId, getSegmentDigestHex, getSegmentPreview, processedSegments, segmentDigestMap, storyId]);
 
   const removeSegmentFromDefault = useCallback((index: number) => {
     const setId = ensureDefaultSetId();
@@ -771,10 +875,21 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
     toggleHighlight(index);
     if (!before) {
       addSegmentToDefault(index);
+      // First-time nudge: tell the user where the highlight went. Persisted
+      // so we don't keep nagging after the user is already aware.
+      const key = "arknights-highlight-intro-shown";
+      try {
+        if (!localStorage.getItem(key)) {
+          toast.success("已加入默认线索集「我的线索集」，可在底部「线索集」Tab 查看或分享");
+          localStorage.setItem(key, "1");
+        }
+      } catch {
+        /* ignore */
+      }
     } else {
       removeSegmentFromDefault(index);
     }
-  }, [addSegmentToDefault, isHighlighted, removeSegmentFromDefault, toggleHighlight]);
+  }, [addSegmentToDefault, isHighlighted, removeSegmentFromDefault, toast, toggleHighlight]);
 
   const clearCharacterHighlight = useCallback(() => {
     setActiveCharacter(null);
@@ -869,6 +984,7 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
       }
 
       if (segment.type === "decision") {
+        const values = segment.values ?? [];
         return (
           <div
             key={index}
@@ -880,16 +996,24 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
             style={{ marginBottom: spacing }}
           >
             <div className="reader-decision-title">选择：</div>
-            {segment.options.map((option, optionIndex) => (
-              <div
-                key={optionIndex}
-                className="reader-decision-option motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-500"
-                style={{ animationDelay: `${optionIndex * 60}ms` }}
-              >
-                <span className="reader-decision-bullet">{optionIndex + 1}</span>
-                <span>{option}</span>
-              </div>
-            ))}
+            {segment.options.map((option, optionIndex) => {
+              const tag = values[optionIndex];
+              return (
+                <div
+                  key={optionIndex}
+                  className="reader-decision-option motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-500"
+                  style={{ animationDelay: `${optionIndex * 60}ms` }}
+                >
+                  <span className="reader-decision-bullet">{optionIndex + 1}</span>
+                  <span className="flex-1">{option}</span>
+                  {tag ? (
+                    <span className="text-[10px] uppercase tracking-wider text-[hsl(var(--color-muted-foreground))]">
+                      {tag}
+                    </span>
+                  ) : null}
+                </div>
+              );
+            })}
           </div>
         );
       }
@@ -983,16 +1107,16 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center h-screen">
-        <div className="text-muted-foreground">加载中...</div>
+      <div className="flex items-center justify-center h-full">
+        <div className="text-[hsl(var(--color-muted-foreground))]">加载中...</div>
       </div>
     );
   }
 
   if (error) {
     return (
-      <div className="flex flex-col items-center justify-center h-screen gap-4">
-        <div className="text-destructive">加载失败: {error}</div>
+      <div className="flex flex-col items-center justify-center h-full gap-4">
+        <div className="text-[hsl(var(--color-destructive))]">加载失败: {error}</div>
         <Button onClick={onBack} variant="outline">
           <ArrowLeft className="mr-2 h-4 w-4" />
           返回
@@ -1003,8 +1127,8 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
 
   if (!content || processedSegments.length === 0) {
     return (
-      <div className="flex flex-col items-center justify-center h-screen gap-4">
-        <div className="text-muted-foreground">暂无内容</div>
+      <div className="flex flex-col items-center justify-center h-full gap-4">
+        <div className="text-[hsl(var(--color-muted-foreground))]">暂无内容</div>
         <Button onClick={onBack} variant="outline">
           <ArrowLeft className="mr-2 h-4 w-4" />
           返回
@@ -1183,6 +1307,30 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
                     trackOffsetTop="4.5rem"
                   >
                     <div className="p-6 space-y-8">
+                      {insights.headers.length > 0 && (
+                        <section>
+                          <div className="flex items-center justify-between mb-3">
+                            <h3 className="text-sm font-semibold uppercase tracking-widest text-[hsl(var(--color-muted-foreground))]">
+                              章节目录
+                            </h3>
+                            <span className="text-xs text-[hsl(var(--color-muted-foreground))]">
+                              {insights.headers.length} 节
+                            </span>
+                          </div>
+                          <div className="space-y-1">
+                            {insights.headers.map((h) => (
+                              <button
+                                key={`toc-${h.index}`}
+                                className="w-full rounded-lg border border-transparent px-3 py-2 text-left text-sm transition-colors hover:border-[hsl(var(--color-border))] hover:bg-[hsl(var(--color-accent))]"
+                                onClick={() => handleJumpToSegment(h.index)}
+                              >
+                                {h.title}
+                              </button>
+                            ))}
+                          </div>
+                        </section>
+                      )}
+
                       <section>
                         <div className="flex items-center justify-between mb-3">
                           <h3 className="text-sm font-semibold uppercase tracking-widest text-[hsl(var(--color-muted-foreground))]">
@@ -1334,53 +1482,6 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
               </Card>
             </div>
           </aside>
-        </>
-      )}
-
-      {cluePickerOpen && (
-        <>
-          <div className="fixed inset-0 z-40 bg-black/40" onClick={() => setCluePickerOpen(false)} />
-          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-            <Card className="w-full max-w-md">
-              <CardHeader className="pb-2">
-                <CardTitle className="text-base">加入线索集</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-4">
-                <div>
-                  <div className="text-xs text-[hsl(var(--color-muted-foreground))] mb-2">选择现有线索集</div>
-                  <div className="max-h-48 overflow-auto border rounded">
-                    {Object.values(clueSets).length === 0 ? (
-                      <div className="p-3 text-xs text-[hsl(var(--color-muted-foreground))]">暂无线索集</div>
-                    ) : (
-                      Object.values(clueSets)
-                        .sort((a, b) => b.updatedAt - a.updatedAt)
-                        .map((s) => (
-                          <button key={s.id} className="w-full px-3 py-2 text-left hover:bg-[hsl(var(--color-accent))] border-b last:border-b-0" onClick={() => confirmAddToSet()}>
-                            <div className="text-sm">{s.title}</div>
-                            <div className="text-[10px] text-[hsl(var(--color-muted-foreground))]">{s.items.length} 条</div>
-                          </button>
-                        ))
-                    )}
-                  </div>
-                </div>
-                <div>
-                  <div className="text-xs text-[hsl(var(--color-muted-foreground))] mb-2">或新建线索集</div>
-                  <div className="flex items-center gap-2">
-                    <Input placeholder="线索集名称" value={cluePickerTitle} onChange={(e) => setCluePickerTitle(e.target.value)} />
-                    <Button onClick={() => {
-                      createSet(cluePickerTitle.trim() || "我的线索集");
-                      confirmAddToSet();
-                    }} disabled={!cluePickerTitle.trim()}>
-                      新建并加入
-                    </Button>
-                  </div>
-                </div>
-                <div className="flex justify-end">
-                  <Button variant="outline" onClick={() => setCluePickerOpen(false)}>取消</Button>
-                </div>
-              </CardContent>
-            </Card>
-          </div>
         </>
       )}
 

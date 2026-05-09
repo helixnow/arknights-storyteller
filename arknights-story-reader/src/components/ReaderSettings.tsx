@@ -10,6 +10,14 @@ const READING_MODES: Array<{ value: Settings["readingMode"]; label: string; desc
     { value: "paged", label: "章节分页", description: "按页分段阅读，便于快速定位" },
   ];
 
+const READER_THEMES: Array<{ value: Settings["theme"]; label: string; swatch: string }> = [
+  { value: "default", label: "跟随应用", swatch: "hsl(var(--color-background))" },
+  { value: "paper", label: "白纸", swatch: "#fafafa" },
+  { value: "sepia", label: "羊皮纸", swatch: "#f5ecd7" },
+  { value: "green", label: "护眼绿", swatch: "#d7ebd2" },
+  { value: "dark", label: "夜幕", swatch: "#0e1014" },
+];
+
 interface ReaderSettingsProps {
   open: boolean;
   settings: Settings;
@@ -79,6 +87,37 @@ export function ReaderSettingsPanel({
                         </div>
                       </button>
                     ))}
+                  </div>
+                </div>
+
+                {/* 阅读主题（与全局主题色独立，仅作用于阅读器背景/文字） */}
+                <div className="space-y-3">
+                  <label className="text-sm font-medium">阅读主题</label>
+                  <div className="grid grid-cols-5 gap-2">
+                    {READER_THEMES.map((t) => {
+                      const active = settings.theme === t.value;
+                      return (
+                        <button
+                          key={t.value}
+                          type="button"
+                          aria-pressed={active}
+                          onClick={() => onUpdateSettings({ theme: t.value })}
+                          className={`flex flex-col items-center gap-1 rounded-lg border p-2 transition-colors ${
+                            active
+                              ? "border-[hsl(var(--color-primary))] bg-[hsl(var(--color-accent))]"
+                              : "border-[hsl(var(--color-border))]"
+                          }`}
+                        >
+                          <span
+                            className="h-6 w-6 rounded-full border border-black/10 shadow-sm"
+                            style={{ backgroundColor: t.swatch }}
+                          />
+                          <span className="text-[11px] text-[hsl(var(--color-muted-foreground))]">
+                            {t.label}
+                          </span>
+                        </button>
+                      );
+                    })}
                   </div>
                 </div>
 
@@ -233,6 +272,33 @@ export function ReaderSettingsPanel({
                       两端对齐
                     </button>
                   </div>
+                </div>
+
+                {/* 首行缩进 */}
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-medium">段落首行缩进</div>
+                    <div className="text-xs text-[hsl(var(--color-muted-foreground))]">
+                      按照中文小说排版，每段首行缩进两字
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={settings.paragraphIndent}
+                    onClick={() => onUpdateSettings({ paragraphIndent: !settings.paragraphIndent })}
+                    className={`relative inline-flex h-6 w-11 flex-shrink-0 items-center rounded-full border transition-colors ${
+                      settings.paragraphIndent
+                        ? "bg-[hsl(var(--color-primary))] border-[hsl(var(--color-primary))]"
+                        : "bg-[hsl(var(--color-secondary))] border-[hsl(var(--color-border))]"
+                    }`}
+                  >
+                    <span
+                      className={`inline-block h-5 w-5 transform rounded-full bg-[hsl(var(--color-card))] shadow transition-transform ${
+                        settings.paragraphIndent ? "translate-x-5" : "translate-x-0.5"
+                      }`}
+                    />
+                  </button>
                 </div>
               </div>
             </CustomScrollArea>

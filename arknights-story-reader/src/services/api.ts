@@ -5,6 +5,7 @@ import type {
   Chapter,
   ParsedStoryContent,
   SearchResult,
+  SearchResultsPage,
   StoryEntry,
   StoryIndexStatus,
   SearchDebugResponse,
@@ -136,6 +137,11 @@ export const api = {
     return invoke("search_stories", { query });
   },
 
+  /** 扩展搜索：返回总数 + facet */
+  searchStoriesEx: async (query: string): Promise<SearchResultsPage> => {
+    return invoke("search_stories_ex", { query });
+  },
+
   // 搜索剧情（带进度事件）
   searchStoriesWithProgress: async (query: string): Promise<SearchResult[]> => {
     return invoke("search_stories_with_progress", { query });
@@ -144,6 +150,14 @@ export const api = {
   // 监听搜索进度
   onSearchProgress: (callback: (progress: { phase: string; current: number; total: number; message: string }) => void) => {
     return listen("search-progress", (event) => {
+      // @ts-expect-error payload shape from Rust
+      callback(event.payload);
+    });
+  },
+
+  // 监听索引重建进度
+  onIndexProgress: (callback: (progress: { phase: string; current: number; total: number; message: string }) => void) => {
+    return listen("index-progress", (event) => {
       // @ts-expect-error payload shape from Rust
       callback(event.payload);
     });

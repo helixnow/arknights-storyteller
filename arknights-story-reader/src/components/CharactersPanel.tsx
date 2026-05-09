@@ -154,30 +154,54 @@ export function CharactersPanel({ onOpenStory }: CharactersPanelProps) {
       if (!cacheApplied) {
         setCacheUsed(false);
         setCacheBuiltAt(null);
-        for (let i = 0; i < stories.length; i += 1) {
-          const story = stories[i];
-          try {
-            const content = await api.getStoryContent(story.storyTxt);
-            const localCounts = countCharactersInStory(content);
-            localCounts.forEach((count, name) => {
-              const existing = aggMap.get(name);
-              if (existing) {
-                existing.total += count;
-                existing.perStory.push({ story, count });
-              } else {
-                aggMap.set(name, {
-                  name,
-                  total: count,
-                  perStory: [{ story, count }],
-                });
+        // Concurrency pool: process N stories in parallel so first-start on
+        // slow devices doesn't take minutes. Each story's aggregation still
+        // runs on a single thread — we just overlap I/O and parse work.
+        const POOL_SIZE = 6;
+        let cursor = 0;
+        let done = 0;
+        const aggLock = { busy: false };
+        const applyCounts = (story: StoryEntry, counts: Map<string, number>) => {
+          counts.forEach((count, name) => {
+            const existing = aggMap.get(name);
+            if (existing) {
+              existing.total += count;
+              existing.perStory.push({ story, count });
+            } else {
+              aggMap.set(name, {
+                name,
+                total: count,
+                perStory: [{ story, count }],
+              });
+            }
+          });
+        };
+        const worker = async () => {
+          while (true) {
+            const i = cursor++;
+            if (i >= stories.length) return;
+            const story = stories[i];
+            try {
+              const content = await api.getStoryContent(story.storyTxt);
+              const localCounts = countCharactersInStory(content);
+              // Simple spin-lock via async boolean — aggregation is cheap.
+              while (aggLock.busy) {
+                await new Promise((r) => setTimeout(r, 0));
               }
-            });
-          } catch (e) {
-            // 单章失败不影响整体
-            console.warn("[CharactersPanel] 读取剧情失败:", story.storyName, e);
+              aggLock.busy = true;
+              applyCounts(story, localCounts);
+              aggLock.busy = false;
+            } catch (e) {
+              console.warn("[CharactersPanel] 读取剧情失败:", story.storyName, e);
+            } finally {
+              done += 1;
+              setProgress({ current: done, total: stories.length });
+            }
           }
-          setProgress({ current: i + 1, total: stories.length });
-        }
+        };
+        await Promise.all(
+          Array.from({ length: Math.min(POOL_SIZE, stories.length) }, () => worker())
+        );
       }
 
       // 整理每个角色的 perStory 排序（默认先按章节内排序）

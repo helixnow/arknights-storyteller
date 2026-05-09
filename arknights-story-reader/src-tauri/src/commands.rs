@@ -1,7 +1,7 @@
 use crate::data_service::DataService;
 use crate::models::{
-    Chapter, ParsedStoryContent, SearchDebugResponse, SearchResult, StoryCategory, StoryEntry,
-    StoryIndexStatus,
+    Chapter, ParsedStoryContent, SearchDebugResponse, SearchResult, SearchResultsPage,
+    StoryCategory, StoryEntry, StoryIndexStatus,
 };
 use crate::parser::parse_story_text;
 use std::sync::{Arc, Mutex};
@@ -113,9 +113,9 @@ pub async fn get_story_index_status(
 }
 
 #[tauri::command]
-pub async fn build_story_index(state: State<'_, AppState>) -> Result<(), String> {
+pub async fn build_story_index(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let service = clone_service(&state);
-    tauri::async_runtime::spawn_blocking(move || service.rebuild_story_index())
+    tauri::async_runtime::spawn_blocking(move || service.rebuild_story_index_with_progress(&app))
         .await
         .map_err(|err| format!("Failed to join build story index task: {}", err))?
 }
@@ -127,6 +127,17 @@ pub async fn search_stories(
 ) -> Result<Vec<SearchResult>, String> {
     let service = lock_service(&state.data_service);
     service.search_stories(&query)
+}
+
+#[tauri::command]
+pub async fn search_stories_ex(
+    state: State<'_, AppState>,
+    query: String,
+) -> Result<SearchResultsPage, String> {
+    let service = clone_service(&state);
+    tauri::async_runtime::spawn_blocking(move || service.search_stories_ex(&query))
+        .await
+        .map_err(|err| format!("Failed to join search_ex task: {}", err))?
 }
 
 #[tauri::command]

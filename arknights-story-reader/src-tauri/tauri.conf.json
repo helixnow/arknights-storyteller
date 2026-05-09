@@ -15,7 +15,10 @@
         "title": "明日方舟剧情阅读器",
         "width": 414,
         "height": 896,
-        "resizable": true
+        "minWidth": 360,
+        "minHeight": 560,
+        "resizable": true,
+        "center": true
       }
     ],
     "security": {
