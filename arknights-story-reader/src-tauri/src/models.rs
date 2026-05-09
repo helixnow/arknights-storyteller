@@ -167,6 +167,33 @@ pub struct SearchResultsPage {
     pub facets: std::collections::BTreeMap<String, usize>,
 }
 
+/// A single segment hit from the segment-level index. Enables precise
+/// "jump to this paragraph" search results.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SegmentHit {
+    #[serde(rename = "storyId")]
+    pub story_id: String,
+    #[serde(rename = "storyName")]
+    pub story_name: String,
+    pub category: String,
+    #[serde(rename = "segmentIndex")]
+    pub segment_index: usize,
+    #[serde(rename = "segmentType")]
+    pub segment_type: String,
+    #[serde(rename = "characterName")]
+    pub character_name: Option<String>,
+    #[serde(rename = "matchedText")]
+    pub matched_text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SegmentSearchPage {
+    pub hits: Vec<SegmentHit>,
+    #[serde(rename = "totalMatched")]
+    pub total_matched: usize,
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchDebugResponse {
     pub results: Vec<SearchResult>,

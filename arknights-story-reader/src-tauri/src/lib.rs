@@ -5,6 +5,36 @@ mod data_service;
 mod models;
 mod parser;
 
+/// Thin test harness exposed for integration tests in `tests/`. Do not use
+/// from application code.
+#[doc(hidden)]
+pub mod data_service_test {
+    use std::path::PathBuf;
+
+    use crate::data_service::DataService;
+    pub use crate::models::{SearchResultsPage, SegmentSearchPage};
+
+    pub struct DataServiceHandle {
+        inner: DataService,
+    }
+
+    impl DataServiceHandle {
+        pub fn new(app_data_dir: PathBuf) -> Self {
+            Self {
+                inner: DataService::new(app_data_dir),
+            }
+        }
+
+        pub fn search_stories_ex(&self, q: &str) -> Result<SearchResultsPage, String> {
+            self.inner.search_stories_ex(q)
+        }
+
+        pub fn search_segments(&self, q: &str) -> Result<SegmentSearchPage, String> {
+            self.inner.search_segments(q)
+        }
+    }
+}
+
 use commands::AppState;
 use data_service::DataService;
 use std::sync::Arc;
@@ -67,6 +97,7 @@ pub fn run() {
             commands::build_story_index,
             commands::search_stories,
             commands::search_stories_ex,
+            commands::search_segments,
             commands::search_stories_with_progress,
             commands::search_stories_debug,
         ])

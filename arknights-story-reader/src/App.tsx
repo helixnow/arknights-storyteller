@@ -128,9 +128,24 @@ function App() {
     () => <StoryList onSelectStory={handleSelectStory} />,
     [handleSelectStory]
   );
+  const handleOpenSegmentResult = useCallback(
+    (story: StoryEntry, jump: { segmentIndex: number; preview?: string; query: string }) => {
+      handleOpenStoryJump(story, {
+        segmentIndex: jump.segmentIndex,
+        preview: jump.preview,
+      });
+    },
+    [handleOpenStoryJump]
+  );
+
   const searchView = useMemo(
-    () => <SearchPanel onSelectResult={handleSearchResult} />,
-    [handleSearchResult]
+    () => (
+      <SearchPanel
+        onSelectResult={handleSearchResult}
+        onSelectSegment={handleOpenSegmentResult}
+      />
+    ),
+    [handleSearchResult, handleOpenSegmentResult]
   );
   const settingsView = useMemo(() => <Settings />, []);
   const cluesView = useMemo(

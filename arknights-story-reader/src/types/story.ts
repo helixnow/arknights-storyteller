@@ -131,6 +131,23 @@ export interface SearchResultsPage {
   facets: Record<string, number>;
 }
 
+/** 段级搜索命中 */
+export interface SegmentHit {
+  storyId: string;
+  storyName: string;
+  category: string;
+  segmentIndex: number;
+  segmentType: "dialogue" | "narration" | "system" | "subtitle" | "sticker" | "header" | "decision";
+  characterName?: string | null;
+  matchedText: string;
+}
+
+export interface SegmentSearchPage {
+  hits: SegmentHit[];
+  totalMatched: number;
+  truncated: boolean;
+}
+
 export interface SearchDebugResponse {
   results: SearchResult[];
   logs: string[];

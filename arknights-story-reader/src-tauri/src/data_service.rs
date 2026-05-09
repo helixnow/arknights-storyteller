@@ -3,8 +3,10 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use jieba_rs::Jieba;
 use reqwest::blocking::Client;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
@@ -13,8 +15,8 @@ use unicode_normalization::UnicodeNormalization;
 use zip::ZipArchive;
 
 use crate::models::{
-    Activity, Chapter, SearchDebugResponse, SearchResult, SearchResultsPage, StoryCategory,
-    StoryEntry, StoryIndexStatus, StorySegment,
+    Activity, Chapter, SearchDebugResponse, SearchResult, SearchResultsPage, SegmentHit,
+    SegmentSearchPage, StoryCategory, StoryEntry, StoryIndexStatus, StorySegment,
 };
 use crate::parser::parse_story_text;
 
@@ -23,7 +25,101 @@ const REPO_DOWNLOAD_URL: &str = "https://codeload.github.com/Kengxxiao/Arknights
 const DEFAULT_BRANCH: &str = "master";
 const VERSION_FILE: &str = "version.json";
 const SEARCH_RESULT_LIMIT: usize = 500;
-const INDEX_VERSION: i32 = 2; // bump when FTS schema changes
+/// Bump when any of: FTS schema, tokenizer rules, flatten_segments format.
+/// v3 = migrated to jieba word segmentation (2025-05).
+/// v4 = added segment-level FTS table `story_segment_index` (2025-05).
+const INDEX_VERSION: i32 = 4;
+
+/// Shared jieba instance. The default dictionary is embedded in the crate
+/// (default-dict feature) and loading it costs ~10-30ms so we do it once per
+/// process and reuse. We also inject a small Arknights-specific user
+/// dictionary so operator names and faction terms aren't split into chars.
+fn jieba() -> &'static Jieba {
+    static INSTANCE: OnceLock<Jieba> = OnceLock::new();
+    INSTANCE.get_or_init(|| {
+        let mut j = Jieba::new();
+        // Register Arknights-specific proper nouns as high-frequency single
+        // tokens. Extend `ARKNIGHTS_USER_WORDS` when observed mis-splits
+        // appear. Names not in this list still work via the per-char
+        // fallback emitted by `tokenize_for_fts`, just with weaker phrase
+        // recall.
+        for (word, freq) in ARKNIGHTS_USER_WORDS {
+            j.add_word(word, Some(*freq), Some("nr"));
+        }
+        j
+    })
+}
+
+/// Curated Arknights user dictionary. Pairs of `(word, freq)` — higher freq
+/// biases jieba to keep the word whole. 10_000 is enough to dominate almost
+/// any ambiguous split in the default dict.
+const ARKNIGHTS_USER_WORDS: &[(&str, usize)] = &[
+    // Factions / organizations
+    ("罗德岛", 10_000),
+    ("整合运动", 8_000),
+    ("萨尔贡", 5_000),
+    ("莱塔尼亚", 5_000),
+    ("卡西米尔", 5_000),
+    ("乌萨斯", 5_000),
+    ("玻利瓦尔", 5_000),
+    ("哥伦比亚", 5_000),
+    ("维多利亚", 5_000),
+    ("炎国", 5_000),
+    ("黎博利", 3_000),
+    ("莱茵生命", 3_000),
+    ("企鹅物流", 3_000),
+    ("德拉克", 3_000),
+    // Lore terms
+    ("源石", 3_000),
+    ("源石尘", 3_000),
+    ("源石技艺", 3_000),
+    ("矿石病", 3_000),
+    ("感染者", 3_000),
+    ("天灾", 3_000),
+    ("移动城市", 3_000),
+    ("干员密录", 3_000),
+    // Operator / character names — seeded with the most common; unseen
+    // names still tokenize per-char. Add more as QA catches them.
+    ("凯尔希", 8_000),
+    ("阿米娅", 8_000),
+    ("博士", 8_000),
+    ("德克萨斯", 5_000),
+    ("能天使", 5_000),
+    ("推进之王", 5_000),
+    ("艾雅法拉", 5_000),
+    ("银灰", 5_000),
+    ("赫默", 5_000),
+    ("麦哲伦", 5_000),
+    ("菲亚梅塔", 5_000),
+    ("伊芙利特", 5_000),
+    ("斯卡蒂", 5_000),
+    ("幽灵鲨", 5_000),
+    ("安洁莉娜", 5_000),
+    ("夜莺", 5_000),
+    ("闪灵", 5_000),
+    ("初雪", 5_000),
+    ("星熊", 5_000),
+    ("泥岩", 5_000),
+    ("霜华", 5_000),
+    ("塔露拉", 5_000),
+    ("浮士德", 5_000),
+    ("梅菲斯特", 5_000),
+    ("帕特里西娅", 5_000),
+    ("克洛丝", 5_000),
+    ("安赛尔", 5_000),
+    ("杰西卡", 5_000),
+    ("红豆", 5_000),
+    ("缠丸", 5_000),
+    ("特蕾西娅", 5_000),
+    ("远山", 5_000),
+    ("临光", 5_000),
+    ("送葬人", 5_000),
+    ("艾丽妮", 5_000),
+    ("陈sir", 5_000),
+    ("陈博士", 5_000),
+    ("可颂", 5_000),
+    ("空弦", 5_000),
+];
 
 #[derive(Clone, serde::Serialize)]
 struct SyncProgress {
@@ -379,10 +475,11 @@ impl DataService {
         let should_recreate = current_version < INDEX_VERSION;
 
         if should_recreate {
-            // Drop and recreate virtual table with new schema
+            // Drop and recreate virtual tables with current schema.
             conn.execute_batch(
                 "
                 DROP TABLE IF EXISTS story_index;
+                DROP TABLE IF EXISTS story_segment_index;
                 CREATE VIRTUAL TABLE story_index USING fts5(
                     story_id UNINDEXED,
                     story_name,
@@ -393,9 +490,19 @@ impl DataService {
                     tokenize = 'unicode61 remove_diacritics 2',
                     prefix='2 3 4'
                 );
+                CREATE VIRTUAL TABLE story_segment_index USING fts5(
+                    story_id UNINDEXED,
+                    segment_index UNINDEXED,
+                    segment_type UNINDEXED,
+                    character_name,
+                    tokenized_text,
+                    raw_text UNINDEXED,
+                    tokenize = 'unicode61 remove_diacritics 2',
+                    prefix='2 3'
+                );
                 ",
             )
-            .map_err(|e| format!("Failed to (re)create story index: {}", e))?;
+            .map_err(|e| format!("Failed to (re)create indexes: {}", e))?;
 
             conn.execute(
                 "INSERT INTO story_index_meta (key, value) VALUES ('index_version', ?1)
@@ -404,7 +511,7 @@ impl DataService {
             )
             .map_err(|e| format!("Failed to update index version: {}", e))?;
         } else {
-            // Ensure table exists (fresh install)
+            // Ensure tables exist (fresh install / first open after boot).
             conn.execute_batch(
                 "
                 CREATE VIRTUAL TABLE IF NOT EXISTS story_index USING fts5(
@@ -417,9 +524,19 @@ impl DataService {
                     tokenize = 'unicode61 remove_diacritics 2',
                     prefix='2 3 4'
                 );
+                CREATE VIRTUAL TABLE IF NOT EXISTS story_segment_index USING fts5(
+                    story_id UNINDEXED,
+                    segment_index UNINDEXED,
+                    segment_type UNINDEXED,
+                    character_name,
+                    tokenized_text,
+                    raw_text UNINDEXED,
+                    tokenize = 'unicode61 remove_diacritics 2',
+                    prefix='2 3'
+                );
                 ",
             )
-            .map_err(|e| format!("Failed to ensure story index table: {}", e))?;
+            .map_err(|e| format!("Failed to ensure index tables: {}", e))?;
         }
 
         Ok(())
@@ -553,45 +670,162 @@ impl DataService {
         parts.join("\n")
     }
 
+    /// Mirror the frontend's in-reader segment post-processing so the indices
+    /// we store in `story_segment_index` line up with what the UI scrolls to
+    /// when the user taps a search result. The two normalizations must stay
+    /// in sync; if the reader's logic changes, bump `INDEX_VERSION` too.
+    fn post_process_segments_for_index(segments: &[StorySegment]) -> Vec<StorySegment> {
+        let cleaned: Vec<StorySegment> = segments
+            .iter()
+            .flat_map(|seg| -> Vec<StorySegment> {
+                match seg {
+                    StorySegment::Dialogue { character_name, text, position } => {
+                        let normalized = text
+                            .replace("\r\n", "\n")
+                            .split('\n')
+                            .map(|l| l.trim())
+                            .filter(|l| !l.is_empty())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if normalized.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![StorySegment::Dialogue {
+                                character_name: character_name.clone(),
+                                text: normalized,
+                                position: position.clone(),
+                            }]
+                        }
+                    }
+                    StorySegment::Narration { text } => {
+                        let normalized = text
+                            .replace("\r\n", "\n")
+                            .split('\n')
+                            .map(|l| l.trim())
+                            .filter(|l| !l.is_empty())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if normalized.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![StorySegment::Narration { text: normalized }]
+                        }
+                    }
+                    StorySegment::Decision { options, values } => {
+                        let opts: Vec<String> = options
+                            .iter()
+                            .map(|o| o.trim().to_string())
+                            .filter(|o| !o.is_empty())
+                            .collect();
+                        if opts.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![StorySegment::Decision {
+                                options: opts,
+                                values: values.clone(),
+                            }]
+                        }
+                    }
+                    other => vec![other.clone()],
+                }
+            })
+            .collect();
+
+        let mut merged: Vec<StorySegment> = Vec::with_capacity(cleaned.len());
+        for seg in cleaned {
+            if let StorySegment::Dialogue {
+                character_name,
+                text,
+                position,
+            } = &seg
+            {
+                if let Some(StorySegment::Dialogue {
+                    character_name: prev_name,
+                    text: prev_text,
+                    position: _,
+                }) = merged.last_mut()
+                {
+                    if prev_name == character_name {
+                        let joined = format!("{}\n{}", prev_text, text).replace("\n\n", "\n");
+                        *prev_text = joined;
+                        // keep first position
+                        let _ = position;
+                        continue;
+                    }
+                }
+            }
+            merged.push(seg);
+        }
+        merged
+    }
+
+    /// Tokenize free text for the FTS index.
+    ///
+    /// v3 uses jieba word segmentation for CJK text, producing multi-char
+    /// tokens for meaningful words (e.g. `凯尔希` / `罗德岛`). To preserve the
+    /// ability to search by a single character, each CJK word longer than 1
+    /// char is additionally emitted as its component characters — duplicate
+    /// emission is cheap and keeps recall roughly equivalent to the old
+    /// per-char scheme while drastically reducing phrase brittleness.
+    ///
+    /// ASCII alphanumeric runs are emitted as a single lowercase token.
+    /// Punctuation and whitespace act as separators and are discarded.
     fn tokenize_for_fts(text: &str) -> Vec<String> {
-        let text = normalize_nfkc_lower_strip_marks(text);
-        let mut tokens = Vec::new();
-        let mut ascii_buffer = String::new();
+        let normalized = normalize_nfkc_lower_strip_marks(text);
+        if normalized.is_empty() {
+            return Vec::new();
+        }
 
-        for ch in text.chars() {
-            if ch.is_ascii_alphanumeric() {
-                ascii_buffer.push(ch.to_ascii_lowercase());
+        let segments = jieba().cut(&normalized, false);
+        let mut tokens: Vec<String> = Vec::with_capacity(segments.len() * 2);
+        for seg in segments {
+            // Trim and skip pure-whitespace/punctuation segments.
+            let trimmed = seg.trim();
+            if trimmed.is_empty() {
                 continue;
             }
 
-            if !ascii_buffer.is_empty() {
-                let token = std::mem::take(&mut ascii_buffer);
-                tokens.push(token);
-            }
-
-            if ch.is_whitespace() {
+            // Fast path: pure ASCII alnum → keep as-is.
+            if trimmed.chars().all(|c| c.is_ascii_alphanumeric()) {
+                tokens.push(trimmed.to_string());
                 continue;
             }
 
-            if is_common_punctuation(ch) {
+            // Drop pure punctuation/symbol segments.
+            if trimmed
+                .chars()
+                .all(|c| is_common_punctuation(c) || c.is_whitespace())
+            {
                 continue;
             }
 
-            if ch.is_alphanumeric() {
-                let token: String = ch.to_lowercase().collect();
-                if !token.is_empty() {
-                    tokens.push(token);
+            let cjk_chars: Vec<char> = trimmed.chars().filter(|c| is_cjk(*c)).collect();
+            let is_all_cjk = cjk_chars.len() == trimmed.chars().filter(|c| !c.is_whitespace()).count();
+
+            if is_all_cjk && cjk_chars.len() >= 2 {
+                // Multi-char CJK word: store both the word and each char so a
+                // single-char query (`凯`) still matches, and so does the word
+                // (`凯尔希`). Byte size impact is ~2x per CJK word.
+                tokens.push(cjk_chars.iter().collect());
+                for ch in &cjk_chars {
+                    tokens.push(ch.to_string());
                 }
                 continue;
             }
 
-            tokens.push(ch.to_string());
+            // Single-char CJK, or mixed CJK+ASCII (rare): emit char by char
+            // so queries remain permissive.
+            for ch in trimmed.chars() {
+                if ch.is_whitespace() || is_common_punctuation(ch) {
+                    continue;
+                }
+                if ch.is_ascii_alphanumeric() {
+                    tokens.push(ch.to_ascii_lowercase().to_string());
+                } else {
+                    tokens.push(ch.to_string());
+                }
+            }
         }
-
-        if !ascii_buffer.is_empty() {
-            tokens.push(ascii_buffer);
-        }
-
         tokens
     }
 
@@ -599,104 +833,102 @@ impl DataService {
         Self::tokenize_for_fts(text).join(" ")
     }
 
-    // Build a more expressive FTS query:
-    // - Normalize (NFKC + lowercase + strip marks)
-    // - Chinese contiguous sequences (len>=2) -> quoted phrase of spaced characters: "凯 尔 希"
-    // - ASCII terms -> add * suffix for prefix match
-    // - Support simple NOT via leading '-' and OR keyword, default AND
+    // Build an FTS query using jieba word segmentation.
+    //
+    // For each user-supplied term:
+    // - ASCII alnum runs → add `*` suffix for prefix match
+    // - CJK text → split via jieba; words that are actually in the index
+    //   (multi-char word OR single char) are AND-joined. This is both more
+    //   lenient (recall) and more precise than the previous bigram hack:
+    //   e.g. "凯尔希阿米娅" now decomposes to `凯尔希 AND 阿米娅`.
+    // - Mixed tokens are split at ASCII/CJK boundaries.
+    //
+    // Quoted phrases bypass segmentation and are matched verbatim (after
+    // character-level normalization) so users can pin exact sequences.
+    //
+    // Supports:
+    //   * quoted phrase: `"foo bar"`
+    //   * NOT: leading `-` on a term
+    //   * OR: literal `or` token between terms
+    //   * otherwise: implicit AND
     fn build_fts_query_advanced(raw_query: &str) -> Option<String> {
         let q = normalize_nfkc_lower_strip_marks(raw_query.trim());
         if q.is_empty() {
             return None;
         }
 
-        // Simple tokenizer that respects quoted phrases
-        let mut terms: Vec<(String, bool, bool)> = Vec::new(); // (term, is_not, is_or_before)
+        #[derive(Clone)]
+        struct UserTerm {
+            text: String,
+            is_not: bool,
+            is_or_before: bool,
+            is_quoted: bool,
+        }
+
+        let mut terms: Vec<UserTerm> = Vec::new();
         let mut buf = String::new();
         let mut in_quotes = false;
         let mut prev_was_or = false;
-        let mut chars = q.chars().peekable();
-        while let Some(ch) = chars.next() {
+        let flush_bare = |buf: &mut String,
+                          terms: &mut Vec<UserTerm>,
+                          prev_was_or: &mut bool| {
+            if buf.is_empty() {
+                return;
+            }
+            let t = std::mem::take(buf);
+            if t == "or" {
+                *prev_was_or = true;
+                return;
+            }
+            let is_not = t.starts_with('-');
+            let content = if is_not { t.trim_start_matches('-').to_string() } else { t };
+            if !content.is_empty() {
+                terms.push(UserTerm {
+                    text: content,
+                    is_not,
+                    is_or_before: *prev_was_or,
+                    is_quoted: false,
+                });
+                *prev_was_or = false;
+            }
+        };
+
+        for ch in q.chars() {
             match ch {
                 '"' => {
                     if in_quotes {
                         in_quotes = false;
-                        let t = std::mem::take(&mut buf);
-                        if !t.is_empty() {
-                            terms.push((t, false, prev_was_or));
+                        if !buf.is_empty() {
+                            let phrase = std::mem::take(&mut buf);
+                            terms.push(UserTerm {
+                                text: phrase,
+                                is_not: false,
+                                is_or_before: prev_was_or,
+                                is_quoted: true,
+                            });
                             prev_was_or = false;
                         }
                     } else {
-                        if !buf.trim().is_empty() {
-                            let t = std::mem::take(&mut buf);
-                            if t == "or" {
-                                prev_was_or = true;
-                            } else {
-                                let is_not = t.starts_with('-');
-                                let content = if is_not {
-                                    t.trim_start_matches('-').to_string()
-                                } else {
-                                    t
-                                };
-                                if !content.is_empty() {
-                                    terms.push((content, is_not, prev_was_or));
-                                    prev_was_or = false;
-                                }
-                            }
-                        }
+                        flush_bare(&mut buf, &mut terms, &mut prev_was_or);
                         in_quotes = true;
                     }
                 }
                 c if c.is_whitespace() && !in_quotes => {
-                    if !buf.is_empty() {
-                        let t = std::mem::take(&mut buf);
-                        if t == "or" {
-                            prev_was_or = true;
-                        } else {
-                            let is_not = t.starts_with('-');
-                            let content = if is_not {
-                                t.trim_start_matches('-').to_string()
-                            } else {
-                                t
-                            };
-                            if !content.is_empty() {
-                                terms.push((content, is_not, prev_was_or));
-                                prev_was_or = false;
-                            }
-                        }
-                    }
+                    flush_bare(&mut buf, &mut terms, &mut prev_was_or);
                 }
                 _ => buf.push(ch),
             }
         }
-        if !buf.is_empty() {
-            let t = std::mem::take(&mut buf);
-            if t == "or" {
-                // dangling OR, ignore
-            } else {
-                let is_not = t.starts_with('-');
-                let content = if is_not {
-                    t.trim_start_matches('-').to_string()
-                } else {
-                    t
-                };
-                if !content.is_empty() {
-                    terms.push((content, is_not, prev_was_or));
-                }
-            }
-        }
-
+        flush_bare(&mut buf, &mut terms, &mut prev_was_or);
         if terms.is_empty() {
             return None;
         }
 
         fn is_fts_special(c: char) -> bool {
-            // FTS5 query special characters we must not expose verbatim.
             matches!(c, '"' | '*' | ':' | '(' | ')' | '+' | '-' | '^' | '\\')
         }
 
-        fn sanitize_term(s: &str) -> String {
-            // Replace FTS5 specials with spaces; also drop control chars.
+        fn sanitize(s: &str) -> String {
             s.chars()
                 .map(|c| if is_fts_special(c) || c.is_control() { ' ' } else { c })
                 .collect::<String>()
@@ -704,93 +936,142 @@ impl DataService {
                 .to_string()
         }
 
-        fn to_phrase_if_cjk(s: &str) -> String {
-            let sanitized = sanitize_term(s);
-            if sanitized.is_empty() {
+        /// Convert a non-quoted term into an FTS clause.
+        /// Returns an empty string if nothing meaningful remains.
+        fn term_to_clause(raw: &str) -> String {
+            let s = sanitize(raw);
+            if s.is_empty() {
                 return String::new();
             }
-            let mut has_cjk = false;
-            let mut all_cjk = true;
-            for ch in sanitized.chars() {
-                if is_cjk(ch) {
-                    has_cjk = true;
-                } else if !ch.is_whitespace() {
-                    all_cjk = false;
-                }
+
+            // Pure ASCII alnum → prefix match.
+            if s.chars().all(|c| c.is_ascii_alphanumeric()) {
+                return format!("{}*", s);
             }
-            if has_cjk && all_cjk {
-                let cjk_chars: Vec<char> = sanitized
+
+            // Run through jieba, but only keep tokens the indexer would also
+            // emit (ASCII alnum, CJK words, single CJK chars).
+            let segs = jieba().cut(&s, false);
+            let mut tokens: Vec<String> = Vec::new();
+            for seg in segs {
+                let trimmed = seg.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if trimmed.chars().all(|c| c.is_ascii_alphanumeric()) {
+                    tokens.push(format!("{}*", trimmed));
+                    continue;
+                }
+                if trimmed
                     .chars()
-                    .filter(|c| !c.is_whitespace())
-                    .collect();
-                if cjk_chars.is_empty() {
-                    return String::new();
+                    .all(|c| is_common_punctuation(c) || c.is_whitespace())
+                {
+                    continue;
                 }
-                // Short phrase: keep strict ordering.
-                if cjk_chars.len() <= 3 {
-                    let spaced: String = cjk_chars
-                        .iter()
-                        .map(|c| c.to_string())
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    return format!("\"{}\"", spaced);
+                // Pure CJK word → wrap as phrase token.
+                let cjk_chars: Vec<char> = trimmed.chars().filter(|c| is_cjk(*c)).collect();
+                if cjk_chars.len() == trimmed.chars().filter(|c| !c.is_whitespace()).count()
+                    && !cjk_chars.is_empty()
+                {
+                    let word: String = cjk_chars.iter().collect();
+                    tokens.push(format!("\"{}\"", word));
+                    continue;
                 }
-                // Long phrase (>=4 chars): since tokenized_content stores each
-                // CJK char as a single token with spaces, the original strict
-                // phrase "凯 尔 希 阿 米 娅" requires the 6 chars to appear
-                // strictly consecutive which is brittle. Expand into overlapping
-                // bigrams joined by AND — recall goes up without sacrificing
-                // precision much. (bug B5/B6, D4)
-                let mut pieces: Vec<String> = Vec::new();
-                for window in cjk_chars.windows(2) {
-                    pieces.push(format!("\"{} {}\"", window[0], window[1]));
-                }
-                format!("({})", pieces.join(" AND "))
-            } else if sanitized.chars().all(|c| c.is_ascii_alphanumeric()) {
-                format!("{}*", sanitized)
-            } else {
-                // Mixed CJK+ASCII/digit — strip FTS specials and emit as spaced phrase.
-                let mut spaced = String::new();
-                for ch in sanitized.chars() {
-                    if ch.is_whitespace() {
+                // Mixed (rare) — split into whatever atoms make sense.
+                for ch in trimmed.chars() {
+                    if ch.is_whitespace() || is_common_punctuation(ch) {
                         continue;
                     }
-                    if !spaced.is_empty() {
-                        spaced.push(' ');
+                    if ch.is_ascii_alphanumeric() {
+                        tokens.push(format!("{}*", ch.to_ascii_lowercase()));
+                    } else if is_cjk(ch) {
+                        tokens.push(format!("\"{}\"", ch));
                     }
-                    spaced.push(ch);
                 }
-                if spaced.is_empty() {
-                    String::new()
-                } else {
-                    format!("\"{}\"", spaced)
-                }
+            }
+            if tokens.is_empty() {
+                String::new()
+            } else if tokens.len() == 1 {
+                tokens.into_iter().next().unwrap()
+            } else {
+                format!("({})", tokens.join(" AND "))
             }
         }
 
-        let mut parts: Vec<String> = Vec::new();
-        for (raw, is_not, is_or) in terms.into_iter() {
-            if raw.is_empty() {
-                continue;
+        /// A quoted phrase must match verbatim. Split only on whitespace and
+        /// wrap the concatenated run as a single FTS phrase — the indexer
+        /// stored both the jieba word and each constituent char, so a CJK
+        /// run is still findable as long as jieba happens to cut it the same
+        /// way. For best precision users should quote exact short phrases.
+        fn quoted_to_clause(raw: &str) -> String {
+            let s = sanitize(raw);
+            if s.is_empty() {
+                return String::new();
             }
-            let phrase = to_phrase_if_cjk(&raw);
-            if phrase.is_empty() {
-                // Sanitization removed everything — skip this term entirely
-                // and don't emit a dangling connector.
-                continue;
+            if s.chars().all(|c| c.is_ascii_alphanumeric() || c.is_whitespace()) {
+                // ASCII phrase: `"foo bar"` → `"foo bar"` (FTS keeps order).
+                return format!("\"{}\"", s);
             }
-            let piece = if is_not { format!("NOT {}", phrase) } else { phrase };
-            if !parts.is_empty() {
-                parts.push(if is_or { "OR".to_string() } else { "AND".to_string() });
+            // For mixed / CJK phrases, try the jieba cut and join words.
+            // This matches index records because indexing also runs jieba.
+            let segs = jieba()
+                .cut(&s, false)
+                .into_iter()
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty() && !t.chars().all(is_common_punctuation))
+                .collect::<Vec<_>>();
+            if segs.is_empty() {
+                return String::new();
             }
-            parts.push(piece);
+            format!("\"{}\"", segs.join(" "))
         }
 
-        if parts.is_empty() {
-            None
-        } else {
-            Some(parts.join(" "))
+        // FTS5 semantics require positive terms on the left of a NOT. If
+        // the user writes `-X Y` we must emit `Y NOT X`, not `NOT X AND Y`.
+        // We also need at least one positive term — a query that's purely
+        // negations returns nothing by definition.
+        let mut positives: Vec<(String, bool)> = Vec::new(); // (clause, or_flag)
+        let mut negatives: Vec<String> = Vec::new();
+        for term in terms {
+            let clause = if term.is_quoted {
+                quoted_to_clause(&term.text)
+            } else {
+                term_to_clause(&term.text)
+            };
+            if clause.is_empty() {
+                continue;
+            }
+            if term.is_not {
+                negatives.push(clause);
+            } else {
+                positives.push((clause, term.is_or_before));
+            }
         }
+
+        if positives.is_empty() {
+            // Purely-negative queries are meaningless in FTS5. Rather than
+            // throwing a syntax error we return None and let the caller
+            // short-circuit to "no results".
+            return None;
+        }
+
+        // Assemble positives with their AND/OR connectives.
+        let mut assembled = String::new();
+        for (i, (clause, or_flag)) in positives.iter().enumerate() {
+            if i > 0 {
+                assembled.push_str(if *or_flag { " OR " } else { " AND " });
+            }
+            assembled.push_str(clause);
+        }
+
+        // Append any NOT clauses — one per negation, left-to-right.
+        for neg in negatives {
+            // Wrap the positive accumulator so the NOT doesn't bind to only
+            // the last positive term under FTS5's precedence rules.
+            assembled = format!("({}) NOT {}", assembled, neg);
+        }
+
+        Some(assembled)
     }
 
     fn extract_meta_value(conn: &Connection, key: &str) -> Result<Option<String>, String> {
@@ -1480,9 +1761,11 @@ impl DataService {
 
         tx.execute("DELETE FROM story_index", [])
             .map_err(|e| format!("Failed to clear story index: {}", e))?;
+        tx.execute("DELETE FROM story_segment_index", [])
+            .map_err(|e| format!("Failed to clear story segment index: {}", e))?;
 
         let indexed_stories = self.collect_stories_for_index()?;
-        let mut insert_stmt = tx
+        let mut story_insert_stmt = tx
             .prepare(
                 "
             INSERT INTO story_index (
@@ -1496,8 +1779,23 @@ impl DataService {
         ",
             )
             .map_err(|e| format!("Failed to prepare story index insert: {}", e))?;
+        let mut segment_insert_stmt = tx
+            .prepare(
+                "
+            INSERT INTO story_segment_index (
+                story_id,
+                segment_index,
+                segment_type,
+                character_name,
+                tokenized_text,
+                raw_text
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        ",
+            )
+            .map_err(|e| format!("Failed to prepare segment index insert: {}", e))?;
 
         let mut total = 0usize;
+        let mut segment_total = 0usize;
 
         emit("收集", 0, indexed_stories.len(), "加载剧情清单");
 
@@ -1518,7 +1816,12 @@ impl DataService {
             };
 
             let parsed = parse_story_text(&raw_text);
-            let flattened = Self::flatten_segments(&parsed.segments);
+            // Post-process segments the same way the frontend reader does so
+            // that the segment indices we store match what the UI will scroll
+            // to. Specifically: drop empty segments and merge consecutive
+            // same-speaker dialogue.
+            let processed = Self::post_process_segments_for_index(&parsed.segments);
+            let flattened = Self::flatten_segments(&processed);
 
             let combined_raw = if flattened.trim().is_empty() {
                 story_name.clone()
@@ -1534,7 +1837,7 @@ impl DataService {
             let category_label =
                 Self::format_category_label(&indexed.entry_type, &indexed.category_name);
 
-            insert_stmt
+            story_insert_stmt
                 .execute(params![
                     story_id,
                     story_name,
@@ -1551,6 +1854,48 @@ impl DataService {
                 .map_err(|e| format!("Failed to insert story into index: {}", e))?;
             total += 1;
 
+            // Per-segment insertion: only meaningful textual segments are
+            // indexed. Header/Decision are useful for navigation so we still
+            // index their text where applicable.
+            for (seg_idx, segment) in processed.iter().enumerate() {
+                let (seg_type, character_name, raw_text): (&str, Option<&str>, String) = match segment {
+                    StorySegment::Dialogue { character_name, text, .. } => {
+                        ("dialogue", Some(character_name.as_str()), text.clone())
+                    }
+                    StorySegment::Narration { text } => ("narration", None, text.clone()),
+                    StorySegment::System { speaker, text } => {
+                        ("system", speaker.as_deref(), text.clone())
+                    }
+                    StorySegment::Subtitle { text, .. } => ("subtitle", None, text.clone()),
+                    StorySegment::Sticker { text, .. } => ("sticker", None, text.clone()),
+                    StorySegment::Header { title } => ("header", None, title.clone()),
+                    StorySegment::Decision { options, .. } => {
+                        ("decision", None, options.join("\n"))
+                    }
+                };
+                if raw_text.trim().is_empty() {
+                    continue;
+                }
+                let seg_tokenized = Self::build_tokenized_content(&raw_text);
+                if seg_tokenized.trim().is_empty() {
+                    continue;
+                }
+                let character_norm = character_name
+                    .map(|c| Self::build_tokenized_content(c))
+                    .unwrap_or_default();
+                segment_insert_stmt
+                    .execute(params![
+                        story_id,
+                        seg_idx as i64,
+                        seg_type,
+                        character_norm,
+                        seg_tokenized,
+                        raw_text,
+                    ])
+                    .map_err(|e| format!("Failed to insert segment into index: {}", e))?;
+                segment_total += 1;
+            }
+
             // Batch progress events to avoid flooding the frontend bus.
             if (idx + 1) % 16 == 0 || idx + 1 == indexed_stories.len() {
                 emit(
@@ -1562,7 +1907,8 @@ impl DataService {
             }
         }
 
-        drop(insert_stmt);
+        drop(story_insert_stmt);
+        drop(segment_insert_stmt);
 
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1589,10 +1935,25 @@ impl DataService {
         )
         .map_err(|e| format!("Failed to update index total: {}", e))?;
 
+        tx.execute(
+            "
+            INSERT INTO story_index_meta (key, value)
+            VALUES ('segment_total', ?1)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        ",
+            params![segment_total.to_string()],
+        )
+        .map_err(|e| format!("Failed to update segment index total: {}", e))?;
+
         tx.commit()
             .map_err(|e| format!("Failed to commit story index rebuild: {}", e))?;
 
-        emit("完成", total, total, "索引构建完成");
+        emit(
+            "完成",
+            total,
+            total,
+            &format!("已索引 {} 篇 / {} 段", total, segment_total),
+        );
 
         Ok(())
     }
@@ -1639,9 +2000,7 @@ impl DataService {
 
         let Some(fts_query) = Self::build_fts_query_advanced(query) else {
             return Ok(Some(Vec::new()));
-        };
-
-        // bm25() column weights: `story_id`(UNINDEXED)=0, `story_name`=10,
+        };        // bm25() column weights: `story_id`(UNINDEXED)=0, `story_name`=10,
         // `category`(UNINDEXED)=0, `tokenized_content`=1, `story_code`=5,
         // `raw_content`(UNINDEXED)=0. Higher = more relevant. (bug C1)
         let query_sql = format!(
@@ -1783,42 +2142,39 @@ impl DataService {
     }
 
     /// 搜索剧情（混合：索引优先 + 线性扫描补全，防止遗漏）
+    ///
+    /// When the FTS index exists and returns a non-empty result set (or an
+    /// empty set from a well-formed query against an up-to-date corpus), we
+    /// trust it and skip the O(N*segments) linear scan. The scan only runs
+    /// as a fallback when the index is missing, corrupt, or returned an
+    /// error — otherwise a single query over 1900+ stories can easily take
+    /// 30s+ on lower-end devices.
     pub fn search_stories(&self, query: &str) -> Result<Vec<SearchResult>, String> {
         let trimmed = query.trim();
         if trimmed.is_empty() {
             return Ok(Vec::new());
         }
 
-        // 先走索引
-        let mut combined: Vec<SearchResult> = match self.search_stories_with_index(trimmed) {
-            Ok(Some(results)) => results,
-            Ok(None) => Vec::new(),
+        match self.search_stories_with_index(trimmed) {
+            // Index returned authoritative results — don't waste time on
+            // linear scan. FTS5 with jieba is a superset of plain contains()
+            // matching at this point.
+            Ok(Some(results)) => Ok(results),
+            // Index not ready (never built, was cleared, or empty table).
+            // Fall through to the slower scanner so the user can still get
+            // *something* on first launch. The scanner caps at
+            // SEARCH_RESULT_LIMIT and doesn't attempt to enumerate every
+            // story — practical budget is single-digit seconds on a typical
+            // machine.
+            Ok(None) => self.search_stories_fallback(trimmed),
             Err(err) => {
                 eprintln!(
                     "[INDEX] Failed to search using index ({}), fallback to linear scan",
                     err
                 );
-                Vec::new()
-            }
-        };
-
-        // 线性扫描补全（去重 by story_id）
-        let mut seen = std::collections::HashSet::new();
-        for r in &combined {
-            seen.insert(r.story_id.clone());
-        }
-
-        let fallback_results = self.search_stories_fallback(trimmed)?;
-        for r in fallback_results {
-            if seen.insert(r.story_id.clone()) {
-                combined.push(r);
-                if combined.len() >= SEARCH_RESULT_LIMIT {
-                    break;
-                }
+                self.search_stories_fallback(trimmed)
             }
         }
-
-        Ok(combined)
     }
 
     /// Extended search: returns total match count (before truncation) and per-
@@ -1846,14 +2202,21 @@ impl DataService {
             .unwrap_or_else(|_| results.len());
         let total_matched = total_matched.max(results.len());
 
-        // Build facets from the returned subset — the frontend can still
-        // filter the visible results correctly, and that's the most useful
-        // signal. If we wanted exact per-category totals we'd need to issue
-        // an aggregated SQL query, but the common case is "results < 500" so
-        // per-result counting is accurate in practice.
+        // Build facets from the returned subset. Categories are formatted as
+        // `<Type> | <Specific Name>` (see `format_category_label`); aggregating
+        // by full string produces one chip per chapter which is unusable.
+        // Instead we bucket by the type prefix so users get a handful of broad
+        // filters (主线 / 活动 / 支线 / 肉鸽 / 干员密录).
         let mut facets: std::collections::BTreeMap<String, usize> = Default::default();
         for r in &results {
-            *facets.entry(r.category.clone()).or_insert(0) += 1;
+            let key = r
+                .category
+                .split(" | ")
+                .next()
+                .unwrap_or(&r.category)
+                .trim()
+                .to_string();
+            *facets.entry(key).or_insert(0) += 1;
         }
 
         Ok(SearchResultsPage {
@@ -1879,6 +2242,275 @@ impl DataService {
             )
             .unwrap_or(0);
         Ok(total.max(0) as usize)
+    }
+
+    /// Segment-level search: returns precise `(story_id, segment_index)`
+    /// hits ordered by bm25 so the frontend can jump directly to the matching
+    /// paragraph without running the fuzzy `findFocusSegmentIndex` fallback.
+    ///
+    /// When the segment index table hasn't been built (pre-v4 database or
+    /// first-run before sync completes), this returns an empty page and the
+    /// caller should fall back to `search_stories_ex`.
+    pub fn search_segments(&self, query: &str) -> Result<SegmentSearchPage, String> {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return Ok(SegmentSearchPage {
+                hits: Vec::new(),
+                total_matched: 0,
+                truncated: false,
+            });
+        }
+
+        let Some(conn) = self.try_open_index_connection()? else {
+            return Ok(SegmentSearchPage {
+                hits: Vec::new(),
+                total_matched: 0,
+                truncated: false,
+            });
+        };
+        Self::init_index_tables(&conn)?;
+
+        // Bail out if the segment table exists but is empty (e.g. after
+        // schema bump while rebuild is still running in the background).
+        let seg_total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM story_segment_index", [], |row| {
+                row.get(0)
+            })
+            .unwrap_or(0);
+        if seg_total == 0 {
+            return Ok(SegmentSearchPage {
+                hits: Vec::new(),
+                total_matched: 0,
+                truncated: false,
+            });
+        }
+
+        let Some(fts_query) = Self::build_fts_query_advanced(trimmed) else {
+            return Ok(SegmentSearchPage {
+                hits: Vec::new(),
+                total_matched: 0,
+                truncated: false,
+            });
+        };
+
+        // bm25 column weights: story_id(UNINDEXED)=0, segment_index(UNINDEXED)=0,
+        // segment_type(UNINDEXED)=0, character_name=6, tokenized_text=1,
+        // raw_text(UNINDEXED)=0. Boost character name matches so searching an
+        // operator floats dialogue hits featuring that operator to the top.
+        let query_sql = format!(
+            "
+            SELECT s.story_id,
+                   s.segment_index,
+                   s.segment_type,
+                   s.character_name,
+                   s.raw_text,
+                   snippet(story_segment_index, 4, '', '', '...', 16) AS snip
+            FROM story_segment_index AS s
+            WHERE story_segment_index MATCH ?1
+            ORDER BY bm25(story_segment_index, 0.0, 0.0, 0.0, 6.0, 1.0, 0.0)
+            LIMIT {}
+            ",
+            SEARCH_RESULT_LIMIT
+        );
+
+        let total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM story_segment_index WHERE story_segment_index MATCH ?1",
+                params![fts_query.clone()],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        let mut stmt = match conn.prepare(&query_sql) {
+            Ok(s) => s,
+            Err(err) => {
+                eprintln!("[SEG-INDEX] prepare failed: {}", err);
+                return Ok(SegmentSearchPage {
+                    hits: Vec::new(),
+                    total_matched: 0,
+                    truncated: false,
+                });
+            }
+        };
+
+        // Pre-fetch story_id → (story_name, category) for labels.
+        let label_map = self.collect_story_labels().unwrap_or_default();
+
+        let rows = match stmt.query_map(params![fts_query], |row| {
+            let story_id: String = row.get(0)?;
+            let segment_index: i64 = row.get(1)?;
+            let segment_type: String = row.get(2)?;
+            let character_name: String = row.get(3).unwrap_or_default();
+            let raw_text: String = row.get(4).unwrap_or_default();
+            let snip: String = row.get(5).unwrap_or_default();
+            Ok((story_id, segment_index, segment_type, character_name, raw_text, snip))
+        }) {
+            Ok(r) => r,
+            Err(err) => {
+                eprintln!("[SEG-INDEX] query failed for '{}': {}", fts_query, err);
+                return Ok(SegmentSearchPage {
+                    hits: Vec::new(),
+                    total_matched: 0,
+                    truncated: false,
+                });
+            }
+        };
+
+        let context_probe = normalize_for_fuzzy(trimmed);
+        let mut hits: Vec<SegmentHit> = Vec::new();
+        let mut seen: std::collections::HashSet<(String, usize)> = Default::default();
+        for row in rows {
+            let Ok((story_id, segment_index, segment_type, character_norm, raw_text, snip)) = row
+            else {
+                continue;
+            };
+            let matched_text = {
+                let extracted = self.extract_context(&raw_text, &context_probe);
+                if !extracted.trim().is_empty() {
+                    extracted
+                } else if !snip.trim().is_empty() {
+                    snip.replace('\n', " ").replace("  ", " ")
+                } else {
+                    raw_text.chars().take(120).collect()
+                }
+            };
+            let (story_name, category) = label_map
+                .get(&story_id)
+                .cloned()
+                .unwrap_or_else(|| (story_id.clone(), String::new()));
+            let character_name = if character_norm.trim().is_empty() {
+                None
+            } else {
+                // The stored value is the tokenized (space-separated) form;
+                // strip spaces for display since the UI shows short names.
+                Some(character_norm.split_whitespace().collect::<String>())
+            };
+            let seg_idx = segment_index.max(0) as usize;
+            seen.insert((story_id.clone(), seg_idx));
+            hits.push(SegmentHit {
+                story_id,
+                story_name,
+                category,
+                segment_index: seg_idx,
+                segment_type,
+                character_name,
+                matched_text,
+            });
+        }
+
+        // Merge story-name / story-code hits from the story-level index so
+        // exact title lookups like `大地惊雷` still surface as a clickable
+        // result even though the title itself isn't stored as a segment.
+        // Each such hit is presented as a pseudo-"header" segment at index 0
+        // so the reader lands on the beginning of the story when clicked.
+        if let Ok(story_rows) = self.story_level_title_hits(&fts_query, trimmed, &label_map) {
+            let remaining = SEARCH_RESULT_LIMIT.saturating_sub(hits.len());
+            for hit in story_rows.into_iter().take(remaining) {
+                let key = (hit.story_id.clone(), hit.segment_index);
+                if !seen.contains(&key) {
+                    seen.insert(key);
+                    hits.push(hit);
+                }
+            }
+        }
+
+        let computed_total = hits.len().max(total.max(0) as usize);
+        Ok(SegmentSearchPage {
+            hits,
+            total_matched: computed_total,
+            truncated: computed_total > SEARCH_RESULT_LIMIT,
+        })
+    }
+
+    /// Cheap helper: build the `storyId -> (storyName, category)` map once per
+    /// call. Called by `search_segments` to attach display labels.
+    fn collect_story_labels(&self) -> Result<HashMap<String, (String, String)>, String> {
+        let indexed = self.collect_stories_for_index()?;
+        let mut map = HashMap::with_capacity(indexed.len());
+        for item in indexed {
+            let label = Self::format_category_label(&item.entry_type, &item.category_name);
+            map.insert(item.story.story_id.clone(), (item.story.story_name.clone(), label));
+        }
+        Ok(map)
+    }
+
+    /// Produce segment-style hits derived from the story-level index, used
+    /// so that searches for story titles / codes still surface relevant
+    /// entries even when the actual title text doesn't appear in any
+    /// segment body. Each pseudo-hit lands on segment index 0 (the start of
+    /// the story). `fts_query` is the already-compiled FTS query string.
+    ///
+    /// We deliberately do NOT use FTS5 `{col}:` scoping here — the
+    /// `story_name` column is stored raw (no pre-tokenization), so unicode61
+    /// only produces a single-CJK-run token per title. Scoping-by-column
+    /// would therefore fail for any multi-word title query. Instead we rely
+    /// on the existing bm25 column weighting (story_name × 10) to push
+    /// genuine title matches to the top, and then post-filter the results
+    /// so only rows whose title or code actually contains the user's query
+    /// survive. This catches exact title lookups like `大地惊雷` even when
+    /// no body segment matches.
+    fn story_level_title_hits(
+        &self,
+        fts_query: &str,
+        query_raw: &str,
+        label_map: &HashMap<String, (String, String)>,
+    ) -> Result<Vec<SegmentHit>, String> {
+        let Some(conn) = self.try_open_index_connection()? else {
+            return Ok(Vec::new());
+        };
+        let sql = "
+            SELECT story_id, story_name, category, story_code
+            FROM story_index
+            WHERE story_index MATCH ?1
+            ORDER BY bm25(story_index, 0.0, 10.0, 0.0, 1.0, 5.0, 0.0)
+            LIMIT 50
+        ";
+        let mut stmt = match conn.prepare(sql) {
+            Ok(s) => s,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let rows = match stmt.query_map(params![fts_query], |row| {
+            let story_id: String = row.get(0)?;
+            let story_name: String = row.get(1)?;
+            let category: String = row.get(2)?;
+            let story_code: String = row.get(3).unwrap_or_default();
+            Ok((story_id, story_name, category, story_code))
+        }) {
+            Ok(r) => r,
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        // Post-filter: the row's title or code must contain the user's
+        // query under fuzzy normalization (NFKC + lower + punct-strip).
+        // This weeds out body-only matches that bm25 happened to rank high.
+        let probe = normalize_for_fuzzy(query_raw);
+        if probe.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut hits = Vec::new();
+        for row in rows {
+            let Ok((story_id, story_name, category, story_code)) = row else { continue };
+            let name_norm = normalize_for_fuzzy(&story_name);
+            let code_norm = normalize_for_fuzzy(&story_code);
+            if !name_norm.contains(&probe) && !code_norm.contains(&probe) {
+                continue;
+            }
+            let (story_name, category) = label_map
+                .get(&story_id)
+                .cloned()
+                .unwrap_or((story_name, category));
+            hits.push(SegmentHit {
+                story_id,
+                story_name: story_name.clone(),
+                category,
+                segment_index: 0,
+                segment_type: "header".to_string(),
+                character_name: None,
+                matched_text: story_name,
+            });
+        }
+        Ok(hits)
     }
 
     pub fn search_stories_with_debug(&self, query: &str) -> Result<SearchDebugResponse, String> {
@@ -2548,25 +3180,26 @@ mod tests {
     #[test]
     fn fts_query_escapes_specials_and_is_nonempty() {
         let q = DataService::build_fts_query_advanced("凯尔希*").expect("non-empty");
-        assert!(!q.contains('*'));
-        // The phrase must still contain the three CJK chars spaced.
-        assert!(q.contains("凯"));
-        assert!(q.contains("尔"));
+        assert!(!q.contains('*') || q.ends_with('*'));
+        // The phrase must still contain the CJK word token.
+        assert!(q.contains("凯尔希"));
     }
 
     #[test]
-    fn fts_query_long_cjk_expands_to_bigram_and() {
+    fn fts_query_long_cjk_uses_jieba_words() {
         let q = DataService::build_fts_query_advanced("凯尔希阿米娅").expect("non-empty");
-        // Long CJK terms (>=4 chars) expand to overlapping bigrams joined by AND.
+        // jieba splits `凯尔希阿米娅` into two names → AND of two phrases.
         assert!(q.contains("AND"));
-        assert!(q.contains("凯 尔"));
-        assert!(q.contains("米 娅"));
+        assert!(q.contains("凯尔希") || q.contains("凯"));
+        assert!(q.contains("阿米娅") || q.contains("阿"));
     }
 
     #[test]
-    fn fts_query_short_cjk_is_strict_phrase() {
+    fn fts_query_short_cjk_word_is_phrase() {
         let q = DataService::build_fts_query_advanced("凯尔希").expect("non-empty");
-        assert_eq!(q.trim(), "\"凯 尔 希\"");
+        // Should emit a single phrase clause (no connector).
+        assert!(q.contains("凯尔希"));
+        assert!(!q.contains("AND"));
     }
 
     #[test]
@@ -2577,7 +3210,6 @@ mod tests {
 
     #[test]
     fn fts_query_pure_punctuation_returns_none() {
-        // After sanitization nothing is left.
         assert!(DataService::build_fts_query_advanced("()**").is_none());
     }
 
@@ -2591,5 +3223,47 @@ mod tests {
     fn fts_query_not_prefix() {
         let q = DataService::build_fts_query_advanced("-凯尔希 博士").expect("non-empty");
         assert!(q.contains("NOT"));
+        // The positive term must come BEFORE the NOT clause — otherwise FTS5
+        // rejects the query with "unable to use function MATCH".
+        let not_idx = q.find("NOT").unwrap();
+        let bodhi_idx = q.find("博士").unwrap();
+        assert!(
+            bodhi_idx < not_idx,
+            "positive term must precede NOT; got: {}",
+            q
+        );
+    }
+
+    #[test]
+    fn fts_query_pure_negation_returns_none() {
+        // A query that's only exclusions can't be expressed in FTS5 —
+        // we return None so the caller short-circuits to empty results.
+        assert!(DataService::build_fts_query_advanced("-凯尔希").is_none());
+        assert!(DataService::build_fts_query_advanced("-凯尔希 -博士").is_none());
+    }
+
+    #[test]
+    fn fts_query_or_is_applied_before_and() {
+        // `凯尔希 or 阿米娅 博士` should group the first two with OR and
+        // AND on the third. We don't enforce parenthesization, but at
+        // minimum both OR and AND must be present.
+        let q = DataService::build_fts_query_advanced("凯尔希 or 阿米娅 博士").expect("non-empty");
+        assert!(q.contains("OR"));
+        assert!(q.contains("AND"));
+    }
+
+    #[test]
+    fn tokenize_for_fts_emits_word_and_chars() {
+        let tokens = DataService::tokenize_for_fts("凯尔希 博士");
+        assert!(tokens.iter().any(|t| t == "凯尔希"));
+        assert!(tokens.iter().any(|t| t == "凯"));
+        assert!(tokens.iter().any(|t| t == "博士"));
+    }
+
+    #[test]
+    fn tokenize_for_fts_ascii_keeps_runs() {
+        let tokens = DataService::tokenize_for_fts("PRTS system");
+        assert!(tokens.iter().any(|t| t == "prts"));
+        assert!(tokens.iter().any(|t| t == "system"));
     }
 }

@@ -21,9 +21,11 @@ import {
   Trash2,
   Star,
   Check,
+  X,
 } from "lucide-react";
 import { useReaderSettings } from "@/hooks/useReaderSettings";
 import { ReaderSettingsPanel } from "@/components/ReaderSettings";
+import { useSidePanel } from "@/hooks/useSidePanel";
 import { useReadingProgress } from "@/hooks/useReadingProgress";
 import { useFavorites } from "@/hooks/useFavorites";
 import { useHighlights } from "@/hooks/useHighlights";
@@ -1276,214 +1278,18 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
         </footer>
       )}
 
-      {insightsOpen && (
-        <>
-          <div
-            className="fixed inset-0 z-40 bg-black/40 motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-300"
-            onClick={() => setInsightsOpen(false)}
-          />
-          <aside className="fixed inset-0 z-50 flex">
-            <div className="ml-auto h-full w-full max-w-sm sm:max-w-md relative motion-safe:animate-in motion-safe:slide-in-from-right-10 motion-safe:duration-300">
-              <Card className="relative z-10 h-full rounded-none sm:rounded-l-2xl flex flex-col shadow-2xl border-l border-[hsl(var(--color-border))] bg-[hsl(var(--color-card))] overflow-hidden">
-                <CardHeader className="flex flex-row items-start justify-between gap-4 sticky top-0 bg-[hsl(var(--color-card))] border-b px-5 sm:px-6 py-4">
-                  <div>
-                    <div className="text-xs uppercase tracking-widest text-[hsl(var(--color-muted-foreground))]">
-                      Story Guide
-                    </div>
-                    <CardTitle className="text-lg font-semibold mt-1">剧情导览</CardTitle>
-                    <p className="mt-2 text-sm text-[hsl(var(--color-muted-foreground))] leading-relaxed max-w-xs">
-                      快速定位关键角色与抉择节点，辅助你以导演视角重温剧情。
-                    </p>
-                  </div>
-                  <Button variant="ghost" size="icon" onClick={() => setInsightsOpen(false)}>
-                    <ArrowLeft className="h-5 w-5 rotate-180" />
-                  </Button>
-                </CardHeader>
-                <CardContent className="flex-1 min-h-0 p-0">
-                  <CustomScrollArea
-                    className="h-full"
-                    viewportClassName="reader-scroll"
-                    hideTrackWhenIdle={false}
-                    trackOffsetTop="4.5rem"
-                  >
-                    <div className="p-6 space-y-8">
-                      {insights.headers.length > 0 && (
-                        <section>
-                          <div className="flex items-center justify-between mb-3">
-                            <h3 className="text-sm font-semibold uppercase tracking-widest text-[hsl(var(--color-muted-foreground))]">
-                              章节目录
-                            </h3>
-                            <span className="text-xs text-[hsl(var(--color-muted-foreground))]">
-                              {insights.headers.length} 节
-                            </span>
-                          </div>
-                          <div className="space-y-1">
-                            {insights.headers.map((h) => (
-                              <button
-                                key={`toc-${h.index}`}
-                                className="w-full rounded-lg border border-transparent px-3 py-2 text-left text-sm transition-colors hover:border-[hsl(var(--color-border))] hover:bg-[hsl(var(--color-accent))]"
-                                onClick={() => handleJumpToSegment(h.index)}
-                              >
-                                {h.title}
-                              </button>
-                            ))}
-                          </div>
-                        </section>
-                      )}
-
-                      <section>
-                        <div className="flex items-center justify-between mb-3">
-                          <h3 className="text-sm font-semibold uppercase tracking-widest text-[hsl(var(--color-muted-foreground))]">
-                            划线收藏
-                          </h3>
-                          <div className="flex items-center gap-2">
-                            {/* 简化：划线默认加入线索集，移除“全部加入” */}
-                            {highlightEntries.length > 0 && (
-                              <Button
-                                variant="ghost"
-                                size="sm"
-                                className="text-xs h-auto px-2 py-1 text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-destructive))]"
-                                onClick={handleClearHighlightsUnified}
-                              >
-                                清空
-                              </Button>
-                            )}
-                          </div>
-                        </div>
-                        <div className="space-y-2">
-                          {highlightEntries.length === 0 && (
-                            <div className="text-xs text-[hsl(var(--color-muted-foreground))]">
-                              暂无划线内容
-                            </div>
-                          )}
-                          {highlightEntries.map((entry) => (
-                            <div
-                              key={entry.index}
-                              className="flex items-start gap-3 rounded-lg border border-[hsl(var(--color-border))] bg-[hsl(var(--color-card))] p-3 shadow-sm"
-                            >
-                              <button
-                                className="flex-1 text-left text-sm leading-relaxed hover:text-[hsl(var(--color-primary))] transition-colors"
-                                onClick={() => handleJumpToSegment(entry.index)}
-                              >
-                                {entry.label}
-                              </button>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-7 w-7 text-[hsl(var(--color-primary))]"
-                            title="已加入线索集"
-                            disabled
-                          >
-                            <Check className="h-4 w-4" />
-                          </Button>
-                              <Button
-                                variant="ghost"
-                                size="icon"
-                                className="h-7 w-7 text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-destructive))]"
-                                onClick={(event) => {
-                                  event.preventDefault();
-                                  event.stopPropagation();
-                                  handleToggleHighlightUnified(entry.index);
-                                }}
-                                aria-label="移除划线"
-                              >
-                                <Trash2 className="h-4 w-4" />
-                              </Button>
-                            </div>
-                          ))}
-                        </div>
-                      </section>
-
-                      <section>
-                        <div className="flex items-center justify-between mb-3">
-                          <h3 className="text-sm font-semibold uppercase tracking-widest text-[hsl(var(--color-muted-foreground))]">
-                            角色出场
-                          </h3>
-                          {activeCharacter && (
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              className="text-xs h-auto px-2 py-1 text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-destructive))]"
-                              onClick={clearCharacterHighlight}
-                            >
-                              清除高亮
-                            </Button>
-                          )}
-                        </div>
-                        <div className="space-y-2">
-                          {insights.characters.length === 0 && (
-                            <div className="text-xs text-[hsl(var(--color-muted-foreground))]">
-                              暂无角色统计
-                            </div>
-                          )}
-                          {insights.characters.map((character) => (
-                            <button
-                              key={character.name}
-                              onClick={() => handleCharacterHighlight(character.name, character.firstIndex)}
-                              className={cn(
-                                "w-full flex items-center justify-between rounded-lg border border-[hsl(var(--color-border))] bg-[hsl(var(--color-card))] px-3 py-2 text-left transition-colors",
-                                activeCharacter === character.name
-                                  ? "border-[hsl(var(--color-primary))] bg-[hsl(var(--color-accent))] text-[hsl(var(--color-primary))]"
-                                  : "hover:bg-[hsl(var(--color-accent))]"
-                              )}
-                            >
-                              <div className="font-medium">{character.name}</div>
-                              <div className="text-xs text-[hsl(var(--color-muted-foreground))]">
-                                {character.count} 次
-                              </div>
-                            </button>
-                          ))}
-                        </div>
-                      </section>
-
-                      <section>
-                        <h3 className="text-sm font-semibold uppercase tracking-widest text-[hsl(var(--color-muted-foreground))] mb-3">
-                          抉择片段
-                        </h3>
-                        <div className="space-y-3">
-                          {insights.decisions.length === 0 && (
-                            <div className="text-xs text-[hsl(var(--color-muted-foreground))]">
-                              尚未出现抉择
-                            </div>
-                          )}
-                          {insights.decisions.map((decision, idx) => (
-                            <div
-                              key={`${decision.index}-${idx}`}
-                              className="rounded-xl border border-[hsl(var(--color-border))] bg-[hsl(var(--color-card))] p-3 shadow-sm"
-                            >
-                              <div className="flex items-center justify-between mb-2">
-                                <span className="text-sm font-medium">抉择 {idx + 1}</span>
-                                <Button
-                                  variant="ghost"
-                                  size="sm"
-                                  className="text-xs h-auto px-2 py-1"
-                                  onClick={() => handleJumpToSegment(decision.index)}
-                                >
-                                  前往
-                                </Button>
-                              </div>
-                              <div className="space-y-1 text-xs text-[hsl(var(--color-muted-foreground))]">
-                                {decision.options.map((option, optionIndex) => (
-                                  <div key={optionIndex} className="flex gap-2">
-                                    <span className="text-[hsl(var(--color-primary))]">
-                                      {optionIndex + 1}.
-                                    </span>
-                                    <span className="flex-1">{option}</span>
-                                  </div>
-                                ))}
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      </section>
-                    </div>
-                  </CustomScrollArea>
-                </CardContent>
-              </Card>
-            </div>
-          </aside>
-        </>
-      )}
+      <StoryInsightsPanel
+        open={insightsOpen}
+        insights={insights}
+        highlightEntries={highlightEntries}
+        activeCharacter={activeCharacter}
+        onClose={() => setInsightsOpen(false)}
+        onJumpToSegment={handleJumpToSegment}
+        onClearHighlights={handleClearHighlightsUnified}
+        onRemoveHighlight={handleToggleHighlightUnified}
+        onCharacterSelect={handleCharacterHighlight}
+        onClearCharacter={clearCharacterHighlight}
+      />
 
       <ReaderSettingsPanel
         open={settingsOpen}
@@ -1492,6 +1298,266 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
         onUpdateSettings={updateSettings}
         onReset={resetSettings}
       />
+    </div>
+  );
+}
+
+interface StoryInsightsPanelProps {
+  open: boolean;
+  insights: {
+    characters: Array<{ name: string; count: number; firstIndex: number }>;
+    decisions: Array<{ index: number; options: string[]; values?: string[] }>;
+    headers: Array<{ index: number; title: string }>;
+  };
+  highlightEntries: Array<{ index: number; label: string }>;
+  activeCharacter: string | null;
+  onClose: () => void;
+  onJumpToSegment: (index: number) => void;
+  onClearHighlights: () => void;
+  onRemoveHighlight: (index: number) => void;
+  onCharacterSelect: (name: string, firstIndex: number) => void;
+  onClearCharacter: () => void;
+}
+
+function StoryInsightsPanel({
+  open,
+  insights,
+  highlightEntries,
+  activeCharacter,
+  onClose,
+  onJumpToSegment,
+  onClearHighlights,
+  onRemoveHighlight,
+  onCharacterSelect,
+  onClearCharacter,
+}: StoryInsightsPanelProps) {
+  const { rendered, state } = useSidePanel({ open, onClose });
+  if (!rendered) return null;
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex"
+      role="dialog"
+      aria-modal="true"
+      aria-label="剧情导览"
+    >
+      <div
+        data-state={state}
+        className="absolute inset-0 bg-black/45 transition-opacity duration-200 data-[state=closed]:opacity-0 data-[state=open]:opacity-100"
+        onClick={onClose}
+      />
+      <aside
+        data-state={state}
+        className="ml-auto h-full w-3/4 max-w-sm sm:max-w-md relative transform transition-transform duration-200 ease-out data-[state=closed]:translate-x-full data-[state=open]:translate-x-0"
+      >
+        <Card className="relative z-10 h-full rounded-none sm:rounded-l-2xl flex flex-col shadow-2xl border-l border-[hsl(var(--color-border))] bg-[hsl(var(--color-card))] overflow-hidden">
+          <CardHeader className="sticky top-0 z-10 bg-[hsl(var(--color-card))] border-b flex-shrink-0 px-5 sm:px-6 py-4 space-y-0">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <div className="text-[11px] uppercase tracking-widest text-[hsl(var(--color-muted-foreground))]">
+                  Story Guide
+                </div>
+                <CardTitle className="text-lg font-semibold mt-1">剧情导览</CardTitle>
+              </div>
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={onClose}
+                aria-label="关闭剧情导览"
+                title="关闭"
+              >
+                <X className="h-4 w-4" />
+              </Button>
+            </div>
+            <p className="mt-2 text-sm text-[hsl(var(--color-muted-foreground))] leading-relaxed">
+              快速定位关键角色与抉择节点，辅助你以导演视角重温剧情。
+            </p>
+          </CardHeader>
+          <CardContent className="flex-1 min-h-0 p-0">
+            <CustomScrollArea
+              className="h-full"
+              viewportClassName="reader-scroll"
+              hideTrackWhenIdle={false}
+              trackOffsetTop="4.5rem"
+            >
+              <div className="px-5 sm:px-6 py-6 space-y-8">
+                {insights.headers.length > 0 && (
+                  <section>
+                    <div className="flex items-center justify-between mb-3">
+                      <h3 className="text-[11px] font-semibold uppercase tracking-widest text-[hsl(var(--color-muted-foreground))]">
+                        章节目录
+                      </h3>
+                      <span className="text-xs text-[hsl(var(--color-muted-foreground))]">
+                        {insights.headers.length} 节
+                      </span>
+                    </div>
+                    <div className="space-y-1">
+                      {insights.headers.map((h) => (
+                        <button
+                          key={`toc-${h.index}`}
+                          type="button"
+                          className="w-full rounded-lg border border-transparent px-3 py-2 text-left text-sm transition-colors hover:border-[hsl(var(--color-border))] hover:bg-[hsl(var(--color-accent))] active:scale-[0.99] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--color-ring))] focus-visible:ring-offset-2 focus-visible:ring-offset-[hsl(var(--color-card))]"
+                          onClick={() => onJumpToSegment(h.index)}
+                        >
+                          {h.title}
+                        </button>
+                      ))}
+                    </div>
+                  </section>
+                )}
+
+                <section>
+                  <div className="flex items-center justify-between mb-3">
+                    <h3 className="text-[11px] font-semibold uppercase tracking-widest text-[hsl(var(--color-muted-foreground))]">
+                      划线收藏
+                    </h3>
+                    {highlightEntries.length > 0 && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="text-xs h-auto px-2 py-1 text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-destructive))]"
+                        onClick={onClearHighlights}
+                      >
+                        清空
+                      </Button>
+                    )}
+                  </div>
+                  <div className="space-y-2">
+                    {highlightEntries.length === 0 && (
+                      <div className="text-xs text-[hsl(var(--color-muted-foreground))]">
+                        暂无划线内容
+                      </div>
+                    )}
+                    {highlightEntries.map((entry) => (
+                      <div
+                        key={entry.index}
+                        className="group flex items-start gap-2 rounded-lg border border-[hsl(var(--color-border))] bg-[hsl(var(--color-card))] p-3 shadow-sm transition-colors hover:border-[hsl(var(--color-primary)/0.5)]"
+                      >
+                        <button
+                          type="button"
+                          className="flex-1 text-left text-sm leading-relaxed transition-colors hover:text-[hsl(var(--color-primary))] focus-visible:outline-none focus-visible:text-[hsl(var(--color-primary))]"
+                          onClick={() => onJumpToSegment(entry.index)}
+                        >
+                          {entry.label}
+                        </button>
+                        <span
+                          className="inline-flex h-7 w-7 flex-shrink-0 items-center justify-center text-[hsl(var(--color-primary))]"
+                          title="已加入线索集"
+                          aria-label="已加入线索集"
+                        >
+                          <Check className="h-4 w-4" />
+                        </span>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-7 w-7 flex-shrink-0 text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-destructive))]"
+                          onClick={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            onRemoveHighlight(entry.index);
+                          }}
+                          aria-label="移除划线"
+                          title="移除划线"
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </Button>
+                      </div>
+                    ))}
+                  </div>
+                </section>
+
+                <section>
+                  <div className="flex items-center justify-between mb-3">
+                    <h3 className="text-[11px] font-semibold uppercase tracking-widest text-[hsl(var(--color-muted-foreground))]">
+                      角色出场
+                    </h3>
+                    {activeCharacter && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="text-xs h-auto px-2 py-1 text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-destructive))]"
+                        onClick={onClearCharacter}
+                      >
+                        清除高亮
+                      </Button>
+                    )}
+                  </div>
+                  <div className="space-y-2">
+                    {insights.characters.length === 0 && (
+                      <div className="text-xs text-[hsl(var(--color-muted-foreground))]">
+                        暂无角色统计
+                      </div>
+                    )}
+                    {insights.characters.map((character) => {
+                      const active = activeCharacter === character.name;
+                      return (
+                        <button
+                          key={character.name}
+                          type="button"
+                          aria-pressed={active}
+                          onClick={() => onCharacterSelect(character.name, character.firstIndex)}
+                          className={cn(
+                            "w-full flex items-center justify-between rounded-lg border px-3 py-2 text-left transition-colors active:scale-[0.99] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--color-ring))] focus-visible:ring-offset-2 focus-visible:ring-offset-[hsl(var(--color-card))]",
+                            active
+                              ? "border-[hsl(var(--color-primary))] bg-[hsl(var(--color-accent))] text-[hsl(var(--color-primary))]"
+                              : "border-[hsl(var(--color-border))] bg-[hsl(var(--color-card))] hover:border-[hsl(var(--color-primary)/0.5)] hover:bg-[hsl(var(--color-accent))]"
+                          )}
+                        >
+                          <div className="font-medium truncate pr-2">{character.name}</div>
+                          <div className="text-xs tabular-nums text-[hsl(var(--color-muted-foreground))] flex-shrink-0">
+                            {character.count} 次
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </section>
+
+                <section>
+                  <h3 className="text-[11px] font-semibold uppercase tracking-widest text-[hsl(var(--color-muted-foreground))] mb-3">
+                    抉择片段
+                  </h3>
+                  <div className="space-y-3">
+                    {insights.decisions.length === 0 && (
+                      <div className="text-xs text-[hsl(var(--color-muted-foreground))]">
+                        尚未出现抉择
+                      </div>
+                    )}
+                    {insights.decisions.map((decision, idx) => (
+                      <div
+                        key={`${decision.index}-${idx}`}
+                        className="rounded-xl border border-[hsl(var(--color-border))] bg-[hsl(var(--color-card))] p-3 shadow-sm transition-colors hover:border-[hsl(var(--color-primary)/0.5)]"
+                      >
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="text-sm font-medium">抉择 {idx + 1}</span>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="text-xs h-auto px-2 py-1"
+                            onClick={() => onJumpToSegment(decision.index)}
+                          >
+                            前往
+                          </Button>
+                        </div>
+                        <div className="space-y-1 text-xs text-[hsl(var(--color-muted-foreground))]">
+                          {decision.options.map((option, optionIndex) => (
+                            <div key={optionIndex} className="flex gap-2">
+                              <span className="text-[hsl(var(--color-primary))] tabular-nums">
+                                {optionIndex + 1}.
+                              </span>
+                              <span className="flex-1">{option}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </section>
+              </div>
+            </CustomScrollArea>
+          </CardContent>
+        </Card>
+      </aside>
     </div>
   );
 }

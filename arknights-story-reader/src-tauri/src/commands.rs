@@ -1,7 +1,7 @@
 use crate::data_service::DataService;
 use crate::models::{
     Chapter, ParsedStoryContent, SearchDebugResponse, SearchResult, SearchResultsPage,
-    StoryCategory, StoryEntry, StoryIndexStatus,
+    SegmentSearchPage, StoryCategory, StoryEntry, StoryIndexStatus,
 };
 use crate::parser::parse_story_text;
 use std::sync::{Arc, Mutex};
@@ -138,6 +138,17 @@ pub async fn search_stories_ex(
     tauri::async_runtime::spawn_blocking(move || service.search_stories_ex(&query))
         .await
         .map_err(|err| format!("Failed to join search_ex task: {}", err))?
+}
+
+#[tauri::command]
+pub async fn search_segments(
+    state: State<'_, AppState>,
+    query: String,
+) -> Result<SegmentSearchPage, String> {
+    let service = clone_service(&state);
+    tauri::async_runtime::spawn_blocking(move || service.search_segments(&query))
+        .await
+        .map_err(|err| format!("Failed to join search_segments task: {}", err))?
 }
 
 #[tauri::command]

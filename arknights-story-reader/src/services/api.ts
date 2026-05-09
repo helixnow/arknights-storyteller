@@ -6,6 +6,7 @@ import type {
   ParsedStoryContent,
   SearchResult,
   SearchResultsPage,
+  SegmentSearchPage,
   StoryEntry,
   StoryIndexStatus,
   SearchDebugResponse,
@@ -140,6 +141,11 @@ export const api = {
   /** 扩展搜索：返回总数 + facet */
   searchStoriesEx: async (query: string): Promise<SearchResultsPage> => {
     return invoke("search_stories_ex", { query });
+  },
+
+  /** 段级搜索：返回精确段落位置 */
+  searchSegments: async (query: string): Promise<SegmentSearchPage> => {
+    return invoke("search_segments", { query });
   },
 
   // 搜索剧情（带进度事件）

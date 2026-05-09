@@ -4,26 +4,77 @@
 
 @font-face {
   font-family: "Arknights Noto Sans SC";
-  src: url("/fonts/NotoSansSC-Regular.woff2") format("woff2");
+  src: url("/fonts/subset/NotoSansSC-latin.woff2") format("woff2");
   font-weight: 400;
   font-style: normal;
   font-display: swap;
+  unicode-range: U+0020-00FF, U+2000-206F, U+2E80-2EFF, U+3000-303F, U+FF00-FFEF;
+}
+@font-face {
+  font-family: "Arknights Noto Sans SC";
+  src: url("/fonts/subset/NotoSansSC-common.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+  unicode-range: U+4E00-9FFF;
+}
+@font-face {
+  font-family: "Arknights Noto Sans SC";
+  src: url("/fonts/subset/NotoSansSC-ext.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+  unicode-range: U+3400-4DBF, U+20000-2A6DF;
 }
 
 @font-face {
   font-family: "Arknights Noto Serif SC";
-  src: url("/fonts/NotoSerifSC-Regular.woff2") format("woff2");
+  src: url("/fonts/subset/NotoSerifSC-latin.woff2") format("woff2");
   font-weight: 400;
   font-style: normal;
   font-display: swap;
+  unicode-range: U+0020-00FF, U+2000-206F, U+2E80-2EFF, U+3000-303F, U+FF00-FFEF;
+}
+@font-face {
+  font-family: "Arknights Noto Serif SC";
+  src: url("/fonts/subset/NotoSerifSC-common.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+  unicode-range: U+4E00-9FFF;
+}
+@font-face {
+  font-family: "Arknights Noto Serif SC";
+  src: url("/fonts/subset/NotoSerifSC-ext.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+  unicode-range: U+3400-4DBF, U+20000-2A6DF;
 }
 
 @font-face {
   font-family: "Arknights LXGW WenKai";
-  src: url("/fonts/LXGWWenKai-Regular.woff2") format("woff2");
+  src: url("/fonts/subset/LXGWWenKai-latin.woff2") format("woff2");
   font-weight: 400;
   font-style: normal;
   font-display: swap;
+  unicode-range: U+0020-00FF, U+2000-206F, U+2E80-2EFF, U+3000-303F, U+FF00-FFEF;
+}
+@font-face {
+  font-family: "Arknights LXGW WenKai";
+  src: url("/fonts/subset/LXGWWenKai-common.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+  unicode-range: U+4E00-9FFF;
+}
+@font-face {
+  font-family: "Arknights LXGW WenKai";
+  src: url("/fonts/subset/LXGWWenKai-ext.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+  unicode-range: U+3400-4DBF, U+20000-2A6DF;
 }
 
 :root,

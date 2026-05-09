@@ -31,6 +31,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
 rusqlite = { version = "0.30", features = ["bundled", "vtab"] }
 unicode-normalization = "0.1"
+jieba-rs = { version = "0.7", default-features = false, features = ["default-dict"] }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 tauri-plugin-opener = "2"

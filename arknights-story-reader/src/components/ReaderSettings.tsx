@@ -2,6 +2,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { CustomScrollArea } from "@/components/ui/custom-scroll-area";
 import { FONT_FAMILIES, ReaderSettings as Settings } from "@/hooks/useReaderSettings";
+import { useSidePanel } from "@/hooks/useSidePanel";
 import { RotateCcw, X } from "lucide-react";
 
 const READING_MODES: Array<{ value: Settings["readingMode"]; label: string; description: string }> =
@@ -33,31 +34,53 @@ export function ReaderSettingsPanel({
   onUpdateSettings,
   onReset,
 }: ReaderSettingsProps) {
-  if (!open) return null;
+  const { rendered, state } = useSidePanel({ open, onClose });
+  if (!rendered) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex">
-      <div className="absolute inset-0 bg-black/45" onClick={onClose} />
-      <div className="ml-auto h-full w-full max-w-sm sm:max-w-md relative motion-safe:animate-in motion-safe:slide-in-from-right-10 motion-safe:duration-300">
+    <div className="fixed inset-0 z-50 flex" role="dialog" aria-modal="true" aria-label="阅读设置">
+      <div
+        data-state={state}
+        className="absolute inset-0 bg-black/45 transition-opacity duration-200 data-[state=closed]:opacity-0 data-[state=open]:opacity-100"
+        onClick={onClose}
+      />
+      <div
+        data-state={state}
+        className="ml-auto h-full w-3/4 max-w-sm sm:max-w-md relative transform transition-transform duration-200 ease-out data-[state=closed]:translate-x-full data-[state=open]:translate-x-0"
+      >
         <Card className="relative z-10 h-full rounded-none sm:rounded-l-2xl flex flex-col shadow-2xl border-l border-[hsl(var(--color-border))] bg-[hsl(var(--color-card))] overflow-hidden">
-          <CardHeader className="flex flex-row items-start justify-between gap-4 sticky top-0 z-10 bg-[hsl(var(--color-card))] border-b flex-shrink-0 px-5 sm:px-6 py-4">
-            <div>
-              <div className="text-xs uppercase tracking-widest text-[hsl(var(--color-muted-foreground))]">
-                Reader Preferences
+          <CardHeader className="sticky top-0 z-10 bg-[hsl(var(--color-card))] border-b flex-shrink-0 px-5 sm:px-6 py-4 space-y-0">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <div className="text-[11px] uppercase tracking-widest text-[hsl(var(--color-muted-foreground))]">
+                  Reader Preferences
+                </div>
+                <CardTitle className="text-lg font-semibold mt-1">阅读设置</CardTitle>
               </div>
-              <CardTitle className="text-lg font-semibold mt-1">阅读设置</CardTitle>
-              <p className="mt-2 text-sm text-[hsl(var(--color-muted-foreground))] leading-relaxed max-w-xs">
-                调整排版与布局，找到最舒适的阅读方式。
-              </p>
+              <div className="flex items-center gap-1">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={onReset}
+                  aria-label="重置设置"
+                  title="恢复默认"
+                >
+                  <RotateCcw className="h-4 w-4" />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={onClose}
+                  aria-label="关闭阅读设置"
+                  title="关闭"
+                >
+                  <X className="h-4 w-4" />
+                </Button>
+              </div>
             </div>
-            <div className="flex flex-col sm:flex-row gap-2">
-              <Button variant="ghost" size="icon" onClick={onReset} aria-label="重置设置">
-                <RotateCcw className="h-4 w-4" />
-              </Button>
-              <Button variant="ghost" size="icon" onClick={onClose} aria-label="关闭阅读设置">
-                <X className="h-4 w-4" />
-              </Button>
-            </div>
+            <p className="mt-2 text-sm text-[hsl(var(--color-muted-foreground))] leading-relaxed">
+              调整排版与布局，找到最舒适的阅读方式。
+            </p>
           </CardHeader>
           <CardContent className="flex-1 min-h-0 p-0">
             <CustomScrollArea
@@ -71,22 +94,27 @@ export function ReaderSettingsPanel({
                 <div className="space-y-3">
                   <label className="text-sm font-medium">阅读模式</label>
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                    {READING_MODES.map((mode) => (
-                      <button
-                        key={mode.value}
-                        onClick={() => onUpdateSettings({ readingMode: mode.value })}
-                        className={`p-3 border rounded-lg text-sm transition-all duration-200 text-left hover:-translate-y-0.5 ${
-                          settings.readingMode === mode.value
-                            ? "border-[hsl(var(--color-primary))] bg-[hsl(var(--color-accent))]"
-                            : "border-[hsl(var(--color-border))]"
-                        }`}
-                      >
-                        <div className="font-medium">{mode.label}</div>
-                        <div className="text-xs text-[hsl(var(--color-muted-foreground))] mt-1 leading-relaxed">
-                          {mode.description}
-                        </div>
-                      </button>
-                    ))}
+                    {READING_MODES.map((mode) => {
+                      const active = settings.readingMode === mode.value;
+                      return (
+                        <button
+                          key={mode.value}
+                          type="button"
+                          aria-pressed={active}
+                          onClick={() => onUpdateSettings({ readingMode: mode.value })}
+                          className={`p-3 border rounded-lg text-sm text-left transition-all duration-150 active:scale-[0.98] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--color-ring))] focus-visible:ring-offset-2 focus-visible:ring-offset-[hsl(var(--color-card))] ${
+                            active
+                              ? "border-[hsl(var(--color-primary))] bg-[hsl(var(--color-accent))]"
+                              : "border-[hsl(var(--color-border))] hover:border-[hsl(var(--color-primary)/0.5)] hover:bg-[hsl(var(--color-accent)/0.5)]"
+                          }`}
+                        >
+                          <div className="font-medium">{mode.label}</div>
+                          <div className="text-xs text-[hsl(var(--color-muted-foreground))] mt-1 leading-relaxed">
+                            {mode.description}
+                          </div>
+                        </button>
+                      );
+                    })}
                   </div>
                 </div>
 
@@ -101,11 +129,13 @@ export function ReaderSettingsPanel({
                           key={t.value}
                           type="button"
                           aria-pressed={active}
+                          aria-label={`切换至${t.label}主题`}
+                          title={t.label}
                           onClick={() => onUpdateSettings({ theme: t.value })}
-                          className={`flex flex-col items-center gap-1 rounded-lg border p-2 transition-colors ${
+                          className={`flex flex-col items-center gap-1 rounded-lg border p-2 transition-colors active:scale-[0.98] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--color-ring))] focus-visible:ring-offset-2 focus-visible:ring-offset-[hsl(var(--color-card))] ${
                             active
                               ? "border-[hsl(var(--color-primary))] bg-[hsl(var(--color-accent))]"
-                              : "border-[hsl(var(--color-border))]"
+                              : "border-[hsl(var(--color-border))] hover:border-[hsl(var(--color-primary)/0.5)]"
                           }`}
                         >
                           <span
@@ -125,20 +155,25 @@ export function ReaderSettingsPanel({
                 <div className="space-y-2">
                   <label className="text-sm font-medium">字体</label>
                   <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-                    {FONT_FAMILIES.map((font) => (
-                      <button
-                        key={font.value}
-                        onClick={() => onUpdateSettings({ fontFamily: font.value })}
-                        className={`p-2 border rounded-md text-sm transition-all duration-200 hover:-translate-y-0.5 ${
-                          settings.fontFamily === font.value
-                            ? "border-[hsl(var(--color-primary))] bg-[hsl(var(--color-accent))]"
-                            : "border-[hsl(var(--color-border))]"
-                        }`}
-                        style={{ fontFamily: font.value === "system" ? undefined : font.value }}
-                      >
-                        {font.label}
-                      </button>
-                    ))}
+                    {FONT_FAMILIES.map((font) => {
+                      const active = settings.fontFamily === font.value;
+                      return (
+                        <button
+                          key={font.value}
+                          type="button"
+                          aria-pressed={active}
+                          onClick={() => onUpdateSettings({ fontFamily: font.value })}
+                          className={`p-2 border rounded-md text-sm transition-colors active:scale-[0.98] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--color-ring))] focus-visible:ring-offset-2 focus-visible:ring-offset-[hsl(var(--color-card))] ${
+                            active
+                              ? "border-[hsl(var(--color-primary))] bg-[hsl(var(--color-accent))]"
+                              : "border-[hsl(var(--color-border))] hover:border-[hsl(var(--color-primary)/0.5)] hover:bg-[hsl(var(--color-accent)/0.5)]"
+                          }`}
+                          style={{ fontFamily: font.value === "system" ? undefined : font.value }}
+                        >
+                          {font.label}
+                        </button>
+                      );
+                    })}
                   </div>
                 </div>
 
@@ -146,7 +181,7 @@ export function ReaderSettingsPanel({
                 <div className="space-y-2">
                   <div className="flex justify-between">
                     <label className="text-sm font-medium">字号</label>
-                    <span className="text-sm text-[hsl(var(--color-muted-foreground))]">
+                    <span className="text-sm tabular-nums text-[hsl(var(--color-muted-foreground))]">
                       {settings.fontSize}px
                     </span>
                   </div>
@@ -158,6 +193,7 @@ export function ReaderSettingsPanel({
                     value={settings.fontSize}
                     onChange={(e) => onUpdateSettings({ fontSize: parseInt(e.target.value, 10) })}
                     className="w-full"
+                    aria-label="字号"
                   />
                   <div className="flex justify-between text-xs text-[hsl(var(--color-muted-foreground))]">
                     <span>小</span>
@@ -169,7 +205,7 @@ export function ReaderSettingsPanel({
                 <div className="space-y-2">
                   <div className="flex justify-between">
                     <label className="text-sm font-medium">行距</label>
-                    <span className="text-sm text-[hsl(var(--color-muted-foreground))]">
+                    <span className="text-sm tabular-nums text-[hsl(var(--color-muted-foreground))]">
                       {settings.lineHeight.toFixed(1)}
                     </span>
                   </div>
@@ -181,6 +217,7 @@ export function ReaderSettingsPanel({
                     value={settings.lineHeight}
                     onChange={(e) => onUpdateSettings({ lineHeight: parseFloat(e.target.value) })}
                     className="w-full"
+                    aria-label="行距"
                   />
                 </div>
 
@@ -188,7 +225,7 @@ export function ReaderSettingsPanel({
                 <div className="space-y-2">
                   <div className="flex justify-between">
                     <label className="text-sm font-medium">字间距</label>
-                    <span className="text-sm text-[hsl(var(--color-muted-foreground))]">
+                    <span className="text-sm tabular-nums text-[hsl(var(--color-muted-foreground))]">
                       {settings.letterSpacing.toFixed(1)}px
                     </span>
                   </div>
@@ -200,6 +237,7 @@ export function ReaderSettingsPanel({
                     value={settings.letterSpacing}
                     onChange={(e) => onUpdateSettings({ letterSpacing: parseFloat(e.target.value) })}
                     className="w-full"
+                    aria-label="字间距"
                   />
                 </div>
 
@@ -207,7 +245,7 @@ export function ReaderSettingsPanel({
                 <div className="space-y-2">
                   <div className="flex justify-between">
                     <label className="text-sm font-medium">段落间距</label>
-                    <span className="text-sm text-[hsl(var(--color-muted-foreground))]">
+                    <span className="text-sm tabular-nums text-[hsl(var(--color-muted-foreground))]">
                       {settings.paragraphSpacing.toFixed(1)}rem
                     </span>
                   </div>
@@ -221,6 +259,7 @@ export function ReaderSettingsPanel({
                       onUpdateSettings({ paragraphSpacing: parseFloat(e.target.value) })
                     }
                     className="w-full"
+                    aria-label="段落间距"
                   />
                 </div>
 
@@ -228,7 +267,7 @@ export function ReaderSettingsPanel({
                 <div className="space-y-2">
                   <div className="flex justify-between">
                     <label className="text-sm font-medium">页面宽度</label>
-                    <span className="text-sm text-[hsl(var(--color-muted-foreground))]">
+                    <span className="text-sm tabular-nums text-[hsl(var(--color-muted-foreground))]">
                       {settings.pageWidth}%
                     </span>
                   </div>
@@ -240,6 +279,7 @@ export function ReaderSettingsPanel({
                     value={settings.pageWidth}
                     onChange={(e) => onUpdateSettings({ pageWidth: parseInt(e.target.value, 10) })}
                     className="w-full"
+                    aria-label="页面宽度"
                   />
                   <div className="flex justify-between text-xs text-[hsl(var(--color-muted-foreground))]">
                     <span>窄幅</span>
@@ -251,26 +291,27 @@ export function ReaderSettingsPanel({
                 <div className="space-y-2">
                   <label className="text-sm font-medium">对齐方式</label>
                   <div className="grid grid-cols-2 gap-2">
-                    <button
-                      onClick={() => onUpdateSettings({ textAlign: "left" })}
-                      className={`p-2 border rounded-md text-sm transition-colors ${
-                        settings.textAlign === "left"
-                          ? "border-[hsl(var(--color-primary))] bg-[hsl(var(--color-accent))]"
-                          : "border-[hsl(var(--color-border))]"
-                      }`}
-                    >
-                      左对齐
-                    </button>
-                    <button
-                      onClick={() => onUpdateSettings({ textAlign: "justify" })}
-                      className={`p-2 border rounded-md text-sm transition-colors ${
-                        settings.textAlign === "justify"
-                          ? "border-[hsl(var(--color-primary))] bg-[hsl(var(--color-accent))]"
-                          : "border-[hsl(var(--color-border))]"
-                      }`}
-                    >
-                      两端对齐
-                    </button>
+                    {([
+                      { value: "left" as const, label: "左对齐" },
+                      { value: "justify" as const, label: "两端对齐" },
+                    ]).map((option) => {
+                      const active = settings.textAlign === option.value;
+                      return (
+                        <button
+                          key={option.value}
+                          type="button"
+                          aria-pressed={active}
+                          onClick={() => onUpdateSettings({ textAlign: option.value })}
+                          className={`p-2 border rounded-md text-sm transition-colors active:scale-[0.98] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--color-ring))] focus-visible:ring-offset-2 focus-visible:ring-offset-[hsl(var(--color-card))] ${
+                            active
+                              ? "border-[hsl(var(--color-primary))] bg-[hsl(var(--color-accent))]"
+                              : "border-[hsl(var(--color-border))] hover:border-[hsl(var(--color-primary)/0.5)] hover:bg-[hsl(var(--color-accent)/0.5)]"
+                          }`}
+                        >
+                          {option.label}
+                        </button>
+                      );
+                    })}
                   </div>
                 </div>
 
@@ -286,8 +327,9 @@ export function ReaderSettingsPanel({
                     type="button"
                     role="switch"
                     aria-checked={settings.paragraphIndent}
+                    aria-label="段落首行缩进"
                     onClick={() => onUpdateSettings({ paragraphIndent: !settings.paragraphIndent })}
-                    className={`relative inline-flex h-6 w-11 flex-shrink-0 items-center rounded-full border transition-colors ${
+                    className={`relative inline-flex h-6 w-11 flex-shrink-0 items-center rounded-full border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--color-ring))] focus-visible:ring-offset-2 focus-visible:ring-offset-[hsl(var(--color-card))] ${
                       settings.paragraphIndent
                         ? "bg-[hsl(var(--color-primary))] border-[hsl(var(--color-primary))]"
                         : "bg-[hsl(var(--color-secondary))] border-[hsl(var(--color-border))]"

@@ -1,20 +1,28 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "@/services/api";
 import type {
   SearchResult,
   SearchResultsPage,
+  SegmentHit,
+  SegmentSearchPage,
   StoryEntry,
   StoryIndexStatus,
 } from "@/types/story";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import { Search, X, Filter } from "lucide-react";
+import { Search, X, BookOpen, MessageSquare } from "lucide-react";
 import { CustomScrollArea } from "@/components/ui/custom-scroll-area";
 import { cn } from "@/lib/utils";
 import { useToast } from "@/components/ui/toast";
 
+type SearchMode = "story" | "segment";
+
 interface SearchPanelProps {
   onSelectResult: (story: StoryEntry, focus: { query: string; snippet?: string | null }) => void;
+  onSelectSegment: (
+    story: StoryEntry,
+    jump: { segmentIndex: number; preview?: string; query: string }
+  ) => void;
 }
 
 interface CachedPage {
@@ -23,9 +31,27 @@ interface CachedPage {
   version: string;
 }
 
+interface CachedSegmentPage {
+  page: SegmentSearchPage;
+  updatedAt: number;
+  version: string;
+}
+
 const HISTORY_KEY = "arknights-story-search-history";
 const CACHE_KEY = "arknights-story-search-cache-v2";
+const SEGMENT_CACHE_KEY = "arknights-story-segment-cache-v1";
 const DEBUG_STATE_KEY = "arknights-story-search-debug";
+const SEARCH_MODE_KEY = "arknights-story-search-mode";
+
+const SEGMENT_TYPE_LABEL: Record<SegmentHit["segmentType"], string> = {
+  dialogue: "对话",
+  narration: "旁白",
+  system: "系统",
+  subtitle: "字幕",
+  sticker: "标语",
+  header: "标题",
+  decision: "抉择",
+};
 
 /** Wrap matched terms in the text with <mark> for visible highlight. */
 function highlightMatches(text: string, query: string): React.ReactNode {
@@ -64,9 +90,18 @@ function highlightMatches(text: string, query: string): React.ReactNode {
   );
 }
 
-export function SearchPanel({ onSelectResult }: SearchPanelProps) {
+export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProps) {
   const [query, setQuery] = useState("");
+  const [mode, setMode] = useState<SearchMode>(() => {
+    try {
+      const stored = localStorage.getItem(SEARCH_MODE_KEY);
+      return stored === "segment" ? "segment" : "story";
+    } catch {
+      return "story";
+    }
+  });
   const [page, setPage] = useState<SearchResultsPage | null>(null);
+  const [segmentPage, setSegmentPage] = useState<SegmentSearchPage | null>(null);
   const [searching, setSearching] = useState(false);
   const [searched, setSearched] = useState(false);
   const [indexStatus, setIndexStatus] = useState<StoryIndexStatus | null>(null);
@@ -99,10 +134,10 @@ export function SearchPanel({ onSelectResult }: SearchPanelProps) {
   const indexProgressUnlistenRef = useRef<null | (() => void)>(null);
   const [history, setHistory] = useState<string[]>([]);
   const [cache, setCache] = useState<Record<string, CachedPage>>({});
+  const [segmentCache, setSegmentCache] = useState<Record<string, CachedSegmentPage>>({});
   const [fromCache, setFromCache] = useState<{ used: boolean; updatedAt?: number }>({
     used: false,
   });
-  const [activeFacet, setActiveFacet] = useState<string | null>(null);
   const [version, setVersion] = useState<string>("");
   const toast = useToast();
 
@@ -142,15 +177,50 @@ export function SearchPanel({ onSelectResult }: SearchPanelProps) {
         };
       }
 
+      if (mode === "segment") {
+        if (!opts?.forceRefresh) {
+          const cached = segmentCache[raw];
+          if (cached && cached.version === version) {
+            setSegmentPage(cached.page);
+            setPage(null);
+            setSearched(true);
+            setFromCache({ used: true, updatedAt: cached.updatedAt });
+            setSearching(false);
+            setProgress(null);
+            saveHistory(raw);
+            return;
+          }
+        }
+        const data = await api.searchSegments(raw);
+        setSegmentPage(data);
+        setPage(null);
+        const updatedAt = Date.now();
+        const nextCache = { ...segmentCache, [raw]: { page: data, updatedAt, version } };
+        setSegmentCache(nextCache);
+        try {
+          localStorage.setItem(SEGMENT_CACHE_KEY, JSON.stringify(nextCache));
+        } catch {
+          /* ignore */
+        }
+        setFromCache({ used: false });
+        setSearched(true);
+        saveHistory(raw);
+        if (data.hits.length === 0 && indexStatus?.ready) {
+          toast.warn("段级索引暂无命中，已自动落回整篇搜索", 2500);
+          setMode("story");
+        }
+        return;
+      }
+
       if (!opts?.forceRefresh && !debugMode) {
         const cached = cache[raw];
         if (cached && cached.version === version) {
           setPage(cached.page);
+          setSegmentPage(null);
           setSearched(true);
           setFromCache({ used: true, updatedAt: cached.updatedAt });
           setSearching(false);
           setProgress(null);
-          setActiveFacet(null);
           saveHistory(raw);
           return;
         }
@@ -164,11 +234,13 @@ export function SearchPanel({ onSelectResult }: SearchPanelProps) {
           truncated: false,
           facets: {},
         });
+        setSegmentPage(null);
         setDebugLogs(data.logs);
         setDebugExpanded(true);
       } else {
         const data = await api.searchStoriesEx(raw);
         setPage(data);
+        setSegmentPage(null);
         setDebugLogs([]);
         setDebugExpanded(false);
         const updatedAt = Date.now();
@@ -182,7 +254,6 @@ export function SearchPanel({ onSelectResult }: SearchPanelProps) {
         setFromCache({ used: false });
       }
       setSearched(true);
-      setActiveFacet(null);
       saveHistory(raw);
     } catch (err) {
       console.error("Search failed:", err);
@@ -206,6 +277,23 @@ export function SearchPanel({ onSelectResult }: SearchPanelProps) {
     }
   };
 
+  const openSegment = async (hit: SegmentHit) => {
+    try {
+      setOpeningStoryId(hit.storyId);
+      const story = await api.getStoryEntry(hit.storyId);
+      onSelectSegment(story, {
+        segmentIndex: hit.segmentIndex,
+        preview: hit.matchedText,
+        query,
+      });
+    } catch (err) {
+      console.error("Open segment failed:", err);
+      toast.error("打开剧情失败");
+    } finally {
+      setOpeningStoryId(null);
+    }
+  };
+
   const handleKeyPress = (e: React.KeyboardEvent) => {
     if (e.key === "Enter") {
       handleSearch();
@@ -215,11 +303,11 @@ export function SearchPanel({ onSelectResult }: SearchPanelProps) {
   const clearSearch = () => {
     setQuery("");
     setPage(null);
+    setSegmentPage(null);
     setSearched(false);
     setDebugLogs([]);
     setDebugExpanded(false);
     setOpeningStoryId(null);
-    setActiveFacet(null);
   };
 
   const refreshIndexStatus = useCallback(async () => {
@@ -264,6 +352,8 @@ export function SearchPanel({ onSelectResult }: SearchPanelProps) {
       setHistory(raw ? JSON.parse(raw) : []);
       const cacheRaw = localStorage.getItem(CACHE_KEY);
       setCache(cacheRaw ? JSON.parse(cacheRaw) : {});
+      const segCacheRaw = localStorage.getItem(SEGMENT_CACHE_KEY);
+      setSegmentCache(segCacheRaw ? JSON.parse(segCacheRaw) : {});
     } catch {
       /* ignore */
     }
@@ -288,18 +378,20 @@ export function SearchPanel({ onSelectResult }: SearchPanelProps) {
   }, [debugMode]);
 
   useEffect(() => {
+    try {
+      localStorage.setItem(SEARCH_MODE_KEY, mode);
+    } catch {
+      /* ignore */
+    }
+  }, [mode]);
+
+  useEffect(() => {
     const handler = () => {
       void handleBuildIndex();
     };
     window.addEventListener("app:rebuild-story-index", handler);
     return () => window.removeEventListener("app:rebuild-story-index", handler);
   }, [handleBuildIndex]);
-
-  const visibleResults = useMemo(() => {
-    if (!page) return [] as SearchResult[];
-    if (!activeFacet) return page.results;
-    return page.results.filter((r) => r.category === activeFacet);
-  }, [page, activeFacet]);
 
   const renderIndexStatusText = () => {
     if (!indexStatus) return "索引状态获取中...";
@@ -343,6 +435,38 @@ export function SearchPanel({ onSelectResult }: SearchPanelProps) {
               <Search className="mr-2 h-4 w-4" />
               搜索
             </Button>
+          </div>
+
+          {/* 搜索模式切换：整篇 vs 段落 */}
+          <div className="mt-3 inline-flex rounded-full border border-[hsl(var(--color-border))] p-0.5">
+            <button
+              type="button"
+              aria-pressed={mode === "story"}
+              onClick={() => setMode("story")}
+              className={cn(
+                "flex items-center gap-1 rounded-full px-3 py-1 text-xs transition-colors",
+                mode === "story"
+                  ? "bg-[hsl(var(--color-primary))] text-[hsl(var(--color-primary-foreground))]"
+                  : "text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-foreground))]"
+              )}
+            >
+              <BookOpen className="h-3.5 w-3.5" />
+              整篇
+            </button>
+            <button
+              type="button"
+              aria-pressed={mode === "segment"}
+              onClick={() => setMode("segment")}
+              className={cn(
+                "flex items-center gap-1 rounded-full px-3 py-1 text-xs transition-colors",
+                mode === "segment"
+                  ? "bg-[hsl(var(--color-primary))] text-[hsl(var(--color-primary-foreground))]"
+                  : "text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-foreground))]"
+              )}
+            >
+              <MessageSquare className="h-3.5 w-3.5" />
+              段落
+            </button>
           </div>
 
           {history.length > 0 && !searched && (
@@ -479,40 +603,6 @@ export function SearchPanel({ onSelectResult }: SearchPanelProps) {
               </div>
             </div>
           )}
-
-          {/* 分类 facet 过滤 */}
-          {page && page.results.length > 0 && Object.keys(page.facets).length > 1 && (
-            <div className="mt-3 flex flex-wrap items-center gap-2">
-              <Filter className="h-3.5 w-3.5 text-[hsl(var(--color-muted-foreground))]" />
-              <button
-                onClick={() => setActiveFacet(null)}
-                className={cn(
-                  "rounded-full border px-3 py-0.5 text-xs transition-colors",
-                  activeFacet === null
-                    ? "bg-[hsl(var(--color-primary))] text-[hsl(var(--color-primary-foreground))] border-transparent"
-                    : "border-[hsl(var(--color-border))] text-[hsl(var(--color-muted-foreground))]"
-                )}
-              >
-                全部 {page.results.length}
-              </button>
-              {Object.entries(page.facets)
-                .sort((a, b) => b[1] - a[1])
-                .map(([facet, count]) => (
-                  <button
-                    key={facet}
-                    onClick={() => setActiveFacet(facet === activeFacet ? null : facet)}
-                    className={cn(
-                      "rounded-full border px-3 py-0.5 text-xs transition-colors",
-                      facet === activeFacet
-                        ? "bg-[hsl(var(--color-primary))] text-[hsl(var(--color-primary-foreground))] border-transparent"
-                        : "border-[hsl(var(--color-border))] text-[hsl(var(--color-muted-foreground))]"
-                    )}
-                  >
-                    {facet.split(" | ")[0]} {count}
-                  </button>
-                ))}
-            </div>
-          )}
         </div>
       </header>
 
@@ -525,33 +615,78 @@ export function SearchPanel({ onSelectResult }: SearchPanelProps) {
           trackOffsetBottom="calc(4.5rem + env(safe-area-inset-bottom, 0px))"
         >
           <div className="container py-6 pb-24 motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-700">
-            {searching && !page && (
+            {searching && !page && !segmentPage && (
               <div className="text-center text-[hsl(var(--color-muted-foreground))]">
                 {progress ? `${progress.phase} ${progress.current}/${progress.total}` : "搜索中..."}
               </div>
             )}
 
-            {!searching && searched && page && page.results.length === 0 && (
+            {/* 段落模式结果 */}
+            {!searching && mode === "segment" && segmentPage && segmentPage.hits.length === 0 && searched && (
+              <div className="text-center text-[hsl(var(--color-muted-foreground))]">
+                未找到包含该关键词的段落
+              </div>
+            )}
+            {!searching && mode === "segment" && segmentPage && segmentPage.hits.length > 0 && (
+              <div className="space-y-3">
+                <div className="flex items-center justify-between text-sm text-[hsl(var(--color-muted-foreground))]">
+                  <span>共 {segmentPage.totalMatched} 段命中</span>
+                  {segmentPage.truncated && (
+                    <span className="text-xs">
+                      已显示 {segmentPage.hits.length} / {segmentPage.totalMatched}，缩小关键词可获得更精确结果
+                    </span>
+                  )}
+                </div>
+                {segmentPage.hits.map((hit, index) => (
+                  <button
+                    key={`${hit.storyId}-${hit.segmentIndex}-${index}`}
+                    onClick={() => openSegment(hit)}
+                    disabled={openingStoryId === hit.storyId}
+                    className="w-full p-4 rounded-lg border border-[hsl(var(--color-border))] hover:bg-[hsl(var(--color-accent))] transition-all duration-200 text-left hover:-translate-y-0.5 motion-safe:animate-in motion-safe:fade-in-0 disabled:opacity-60 disabled:cursor-wait"
+                    style={{ animationDelay: `${Math.min(index, 10) * 40}ms` }}
+                  >
+                    <div className="flex items-baseline justify-between gap-2 mb-1">
+                      <div className="font-medium truncate">
+                        {highlightMatches(hit.storyName, query)}
+                      </div>
+                      <span className="flex-shrink-0 text-[10px] uppercase tracking-widest text-[hsl(var(--color-muted-foreground))]">
+                        {SEGMENT_TYPE_LABEL[hit.segmentType] ?? hit.segmentType}
+                        {" · #"}
+                        {hit.segmentIndex}
+                      </span>
+                    </div>
+                    <div className="text-xs text-[hsl(var(--color-muted-foreground))] mb-2">
+                      {hit.category}
+                      {hit.characterName ? ` · ${hit.characterName}` : ""}
+                    </div>
+                    {hit.matchedText && (
+                      <div className="text-sm text-[hsl(var(--color-muted-foreground))] line-clamp-3">
+                        {highlightMatches(hit.matchedText, query)}
+                      </div>
+                    )}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {/* 整篇模式结果 */}
+            {!searching && mode === "story" && searched && page && page.results.length === 0 && (
               <div className="text-center text-[hsl(var(--color-muted-foreground))]">
                 未找到相关剧情
               </div>
             )}
 
-            {!searching && page && page.results.length > 0 && (
+            {!searching && mode === "story" && page && page.results.length > 0 && (
               <div className="space-y-3">
                 <div className="flex items-center justify-between text-sm text-[hsl(var(--color-muted-foreground))]">
-                  <span>
-                    {activeFacet
-                      ? `「${activeFacet.split(" | ")[0]}」 ${visibleResults.length} 条`
-                      : `共 ${page.totalMatched} 条匹配`}
-                  </span>
+                  <span>共 {page.totalMatched} 条匹配</span>
                   {page.truncated && (
                     <span className="text-xs">
                       已显示 {page.results.length} / {page.totalMatched}，缩小关键词可获得更精确结果
                     </span>
                   )}
                 </div>
-                {visibleResults.map((result, index) => (
+                {page.results.map((result, index) => (
                   <button
                     key={`${result.storyId}-${index}`}
                     onClick={() => openResult(result)}
@@ -582,7 +717,7 @@ export function SearchPanel({ onSelectResult }: SearchPanelProps) {
 
             {!searching && !searched && (
               <div className="text-center text-[hsl(var(--color-muted-foreground))]">
-                输入关键词搜索剧情，支持空格 AND、`OR`、`-排除词`、引号短语
+                输入关键词搜索剧情，支持空格 AND、<code>OR</code>、<code>-排除词</code>、引号短语
               </div>
             )}
           </div>
