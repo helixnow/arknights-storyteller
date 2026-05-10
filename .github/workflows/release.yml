@@ -1,4 +1,4 @@
-name: publish
+name: release-android
 
 on:
   workflow_dispatch:
@@ -10,81 +10,27 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  publish-tauri:
-    name: Build desktop bundles
-    runs-on: ${{ matrix.platform }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: macos-latest
-            args: "--target aarch64-apple-darwin"
-          - platform: macos-latest
-            args: "--target x86_64-apple-darwin"
-          - platform: ubuntu-22.04
-            args: ""
-          - platform: windows-latest
-            args: ""
-    permissions:
-      contents: write
+  check-android-secrets:
+    name: Check Android signing secrets
+    runs-on: ubuntu-24.04
     outputs:
-      release_id: ${{ steps.publish.outputs.releaseId }}
-      release_upload_url: ${{ steps.publish.outputs.releaseUploadUrl }}
-      app_version: ${{ steps.publish.outputs.appVersion }}
+      has_keystore: ${{ steps.check.outputs.has_keystore }}
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install system deps (Ubuntu)
-        if: contains(matrix.platform, 'ubuntu')
+      - id: check
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libappindicator3-dev \
-            librsvg2-dev \
-            patchelf
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: lts/*
-          cache: npm
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: ./src-tauri -> target
-
-      - name: Install frontend dependencies
-        run: npm ci
-
-      - name: Build with tauri-action
-        id: publish
-        uses: tauri-apps/tauri-action@v0
+          if [ -n "$ANDROID_KEYSTORE_B64" ]; then
+            echo "has_keystore=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_keystore=false" >> "$GITHUB_OUTPUT"
+          fi
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
-          TAURI_UPDATER_ENDPOINT: ${{ secrets.TAURI_UPDATER_ENDPOINT }}
-        with:
-          tagName: app-v__VERSION__
-          releaseName: 明日方舟剧情阅读器 v__VERSION__
-          releaseBody: |
-            自动构建版本。请在附件中获取对应平台的安装包。
-          releaseDraft: true
-          args: ${{ matrix.args }}
+          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
 
   android:
     name: Build signed Android APK
-    needs: publish-tauri
-    if: needs.publish-tauri.outputs.release_id != '' && secrets.ANDROID_KEYSTORE_B64 != ''
-    runs-on: ubuntu-22.04
+    needs: check-android-secrets
+    if: needs.check-android-secrets.outputs.has_keystore == 'true'
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
@@ -95,6 +41,7 @@ jobs:
         with:
           node-version: lts/*
           cache: npm
+          cache-dependency-path: arknights-story-reader/package-lock.json
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -103,14 +50,25 @@ jobs:
           java-version: "17"
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          packages: |
-            tools
-            platform-tools
-            platforms;android-34
-            build-tools;34.0.0
-            ndk;26.1.10909125
+        run: |
+          # Android SDK is pre-installed on ubuntu runners
+          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> $GITHUB_ENV
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$ANDROID_HOME/platform-tools" >> $GITHUB_PATH
+          echo "$ANDROID_HOME/build-tools/34.0.0" >> $GITHUB_PATH
+          
+          # Accept licenses
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+          
+          # Install required packages
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "ndk;26.1.10909125"
+          
+          # Set NDK_HOME after NDK installation
+          echo "NDK_HOME=$ANDROID_HOME/ndk/26.1.10909125" >> $GITHUB_ENV
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -120,69 +78,164 @@ jobs:
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: ./src-tauri -> target
+          workspaces: arknights-story-reader/src-tauri -> target
 
       - name: Install frontend dependencies
         run: npm ci
+        working-directory: arknights-story-reader
+
+      - name: Bump version and get app version
+        id: get_version
+        run: |
+          # Read current version
+          CURRENT_VERSION=$(node -p "require('./package.json').version")
+          echo "Current version: $CURRENT_VERSION"
+          
+          # Bump patch version
+          NEW_VERSION=$(node -e "
+            const current = '$CURRENT_VERSION';
+            const parts = current.split('.');
+            parts[2] = String(parseInt(parts[2]) + 1);
+            console.log(parts.join('.'));
+          ")
+          echo "New version: $NEW_VERSION"
+          
+          # Update package.json
+          npm version $NEW_VERSION --no-git-tag-version
+          
+          # Update tauri.conf.json
+          node -e "
+            const fs = require('fs');
+            const path = 'src-tauri/tauri.conf.json';
+            const config = JSON.parse(fs.readFileSync(path, 'utf8'));
+            config.version = '$NEW_VERSION';
+            fs.writeFileSync(path, JSON.stringify(config, null, 2) + '\n');
+          "
+          
+          # Update Cargo.toml
+          sed -i.bak "s/^version = \".*\"/version = \"$NEW_VERSION\"/" src-tauri/Cargo.toml
+          rm -f src-tauri/Cargo.toml.bak
+          
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+        working-directory: arknights-story-reader
+
+      - name: Commit version bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          cd arknights-story-reader
+          git add package.json package-lock.json src-tauri/tauri.conf.json src-tauri/Cargo.toml
+          [ -f src-tauri/Cargo.lock ] && git add src-tauri/Cargo.lock || true
+          cd ..
+          git diff --staged --quiet || git commit -m "chore: bump version to ${{ steps.get_version.outputs.version }}"
+          git push origin release || echo "Failed to push version bump"
+
+      - name: Create GitHub Release
+        id: create_release
+        env:
+          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          VERSION: "${{ steps.get_version.outputs.version }}"
+        run: |
+          TAG="app-v${VERSION}"
+          RELEASE_NAME="明日方舟剧情阅读器 v${VERSION}"
+          
+          # Check if release already exists
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists"
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          else
+            echo "Creating new release $TAG"
+            gh release create "$TAG" \
+              --title "$RELEASE_NAME" \
+              --notes "自动构建版本。Android APK 安装包。" \
+              --draft \
+              --latest
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build frontend with update feed
+        env:
+          VITE_ANDROID_UPDATE_FEED: "https://api.github.com/repos/${{ github.repository }}/releases/latest"
+          VITE_ANDROID_ANNOUNCEMENTS_URL: "https://raw.githubusercontent.com/${{ github.repository }}/release/android-announcements.json"
+        run: npm run build
+        working-directory: arknights-story-reader
 
       - name: Restore Android keystore
+        env:
+          ANDROID_KEYSTORE_B64: "${{ secrets.ANDROID_KEYSTORE_B64 }}"
+          ANDROID_KEYSTORE_PASSWORD: "${{ secrets.ANDROID_KEYSTORE_PASSWORD }}"
+          ANDROID_KEY_ALIAS: "${{ secrets.ANDROID_KEY_ALIAS }}"
+          ANDROID_KEY_PASSWORD: "${{ secrets.ANDROID_KEY_PASSWORD }}"
         run: |
           mkdir -p src-tauri/gen/android
           echo "$ANDROID_KEYSTORE_B64" | base64 --decode > src-tauri/gen/android/upload-keystore.jks
-
           KEY_PASSWORD="${ANDROID_KEY_PASSWORD:-$ANDROID_KEYSTORE_PASSWORD}"
-          cat <<'EOF' > src-tauri/gen/android/keystore.properties
-          storePassword=$ANDROID_KEYSTORE_PASSWORD
-          keyPassword=$KEY_PASSWORD
+          cat > src-tauri/gen/android/keystore.properties <<EOF
+          storePassword=${ANDROID_KEYSTORE_PASSWORD}
+          keyPassword=${KEY_PASSWORD}
           keyAlias=${ANDROID_KEY_ALIAS}
-          storeFile=${{ github.workspace }}/src-tauri/gen/android/upload-keystore.jks
+          storeFile=${GITHUB_WORKSPACE}/arknights-story-reader/src-tauri/gen/android/upload-keystore.jks
           EOF
-        env:
-          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
-          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        working-directory: arknights-story-reader
 
       - name: Build signed Android APK
         env:
-          ANDROID_KEYSTORE_PATH: ${{ github.workspace }}/src-tauri/gen/android/upload-keystore.jks
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: |
-          bash scripts/build-apk.sh
+          ANDROID_KEYSTORE_PATH: "${{ github.workspace }}/arknights-story-reader/src-tauri/gen/android/upload-keystore.jks"
+          ANDROID_KEY_ALIAS: "${{ secrets.ANDROID_KEY_ALIAS }}"
+          ANDROID_KEYSTORE_PASSWORD: "${{ secrets.ANDROID_KEYSTORE_PASSWORD }}"
+          ANDROID_KEY_PASSWORD: "${{ secrets.ANDROID_KEY_PASSWORD }}"
+          VITE_ANDROID_UPDATE_FEED: "https://api.github.com/repos/${{ github.repository }}/releases/latest"
+          VITE_ANDROID_ANNOUNCEMENTS_URL: "https://raw.githubusercontent.com/${{ github.repository }}/release/android-announcements.json"
+          SKIP_WEB_BUILD: "1"
+        run: bash scripts/build-apk.sh
+        working-directory: arknights-story-reader
 
       - name: Upload APK to release
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          VERSION: "${{ steps.get_version.outputs.version }}"
+          TAG: "${{ steps.create_release.outputs.tag }}"
         run: |
           APK_PATH="src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-signed.apk"
           if [ ! -f "$APK_PATH" ]; then
             echo "Signed APK not found at $APK_PATH" >&2
             exit 1
           fi
-          TAG="app-v${{ needs.publish-tauri.outputs.app_version }}"
-          RELEASE_NAME="arknights-story-reader-android-${{ needs.publish-tauri.outputs.app_version }}.apk"
-          gh release upload "$TAG" "$APK_PATH#$RELEASE_NAME" --clobber
+          RELEASE_NAME="arknights-story-reader-android-${VERSION}.apk"
+          RENAMED_APK="src-tauri/gen/android/app/build/outputs/apk/universal/release/${RELEASE_NAME}"
+          cp "$APK_PATH" "$RENAMED_APK"
+          gh release upload "$TAG" "$RENAMED_APK" --clobber
+        working-directory: arknights-story-reader
 
       - name: Publish Android update manifest
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          VERSION: "${{ steps.get_version.outputs.version }}"
+          TAG: "${{ steps.create_release.outputs.tag }}"
+          REPO: "${{ github.repository }}"
         run: |
-          TAG="app-v${{ needs.publish-tauri.outputs.app_version }}"
-          VERSION="${{ needs.publish-tauri.outputs.app_version }}"
-          APK_NAME="arknights-story-reader-android-${{ needs.publish-tauri.outputs.app_version }}.apk"
+          APK_NAME="arknights-story-reader-android-${VERSION}.apk"
           JSON_PATH="android-latest.json"
-          cat <<'EOF' > "$JSON_PATH"
-          {
-            "version": "$VERSION",
-            "notes": "",
-            "url": "https://github.com/${{ github.repository }}/releases/download/$TAG/$APK_NAME",
-            "fileName": "$APK_NAME"
-          }
-          EOF
+          echo "{" > "$JSON_PATH"
+          echo "  \"version\": \"$VERSION\"," >> "$JSON_PATH"
+          echo "  \"notes\": \"\"," >> "$JSON_PATH"
+          echo "  \"url\": \"https://github.com/$REPO/releases/download/$TAG/$APK_NAME\"," >> "$JSON_PATH"
+          echo "  \"fileName\": \"$APK_NAME\"" >> "$JSON_PATH"
+          echo "}" >> "$JSON_PATH"
+          cat "$JSON_PATH"
           gh release upload "$TAG" "$JSON_PATH#$JSON_PATH" --clobber
+        working-directory: arknights-story-reader
+
+      - name: Publish release
+        env:
+          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          TAG: "${{ steps.create_release.outputs.tag }}"
+        run: |
+          echo "Publishing release $TAG"
+          gh release edit "$TAG" --draft=false
+        working-directory: arknights-story-reader
 
       - name: Cleanup keystore
         if: always()
         run: rm -f src-tauri/gen/android/upload-keystore.jks src-tauri/gen/android/keystore.properties
+        working-directory: arknights-story-reader
