@@ -56,7 +56,7 @@ class MainActivity : TauriActivity() {
    * handler. If the hook name changes in future Tauri versions, we fall back
    * to [findWebView] which walks the view tree.
    */
-  fun onWebViewCreate(webView: WebView) {
+  override fun onWebViewCreate(webView: WebView) {
     this.webView = webView
   }
 
