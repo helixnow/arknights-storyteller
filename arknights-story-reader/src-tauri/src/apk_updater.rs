@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use tauri::{
     plugin::{Builder, PluginApi, PluginHandle, TauriPlugin},
-    Runtime,
+    Manager, Runtime,
 };
 
 type PluginResult<T> = Result<T, String>;
