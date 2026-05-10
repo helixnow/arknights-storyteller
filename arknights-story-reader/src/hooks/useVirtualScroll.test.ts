@@ -1,7 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
 import { useVirtualScroll } from './useVirtualScroll';
-import { createRef } from 'react';
 
 describe('useVirtualScroll', () => {
   let containerRef: React.RefObject<HTMLDivElement>;
@@ -12,7 +11,7 @@ describe('useVirtualScroll', () => {
       clientHeight: 600,
       scrollTop: 0,
       scrollHeight: 10000,
-      scrollTo: vi.fn(),
+      scrollTo: vi.fn() as unknown as HTMLDivElement['scrollTo'],
       addEventListener: vi.fn(),
       removeEventListener: vi.fn(),
     };
