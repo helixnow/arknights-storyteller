@@ -97,6 +97,9 @@ pub enum StorySegment {
         /// 可选的对话位置（例如右侧头像）
         #[serde(skip_serializing_if = "Option::is_none")]
         position: Option<String>,
+        /// 角色 ID（如 char_xxx），可选
+        #[serde(rename = "characterId", skip_serializing_if = "Option::is_none")]
+        character_id: Option<String>,
     },
     Narration {
         text: String,
@@ -124,6 +127,14 @@ pub enum StorySegment {
     },
     Header {
         title: String,
+    },
+    Image {
+        token: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
+    },
+    Music {
+        key: String,
     },
 }
 
