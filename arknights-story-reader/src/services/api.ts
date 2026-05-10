@@ -226,4 +226,9 @@ export const api = {
   getStoryNeighbors: async (storyId: string): Promise<StoryNeighbors> => {
     return invoke<StoryNeighbors>("get_story_neighbors", { storyId });
   },
+
+  /** 根据 storyId 拿所在章节 / 活动名（分享图会用）。 */
+  getStoryCategoryName: async (storyId: string): Promise<string | null> => {
+    return invoke<string | null>("get_story_category_name", { storyId });
+  },
 };

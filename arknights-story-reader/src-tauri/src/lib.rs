@@ -108,6 +108,7 @@ pub fn run() {
             commands::resolve_asset_urls,
             commands::get_character_index,
             commands::get_story_neighbors,
+            commands::get_story_category_name,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

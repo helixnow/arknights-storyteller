@@ -20,14 +20,23 @@ interface AssetImageProps {
   lazy?: boolean;
   /** 加载完成回调，可用于父级切换 skeleton。 */
   onReady?: (url: string) => void;
+  /** 所有 URL 都加载失败时调用，父级可用来隐藏自己。 */
+  onExhausted?: () => void;
 }
 
+// Session 级失败缓存：同一 URL 本进程内失败过就不再尝试。
+const failedUrls = new Set<string>();
+
 /**
- * 统一的素材 `<img>` 封装：
- * 1. 从后端 `resolve_asset_urls` 拿一条候选链
- * 2. 渲染时按顺序尝试，首个加载成功的即作为最终 src
- * 3. 全部失败则显示 fallback（默认透明占位）
- * 4. 交叉 observer 懒加载；首屏外不占用带宽
+ * 统一的素材 `<img>` 封装。性能注意点：
+ *
+ * 1. **不用 IntersectionObserver**。上一版给每个实例挂一个 observer，
+ *    CharactersPanel 400+ 头像直接把滚动主线程压死。改用浏览器原生
+ *    `loading="lazy"`，0 JS 成本。
+ * 2. **不订阅全局 index**。index 在 provider 里一次性注入，之后 token
+ *    稳定时本组件就不再重新渲染。
+ * 3. **不每帧 filter**。`failedUrls` 只在 onError 时读写一次，候选链
+ *    直接来自 `useAsset` 的 memo 化结果。
  */
 export function AssetImage({
   kind,
@@ -39,41 +48,47 @@ export function AssetImage({
   fallback,
   lazy = true,
   onReady,
+  onExhausted,
 }: AssetImageProps) {
-  const { candidates, loading } = useAsset(kind, token ?? null);
+  const { candidates } = useAsset(kind, token ?? null);
   const [currentIdx, setCurrentIdx] = useState(0);
   const [loaded, setLoaded] = useState(false);
-  const [visible, setVisible] = useState(!lazy);
-  const containerRef = useRef<HTMLDivElement | null>(null);
+  const exhaustedFiredRef = useRef(false);
+
+  // 候选集合变了就重置。key 用字符串拼接而非数组引用比较，避免 memo
+  // 失效时白白 setState。
+  const candidatesKey = candidates.join("|");
+  const prevKeyRef = useRef(candidatesKey);
+  if (prevKeyRef.current !== candidatesKey) {
+    prevKeyRef.current = candidatesKey;
+    // skip state set in render — react batches next effect
+  }
 
   useEffect(() => {
     setCurrentIdx(0);
     setLoaded(false);
-  }, [candidates.join("|")]);
+    exhaustedFiredRef.current = false;
+  }, [candidatesKey]);
+
+  // 过滤失败的 URL，但只在组件首次确定候选链时做一次；失败列表本身在
+  // onError 里 mutate，不触发 re-render。
+  const currentUrl = (() => {
+    for (let i = currentIdx; i < candidates.length; i += 1) {
+      const u = candidates[i];
+      if (!failedUrls.has(u)) return { url: u, idx: i };
+    }
+    return null;
+  })();
+
+  const exhausted = candidates.length > 0 && currentUrl === null;
+  const noneAvailable = candidates.length === 0;
 
   useEffect(() => {
-    if (!lazy || visible) return;
-    const el = containerRef.current;
-    if (!el) return;
-    const io = new IntersectionObserver(
-      (entries) => {
-        for (const entry of entries) {
-          if (entry.isIntersecting) {
-            setVisible(true);
-            io.disconnect();
-            break;
-          }
-        }
-      },
-      { rootMargin: "200px 0px", threshold: 0 }
-    );
-    io.observe(el);
-    return () => io.disconnect();
-  }, [lazy, visible]);
-
-  const currentUrl = candidates[currentIdx];
-  const exhausted = !loading && candidates.length > 0 && currentIdx >= candidates.length;
-  const noneAvailable = !loading && candidates.length === 0;
+    if ((exhausted || noneAvailable) && !exhaustedFiredRef.current) {
+      exhaustedFiredRef.current = true;
+      onExhausted?.();
+    }
+  }, [exhausted, noneAvailable, onExhausted]);
 
   const tintClass =
     tint === "none"
@@ -86,15 +101,14 @@ export function AssetImage({
 
   return (
     <div
-      ref={containerRef}
       className={cn("asset-image-slot relative overflow-hidden", className)}
       style={style}
       data-asset-loaded={loaded ? "true" : "false"}
     >
-      {visible && currentUrl && !exhausted ? (
+      {currentUrl ? (
         <img
-          key={currentUrl}
-          src={currentUrl}
+          key={currentUrl.url}
+          src={currentUrl.url}
           alt={alt ?? ""}
           loading={lazy ? "lazy" : "eager"}
           decoding="async"
@@ -102,17 +116,18 @@ export function AssetImage({
           draggable={false}
           onLoad={() => {
             setLoaded(true);
-            onReady?.(currentUrl);
+            onReady?.(currentUrl.url);
           }}
           onError={() => {
-            if (currentIdx + 1 < candidates.length) {
-              setCurrentIdx((i) => i + 1);
+            failedUrls.add(currentUrl.url);
+            if (currentUrl.idx + 1 < candidates.length) {
+              setCurrentIdx(currentUrl.idx + 1);
             } else {
-              setCurrentIdx(candidates.length); // mark exhausted
+              setCurrentIdx(candidates.length);
             }
           }}
           className={cn(
-            "asset-image h-full w-full object-cover transition-opacity duration-300",
+            "asset-image h-full w-full object-cover",
             tintClass,
             loaded ? "opacity-100" : "opacity-0"
           )}
@@ -122,34 +137,30 @@ export function AssetImage({
         <div
           className={cn(
             "asset-image-fallback absolute inset-0 flex items-center justify-center",
-            loaded && !exhausted && !noneAvailable ? "opacity-0" : "opacity-100",
-            "transition-opacity duration-300"
+            loaded && !exhausted && !noneAvailable ? "opacity-0" : "opacity-100"
           )}
           aria-hidden="true"
         >
-          {fallback ?? <DefaultFallback seed={token ?? ""} />}
+          {fallback ?? <GradientFallback seed={token ?? ""} />}
         </div>
       )}
     </div>
   );
 }
 
-function DefaultFallback({ seed }: { seed: string }) {
+/**
+ * 默认 fallback：纯渐变色块。不显示 monogram 文字——`ac`/`bg`/`act17side`
+ * 这种缩写比空着更丑。调用方（例如 CharacterAvatar）需要文字占位时自己传
+ * `fallback` prop。
+ */
+function GradientFallback({ seed }: { seed: string }) {
   const hue = hashHue(seed || "ark");
   const style: CSSProperties = {
-    background: `linear-gradient(135deg, hsl(${hue} 42% 72% / 0.45), hsl(${
+    background: `linear-gradient(135deg, hsl(${hue} 26% 46% / 0.32), hsl(${
       (hue + 40) % 360
-    } 42% 58% / 0.35))`,
+    } 32% 36% / 0.28))`,
   };
-  const label = (seed || "?").replace(/[^\p{L}\p{N}]/gu, "").slice(0, 2) || "…";
-  return (
-    <div
-      style={style}
-      className="h-full w-full flex items-center justify-center text-[hsl(var(--color-foreground)/0.55)] text-lg font-semibold tracking-widest select-none"
-    >
-      {label}
-    </div>
-  );
+  return <div style={style} className="h-full w-full" />;
 }
 
 function hashHue(input: string): number {

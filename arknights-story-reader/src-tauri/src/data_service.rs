@@ -2834,6 +2834,23 @@ impl DataService {
         Ok(crate::models::StoryNeighbors { prev, next })
     }
 
+    /// 查找指定 storyId 所在的 **章节 / 活动** 名。
+    /// 返回如 "黑暗时代·上"、"和光同尘" 等；找不到返回 None。
+    pub fn get_story_category_name(&self, story_id: &str) -> Result<Option<String>, String> {
+        let stories = self.collect_stories_for_index()?;
+        for indexed in stories {
+            if indexed.story.story_id == story_id {
+                let name = indexed.category_name.trim();
+                return Ok(if name.is_empty() {
+                    None
+                } else {
+                    Some(name.to_string())
+                });
+            }
+        }
+        Ok(None)
+    }
+
     /// 提取匹配文本的上下文
     ///
     /// Return a clean preview of the segment body, collapsing any

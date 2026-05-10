@@ -288,3 +288,15 @@ pub async fn get_story_neighbors(
         .await
         .map_err(|err| format!("Failed to join neighbors task: {}", err))?
 }
+
+/// 返回 storyId 所在的章节 / 活动显示名（例如 "黑暗时代·上"）。
+#[tauri::command]
+pub async fn get_story_category_name(
+    state: State<'_, AppState>,
+    story_id: String,
+) -> Result<Option<String>, String> {
+    let service = clone_service(&state);
+    tauri::async_runtime::spawn_blocking(move || service.get_story_category_name(&story_id))
+        .await
+        .map_err(|err| format!("Failed to join category name task: {}", err))?
+}

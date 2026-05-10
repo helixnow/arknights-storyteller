@@ -1,5 +1,6 @@
 import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import { api } from "@/services/api";
+import { setGlobalCharacterIndex } from "@/hooks/useAsset";
 import type { CharacterIndex } from "@/types/story";
 
 interface CharacterContextValue extends CharacterIndex {
@@ -34,6 +35,8 @@ export function CharacterResolverProvider({ children }: { children: ReactNode })
       .then((idx) => {
         if (cancelled) return;
         setIndex(idx);
+        // 注入到全局，让 useAsset 的本地 URL 解析能用上真正的 charId 映射
+        setGlobalCharacterIndex(idx);
         setLoaded(true);
       })
       .catch((err) => {

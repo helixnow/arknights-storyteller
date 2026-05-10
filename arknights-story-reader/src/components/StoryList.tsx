@@ -1097,10 +1097,11 @@ function StoryItem({
     showSummary && summaryState === "ready" ? summaryContent.split("\n") : [];
 
   const storyTxt = story.storyTxt ?? "";
-  const isMemoryStory =
-    storyTxt.startsWith("obt/memory/") || story.storyReviewType === "NONE";
-  const isMainStory =
-    storyTxt.startsWith("obt/main/") || story.storyReviewType === "MAIN_STORY";
+  // 仅用 storyTxt 路径前缀判断素材类别。`storyReviewType === "NONE"` 是
+  // 一个坏信号——主线的序章、开场 guide 也是 NONE，若据此走 memory 头像分支
+  // 会把章节卡渲染成角色 monogram。
+  const isMemoryStory = storyTxt.startsWith("obt/memory/");
+  const isMainStory = storyTxt.startsWith("obt/main/");
   const charId = isMemoryStory ? extractCharIdFromStoryTxt(storyTxt) : null;
   const charName = isMemoryStory
     ? story.storyName.split("·")[0]?.trim() || null

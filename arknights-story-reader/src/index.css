@@ -865,27 +865,27 @@ input[type="range"]::-moz-range-thumb {
 
 .asset-image-slot {
   background: hsl(var(--color-muted) / 0.25);
-  transition: background-color 0.3s ease;
 }
 
 .asset-image {
-  will-change: opacity;
   /* 避免 Safari 老式加载时闪一下黑色。 */
   background: transparent;
 }
 
-/* 默认"柔和"tint：降饱和 + 与主题色混色，让素材融入纸质阅读风。 */
+/* 默认"柔和"tint：降饱和 + 与主题色混色，让素材融入纸质阅读风。
+   只用在封面/插画这种"装饰"区域；头像不要加 filter，会让每个头像
+   都变成独立合成层，400+ 一屏时滚动严重掉帧。 */
 .asset-tinted {
-  filter: saturate(0.78) contrast(1.03) brightness(0.98);
+  filter: saturate(0.85);
 }
 .asset-tinted--strong {
-  filter: saturate(0.6) contrast(1.05) brightness(0.94);
+  filter: saturate(0.7) brightness(0.96);
 }
 .dark .asset-tinted {
-  filter: saturate(0.72) brightness(0.9);
+  filter: saturate(0.78) brightness(0.94);
 }
 .dark .asset-tinted--strong {
-  filter: saturate(0.55) brightness(0.82);
+  filter: saturate(0.6) brightness(0.86);
 }
 
 /* 极简模式：隐藏所有装饰素材与封面区块。 */
@@ -1019,6 +1019,14 @@ input[type="range"]::-moz-range-thumb {
 .bottom-nav-pill[aria-selected="true"] {
   background: hsl(var(--color-primary) / 0.14);
   color: hsl(var(--color-primary));
+}
+
+/* 人物统计网格：视口外的卡片跳过绘制/布局。400+ 行的面板，
+   没有这个会整屏 repaint；加上之后滚动几乎没额外成本。 */
+.character-grid-cell {
+  content-visibility: auto;
+  contain-intrinsic-size: 1px 72px;
+  contain: layout paint style;
 }
 
 /* 对话段头像槽 */

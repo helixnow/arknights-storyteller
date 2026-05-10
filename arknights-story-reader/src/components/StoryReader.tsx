@@ -134,6 +134,7 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
   const { progress, updateProgress } = useReadingProgress(storyPath);
   const { isFavorite, toggleFavorite } = useFavorites();
   const [neighbors, setNeighbors] = useState<StoryNeighbors>({ prev: null, next: null });
+  const [categoryName, setCategoryName] = useState<string | null>(null);
 
   // Multi-select state for "分享为图片". Keeps indices in insertion order so
   // the exported image preserves the user's chosen emphasis; sorting happens
@@ -618,6 +619,23 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
       try {
         const n = await api.getStoryNeighbors(storyId);
         if (mounted) setNeighbors(n);
+      } catch {
+        // ignore
+      }
+    })();
+    return () => {
+      mounted = false;
+    };
+  }, [storyId]);
+
+  // 加载章节/活动名，供分享图与顶栏使用
+  useEffect(() => {
+    let mounted = true;
+    setCategoryName(null);
+    (async () => {
+      try {
+        const name = await api.getStoryCategoryName(storyId);
+        if (mounted) setCategoryName(name ?? null);
       } catch {
         // ignore
       }
@@ -1240,7 +1258,7 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
             key={index}
             data-segment-index={index}
             className={cn(
-              "reader-header-cover",
+              "reader-header",
               searchHighlighted && "reader-search-highlight",
               selectionClass
             )}
@@ -1249,16 +1267,7 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
             data-search-pulse={searchPulseActive ? "true" : undefined}
             style={{ marginBottom: spacing }}
           >
-            {!minimalMode && (
-              <AssetImage
-                kind="chapter_cover"
-                token={storyEntry?.storyGroup ?? null}
-                alt={segment.title}
-                tint="tint"
-                className="absolute inset-0"
-              />
-            )}
-            <span className="reader-header-cover__label">{segment.title}</span>
+            {segment.title}
           </div>
         );
       }
@@ -1266,28 +1275,15 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
       if (segment.type === "image") {
         if (!inlineImages || minimalMode) return null;
         return (
-          <div
+          <ReaderImageSegment
             key={index}
-            data-segment-index={index}
-            className={cn(
-              "reader-segment-image reader-segment",
-              searchHighlighted && "reader-search-highlight",
-              selectionClass
-            )}
-            data-search-pulse={searchPulseActive ? "true" : undefined}
-            style={{ marginBottom: spacing }}
-          >
-            <AssetImage
-              kind="image"
-              token={segment.token}
-              alt={segment.caption ?? "剧情插画"}
-              tint="soft"
-              className="h-full w-full"
-            />
-            {segment.caption ? (
-              <div className="reader-segment-image-caption">{segment.caption}</div>
-            ) : null}
-          </div>
+            index={index}
+            segment={segment}
+            spacing={spacing}
+            searchHighlighted={searchHighlighted}
+            searchPulseActive={searchPulseActive}
+            selectionClass={selectionClass}
+          />
         );
       }
 
@@ -1310,7 +1306,6 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
       searchPulseToken,
       selectMode,
       selectedSegments,
-      storyEntry,
       toggleSegmentSelection,
     ]
   );
@@ -1627,9 +1622,62 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
         open={shareDialogOpen}
         onClose={() => setShareDialogOpen(false)}
         storyName={storyName}
+        categoryName={categoryName}
+        storyCode={storyEntry?.storyCode ?? null}
         segments={selectedShareSegments}
       />
     </div>
   );
 }
 
+
+interface ReaderImageSegmentProps {
+  index: number;
+  segment: { type: "image"; token: string; caption?: string | null };
+  spacing: string;
+  searchHighlighted: boolean;
+  searchPulseActive: boolean;
+  selectionClass: string;
+}
+
+/**
+ * 阅读器内的插画段。独立组件，因为需要一个本地 `failed` 状态：当素材加载
+ * 失败时把整个段落从文档中移除，避免 16:9 的灰色块打断正文（这是 v1.11
+ * 第一次迭代中最明显的视觉污染来源——字段 `bg_xxx` / `avg_xxx` 在社区
+ * 镜像里的命中率并不是 100%）。
+ */
+function ReaderImageSegment({
+  index,
+  segment,
+  spacing,
+  searchHighlighted,
+  searchPulseActive,
+  selectionClass,
+}: ReaderImageSegmentProps) {
+  const [failed, setFailed] = useState(false);
+  if (failed) return null;
+  return (
+    <div
+      data-segment-index={index}
+      className={cn(
+        "reader-segment-image reader-segment",
+        searchHighlighted && "reader-search-highlight",
+        selectionClass
+      )}
+      data-search-pulse={searchPulseActive ? "true" : undefined}
+      style={{ marginBottom: spacing }}
+    >
+      <AssetImage
+        kind="image"
+        token={segment.token}
+        alt={segment.caption ?? "剧情插画"}
+        tint="soft"
+        className="h-full w-full"
+        onExhausted={() => setFailed(true)}
+      />
+      {segment.caption ? (
+        <div className="reader-segment-image-caption">{segment.caption}</div>
+      ) : null}
+    </div>
+  );
+}

@@ -402,7 +402,7 @@ export function CharactersPanel({ onOpenStory }: CharactersPanelProps) {
                 <button
                   key={c.name}
                   className={cn(
-                    "flex items-center gap-3 rounded-lg border border-[hsl(var(--color-border))] bg-[hsl(var(--color-card))] p-3 text-left hover:bg-[hsl(var(--color-accent))] transition-colors"
+                    "character-grid-cell flex items-center gap-3 rounded-lg border border-[hsl(var(--color-border))] bg-[hsl(var(--color-card))] p-3 text-left"
                   )}
                   onClick={() => setSelected(c.name)}
                 >

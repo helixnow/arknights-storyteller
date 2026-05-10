@@ -27,6 +27,10 @@ interface ShareImageDialogProps {
   open: boolean;
   onClose: () => void;
   storyName: string;
+  /** 所在章节/活动名，例如 "黑暗时代·上"、"和光同尘"。未知时传 null。 */
+  categoryName?: string | null;
+  /** 关卡代号，例如 "0-1"。未知时传 null。 */
+  storyCode?: string | null;
   segments: ShareSegmentInput[];
 }
 
@@ -232,6 +236,7 @@ interface LayoutBlock {
 function buildLayout(
   ctx: CanvasRenderingContext2D,
   storyName: string,
+  subtitle: string | null,
   prepared: PreparedSegment[],
   contentWidth: number
 ): LayoutBlock[] {
@@ -250,6 +255,23 @@ function buildLayout(
       titleLines.forEach((line, i) => c.fillText(line, x, top + i * 48));
     },
   });
+
+  // Optional subtitle: chapter / activity name + story code
+  const subLabel = (subtitle ?? "").trim();
+  if (subLabel) {
+    ctx.font = `500 24px ${TITLE_FONT_FAMILY}`;
+    const subLines = wrapText(ctx, subLabel, contentWidth);
+    blocks.push({
+      marginTop: 14,
+      height: subLines.length * 32,
+      draw: (c, x, top, _w) => {
+        c.fillStyle = ACCENT_COLOR;
+        c.font = `500 24px ${TITLE_FONT_FAMILY}`;
+        c.textBaseline = "top";
+        subLines.forEach((line, i) => c.fillText(line, x, top + i * 32));
+      },
+    });
+  }
 
   // Sub-label (brand)
   ctx.font = `500 20px ${TITLE_FONT_FAMILY}`;
@@ -384,6 +406,7 @@ function buildLayout(
 
 function renderImage(
   storyName: string,
+  subtitle: string | null,
   segments: ShareSegmentInput[]
 ): { canvas: HTMLCanvasElement; dataUrl: string; blob: Promise<Blob | null> } | null {
   if (!segments.length) return null;
@@ -406,7 +429,7 @@ function renderImage(
   const probeCtx = probe.getContext("2d");
   if (!probeCtx) return null;
 
-  const blocks = buildLayout(probeCtx, storyName, prepared, contentWidth);
+  const blocks = buildLayout(probeCtx, storyName, subtitle, prepared, contentWidth);
   const totalHeight = blocks.reduce((acc, block) => acc + block.marginTop + block.height, 0);
   const canvasHeight = CANVAS_TOP_PADDING + totalHeight + CANVAS_BOTTOM_PADDING;
 
@@ -492,6 +515,7 @@ const QUOTE_WATERMARK_FONT_SIZE = 12;
  */
 function renderQuoteImage(
   storyName: string,
+  subtitle: string | null,
   dialogue: DialogueSegment
 ): { canvas: HTMLCanvasElement; dataUrl: string; blob: Promise<Blob | null> } | null {
   const width = QUOTE_CANVAS_WIDTH;
@@ -562,7 +586,8 @@ function renderQuoteImage(
 
   // Bottom-right attribution — bold so it reads as the "signature" of the
   // piece without dominating the quote body.
-  const attribution = `—— ${dialogue.characterName} · ${storyName}`;
+  const storyLabel = [subtitle?.trim(), storyName].filter(Boolean).join(" · ");
+  const attribution = `—— ${dialogue.characterName} · ${storyLabel}`;
   ctx.fillStyle = TEXT_COLOR;
   ctx.font = `700 ${QUOTE_ATTR_FONT_SIZE}px ${CONTENT_FONT_FAMILY}`;
   ctx.textBaseline = "bottom";
@@ -616,6 +641,8 @@ export function ShareImageDialog({
   open,
   onClose,
   storyName,
+  categoryName,
+  storyCode,
   segments,
 }: ShareImageDialogProps) {
   const { rendered, state } = useSidePanel({ open, onClose });
@@ -706,6 +733,12 @@ export function ShareImageDialog({
         await ensureFontsLoaded(sample);
         if (cancelled) return;
 
+        // Compose the visual subtitle used on both templates: "章节/活动名 · 关卡代号"。
+        // 任一部分缺失时自动省略对应段，不会出现多余的连接符。
+        const subtitle = [categoryName?.trim(), storyCode?.trim()]
+          .filter((x): x is string => Boolean(x))
+          .join(" · ") || null;
+
         // Resolve which template to actually render. `template` is the
         // user's choice; `effective` is what we ship — they diverge when
         // the user picks "quote" but the selection has no dialogue.
@@ -721,12 +754,12 @@ export function ShareImageDialog({
           if (!firstDialogue) {
             toast.warn("金句模板需至少选中一条对话，已回落到经典模板");
             effective = "classic";
-            result = renderImage(storyName, segments);
+            result = renderImage(storyName, subtitle, segments);
           } else {
-            result = renderQuoteImage(storyName, firstDialogue.segment);
+            result = renderQuoteImage(storyName, subtitle, firstDialogue.segment);
           }
         } else {
-          result = renderImage(storyName, segments);
+          result = renderImage(storyName, subtitle, segments);
         }
 
         if (cancelled) return;
@@ -771,7 +804,7 @@ export function ShareImageDialog({
     return () => {
       cancelled = true;
     };
-  }, [open, segments, storyName, template, toast]);
+  }, [open, segments, storyName, categoryName, storyCode, template, toast]);
 
   // Revoke the preview URL on unmount so we don't leak across story
   // switches when the dialog is kept mounted by a parent KeepAlive.

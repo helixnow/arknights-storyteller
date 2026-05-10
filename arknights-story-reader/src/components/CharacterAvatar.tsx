@@ -1,4 +1,4 @@
-import { type CSSProperties } from "react";
+import { memo, type CSSProperties } from "react";
 import { AssetImage } from "@/components/AssetImage";
 import { useCharacterResolver } from "@/hooks/useCharacterResolver";
 import { cn } from "@/lib/utils";
@@ -16,13 +16,13 @@ interface CharacterAvatarProps {
   label?: string;
 }
 
-export function CharacterAvatar({
+function CharacterAvatarImpl({
   name,
   charId,
   size = 40,
   className,
   style,
-  tint = "soft",
+  tint = "none",
   label,
 }: CharacterAvatarProps) {
   const resolver = useCharacterResolver();
@@ -40,8 +40,14 @@ export function CharacterAvatar({
       kind="avatar"
       token={token}
       alt={resolvedName ?? name ?? ""}
+      // 默认不给头像加 CSS filter。`filter: saturate/brightness` 每个元素
+      // 都会生成独立的合成层，一屏 100+ 头像时滚动会严重掉帧。tint=none
+      // 让头像保持彩色——这也更符合"看清楚谁是谁"的直觉。
       tint={tint === "mono" ? "tint" : tint === "soft" ? "soft" : "none"}
-      className={cn("character-avatar rounded-full ring-1 ring-[hsl(var(--color-border)/0.8)]", className)}
+      className={cn(
+        "character-avatar rounded-full ring-1 ring-[hsl(var(--color-border)/0.8)]",
+        className
+      )}
       style={{ width: size, height: size, ...style }}
       fallback={
         <div
@@ -54,3 +60,11 @@ export function CharacterAvatar({
     />
   );
 }
+
+/**
+ * 用 `React.memo` 包一层。父组件（CharactersPanel）state 变化时，400+ 个
+ * 头像只要 props 不变就不会重新渲染——滚动、搜索、选中等操作的刷新面
+ * 大幅减小。
+ */
+export const CharacterAvatar = memo(CharacterAvatarImpl);
+CharacterAvatar.displayName = "CharacterAvatar";

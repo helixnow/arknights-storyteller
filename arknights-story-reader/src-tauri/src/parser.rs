@@ -93,11 +93,15 @@ fn parse_command_line(line: &str, current_char_id: Option<&str>) -> Option<Story
                     alignment: None,
                 });
             }
+            // `[name="xxx"]` 是对话显示名，权威来源。不要继承上一条
+            // `[Character(name="char_...")]` 的 charId——脚本常常在同一
+            // `[Character]` 还没翻页的情况下切换说话人（尤其罗德岛多人同场）。
+            // 让前端通过 `character_table` 用 `character_name` 反查 charId。
             Some(StorySegment::Dialogue {
                 character_name,
                 text,
                 position: None,
-                character_id: current_char_id.map(|s| s.to_string()),
+                character_id: None,
             })
         }
         "multiline" => {
@@ -106,11 +110,12 @@ fn parse_command_line(line: &str, current_char_id: Option<&str>) -> Option<Story
             if text.is_empty() {
                 return None;
             }
+            // 同 `name`：显示名权威，不继承 current_char_id。
             Some(StorySegment::Dialogue {
                 character_name,
                 text,
                 position: None,
-                character_id: current_char_id.map(|s| s.to_string()),
+                character_id: None,
             })
         }
         "decision" => {
@@ -171,9 +176,11 @@ fn parse_command_line(line: &str, current_char_id: Option<&str>) -> Option<Story
                 .filter(|s| !s.is_empty());
             Some(StorySegment::System { speaker, text })
         }
-        // 非文本指令一律忽略（但 Image/Background/PlayMusic 已在上方单独处理）
-        "imagetween" | "character" | "stopmusic" | "playsound" | "delay" | "camerashake"
-        | "blocker" => None,
+        // 非文本指令一律忽略（但 Image/PlayMusic 已在上方单独处理）。
+        // Background 被有意忽略：它是 AVG 的场景切换信号，一章会出现几十条，
+        // 当成 16:9 大图渲染会把正文切得稀碎；真正值得渲染的是 `[Image]`。
+        "background" | "imagetween" | "character" | "stopmusic" | "playsound" | "delay"
+        | "camerashake" | "blocker" => None,
         "image" => {
             // 原始形如：[Image(image="avg_8_34",screenadapt="coverall",fadetime=2)]
             let token = attrs
@@ -183,18 +190,6 @@ fn parse_command_line(line: &str, current_char_id: Option<&str>) -> Option<Story
             let caption = attrs
                 .get("caption")
                 .or_else(|| attrs.get("text"))
-                .map(|s| clean_text(s))
-                .filter(|s| !s.is_empty());
-            Some(StorySegment::Image { token, caption })
-        }
-        "background" => {
-            // 把有图片的 Background 也作为 Image 段展示，空 Background 用于清屏，忽略
-            let token = attrs
-                .get("image")
-                .map(|s| s.trim().trim_matches('"').to_string())
-                .filter(|s| !s.is_empty())?;
-            let caption = attrs
-                .get("caption")
                 .map(|s| clean_text(s))
                 .filter(|s| !s.is_empty());
             Some(StorySegment::Image { token, caption })
