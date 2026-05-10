@@ -19,6 +19,7 @@ import {
   ChevronLeft,
   ChevronRight,
   ListTree,
+  MoreHorizontal,
   Settings as SettingsIcon,
   Share2,
   Star,
@@ -117,7 +118,6 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
   // animation. Bumped each time the reader jumps to a new hit; cleared
   // after the pulse keyframes finish so the data attribute auto-removes.
   const [searchPulseToken, setSearchPulseToken] = useState(0);
-  const [bookmarkMode, setBookmarkMode] = useState(false);
   const [activeCharacter, setActiveCharacter] = useState<string | null>(null);
   const [storyEntry, setStoryEntry] = useState<StoryEntry | null>(null);
   const [storyInfoText, setStoryInfoText] = useState<string | null>(null);
@@ -142,6 +142,8 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
   const [selectedSegments, setSelectedSegments] = useState<number[]>([]);
   const [selectMode, setSelectMode] = useState(false);
   const [shareDialogOpen, setShareDialogOpen] = useState(false);
+  const [moreMenuOpen, setMoreMenuOpen] = useState(false);
+  const moreMenuRef = useRef<HTMLDivElement | null>(null);
 
   // Back-button stack. `useBackHandler` is LIFO — the most recently mounted
   // handler that returns `true` wins, so the effective priority is "最近
@@ -166,10 +168,29 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
     setSelectedSegments([]);
     return true;
   });
-  useBackHandler(bookmarkMode, () => {
-    setBookmarkMode(false);
+  useBackHandler(moreMenuOpen, () => {
+    setMoreMenuOpen(false);
     return true;
   });
+
+  // 点击外部关闭更多菜单
+  useEffect(() => {
+    if (!moreMenuOpen) return;
+    const handlePointer = (event: PointerEvent) => {
+      const target = event.target as Node | null;
+      if (target && moreMenuRef.current?.contains(target)) return;
+      setMoreMenuOpen(false);
+    };
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setMoreMenuOpen(false);
+    };
+    window.addEventListener("pointerdown", handlePointer);
+    window.addEventListener("keydown", handleKey);
+    return () => {
+      window.removeEventListener("pointerdown", handlePointer);
+      window.removeEventListener("keydown", handleKey);
+    };
+  }, [moreMenuOpen]);
 
   // iOS-style edge swipe back — close the reader when the user swipes from
   // the left edge. Only active when none of the inner modals are open so the
@@ -944,13 +965,12 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
     setSelectedSegments([]);
   }, []);
 
-  // Flip to share mode: preserves any existing selection so the user can
+  // Flip to select mode: preserves any existing selection so the user can
   // turn the page in paged-mode and keep accumulating picks across pages.
   // The explicit "清空" / "取消" controls still reset the selection.
   const enterSelectMode = useCallback(() => {
     setSelectMode(true);
     setInsightsOpen(false);
-    setBookmarkMode(false);
   }, []);
 
   const exitSelectMode = useCallback(() => {
@@ -1001,6 +1021,39 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
     [selectedSegments, processedSegments]
   );
 
+  // 当前选中段落的收藏状态：如果全部已收藏则点击为"取消收藏"，
+  // 否则为"加入收藏"（把未收藏的补上，保持已收藏的不变）。
+  const selectionBookmarkState = useMemo(() => {
+    const highlightable = selectedSegments.filter((idx) => {
+      const seg = processedSegments[idx];
+      return Boolean(seg && isSegmentHighlightable(seg));
+    });
+    if (highlightable.length === 0) return { mode: "none" as const, count: 0 };
+    const allHighlighted = highlightable.every((idx) => isHighlighted(idx));
+    return {
+      mode: allHighlighted ? ("remove" as const) : ("add" as const),
+      count: highlightable.length,
+    };
+  }, [selectedSegments, processedSegments, isHighlighted]);
+
+  const handleBookmarkSelection = useCallback(() => {
+    const highlightable = selectedSegments.filter((idx) => {
+      const seg = processedSegments[idx];
+      return Boolean(seg && isSegmentHighlightable(seg));
+    });
+    if (highlightable.length === 0) return;
+    const allHighlighted = highlightable.every((idx) => isHighlighted(idx));
+    if (allHighlighted) {
+      // 全部已收藏 → 统一取消
+      highlightable.forEach((idx) => toggleHighlight(idx));
+    } else {
+      // 混合或全部未收藏 → 把未收藏的补上
+      highlightable.forEach((idx) => {
+        if (!isHighlighted(idx)) toggleHighlight(idx);
+      });
+    }
+  }, [selectedSegments, processedSegments, isHighlighted, toggleHighlight]);
+
   const renderSegment = useCallback(
     ({ segment, index }: RenderableSegment, isLast: boolean) => {
       const spacing = isLast ? "0" : readerSpacing;
@@ -1012,15 +1065,11 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
       const searchPulseActive = searchHighlighted && searchPulseToken > 0;
       const characterHighlighted =
         highlightable && segment.type === "dialogue" && activeCharacter === segment.characterName;
-      const highlighted = annotationHighlight || searchHighlighted;
-      const showHighlightButton = highlightable && bookmarkMode && !selectMode;
       const isSelected = selectedSegments.includes(index);
       const selectable = selectMode && segment.type !== "decision"; // selecting a decision block is awkward; skip
 
       const segmentStyle: CSSProperties = { marginBottom: spacing };
-      if (!showHighlightButton) {
-        segmentStyle.paddingRight = "1.25rem";
-      }
+      segmentStyle.paddingRight = "1.25rem";
 
       const handleSegmentClick = (event: ReactMouseEvent<HTMLDivElement>) => {
         if (!selectable) return;
@@ -1062,19 +1111,16 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
           )
         : "";
 
-      const highlightButton = showHighlightButton ? (
-        <button
-          type="button"
-          className={cn("reader-highlight-toggle", annotationHighlight && "is-active")}
-          onClick={(event) => {
-            event.preventDefault();
-            event.stopPropagation();
-            handleToggleHighlightUnified(index);
-          }}
-          aria-label={highlighted ? "取消划线收藏" : "划线收藏"}
+      // 展示用的"已收藏"小角标：阅读时可以一眼看到这一段是否被收藏。
+      // 进入选段模式时隐藏，避免与选中态 ring 视觉冲突。
+      const highlightButton = annotationHighlight && !selectMode ? (
+        <span
+          className="reader-highlight-toggle is-active"
+          aria-label="此段已收藏"
+          title="此段已收藏"
         >
-          {highlighted ? <BookmarkCheck className="h-4 w-4" /> : <BookmarkPlus className="h-4 w-4" />}
-        </button>
+          <BookmarkCheck className="h-4 w-4" />
+        </span>
       ) : null;
 
       if (segment.type === "dialogue") {
@@ -1295,8 +1341,6 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
     },
     [
       activeCharacter,
-      bookmarkMode,
-      handleToggleHighlightUnified,
       highlightSegmentIndex,
       inlineImages,
       isHighlighted,
@@ -1347,21 +1391,15 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
       ref={readerRootRef}
       className="h-full flex flex-col overflow-hidden reader-surface"
       data-reader-theme={settings.theme}
-      data-bookmark-mode={bookmarkMode ? "enabled" : "disabled"}
     >
       <header className="flex-shrink-0 z-20 bg-[hsl(var(--color-background)/0.95)] backdrop-blur border-b">
-        <div className="container flex items-center gap-2 h-16">
+        <div className="container flex items-center gap-2 h-14">
           <Button variant="ghost" size="icon" onClick={onBack} aria-label="返回剧情列表">
             <ArrowLeft className="h-5 w-5" />
           </Button>
           <div className="flex-1 min-w-0">
             <h1 className="text-base font-semibold truncate">{storyName}</h1>
-            <div className="text-[11px] uppercase tracking-wider text-[hsl(var(--color-muted-foreground))]">
-              {settings.readingMode === "paged"
-                ? `第 ${currentPage + 1} / ${totalPages} 页`
-                : `已读 ${progressPercentage}%`}
-            </div>
-            {storyEntry && (
+            {storyEntry && (storyEntry.storyCode || storyEntry.avgTag) && (
               <div className="mt-0.5 flex flex-wrap items-center gap-2 text-[11px] text-[hsl(var(--color-muted-foreground))]">
                 {storyEntry.storyCode && (
                   <span className="px-1.5 py-0.5 rounded bg-[hsl(var(--color-accent))]">{storyEntry.storyCode}</span>
@@ -1384,31 +1422,9 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
             <Button
               variant="ghost"
               size="icon"
-              disabled={!storyEntry}
-              onClick={() => storyEntry && toggleFavorite(storyEntry)}
-              aria-label={isFavorite(storyId) ? "取消收藏" : "收藏本关卡"}
-              title={isFavorite(storyId) ? "取消收藏" : "收藏本关卡"}
-              className={cn(isFavorite(storyId) && "text-[hsl(var(--color-primary))]")}
-            >
-              <Star className="h-5 w-5" fill={isFavorite(storyId) ? "currentColor" : "transparent"} strokeWidth={isFavorite(storyId) ? 0 : 2} />
-            </Button>
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={() => setBookmarkMode((prev) => !prev)}
-              aria-label={bookmarkMode ? "关闭收藏模式" : "开启收藏模式"}
-              title={bookmarkMode ? "关闭收藏模式" : "开启收藏模式"}
-              aria-pressed={bookmarkMode}
-              className={cn(bookmarkMode && "text-[hsl(var(--color-primary))]")}
-            >
-              {bookmarkMode ? <BookmarkCheck className="h-5 w-5" /> : <BookmarkPlus className="h-5 w-5" />}
-            </Button>
-            <Button
-              variant="ghost"
-              size="icon"
               onClick={() => (selectMode ? exitSelectMode() : enterSelectMode())}
-              aria-label={selectMode ? "退出多选" : "选段分享为图片"}
-              title={selectMode ? "退出多选" : "选段分享为图片"}
+              aria-label={selectMode ? "退出选段" : "选段"}
+              title={selectMode ? "退出选段" : "选段（收藏 / 生成图片）"}
               aria-pressed={selectMode}
               className={cn(selectMode && "text-[hsl(var(--color-primary))]")}
             >
@@ -1422,14 +1438,44 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
             >
               <SettingsIcon className="h-5 w-5" />
             </Button>
+            <div className="relative" ref={moreMenuRef}>
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() => setMoreMenuOpen((prev) => !prev)}
+                aria-label="更多操作"
+                aria-haspopup="menu"
+                aria-expanded={moreMenuOpen}
+                className={cn(isFavorite(storyId) && "text-[hsl(var(--color-primary))]")}
+              >
+                <MoreHorizontal className="h-5 w-5" />
+              </Button>
+              {moreMenuOpen && (
+                <div
+                  role="menu"
+                  className="absolute right-0 top-full mt-1 w-44 rounded-md border border-[hsl(var(--color-border))] bg-[hsl(var(--color-popover,var(--color-background)))] shadow-lg overflow-hidden z-30"
+                >
+                  <button
+                    type="button"
+                    role="menuitem"
+                    disabled={!storyEntry}
+                    onClick={() => {
+                      if (storyEntry) toggleFavorite(storyEntry);
+                      setMoreMenuOpen(false);
+                    }}
+                    className="flex w-full items-center gap-2 px-3 py-2 text-sm hover:bg-[hsl(var(--color-accent))] disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    <Star
+                      className="h-4 w-4"
+                      fill={isFavorite(storyId) ? "currentColor" : "transparent"}
+                      strokeWidth={isFavorite(storyId) ? 0 : 2}
+                    />
+                    <span>{isFavorite(storyId) ? "取消收藏整关" : "收藏本关卡"}</span>
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
-        </div>
-        <div className="progress-track">
-          <div
-            className="progress-thumb"
-            style={{ width: `${progressPercentage}%` }}
-            aria-hidden="true"
-          />
         </div>
       </header>
 
@@ -1441,7 +1487,7 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
             settings.readingMode === "paged" && "reader-scroll--paged"
           )}
           viewportRef={scrollContainerRef}
-          trackOffsetTop="calc(4rem + 10px)"
+          trackOffsetTop="calc(3.5rem + 10px)"
           trackOffsetBottom={
             settings.readingMode === "paged"
               ? "5.5rem"
@@ -1463,6 +1509,25 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
           </div>
         </CustomScrollArea>
       </main>
+
+      {settings.readingMode === "scroll" && !selectMode && (
+        <div
+          className="flex-shrink-0 bg-[hsl(var(--color-background)/0.92)] backdrop-blur border-t border-[hsl(var(--color-border))]"
+          style={{ paddingBottom: "env(safe-area-inset-bottom, 0px)" }}
+          aria-hidden="false"
+        >
+          <div className="progress-track">
+            <div
+              className="progress-thumb"
+              style={{ width: `${progressPercentage}%` }}
+              aria-hidden="true"
+            />
+          </div>
+          <div className="container flex items-center justify-end px-4 py-1 text-[11px] uppercase tracking-wider text-[hsl(var(--color-muted-foreground))]">
+            已读 {progressPercentage}%
+          </div>
+        </div>
+      )}
 
       {settings.readingMode === "paged" && !selectMode && (
         <footer className="flex-shrink-0 bg-[hsl(var(--color-background)/0.95)] backdrop-blur border-t p-4">
@@ -1569,7 +1634,7 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
           )}
           <div className="container flex items-center gap-2">
             <div className="flex-1 min-w-0 text-sm">
-              <div className="font-medium">选段分享</div>
+              <div className="font-medium">选段</div>
               <div className="text-xs text-[hsl(var(--color-muted-foreground))]">
                 已选 {selectedSegments.length} 段 · 点击段落切换选中
               </div>
@@ -1584,6 +1649,24 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
             </Button>
             <Button variant="outline" size="sm" onClick={exitSelectMode}>
               取消
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleBookmarkSelection}
+              disabled={selectionBookmarkState.mode === "none"}
+              title={
+                selectionBookmarkState.mode === "remove"
+                  ? "取消收藏选中段落"
+                  : "把选中段落加入收藏"
+              }
+            >
+              {selectionBookmarkState.mode === "remove" ? (
+                <BookmarkCheck className="mr-2 h-4 w-4" />
+              ) : (
+                <BookmarkPlus className="mr-2 h-4 w-4" />
+              )}
+              {selectionBookmarkState.mode === "remove" ? "取消收藏" : "加入收藏"}
             </Button>
             <Button
               size="sm"
@@ -1671,8 +1754,8 @@ function ReaderImageSegment({
         kind="image"
         token={segment.token}
         alt={segment.caption ?? "剧情插画"}
-        tint="soft"
-        className="h-full w-full"
+        tint="none"
+        fit="natural"
         onExhausted={() => setFailed(true)}
       />
       {segment.caption ? (

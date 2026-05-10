@@ -190,6 +190,13 @@ export interface StoryNeighbors {
   next?: StoryEntry | null;
 }
 
+/** 剧情缩略图 token：对应后端 `get_story_preview_token` 的返回。`kind` 目前
+ *  为 `"image"` 或 `"background"`，前端再拿去 `useAsset` 解析成候选 URL。 */
+export interface StoryPreviewToken {
+  kind: 'image' | 'background';
+  token: string;
+}
+
 /** 干员名 ↔ charId 映射（后端 character_table 快照）。 */
 export interface CharacterIndex {
   charIdToName: Record<string, string>;

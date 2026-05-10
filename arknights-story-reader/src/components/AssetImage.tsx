@@ -22,6 +22,14 @@ interface AssetImageProps {
   onReady?: (url: string) => void;
   /** 所有 URL 都加载失败时调用，父级可用来隐藏自己。 */
   onExhausted?: () => void;
+  /**
+   * 图像缩放策略：
+   *  - `cover`（默认）：拉满容器并裁剪，用于封面/头像等固定框。
+   *  - `contain`：保持宽高比铺满容器，不裁剪（容器大小固定）。
+   *  - `natural`：按图片自身尺寸居中显示，容器自适应高度，适用于
+   *    内文插画——这样竖图、方图都能完整呈现，不会被 16:9 切掉。
+   */
+  fit?: "cover" | "contain" | "natural";
 }
 
 // Session 级失败缓存：同一 URL 本进程内失败过就不再尝试。
@@ -49,6 +57,7 @@ export function AssetImage({
   lazy = true,
   onReady,
   onExhausted,
+  fit = "cover",
 }: AssetImageProps) {
   const { candidates } = useAsset(kind, token ?? null);
   const [currentIdx, setCurrentIdx] = useState(0);
@@ -101,7 +110,11 @@ export function AssetImage({
 
   return (
     <div
-      className={cn("asset-image-slot relative overflow-hidden", className)}
+      className={cn(
+        "asset-image-slot relative",
+        fit === "natural" ? "flex items-center justify-center" : "overflow-hidden",
+        className
+      )}
       style={style}
       data-asset-loaded={loaded ? "true" : "false"}
     >
@@ -127,7 +140,12 @@ export function AssetImage({
             }
           }}
           className={cn(
-            "asset-image h-full w-full object-cover",
+            "asset-image",
+            fit === "natural"
+              ? "max-w-full h-auto w-auto mx-auto block"
+              : fit === "contain"
+              ? "h-full w-full object-contain"
+              : "h-full w-full object-cover",
             tintClass,
             loaded ? "opacity-100" : "opacity-0"
           )}

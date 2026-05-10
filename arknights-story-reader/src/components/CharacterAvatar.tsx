@@ -26,8 +26,14 @@ function CharacterAvatarImpl({
   label,
 }: CharacterAvatarProps) {
   const resolver = useCharacterResolver();
-  const resolvedId = charId ?? resolver.resolveCharId(name);
-  const resolvedName = name ?? (charId ? resolver.resolveName(charId) : null);
+  // 既支持真正的 charId（char_xxx），也支持名字 / 内部 alias（如
+  // 干员密录路径里的 `kroos`、`amgoat`）。两侧都经过 resolver，失败时
+  // 保留原值作为 monogram 兜底 token。
+  const resolvedId =
+    (charId ? resolver.resolveCharId(charId) ?? charId : null) ??
+    resolver.resolveCharId(name);
+  const resolvedName = name ?? (resolvedId ? resolver.resolveName(resolvedId) : null);
+
   const token = resolvedId ?? name ?? null;
   const initials =
     label ??

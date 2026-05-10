@@ -95,13 +95,17 @@ fn avg_candidates(token: &str) -> Vec<String> {
     let t = token.trim_start_matches('$');
     vec![
         format!("{}/avgs/{}.png", FEXLI, t),
+        format!("{}/avgs/bg/{}.png", FEXLI, t),
         format!("{}/storyline/images/{}.png", PUPPIIZ, t),
     ]
 }
 
 fn background_candidates(token: &str) -> Vec<String> {
     let t = token.trim_start_matches('$');
+    // fexli 仓库里大多数背景在 `avgs/bg/<token>.png` 子目录，少部分老的在
+    // `avgs/<token>.png` 根目录。按命中率排序。
     vec![
+        format!("{}/avgs/bg/{}.png", FEXLI, t),
         format!("{}/avgs/{}.png", FEXLI, t),
         format!("{}/storyline/backgrounds/{}.png", PUPPIIZ, t),
     ]

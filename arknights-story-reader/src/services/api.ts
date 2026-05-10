@@ -13,6 +13,7 @@ import type {
   AssetKind,
   CharacterIndex,
   StoryNeighbors,
+  StoryPreviewToken,
 } from "@/types/story";
 
 export interface SyncProgress {
@@ -114,6 +115,15 @@ export const api = {
   // 获取剧情内容
   getStoryContent: async (storyPath: string): Promise<ParsedStoryContent> => {
     return invoke("get_story_content", { storyPath });
+  },
+
+  // 获取剧情缩略图 token（第一条 `[Image]` / `[Background]` 的 token）
+  getStoryPreviewToken: async (
+    storyPath: string
+  ): Promise<StoryPreviewToken | null> => {
+    return invoke<StoryPreviewToken | null>("get_story_preview_token", {
+      storyPath,
+    });
   },
 
   // 获取剧情简介

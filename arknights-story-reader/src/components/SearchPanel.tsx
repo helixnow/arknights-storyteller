@@ -43,17 +43,6 @@ const SEGMENT_CACHE_KEY = "arknights-story-segment-cache-v1";
 const DEBUG_STATE_KEY = "arknights-story-search-debug";
 const SEARCH_MODE_KEY = "arknights-story-search-mode";
 
-const HOT_KEYWORDS = [
-  "凯尔希",
-  "罗德岛",
-  "整合运动",
-  "博士",
-  "源石",
-  "阿米娅",
-  "感染者",
-  "特蕾西娅",
-];
-
 const SEGMENT_TYPE_LABEL: Record<SegmentHit["segmentType"], string> = {
   dialogue: "对话",
   narration: "旁白",
@@ -393,6 +382,43 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     };
   }, [refreshIndexStatus]);
 
+  // 自动索引 hook 重建完成后会派发 `app:story-index-updated`；这里监听
+  // 一下把状态条刷成"已就绪"，不用再等用户手动切页。
+  useEffect(() => {
+    const handler = () => {
+      void refreshIndexStatus();
+    };
+    window.addEventListener("app:story-index-updated", handler);
+    return () => window.removeEventListener("app:story-index-updated", handler);
+  }, [refreshIndexStatus]);
+
+  // 同时监听后端的 index-progress 事件：sync_data / import_zip 完成后
+  // 后端会自行在线程里重建索引并 emit 进度，这里收到"完成"阶段时顺带
+  // 刷新一下状态条，保持和自动索引逻辑一致。
+  useEffect(() => {
+    let dispose: (() => void) | null = null;
+    let cancelled = false;
+    void api
+      .onIndexProgress((p) => {
+        if (cancelled) return;
+        setIndexProgress(p);
+        if (p.total > 0 && p.current >= p.total) {
+          void refreshIndexStatus();
+        }
+      })
+      .then((unlisten) => {
+        if (cancelled) {
+          (unlisten as unknown as () => void)();
+          return;
+        }
+        dispose = () => (unlisten as unknown as () => void)();
+      });
+    return () => {
+      cancelled = true;
+      if (dispose) dispose();
+    };
+  }, [refreshIndexStatus]);
+
   useEffect(() => {
     try {
       localStorage.setItem(DEBUG_STATE_KEY, debugMode ? "1" : "0");
@@ -437,13 +463,6 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     };
   }, [moreOpen]);
 
-  const isFirstScreen = !searched && query.trim() === "";
-
-  const triggerHotKeyword = (keyword: string) => {
-    setQuery(keyword);
-    setTimeout(() => handleSearch({ queryOverride: keyword }), 0);
-  };
-
   const renderIndexStatusRow = () => {
     if (!indexStatus) {
       return (
@@ -462,7 +481,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     if (!indexStatus.ready) {
       return (
         <div className="text-xs text-[hsl(var(--color-muted-foreground))]">
-          全文索引尚未建立，当前使用逐条扫描，建议先建立索引以提升搜索速度。
+          全文索引正在后台准备中，首次进入或更新数据后可能稍慢，稍候片刻即可使用高速搜索。
         </div>
       );
     }
@@ -635,26 +654,6 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
                 >
                   清空历史
                 </button>
-              </div>
-            </div>
-          )}
-
-          {isFirstScreen && (
-            <div className="mt-3 space-y-2">
-              <div className="text-xs text-[hsl(var(--color-muted-foreground))]">热门关键词</div>
-              <div className="flex flex-wrap items-center gap-2">
-                {HOT_KEYWORDS.map((h) => (
-                  <Button
-                    key={h}
-                    variant="outline"
-                    size="sm"
-                    onClick={() => triggerHotKeyword(h)}
-                    disabled={searching}
-                    className="h-7 rounded-full px-3 text-xs"
-                  >
-                    {h}
-                  </Button>
-                ))}
               </div>
             </div>
           )}

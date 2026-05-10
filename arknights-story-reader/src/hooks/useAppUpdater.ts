@@ -237,8 +237,12 @@ export function useAppUpdater() {
         });
       } catch (error) {
         if (!isCancelled) {
-          if (error instanceof Error && /plugin/i.test(error.message)) {
-            console.info("[Updater] 桌面更新插件不可用：", error.message);
+          // Tauri 未授予 `updater:allow-check` 权限时会抛 "not allowed" 错误，
+          // 这是配置缺失、不是运行时问题，吞成 info，免得每次启动都在控制台
+          // 刷红。
+          const msg = error instanceof Error ? error.message : String(error);
+          if (/plugin/i.test(msg) || /not allowed/i.test(msg)) {
+            console.info("[Updater] 桌面更新不可用：", msg);
           } else {
             console.error("[Updater] 桌面更新失败", error);
           }

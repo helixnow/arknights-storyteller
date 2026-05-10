@@ -14,19 +14,58 @@ import type { CharacterIndex } from "@/types/story";
 const YUANYAN = "https://raw.githubusercontent.com/yuanyan3060/ArknightsGameResource/main";
 const FEXLI = "https://raw.githubusercontent.com/fexli/ArknightsResource/main";
 const PUPPIIZ = "https://raw.githubusercontent.com/PuppiizSunniiz/Arknight-Images/main";
+/**
+ * 已知 NPC 头像覆盖表。这些角色不在 character_table 中（非干员），
+ * 但在剧情中频繁出现，需要手动指定头像 URL。
+ * 图片已持久化到 public/avatars/npc/ 目录下。
+ * key = 中文名（与剧情脚本 `[name="..."]` 一致）
+ */
+const NPC_AVATAR_OVERRIDES: Record<string, string[]> = {
+  "普瑞赛斯": ["/avatars/npc/priestess.png"],
+  "希尔达": ["/avatars/npc/hierda.png"],
+};
 
 function resolveCharId(token: string, index: CharacterIndex | null): string | null {
   if (token.startsWith("char_")) {
     return token.split("#")[0] ?? token;
   }
   if (!index) return null;
-  return index.nameToCharId[token] ?? null;
+  const exact = index.nameToCharId[token];
+  if (exact) return exact;
+  // alias 兜底：干员密录等场景会传 `char_{num}_{alias}` 的 alias 部分
+  // （如 `kroos`、`amgoat`）。按 index 快照动态构造反向表并缓存，
+  // 避免每次都 O(N) 扫描。
+  const aliasMap = getAliasMap(index);
+  return aliasMap.get(token.toLowerCase()) ?? null;
+}
+
+// 按 CharacterIndex 快照缓存 alias→charId 反向表。index 在启动时稳定，
+// 同一个对象引用拿到的都是同一份 Map，不会重复构造。
+const aliasMapCache = new WeakMap<CharacterIndex, Map<string, string>>();
+function getAliasMap(index: CharacterIndex): Map<string, string> {
+  const hit = aliasMapCache.get(index);
+  if (hit) return hit;
+  const map = new Map<string, string>();
+  for (const cid of Object.keys(index.charIdToName ?? {})) {
+    const m = cid.match(/^char_\d+_(.+?)(?:#.*)?$/);
+    if (!m) continue;
+    const alias = m[1].toLowerCase();
+    if (!map.has(alias)) map.set(alias, cid);
+  }
+  aliasMapCache.set(index, map);
+  return map;
 }
 
 function avatarCandidates(token: string, index: CharacterIndex | null): string[] {
+  // 优先检查 NPC 头像覆盖表（这些角色没有 char_ ID）
+  if (NPC_AVATAR_OVERRIDES[token]) {
+    return NPC_AVATAR_OVERRIDES[token];
+  }
   const cid = resolveCharId(token, index);
   if (!cid) return [];
   return [
+    // 内置头像（打包在 public/bundled/avatar/，无网络开销）
+    `/bundled/avatar/${cid}.png`,
     `${YUANYAN}/avatar/${cid}.png`,
     `${FEXLI}/charpor/${cid}.png`,
     `${PUPPIIZ}/avatars/${cid}.png`,
@@ -34,9 +73,19 @@ function avatarCandidates(token: string, index: CharacterIndex | null): string[]
 }
 
 function portraitCandidates(token: string, index: CharacterIndex | null): string[] {
+  // NPC 立绘覆盖：使用 wiki 全尺寸图
+  if (NPC_AVATAR_OVERRIDES[token]) {
+    // 立绘用全尺寸图（第二条 URL）
+    return NPC_AVATAR_OVERRIDES[token].slice().reverse();
+  }
   const cid = resolveCharId(token, index);
   if (!cid) return [];
+  // 精二立绘优先（`_2`），没有时回落到精一（`_1`）。少数干员（3 星及
+  // 以下或仅作为剧情 NPC 的）没有精二素材，不做强制匹配。
   return [
+    `${YUANYAN}/portrait/${cid}_2.png`,
+    `${FEXLI}/charpack/${cid}_2.png`,
+    `${PUPPIIZ}/characters/${cid}_2.png`,
     `${YUANYAN}/portrait/${cid}_1.png`,
     `${YUANYAN}/portrait/${cid}_1b.png`,
     `${FEXLI}/charpack/${cid}_1.png`,
@@ -46,12 +95,22 @@ function portraitCandidates(token: string, index: CharacterIndex | null): string
 
 function avgCandidates(token: string): string[] {
   const t = token.replace(/^\$/, "");
-  return [`${FEXLI}/avgs/${t}.png`, `${PUPPIIZ}/storyline/images/${t}.png`];
+  return [
+    `${FEXLI}/avgs/${t}.png`,
+    `${FEXLI}/avgs/bg/${t}.png`,
+    `${PUPPIIZ}/storyline/images/${t}.png`,
+  ];
 }
 
 function backgroundCandidates(token: string): string[] {
   const t = token.replace(/^\$/, "");
-  return [`${FEXLI}/avgs/${t}.png`, `${PUPPIIZ}/storyline/backgrounds/${t}.png`];
+  // fexli 仓库里大多数背景其实在 `avgs/bg/<token>.png` 子目录，少部分老的在
+  // `avgs/<token>.png` 根目录。两条路径都列出来，谁先 200 就用谁。
+  return [
+    `${FEXLI}/avgs/bg/${t}.png`,
+    `${FEXLI}/avgs/${t}.png`,
+    `${PUPPIIZ}/storyline/backgrounds/${t}.png`,
+  ];
 }
 
 function stripActPrefix(token: string): string {
@@ -82,11 +141,16 @@ function activityLogoCandidates(token: string): string[] {
 }
 
 function chapterCoverCandidates(token: string): string[] {
-  const t = token.replace(/^main_/, "");
+  // `token` 通常是 `main_0`、`main_8`、`main_13`。
+  const raw = token.replace(/^main_/, "").trim();
+  const nn = /^\d+$/.test(raw) ? raw.padStart(2, "0") : raw;
   return [
-    `${FEXLI}/avgs/bg_main_${t}.png`,
-    `${FEXLI}/avgs/${t}_i01.png`,
-    `${FEXLI}/avgs/${t}_I01.png`,
+    // 内置章节封面（打包在 public/bundled/mapreview/）
+    `/bundled/mapreview/main_${nn}-01.png`,
+    `${FEXLI}/mapreview/main_${nn}-01.png`,
+    `${FEXLI}/avgs/bg_main_${raw}.png`,
+    `${FEXLI}/avgs/${raw}_i01.png`,
+    `${FEXLI}/avgs/${raw}_I01.png`,
   ];
 }
 

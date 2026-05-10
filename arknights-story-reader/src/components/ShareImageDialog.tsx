@@ -1,7 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { CustomScrollArea } from "@/components/ui/custom-scroll-area";
+import {
+  SheetShell,
+  SheetHeader,
+  SheetFooter,
+  SheetGroup,
+  SheetSectionLabel,
+} from "@/components/ui/sheet-shell";
 import { useToast } from "@/components/ui/toast";
 import { useSidePanel } from "@/hooks/useSidePanel";
 import {
@@ -15,8 +21,12 @@ import {
   shareImageViaSystem,
   type ShareImagePayload,
 } from "@/hooks/useImageSharer";
+import { peekAssetCandidates } from "@/hooks/useAsset";
 import type { DialogueSegment, StorySegment } from "@/types/story";
 import { Download, Loader2, Share2, X } from "lucide-react";
+import { cn } from "@/lib/utils";
+
+const SHOW_AVATAR_STORAGE_KEY = "arknights-share-image-show-avatar";
 
 export interface ShareSegmentInput {
   index: number;
@@ -105,11 +115,122 @@ async function ensureFontsLoaded(sampleText: string): Promise<void> {
   );
 }
 
+/**
+ * 头像位图缓存。key 用 "name::charId" 组合，value 是第一条加载成功的
+ * `HTMLImageElement`（canvas `drawImage` 可直接吃），失败则是 null。
+ * 分享弹窗通常会被反复开启 / 切换选段，同一张头像多次入画时不该再次下载。
+ */
+const avatarCache = new Map<string, HTMLImageElement | null>();
+
+function avatarCacheKey(name: string | null | undefined, charId: string | null | undefined): string {
+  return `${(name ?? "").trim()}::${(charId ?? "").trim()}`;
+}
+
+function loadImage(url: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    // 必须是 anonymous —— 否则 webview 会把图片标为 tainted，后续
+    // `canvas.toDataURL()` 会直接抛 SecurityError。GitHub Raw CDN 对
+    // 此类请求允许跨域（响应带 ACAO `*`）。
+    img.crossOrigin = "anonymous";
+    img.referrerPolicy = "no-referrer";
+    img.decoding = "async";
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error(`Failed to load image: ${url}`));
+    img.src = url;
+  });
+}
+
+/**
+ * 按候选顺序异步下载第一张可用的头像位图。失败时缓存 null，避免
+ * 选段切换时反复尝试同一个不存在的头像。
+ */
+async function loadAvatarImage(
+  name: string | null | undefined,
+  charId: string | null | undefined
+): Promise<HTMLImageElement | null> {
+  const key = avatarCacheKey(name, charId);
+  if (avatarCache.has(key)) return avatarCache.get(key) ?? null;
+
+  // 组装候选链：优先 charId（稳定），然后中文名（character_table 反查兜底）。
+  const tokens: string[] = [];
+  if (charId) tokens.push(charId);
+  if (name && name !== charId) tokens.push(name);
+  const seen = new Set<string>();
+  const candidates: string[] = [];
+  for (const t of tokens) {
+    for (const url of peekAssetCandidates("avatar", t)) {
+      if (!seen.has(url)) {
+        seen.add(url);
+        candidates.push(url);
+      }
+    }
+  }
+  if (candidates.length === 0) {
+    avatarCache.set(key, null);
+    return null;
+  }
+
+  for (const url of candidates) {
+    const img = await loadImage(url).catch(() => null);
+    if (img) {
+      avatarCache.set(key, img);
+      return img;
+    }
+  }
+  avatarCache.set(key, null);
+  return null;
+}
+
+/**
+ * 把一张图画成圆头像。`x`/`y` 是外接矩形左上角，`size` 是直径。
+ * 用 `drawImage` 的 4-arg 形式按 object-fit: cover 剪裁：取图片的中心
+ * 正方形喂给圆形裁剪区域，避免 16:9 素材横向拉扁。
+ */
+function drawCircleAvatar(
+  ctx: CanvasRenderingContext2D,
+  img: HTMLImageElement,
+  x: number,
+  y: number,
+  size: number,
+  borderColor?: string
+): void {
+  const radius = size / 2;
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(x + radius, y + radius, radius, 0, Math.PI * 2);
+  ctx.closePath();
+  ctx.clip();
+
+  const iw = img.naturalWidth || img.width || size;
+  const ih = img.naturalHeight || img.height || size;
+  // object-fit: cover —— 取短边为 square 基准，放大到填满圆
+  const scale = Math.max(size / iw, size / ih);
+  const dw = iw * scale;
+  const dh = ih * scale;
+  const dx = x + (size - dw) / 2;
+  const dy = y + (size - dh) / 2;
+  ctx.drawImage(img, dx, dy, dw, dh);
+  ctx.restore();
+
+  if (borderColor) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(x + radius, y + radius, radius - 0.5, 0, Math.PI * 2);
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = borderColor;
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
 interface PreparedSegment {
   index: number;
   role: "dialogue" | "narration" | "subtitle" | "sticker" | "system" | "decision" | "header";
   title?: string;
   speaker?: string;
+  /** `char_xxx` 形式的 ID，dialogue 段特有，用于拼头像 URL。 */
+  characterId?: string | null;
   bodyLines: string[];
   decisions?: string[];
 }
@@ -123,6 +244,7 @@ function prepareSegment({ index, segment }: ShareSegmentInput): PreparedSegment 
         index,
         role: "dialogue",
         speaker: segment.characterName,
+        characterId: segment.characterId ?? null,
         bodyLines: splitLines(segment.text),
       };
     case "narration":
@@ -238,9 +360,12 @@ function buildLayout(
   storyName: string,
   subtitle: string | null,
   prepared: PreparedSegment[],
-  contentWidth: number
+  contentWidth: number,
+  avatarImages: Map<number, HTMLImageElement | null>
 ): LayoutBlock[] {
   const blocks: LayoutBlock[] = [];
+  const AVATAR_SIZE = 56; // diameter of speaker avatar in classic template
+  const AVATAR_GAP = 16; // gap between avatar and speaker name text
 
   // Title block
   ctx.font = `600 38px ${TITLE_FONT_FAMILY}`;
@@ -353,15 +478,27 @@ function buildLayout(
 
     if (item.role === "dialogue" || item.role === "system") {
       if (item.speaker) {
+        // dialogue 段尝试取头像：避免 system 段（没有 characterId）走这条路。
+        const avatarImg = item.role === "dialogue" ? avatarImages.get(item.index) ?? null : null;
+        const hasAvatar = Boolean(avatarImg);
         ctx.font = `600 24px ${TITLE_FONT_FAMILY}`;
+        // 有头像时把这一行撑高到头像直径；没头像就保留原来的 32px。
+        const speakerRowHeight = hasAvatar ? AVATAR_SIZE : 32;
         blocks.push({
           marginTop: firstSegmentMargin,
-          height: 32,
+          height: speakerRowHeight,
           draw: (c, x, top, _w) => {
+            let textX = x;
+            if (hasAvatar && avatarImg) {
+              drawCircleAvatar(c, avatarImg, x, top, AVATAR_SIZE, DIVIDER_COLOR);
+              textX = x + AVATAR_SIZE + AVATAR_GAP;
+            }
             c.fillStyle = ACCENT_COLOR;
             c.font = `600 24px ${TITLE_FONT_FAMILY}`;
-            c.textBaseline = "top";
-            c.fillText(item.speaker ?? "", x, top);
+            // 头像行垂直居中对齐文字；无头像时保持旧的 top 对齐视觉。
+            c.textBaseline = hasAvatar ? "middle" : "top";
+            const textY = hasAvatar ? top + AVATAR_SIZE / 2 : top;
+            c.fillText(item.speaker ?? "", textX, textY);
           },
         });
       }
@@ -407,7 +544,8 @@ function buildLayout(
 function renderImage(
   storyName: string,
   subtitle: string | null,
-  segments: ShareSegmentInput[]
+  segments: ShareSegmentInput[],
+  avatarImages: Map<number, HTMLImageElement | null>
 ): { canvas: HTMLCanvasElement; dataUrl: string; blob: Promise<Blob | null> } | null {
   if (!segments.length) return null;
 
@@ -429,7 +567,7 @@ function renderImage(
   const probeCtx = probe.getContext("2d");
   if (!probeCtx) return null;
 
-  const blocks = buildLayout(probeCtx, storyName, subtitle, prepared, contentWidth);
+  const blocks = buildLayout(probeCtx, storyName, subtitle, prepared, contentWidth, avatarImages);
   const totalHeight = blocks.reduce((acc, block) => acc + block.marginTop + block.height, 0);
   const canvasHeight = CANVAS_TOP_PADDING + totalHeight + CANVAS_BOTTOM_PADDING;
 
@@ -666,6 +804,26 @@ export function ShareImageDialog({
   // to classic (e.g. because the selection had no dialogue segment). Used
   // to pick the right filename suffix and to surface the fallback notice.
   const [effectiveTemplate, setEffectiveTemplate] = useState<TemplateKind>("classic");
+  // 分享图里是否在 speaker 行前渲染头像。开关状态会写入 localStorage，
+  // 这样切换剧情或重开弹窗时保持用户上一次的选择。
+  const [showAvatar, setShowAvatar] = useState<boolean>(() => {
+    if (typeof window === "undefined") return true;
+    try {
+      const raw = window.localStorage.getItem(SHOW_AVATAR_STORAGE_KEY);
+      // 默认开启：首次使用时直接展示更有"朋友圈风格"的排版。
+      return raw === null ? true : raw === "true";
+    } catch {
+      return true;
+    }
+  });
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(SHOW_AVATAR_STORAGE_KEY, String(showAvatar));
+    } catch {
+      // 忽略配额 / 隐私模式等写入失败
+    }
+  }, [showAvatar]);
   const platform = useMemo<RuntimePlatform>(() => detectRuntimePlatform(), []);
 
   // Re-render the image whenever the selection (or the visible story) changes
@@ -733,6 +891,27 @@ export function ShareImageDialog({
         await ensureFontsLoaded(sample);
         if (cancelled) return;
 
+        // 批量加载所有 dialogue 段的头像。关闭开关时跳过整段网络请求，
+        // 等于退回到"只有角色名文字"的旧版排版。
+        const avatarImages = new Map<number, HTMLImageElement | null>();
+        if (showAvatar) {
+          const dialogueEntries = segments.filter(
+            (s): s is ShareSegmentInput & { segment: DialogueSegment } =>
+              s.segment.type === "dialogue"
+          );
+          const resolved = await Promise.all(
+            dialogueEntries.map(async (entry) => {
+              const img = await loadAvatarImage(
+                entry.segment.characterName,
+                entry.segment.characterId ?? null
+              ).catch(() => null);
+              return [entry.index, img] as const;
+            })
+          );
+          if (cancelled) return;
+          for (const [idx, img] of resolved) avatarImages.set(idx, img);
+        }
+
         // Compose the visual subtitle used on both templates: "章节/活动名 · 关卡代号"。
         // 任一部分缺失时自动省略对应段，不会出现多余的连接符。
         const subtitle = [categoryName?.trim(), storyCode?.trim()]
@@ -754,12 +933,12 @@ export function ShareImageDialog({
           if (!firstDialogue) {
             toast.warn("金句模板需至少选中一条对话，已回落到经典模板");
             effective = "classic";
-            result = renderImage(storyName, subtitle, segments);
+            result = renderImage(storyName, subtitle, segments, avatarImages);
           } else {
             result = renderQuoteImage(storyName, subtitle, firstDialogue.segment);
           }
         } else {
-          result = renderImage(storyName, subtitle, segments);
+          result = renderImage(storyName, subtitle, segments, avatarImages);
         }
 
         if (cancelled) return;
@@ -804,7 +983,7 @@ export function ShareImageDialog({
     return () => {
       cancelled = true;
     };
-  }, [open, segments, storyName, categoryName, storyCode, template, toast]);
+  }, [open, segments, storyName, categoryName, storyCode, template, showAvatar, toast]);
 
   // Revoke the preview URL on unmount so we don't leak across story
   // switches when the dialog is kept mounted by a parent KeepAlive.
@@ -918,171 +1097,161 @@ export function ShareImageDialog({
   const showShareAction = platform === "android" || (typeof navigator !== "undefined" && "share" in navigator);
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex"
-      role="dialog"
-      aria-modal="true"
-      aria-label="分享为图片"
-    >
-      <div
-        data-state={state}
-        className="absolute inset-0 bg-black/50 transition-opacity duration-200 data-[state=closed]:opacity-0 data-[state=open]:opacity-100"
-        onClick={onClose}
-      />
-      <div
-        data-state={state}
-        className="relative ml-auto h-full w-full max-w-md transform transition-transform duration-200 ease-out data-[state=closed]:translate-x-full data-[state=open]:translate-x-0"
-      >
-        <div className="h-full flex flex-col bg-[hsl(var(--color-background))] shadow-2xl border-l border-[hsl(var(--color-border))]">
-          <header className="flex-shrink-0 flex items-center justify-between gap-3 px-4 py-3 border-b border-[hsl(var(--color-border))] bg-[hsl(var(--color-background))]">
-            <div className="min-w-0">
-              <h2 className="text-base font-semibold truncate">分享为图片</h2>
-              <p className="text-xs text-[hsl(var(--color-muted-foreground))] truncate">
-                已选 {segments.length} 段 · {storyName}
-              </p>
-            </div>
-            <Button variant="ghost" size="icon" onClick={onClose} aria-label="关闭" title="关闭">
-              <X className="h-5 w-5" />
-            </Button>
-          </header>
-
-          <CustomScrollArea className="flex-1 min-h-0" viewportClassName="reader-scroll">
-            <div className="p-4 space-y-4">
-              <Card>
-                <CardHeader>
-                  <CardTitle className="text-base">模板</CardTitle>
-                </CardHeader>
-                <CardContent>
-                  <div
-                    role="radiogroup"
-                    aria-label="选择分享模板"
-                    className="grid grid-cols-2 gap-2"
-                  >
-                    {(
-                      [
-                        { value: "classic", label: "经典", hint: "长图 · 完整段落" },
-                        { value: "quote", label: "对话金句", hint: "竖版 · 单条对话" },
-                      ] as const
-                    ).map((opt) => {
-                      const active = template === opt.value;
-                      return (
-                        <button
-                          key={opt.value}
-                          type="button"
-                          role="radio"
-                          aria-checked={active}
-                          onClick={() => setTemplate(opt.value)}
-                          className={
-                            "rounded-md border px-3 py-2 text-left transition-colors " +
-                            (active
-                              ? "border-[hsl(var(--color-primary))] bg-[hsl(var(--color-primary)/0.08)]"
-                              : "border-[hsl(var(--color-border))] hover:bg-[hsl(var(--color-accent)/0.3)]")
-                          }
-                        >
-                          <div className="text-sm font-medium">{opt.label}</div>
-                          <div className="text-xs text-[hsl(var(--color-muted-foreground))]">
-                            {opt.hint}
-                          </div>
-                        </button>
-                      );
-                    })}
-                  </div>
-                  {template === "quote" && effectiveTemplate === "classic" && (
-                    <p className="mt-3 text-xs text-[hsl(var(--color-warning-foreground,var(--color-muted-foreground)))]">
-                      当前选段没有对话，已回落到经典模板。
-                    </p>
-                  )}
-                </CardContent>
-              </Card>
-
-              <Card>
-                <CardHeader>
-                  <CardTitle className="text-base">预览</CardTitle>
-                </CardHeader>
-                <CardContent>
-                  <div className="rounded-lg border border-[hsl(var(--color-border))] bg-[hsl(var(--color-muted)/0.3)] p-3 min-h-[220px] flex items-center justify-center">
-                    {rendering && (
-                      <div className="flex items-center gap-2 text-sm text-[hsl(var(--color-muted-foreground))]">
-                        <Loader2 className="h-4 w-4 animate-spin" /> 正在生成图片...
-                      </div>
-                    )}
-                    {!rendering && renderError && (
-                      <div className="text-sm text-[hsl(var(--color-destructive))]">{renderError}</div>
-                    )}
-                    {!rendering && !renderError && previewUrl && (
-                      <img
-                        src={previewUrl}
-                        alt="段落截图预览"
-                        className="max-w-full h-auto rounded shadow-sm"
-                        loading="lazy"
-                      />
-                    )}
-                  </div>
-                  <p className="mt-3 text-xs text-[hsl(var(--color-muted-foreground))] leading-relaxed">
-                    图片会按剧情原文顺序排列，分享或保存时使用同一份 PNG。
-                  </p>
-                </CardContent>
-              </Card>
-
-              {platform === "android" ? (
-                <Card>
-                  <CardHeader>
-                    <CardTitle className="text-base">操作</CardTitle>
-                  </CardHeader>
-                  <CardContent className="space-y-3 text-sm text-[hsl(var(--color-muted-foreground))]">
-                    <p>保存到相册会写入 <span className="font-mono">Pictures/ArknightsStoryReader</span>，首次保存可能需要授权。</p>
-                    <p>分享会唤起系统分享面板，无需额外权限。</p>
-                  </CardContent>
-                </Card>
-              ) : (
-                <Card>
-                  <CardHeader>
-                    <CardTitle className="text-base">说明</CardTitle>
-                  </CardHeader>
-                  <CardContent className="text-sm text-[hsl(var(--color-muted-foreground))] leading-relaxed">
-                    桌面或浏览器环境下将直接下载图片到本地，再由你选择分享方式。
-                  </CardContent>
-                </Card>
-              )}
-            </div>
-          </CustomScrollArea>
-
-          <footer
-            className="flex-shrink-0 border-t border-[hsl(var(--color-border))] bg-[hsl(var(--color-background))] px-4 py-3 flex items-center gap-2"
-            style={{ paddingBottom: "calc(env(safe-area-inset-bottom, 0px) + 0.75rem)" }}
+    <SheetShell state={state} onClose={onClose} ariaLabel="分享为图片">
+      <SheetHeader
+        title="分享为图片"
+        description={`已选 ${segments.length} 段 · ${storyName}`}
+        actions={
+          <Button
+            variant="ghost"
+            size="icon-pill"
+            onClick={onClose}
+            aria-label="关闭"
+            title="关闭"
           >
-            {showShareAction && (
-              <Button
-                type="button"
-                className="flex-1"
-                onClick={handleShare}
-                disabled={!dataUrl || rendering || busyAction !== null}
-              >
-                {busyAction === "share" ? (
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                ) : (
-                  <Share2 className="mr-2 h-4 w-4" />
-                )}
-                分享
-              </Button>
-            )}
-            <Button
-              type="button"
-              variant={showShareAction ? "outline" : "default"}
-              className="flex-1"
-              onClick={handleSave}
-              disabled={!dataUrl || rendering || busyAction !== null}
+            <X className="h-5 w-5" />
+          </Button>
+        }
+      />
+
+      <CustomScrollArea className="flex-1 min-h-0" viewportClassName="reader-scroll">
+        <div className="px-4 pt-3 pb-6 space-y-5">
+          {/* Template picker — segmented card grid, feels like a radio picker
+            on iOS 26 with two tappable chips instead of a card with radios. */}
+          <section className="space-y-2">
+            <SheetSectionLabel>模板</SheetSectionLabel>
+            <div
+              role="radiogroup"
+              aria-label="选择分享模板"
+              className="grid grid-cols-2 gap-2"
             >
-              {busyAction === "save" ? (
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              {(
+                [
+                  { value: "classic", label: "经典", hint: "长图 · 完整段落" },
+                  { value: "quote", label: "对话金句", hint: "竖版 · 单条对话" },
+                ] as const
+              ).map((opt) => {
+                const active = template === opt.value;
+                return (
+                  <button
+                    key={opt.value}
+                    type="button"
+                    role="radio"
+                    aria-checked={active}
+                    onClick={() => setTemplate(opt.value)}
+                    className={cn(
+                      "glass glass-pane text-left px-4 py-3 transition-[background-color,color,box-shadow] duration-200 ease-spring",
+                      active
+                        ? "glass-thick ring-1 ring-[hsl(var(--color-primary)/0.45)] text-[hsl(var(--color-foreground))]"
+                        : "glass-thin text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-foreground))]"
+                    )}
+                  >
+                    <div className={cn("text-sm font-semibold", active && "text-[hsl(var(--color-foreground))]") }>
+                      {opt.label}
+                    </div>
+                    <div className="text-xs opacity-80 mt-0.5">{opt.hint}</div>
+                  </button>
+                );
+              })}
+            </div>
+            {template === "quote" && effectiveTemplate === "classic" && (
+              <p className="text-xs text-[hsl(var(--color-muted-foreground))] px-1">
+                当前选段没有对话，已回落到经典模板。
+              </p>
+            )}
+            {effectiveTemplate === "classic" && (
+              <label className="flex items-center gap-2 px-1 py-1 text-xs text-[hsl(var(--color-muted-foreground))] cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  className="h-3.5 w-3.5 accent-[hsl(var(--color-primary))]"
+                  checked={showAvatar}
+                  onChange={(e) => setShowAvatar(e.target.checked)}
+                />
+                <span>在对话前显示角色头像</span>
+              </label>
+            )}
+          </section>
+
+          <section className="space-y-2">
+            <SheetSectionLabel>预览</SheetSectionLabel>
+            <SheetGroup padded>
+              <div className="rounded-[var(--radius-row)] bg-[hsl(var(--color-foreground)/0.04)] p-3 min-h-[220px] flex items-center justify-center">
+                {rendering && (
+                  <div className="flex items-center gap-2 text-sm text-[hsl(var(--color-muted-foreground))]">
+                    <Loader2 className="h-4 w-4 animate-spin" /> 正在生成图片...
+                  </div>
+                )}
+                {!rendering && renderError && (
+                  <div className="text-sm text-[hsl(var(--color-destructive))]">{renderError}</div>
+                )}
+                {!rendering && !renderError && previewUrl && (
+                  <img
+                    src={previewUrl}
+                    alt="段落截图预览"
+                    className="max-w-full h-auto rounded-[var(--radius-row)] shadow-[0_8px_24px_-8px_hsl(0_0%_0%/0.25)]"
+                    loading="lazy"
+                  />
+                )}
+              </div>
+              <p className="mt-3 text-xs text-[hsl(var(--color-muted-foreground))] leading-relaxed">
+                图片会按剧情原文顺序排列，分享或保存时使用同一份 PNG。
+              </p>
+            </SheetGroup>
+          </section>
+
+          <section className="space-y-2">
+            <SheetSectionLabel>说明</SheetSectionLabel>
+            <SheetGroup padded>
+              {platform === "android" ? (
+                <div className="space-y-2 text-sm text-[hsl(var(--color-muted-foreground))] leading-relaxed">
+                  <p>
+                    保存到相册会写入 <span className="font-mono">Pictures/ArknightsStoryReader</span>，首次保存可能需要授权。
+                  </p>
+                  <p>分享会唤起系统分享面板，无需额外权限。</p>
+                </div>
               ) : (
-                <Download className="mr-2 h-4 w-4" />
+                <p className="text-sm text-[hsl(var(--color-muted-foreground))] leading-relaxed">
+                  桌面或浏览器环境下将直接下载图片到本地，再由你选择分享方式。
+                </p>
               )}
-              {platform === "android" ? "保存到相册" : "下载图片"}
-            </Button>
-          </footer>
+            </SheetGroup>
+          </section>
         </div>
-      </div>
-    </div>
+      </CustomScrollArea>
+
+      <SheetFooter>
+        {showShareAction && (
+          <Button
+            type="button"
+            size="pill"
+            className="flex-1"
+            onClick={handleShare}
+            disabled={!dataUrl || rendering || busyAction !== null}
+          >
+            {busyAction === "share" ? (
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+            ) : (
+              <Share2 className="mr-2 h-4 w-4" />
+            )}
+            分享
+          </Button>
+        )}
+        <Button
+          type="button"
+          size="pill"
+          variant={showShareAction ? "glass" : "default"}
+          className="flex-1"
+          onClick={handleSave}
+          disabled={!dataUrl || rendering || busyAction !== null}
+        >
+          {busyAction === "save" ? (
+            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+          ) : (
+            <Download className="mr-2 h-4 w-4" />
+          )}
+          {platform === "android" ? "保存到相册" : "下载图片"}
+        </Button>
+      </SheetFooter>
+    </SheetShell>
   );
 }

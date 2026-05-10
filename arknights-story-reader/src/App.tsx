@@ -14,6 +14,7 @@ import { KeepAlive } from "@/components/KeepAlive";
 import { CharactersPanel } from "@/components/CharactersPanel";
 import { useAppUpdater } from "@/hooks/useAppUpdater";
 import { useBackHandler } from "@/hooks/useBackHandler";
+import { useAutoIndex } from "@/hooks/useAutoIndex";
 import { ToastProvider } from "@/components/ui/toast";
 
 type Tab = "home" | "stories" | "characters" | "search" | "settings";
@@ -27,6 +28,7 @@ interface ReaderFocus {
 
 function App() {
   useAppUpdater();
+  useAutoIndex();
   const [activeTab, setActiveTab] = useState<Tab>("home");
   const [readerVisible, setReaderVisible] = useState(false);
   const [readerStory, setReaderStory] = useState<StoryEntry | null>(null);
@@ -200,7 +202,10 @@ function App() {
           active={!readerActive && activeTab === "characters"}
           className="absolute inset-0"
         >
-          <CharactersPanel onOpenStory={handleOpenStoryWithCharacter} />
+          <CharactersPanel
+            onOpenStory={handleOpenStoryWithCharacter}
+            onOpenStoryJump={(story, jump) => handleOpenStoryJump(story, jump)}
+          />
         </KeepAlive>
         <KeepAlive active={!readerActive && activeTab === "search"} className="absolute inset-0">
           {searchView}

@@ -103,6 +103,45 @@
   --color-input: 0 0% 86%;
   --color-ring: 0 0% 12%;
   --radius: 0.5rem;
+
+  /* ============================================================= */
+  /* Liquid Glass design tokens (v1)                                */
+  /* ---                                                            */
+  /* Three-tier material stack modelled on iOS 26 Liquid Glass:     */
+  /*   thin     → floating toolbars / pills (low blur, low opacity) */
+  /*   regular  → bottom-nav-like islands (mid blur, mid opacity)   */
+  /*   thick    → sheets / dialogs that must obscure page content   */
+  /*                                                                */
+  /* All utility classes below read from these variables so a theme */
+  /* can retune the whole system by overriding the tokens.          */
+  /* ============================================================= */
+  --glass-blur-thin: 18px;
+  --glass-blur-regular: 28px;
+  --glass-blur-thick: 40px;
+  --glass-saturate: 180%;
+
+  --glass-opacity-thin: 0.55;
+  --glass-opacity-regular: 0.7;
+  --glass-opacity-thick: 0.82;
+
+  /* RGB channel for the inner edge-of-glass highlight so we can control
+     alpha separately per theme. Light themes keep a bright highlight;
+     dark themes dim it so the edge doesn't look like a hairline border. */
+  --glass-highlight-rgb: 255 255 255;
+  --glass-highlight-alpha: 0.12;
+
+  --glass-shadow-soft: 0 20px 48px -22px hsl(0 0% 0% / 0.18);
+  --glass-shadow-lifted: 0 32px 72px -28px hsl(0 0% 0% / 0.28);
+
+  --radius-sheet: 28px;
+  --radius-pane: 22px;
+  --radius-row: 14px;
+
+  /* iOS-standard spring curves. `spring` is the default "soft spring" used
+     for sheets and controls; `spring-snappy` overshoots slightly and is
+     reserved for short, delightful motions like button press rebound. */
+  --ease-spring: cubic-bezier(0.32, 0.72, 0, 1);
+  --ease-spring-snappy: cubic-bezier(0.34, 1.56, 0.64, 1);
 }
 
 :root[data-theme-color="book"] {
@@ -196,6 +235,18 @@
   --color-border: 0 0% 26%;
   --color-input: 0 0% 26%;
   --color-ring: 0 0% 65%;
+
+  /* Dark-mode retuning of the glass tokens. The background is already
+     very dark so we push opacity up — otherwise the sheet looks like a
+     ghostly frame rather than a material. Highlight alpha drops because
+     a bright 12% edge reads as a hairline border on near-black glass. */
+  --glass-opacity-thin: 0.5;
+  --glass-opacity-regular: 0.62;
+  --glass-opacity-thick: 0.78;
+  --glass-highlight-rgb: 255 255 255;
+  --glass-highlight-alpha: 0.06;
+  --glass-shadow-soft: 0 20px 48px -22px hsl(0 0% 0% / 0.55);
+  --glass-shadow-lifted: 0 32px 72px -28px hsl(0 0% 0% / 0.7);
 }
 
 .dark[data-theme-color="book"],
@@ -900,17 +951,33 @@ input[type="range"]::-moz-range-thumb {
   padding-left: 0 !important;
 }
 
-/* 阅读器内插画段 */
+/* 阅读器内插画段：不使用任何容器装饰，原始图片居中展示。
+ * 横图、方图、竖图都按自身尺寸呈现，最大不超过正文栏宽度。
+ */
 .reader-segment-image {
   margin: 1.25rem 0;
-  border-radius: 0.75rem;
-  overflow: hidden;
-  border: 1px solid hsl(var(--color-border) / 0.7);
-  background: hsl(var(--color-muted) / 0.35);
-  aspect-ratio: 16 / 9;
+  /* 抵消 `.reader-segment` 的右内边距，让图片相对正文栏真正居中 */
+  padding-right: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  overflow: visible;
+}
+.reader-segment-image > .asset-image-slot {
+  width: auto;
+  max-width: 100%;
+  background: transparent;
+}
+.reader-segment-image .asset-image {
+  border-radius: 0;
 }
 .reader-segment-image-caption {
   margin-top: 0.5rem;
+  margin-bottom: 0.5rem;
   font-size: 0.85rem;
   color: hsl(var(--color-muted-foreground));
   text-align: center;
@@ -956,6 +1023,15 @@ input[type="range"]::-moz-range-thumb {
   border: 1px solid hsl(var(--color-border));
   background: hsl(var(--color-card));
   transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+  /* 视口外卡片跳过绘制/布局。每张卡的 memory-bg 都有 filter: blur(14px)，
+     一屏 10+ 张会生成等量的独立合成层，把 WKWebView 的合成器挤爆——导致
+     bottom-nav-glass 的 backdrop-filter 在滚动停止后无法刷新采样，玻璃
+     效果"失焦失效、hover 触发 repaint 才恢复"。
+     加上 content-visibility + contain 后，真正在视口里的卡片数 ≤ 10，
+     合成器压力降一个数量级，导航背景就能稳定刷新。 */
+  content-visibility: auto;
+  contain-intrinsic-size: 1px 88px;
+  contain: layout paint style;
 }
 .story-card:hover {
   border-color: hsl(var(--color-primary) / 0.5);
@@ -995,7 +1071,54 @@ input[type="range"]::-moz-range-thumb {
   color: hsl(var(--color-muted-foreground));
 }
 
-/* 浮岛 Glass BottomNav */
+/* 卡片背景：密录用精二立绘，其他类别复用 StoryThumbnail 的多级兜底
+   链。效果统一——毛玻璃 + 左侧卡片色渐变淡出，保证标题可读。 */
+.story-card-memory-bg {
+  overflow: hidden;
+  border-radius: inherit;
+  /* 把整块 blur + 缩放的背景 contain 成独立合成岛，避免它的图层
+     变化传播到父级，挤压 bottom-nav-glass 的 backdrop-filter 采样。 */
+  contain: strict;
+  transform: translateZ(0);
+}
+.story-card-memory-bg .asset-image,
+.story-card-memory-bg img {
+  object-fit: cover !important;
+  object-position: right 25%;
+  filter: blur(14px) saturate(1.05);
+  transform: scale(1.12);
+  opacity: 0.55;
+  /* 让图片留在自己的合成层里，而不是每次 paint 时重算一次 blur。 */
+  will-change: transform;
+}
+/* 隐藏装饰性 fallback：
+   - `.asset-image-fallback`：AssetImage（精二立绘加载中/失败）
+   - `.story-thumbnail-fallback`：StoryThumbnail 的纯渐变兜底
+   避免加载失败时冒出一个不协调的色块，卡片背景就保持干净的 card 底色。 */
+.story-card-memory-bg .asset-image-fallback,
+.story-card-memory-bg .story-thumbnail-fallback {
+  opacity: 0 !important;
+}
+.story-card-memory-overlay {
+  border-radius: inherit;
+  background: linear-gradient(
+    90deg,
+    hsl(var(--color-card) / 0.96) 0%,
+    hsl(var(--color-card) / 0.88) 40%,
+    hsl(var(--color-card) / 0.45) 100%
+  );
+}
+
+/* 浮岛 Glass BottomNav
+ *
+ * 重要：macOS WKWebView 在滚动停止后会"冻结" backdrop-filter 的采样，
+ * 导致导航背景看起来凭空消失，直到有什么触发重绘（比如 hover）才恢复。
+ * 解决方案是强制把导航提到独立的合成层上，让合成器持续刷新它。
+ *   - translateZ(0)：提层
+ *   - will-change: backdrop-filter, transform：告诉浏览器这层要频繁刷新
+ *   - isolation: isolate：隔绝上层 stacking context 的影响，避免某些
+ *     Safari 版本在祖先含 filter/transform 时把 backdrop-filter 当成无效
+ */
 .bottom-nav-glass {
   position: fixed;
   left: max(0.75rem, env(safe-area-inset-left, 0px));
@@ -1003,10 +1126,15 @@ input[type="range"]::-moz-range-thumb {
   bottom: max(0.5rem, env(safe-area-inset-bottom, 0px));
   border-radius: 28px;
   border: 1px solid hsl(var(--color-foreground) / 0.08);
-  background: hsl(var(--color-background) / 0.62);
-  backdrop-filter: blur(22px) saturate(160%);
-  -webkit-backdrop-filter: blur(22px) saturate(160%);
-  box-shadow: 0 10px 30px hsl(var(--color-foreground) / 0.08);
+  background: hsl(var(--color-background) / var(--glass-opacity-regular));
+  backdrop-filter: blur(var(--glass-blur-regular)) saturate(var(--glass-saturate));
+  -webkit-backdrop-filter: blur(var(--glass-blur-regular)) saturate(var(--glass-saturate));
+  box-shadow:
+    inset 0 1px 0 rgb(var(--glass-highlight-rgb) / var(--glass-highlight-alpha)),
+    var(--glass-shadow-soft);
+  transform: translateZ(0);
+  will-change: backdrop-filter, transform;
+  isolation: isolate;
 }
 @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
   .bottom-nav-glass {
@@ -1050,3 +1178,142 @@ input[type="range"]::-moz-range-thumb {
     height: 2rem;
   }
 }
+
+/* ============================================================= */
+/* Liquid Glass utilities                                         */
+/* ============================================================= */
+
+/*
+ * Base glass surface. Pair with one of `.glass-thin/.glass-regular/.glass-thick`
+ * (default is regular) to set blur + opacity, and with a radius utility
+ * (Tailwind's `rounded-*` or one of `.glass-sheet/.glass-pane/.glass-capsule`).
+ *
+ * Layering model:
+ *   background  → theme-tinted wash so content behind shows through
+ *   backdrop    → native blur + saturate for the real glass refraction
+ *   inner edge  → 1px inset highlight (light reflection on curved edge)
+ *   outer shadow → soft lift so the surface reads as "floating"
+ *
+ * The `@supports` fallback lands us on a near-opaque surface if the user's
+ * browser cannot composite `backdrop-filter` (older Android WebView, some
+ * EU browsers) so we never render a washed-out panel that shows the page
+ * bleeding through unblurred.
+ */
+.glass {
+  background: hsl(var(--color-background) / var(--glass-opacity-regular));
+  backdrop-filter: blur(var(--glass-blur-regular)) saturate(var(--glass-saturate));
+  -webkit-backdrop-filter: blur(var(--glass-blur-regular)) saturate(var(--glass-saturate));
+  border: 1px solid hsl(var(--color-foreground) / 0.08);
+  box-shadow:
+    inset 0 1px 0 rgb(var(--glass-highlight-rgb) / var(--glass-highlight-alpha)),
+    var(--glass-shadow-soft);
+}
+
+.glass-thin {
+  background: hsl(var(--color-background) / var(--glass-opacity-thin));
+  backdrop-filter: blur(var(--glass-blur-thin)) saturate(var(--glass-saturate));
+  -webkit-backdrop-filter: blur(var(--glass-blur-thin)) saturate(var(--glass-saturate));
+}
+
+.glass-regular {
+  background: hsl(var(--color-background) / var(--glass-opacity-regular));
+  backdrop-filter: blur(var(--glass-blur-regular)) saturate(var(--glass-saturate));
+  -webkit-backdrop-filter: blur(var(--glass-blur-regular)) saturate(var(--glass-saturate));
+}
+
+.glass-thick {
+  background: hsl(var(--color-background) / var(--glass-opacity-thick));
+  backdrop-filter: blur(var(--glass-blur-thick)) saturate(var(--glass-saturate));
+  -webkit-backdrop-filter: blur(var(--glass-blur-thick)) saturate(var(--glass-saturate));
+  box-shadow:
+    inset 0 1px 0 rgb(var(--glass-highlight-rgb) / var(--glass-highlight-alpha)),
+    var(--glass-shadow-lifted);
+}
+
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .glass,
+  .glass-thin,
+  .glass-regular,
+  .glass-thick {
+    background: hsl(var(--color-background) / 0.96);
+  }
+}
+
+/* Shape shortcuts so components can express intent, not pixels. */
+.glass-sheet { border-radius: var(--radius-sheet); }
+.glass-pane { border-radius: var(--radius-pane); }
+.glass-row { border-radius: var(--radius-row); }
+.glass-capsule { border-radius: 9999px; }
+
+/*
+ * Inset-grouped list row styling à la iOS Settings. Stack rows inside a
+ * `.glass.glass-pane` container and they visually merge into one slab,
+ * separated only by a hairline divider. No border per row.
+ */
+.glass-list {
+  display: flex;
+  flex-direction: column;
+}
+.glass-list > * + * {
+  border-top: 1px solid hsl(var(--color-foreground) / 0.06);
+}
+
+/*
+ * Section header label used above a `.glass-pane` group, mirroring the
+ * "SECTION" labels in iOS Settings. Kept tiny + uppercase so it defers
+ * to the content below.
+ */
+.glass-section-label {
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  color: hsl(var(--color-muted-foreground));
+  padding: 0 0.25rem 0.5rem;
+}
+
+/*
+ * Segmented control item — a pill that sits inside a `.glass-thin` track.
+ * Active state uses an opaque "chip" that looks as if it floats on top
+ * of the glass, matching iOS 26 segmented controls.
+ */
+.glass-segment-track {
+  display: inline-flex;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 9999px;
+  background: hsl(var(--color-foreground) / 0.06);
+  border: 1px solid hsl(var(--color-foreground) / 0.06);
+}
+.glass-segment-item {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.35rem 0.85rem;
+  border-radius: 9999px;
+  font-size: 0.82rem;
+  color: hsl(var(--color-muted-foreground));
+  transition: background-color 0.18s ease, color 0.18s ease;
+}
+.glass-segment-item[aria-selected="true"],
+.glass-segment-item[data-active="true"] {
+  background: hsl(var(--color-background));
+  color: hsl(var(--color-foreground));
+  box-shadow:
+    inset 0 1px 0 rgb(var(--glass-highlight-rgb) / var(--glass-highlight-alpha)),
+    0 2px 6px -2px hsl(0 0% 0% / 0.2);
+}
+
+/*
+ * Overlay scrim behind a sheet. Darker + faintly blurred so the
+ * transition from page → sheet feels like a layered glass stack rather
+ * than a flat modal dim.
+ */
+.glass-scrim {
+  background: hsl(0 0% 0% / 0.32);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+}
+
+/* iOS-default spring used by sheet slide-in/out and pill press rebound. */
+.ease-spring { transition-timing-function: var(--ease-spring); }
+.ease-spring-snappy { transition-timing-function: var(--ease-spring-snappy); }

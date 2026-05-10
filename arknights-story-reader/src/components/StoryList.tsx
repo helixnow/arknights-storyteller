@@ -9,13 +9,25 @@ import { CustomScrollArea } from "@/components/ui/custom-scroll-area";
 import { Input } from "@/components/ui/input";
 import { useFavorites } from "@/hooks/useFavorites";
 import { useAppPreferences } from "@/hooks/useAppPreferences";
+import { StoryThumbnail } from "@/components/StoryThumbnail";
 import { AssetImage } from "@/components/AssetImage";
 import { CharacterAvatar } from "@/components/CharacterAvatar";
 
-function extractCharIdFromStoryTxt(storyTxt: string | null | undefined): string | null {
+/**
+ * 从干员密录类 storyTxt 路径里抠出 charId 候选。
+ *
+ * 历史格式是 `obt/memory/char_002_amiya/*`，直接能拿到 charId。
+ * 当前主流格式是 `obt/memory/story_{alias}_N_M`，其中 `{alias}` 就是
+ * charId 尾段（如 `kroos`、`amgoat`、`yuki`）。这里返回 alias；由
+ * `CharacterAvatar` 内部的 resolver 兜底转成完整 charId。
+ */
+function extractCharTokenFromStoryTxt(storyTxt: string | null | undefined): string | null {
   if (!storyTxt) return null;
-  const match = storyTxt.match(/obt\/memory\/(char_[^/]+)/i);
-  return match ? match[1] : null;
+  const direct = storyTxt.match(/obt\/memory\/(char_[^/]+)/i);
+  if (direct) return direct[1];
+  const storied = storyTxt.match(/obt\/memory\/story_([a-z0-9]+)_/i);
+  if (storied) return storied[1].toLowerCase();
+  return null;
 }
 
 const CATEGORY_TABS = [
@@ -1101,8 +1113,7 @@ function StoryItem({
   // 一个坏信号——主线的序章、开场 guide 也是 NONE，若据此走 memory 头像分支
   // 会把章节卡渲染成角色 monogram。
   const isMemoryStory = storyTxt.startsWith("obt/memory/");
-  const isMainStory = storyTxt.startsWith("obt/main/");
-  const charId = isMemoryStory ? extractCharIdFromStoryTxt(storyTxt) : null;
+  const charId = isMemoryStory ? extractCharTokenFromStoryTxt(storyTxt) : null;
   const charName = isMemoryStory
     ? story.storyName.split("·")[0]?.trim() || null
     : null;
@@ -1118,32 +1129,47 @@ function StoryItem({
           onSelectStory(story);
         }
       }}
-      className="story-card flex w-full gap-3 p-3 items-center text-left cursor-pointer transition-all duration-200 ease-out hover:-translate-y-0.5 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[hsl(var(--color-primary))] motion-safe:animate-in motion-safe:fade-in-0"
+      className="story-card relative flex w-full gap-3 p-3 items-center text-left cursor-pointer overflow-hidden transition-all duration-200 ease-out hover:-translate-y-0.5 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[hsl(var(--color-primary))] motion-safe:animate-in motion-safe:fade-in-0"
     >
-      <div className="relative w-24 h-14 flex-shrink-0 rounded-md overflow-hidden bg-[hsl(var(--color-secondary)/0.4)]">
-        {isMemoryStory ? (
-          <div className="flex h-full w-full items-center justify-center">
-            <CharacterAvatar
-              charId={charId}
-              name={charName}
-              size={44}
-            />
-          </div>
-        ) : isMainStory ? (
+      {/* 卡片底层模糊背景：密录用干员立绘，其他类别复用 StoryThumbnail
+          的多级兜底链（插画 → 章节封面 → 活动 KV）。背景交给 CSS 做
+          blur + overlay，AssetImage 本身不带 tint，避免图片处理两次。 */}
+      <div
+        className="story-card-memory-bg pointer-events-none absolute inset-0 -z-0"
+        aria-hidden="true"
+      >
+        {isMemoryStory && charId ? (
           <AssetImage
-            kind="chapter_cover"
-            token={story.storyGroup}
-            alt={story.storyName}
+            kind="portrait"
+            token={charId}
+            alt=""
+            className="h-full w-full"
+            tint="none"
+            lazy
           />
         ) : (
-          <AssetImage
-            kind="activity_kv"
-            token={story.storyGroup}
-            alt={story.storyName}
-          />
+          <StoryThumbnail story={story} alt="" tint="none" />
         )}
       </div>
-      <div className="flex-1 min-w-0">
+      <div
+        className="story-card-memory-overlay pointer-events-none absolute inset-0 -z-0"
+        aria-hidden="true"
+      />
+
+      <div className="relative z-10 w-16 h-16 flex-shrink-0 flex items-center justify-center">
+        {isMemoryStory ? (
+          <CharacterAvatar
+            charId={charId}
+            name={charName}
+            size={56}
+          />
+        ) : (
+          <div className="relative w-24 h-14 rounded-md overflow-hidden bg-[hsl(var(--color-secondary)/0.4)]">
+            <StoryThumbnail story={story} alt={story.storyName} />
+          </div>
+        )}
+      </div>
+      <div className="flex-1 min-w-0 relative z-10">
         <div className="flex items-start justify-between gap-2">
           <div className="min-w-0 flex-1 flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
             {story.storyCode && (

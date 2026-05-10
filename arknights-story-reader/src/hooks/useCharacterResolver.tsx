@@ -57,6 +57,17 @@ export function CharacterResolverProvider({ children }: { children: ReactNode })
       const key = simplify(k);
       if (key && !simplifiedNameMap.has(key)) simplifiedNameMap.set(key, v);
     });
+    // `char_{num}_{alias}` 里的 alias（小写英文）映射。干员密录的
+    // storyTxt 形如 `obt/memory/story_{alias}_N_M`，没有 char_ 前缀也
+    // 不是中文名/appellation —— 直接从已有的 charIds 反推即可。
+    const aliasMap = new Map<string, string>();
+    Object.keys(idMap).forEach((cid) => {
+      const match = cid.match(/^char_\d+_(.+?)(?:#.*)?$/);
+      if (match) {
+        const alias = match[1].toLowerCase();
+        if (!aliasMap.has(alias)) aliasMap.set(alias, cid);
+      }
+    });
     return {
       charIdToName: idMap,
       nameToCharId: nameMap,
@@ -66,7 +77,13 @@ export function CharacterResolverProvider({ children }: { children: ReactNode })
         const trimmed = name.trim();
         if (!trimmed) return null;
         if (trimmed.startsWith("char_")) return trimmed.split("#")[0];
-        return nameMap[trimmed] ?? simplifiedNameMap.get(simplify(trimmed)) ?? null;
+        if (nameMap[trimmed]) return nameMap[trimmed];
+        const fromSimple = simplifiedNameMap.get(simplify(trimmed));
+        if (fromSimple) return fromSimple;
+        // 兜底尝试 alias（存 charId 小写英文片段），覆盖干员密录这类
+        // 只有 `story_{alias}_` 的路径。
+        const lower = trimmed.toLowerCase();
+        return aliasMap.get(lower) ?? null;
       },
       resolveName: (charId) => {
         if (!charId) return null;

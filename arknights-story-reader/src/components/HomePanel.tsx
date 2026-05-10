@@ -3,7 +3,7 @@ import { api } from "@/services/api";
 import type { StoryEntry } from "@/types/story";
 import { Button } from "@/components/ui/button";
 import { CustomScrollArea } from "@/components/ui/custom-scroll-area";
-import { AssetImage } from "@/components/AssetImage";
+import { StoryThumbnail } from "@/components/StoryThumbnail";
 import { useFavorites } from "@/hooks/useFavorites";
 import { BookOpen, Flame, Sparkles } from "lucide-react";
 
@@ -143,12 +143,6 @@ export function HomePanel({ onSelectStory, onGoToTab }: HomePanelProps) {
 
   const favoritesCount = useMemo(() => Object.keys(favoriteStories).length, [favoriteStories]);
   const continueItem = recentStories[0] ?? null;
-  const coverKind = continueItem
-    ? continueItem.entry.storyTxt.startsWith("activities/")
-      ? "activity_kv"
-      : "chapter_cover"
-    : "chapter_cover";
-  const coverToken = continueItem?.entry.storyGroup ?? null;
 
   return (
     <div className="h-full flex flex-col overflow-hidden">
@@ -156,7 +150,7 @@ export function HomePanel({ onSelectStory, onGoToTab }: HomePanelProps) {
         <div className="text-[11px] uppercase tracking-[0.18em] text-[hsl(var(--color-muted-foreground))]">
           Welcome, Doctor
         </div>
-        <h1 className="mt-1 text-2xl font-semibold">阅读你的罗德岛</h1>
+        <h1 className="mt-1 text-2xl font-semibold">欢迎回来，博士</h1>
       </header>
 
       <main className="flex-1 overflow-hidden">
@@ -183,8 +177,6 @@ export function HomePanel({ onSelectStory, onGoToTab }: HomePanelProps) {
               <ContinueReadingCard
                 entry={continueItem.entry}
                 percentage={continueItem.meta.percentage}
-                coverKind={coverKind as "activity_kv" | "chapter_cover"}
-                coverToken={coverToken}
                 onOpen={() => onSelectStory(continueItem.entry)}
               />
             ) : installed ? (
@@ -247,14 +239,10 @@ function SectionTitle({ icon: Icon, title }: { icon: typeof BookOpen; title: str
 function ContinueReadingCard({
   entry,
   percentage,
-  coverKind,
-  coverToken,
   onOpen,
 }: {
   entry: StoryEntry;
   percentage: number;
-  coverKind: "activity_kv" | "chapter_cover";
-  coverToken: string | null;
   onOpen: () => void;
 }) {
   const pct = Math.max(0, Math.min(100, Math.round(percentage * 100)));
@@ -265,7 +253,7 @@ function ContinueReadingCard({
       aria-label={`继续阅读 ${entry.storyName}`}
     >
       <div className="story-card-cover aspect-[16/9]">
-        <AssetImage kind={coverKind} token={coverToken} tint="tint" alt={entry.storyName} />
+        <StoryThumbnail story={entry} alt={entry.storyName} lazy={false} tint="soft" />
         <div className="absolute bottom-4 left-5 right-5 z-10 space-y-1.5">
           <div className="text-[10px] uppercase tracking-[0.22em] text-[hsl(var(--color-primary))]">
             Continue Reading
@@ -361,7 +349,7 @@ function RecentCard({
       className="story-card flex w-full items-stretch gap-3 p-3 text-left transition-transform active:scale-[0.99]"
     >
       <div className="relative h-16 w-24 flex-shrink-0 overflow-hidden rounded-lg">
-        <AssetImage kind="chapter_cover" token={entry.storyGroup} alt={entry.storyName} />
+        <StoryThumbnail story={entry} alt={entry.storyName} />
       </div>
       <div className="min-w-0 flex-1">
         <div className="flex items-baseline justify-between gap-2">

@@ -5,12 +5,16 @@ import { Button } from "@/components/ui/button";
 import { CustomScrollArea } from "@/components/ui/custom-scroll-area";
 import { Input } from "@/components/ui/input";
 import { Collapsible } from "@/components/ui/collapsible";
-import { ArrowLeft, Loader2 } from "lucide-react";
+import { ArrowLeft, Loader2, Shuffle } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { CharacterAvatar } from "@/components/CharacterAvatar";
 
 interface CharactersPanelProps {
   onOpenStory: (story: StoryEntry, character: string) => void;
+  onOpenStoryJump?: (
+    story: StoryEntry,
+    jump: { segmentIndex: number; preview?: string },
+  ) => void;
 }
 
 interface CharacterStatsPerStory {
@@ -27,6 +31,8 @@ interface CharacterAggregate {
 interface CharacterQuote {
   text: string;
   storyName: string;
+  story: StoryEntry;
+  segmentIndex: number;
 }
 
 type GroupCategory = "main" | "activity" | "memory" | "other";
@@ -49,7 +55,7 @@ function countCharactersInStory(content: ParsedStoryContent): Map<string, number
   return map;
 }
 
-export function CharactersPanel({ onOpenStory }: CharactersPanelProps) {
+export function CharactersPanel({ onOpenStory, onOpenStoryJump }: CharactersPanelProps) {
   const [loading, setLoading] = useState(true);
   const [progress, setProgress] = useState({ current: 0, total: 0 });
   const [error, setError] = useState<string | null>(null);
@@ -63,7 +69,9 @@ export function CharactersPanel({ onOpenStory }: CharactersPanelProps) {
   const [cacheBuiltAt, setCacheBuiltAt] = useState<number | null>(null);
   const [version, setVersion] = useState<string | null>(null);
   const [quotes, setQuotes] = useState<CharacterQuote[]>([]);
+  const [quoteCandidates, setQuoteCandidates] = useState<CharacterQuote[]>([]);
   const [loadingQuotes, setLoadingQuotes] = useState(false);
+  const [quoteShuffleSeed, setQuoteShuffleSeed] = useState(0);
   const quotesRunRef = useRef(0);
 
   const CACHE_PREFIX = "arknights-characters-cache";
@@ -309,12 +317,14 @@ export function CharactersPanel({ onOpenStory }: CharactersPanelProps) {
     if (!selected || !selectedAgg) {
       quotesRunRef.current += 1;
       setQuotes([]);
+      setQuoteCandidates([]);
       setLoadingQuotes(false);
       return;
     }
     const runId = ++quotesRunRef.current;
     setLoadingQuotes(true);
     setQuotes([]);
+    setQuoteCandidates([]);
 
     const perStory = selectedAgg.perStory;
     Promise.all(
@@ -322,11 +332,12 @@ export function CharactersPanel({ onOpenStory }: CharactersPanelProps) {
         try {
           const content = await api.getStoryContent(story.storyTxt);
           const hits: CharacterQuote[] = [];
-          content.segments.forEach((seg) => {
+          content.segments.forEach((seg, segmentIndex) => {
             if (seg.type === "dialogue" && seg.characterName === selected) {
               const text = seg.text.trim();
-              if (text.length > 0) {
-                hits.push({ text, storyName: story.storyName });
+              // 过滤过短（通常无信息量）与过长（不适合当金句展示）的句子
+              if (text.length >= 10 && text.length <= 160) {
+                hits.push({ text, storyName: story.storyName, story, segmentIndex });
               }
             }
           });
@@ -339,8 +350,11 @@ export function CharactersPanel({ onOpenStory }: CharactersPanelProps) {
       .then((all) => {
         if (runId !== quotesRunRef.current) return;
         const flat = all.flat();
+        // 依长度降序取较大的候选池（最多 60 条），再在 UI 层随机抽 5 条
         flat.sort((a, b) => b.text.length - a.text.length);
-        setQuotes(flat.slice(0, 3));
+        const pool = flat.slice(0, 60);
+        setQuoteCandidates(pool);
+        setQuoteShuffleSeed((s) => s + 1);
         setLoadingQuotes(false);
       })
       .catch(() => {
@@ -348,6 +362,39 @@ export function CharactersPanel({ onOpenStory }: CharactersPanelProps) {
         setLoadingQuotes(false);
       });
   }, [selected, selectedAgg]);
+
+  // 根据候选池与 shuffle 种子随机挑选 5 条作为展示金句
+  useEffect(() => {
+    if (quoteCandidates.length === 0) {
+      setQuotes([]);
+      return;
+    }
+    const pool = [...quoteCandidates];
+    // Fisher–Yates 洗牌
+    for (let i = pool.length - 1; i > 0; i -= 1) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [pool[i], pool[j]] = [pool[j], pool[i]];
+    }
+    setQuotes(pool.slice(0, 5));
+  }, [quoteCandidates, quoteShuffleSeed]);
+
+  const handleShuffleQuotes = useCallback(() => {
+    setQuoteShuffleSeed((s) => s + 1);
+  }, []);
+
+  const handleQuoteClick = useCallback(
+    (quote: CharacterQuote) => {
+      if (onOpenStoryJump) {
+        onOpenStoryJump(quote.story, {
+          segmentIndex: quote.segmentIndex,
+          preview: quote.text,
+        });
+      } else {
+        onOpenStory(quote.story, selectedAgg?.name ?? "");
+      }
+    },
+    [onOpenStory, onOpenStoryJump, selectedAgg],
+  );
 
   return (
     <div className="h-full flex flex-col">
@@ -372,8 +419,9 @@ export function CharactersPanel({ onOpenStory }: CharactersPanelProps) {
       <CustomScrollArea
         className="flex-1"
         trackOffsetTop="calc(3.25rem + 10px)"
+        trackOffsetBottom="calc(4.5rem + env(safe-area-inset-bottom, 0px))"
       >
-        <div className="p-4 space-y-4">
+        <div className="p-4 pb-24 space-y-4">
           {loading && (
             <div className="flex items-center gap-3 text-sm text-[hsl(var(--color-muted-foreground))]">
               <Loader2 className="h-4 w-4 animate-spin" />
@@ -447,23 +495,40 @@ export function CharactersPanel({ onOpenStory }: CharactersPanelProps) {
                   className="rounded-lg border border-[hsl(var(--color-border))] bg-[hsl(var(--color-card))] p-4 space-y-3"
                   style={{ minHeight: 80 }}
                 >
-                  <div className="text-sm font-medium">金句</div>
+                  <div className="flex items-center justify-between">
+                    <div className="text-sm font-medium">金句</div>
+                    {quoteCandidates.length > quotes.length && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-7 px-2 text-xs text-[hsl(var(--color-muted-foreground))]"
+                        onClick={handleShuffleQuotes}
+                        aria-label="换一批金句"
+                      >
+                        <Shuffle className="h-3.5 w-3.5 mr-1" />
+                        换一批
+                      </Button>
+                    )}
+                  </div>
                   {quotes.map((quote, i) => (
-                    <blockquote
-                      key={i}
-                      className="relative pl-6 text-sm leading-relaxed text-[hsl(var(--color-foreground))]"
+                    <button
+                      key={`${quote.story.storyId}-${quote.segmentIndex}-${i}`}
+                      type="button"
+                      onClick={() => handleQuoteClick(quote)}
+                      className="relative block w-full pl-6 pr-2 py-1 text-left text-sm leading-relaxed text-[hsl(var(--color-foreground))] rounded-md transition-colors hover:bg-[hsl(var(--color-secondary))] focus:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--color-ring))]"
+                      aria-label={`跳转到 ${quote.storyName} 中的这句话`}
                     >
                       <span
                         aria-hidden="true"
                         className="absolute left-0 top-0 text-2xl leading-none text-[hsl(var(--color-muted-foreground))] select-none"
                       >
-                        “
+                        &ldquo;
                       </span>
                       <div className="whitespace-pre-wrap break-words">{quote.text}</div>
                       <div className="mt-1 text-xs text-[hsl(var(--color-muted-foreground))]">
                         —— {selectedAgg.name} · {quote.storyName}
                       </div>
-                    </blockquote>
+                    </button>
                   ))}
                 </div>
               )}
