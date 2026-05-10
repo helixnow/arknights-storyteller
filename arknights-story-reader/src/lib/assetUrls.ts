@@ -64,8 +64,6 @@ function avatarCandidates(token: string, index: CharacterIndex | null): string[]
   const cid = resolveCharId(token, index);
   if (!cid) return [];
   return [
-    // 内置头像（打包在 public/bundled/avatar/，无网络开销）
-    `/bundled/avatar/${cid}.png`,
     `${YUANYAN}/avatar/${cid}.png`,
     `${FEXLI}/charpor/${cid}.png`,
     `${PUPPIIZ}/avatars/${cid}.png`,
