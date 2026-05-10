@@ -75,7 +75,13 @@ export function CharactersPanel({ onOpenStory, onOpenStoryJump }: CharactersPane
   const quotesRunRef = useRef(0);
 
   const CACHE_PREFIX = "arknights-characters-cache";
-  const getCacheKey = useCallback((v: string) => `${CACHE_PREFIX}:${v}`, []);
+  // 缓存 key 只取 commit hash 部分（版本字符串前 7 位），忽略时间戳。
+  // 这样只要底层数据没变（同一个 commit），缓存就一直有效，不会因为
+  // 重启或重新同步（同版本）而失效。
+  const getCacheKey = useCallback((v: string) => {
+    const commitPart = v.split(" ")[0] || v;
+    return `${CACHE_PREFIX}:${commitPart}`;
+  }, []);
 
   const loadAll = useCallback(async (opts?: { forceRefresh?: boolean }) => {
     if (loadingRef.current) return;
