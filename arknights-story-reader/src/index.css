@@ -4,26 +4,77 @@
 
 @font-face {
   font-family: "Arknights Noto Sans SC";
-  src: url("/fonts/NotoSansSC-Regular.woff2") format("woff2");
+  src: url("/fonts/subset/NotoSansSC-latin.woff2") format("woff2");
   font-weight: 400;
   font-style: normal;
   font-display: swap;
+  unicode-range: U+0020-00FF, U+2000-206F, U+2E80-2EFF, U+3000-303F, U+FF00-FFEF;
+}
+@font-face {
+  font-family: "Arknights Noto Sans SC";
+  src: url("/fonts/subset/NotoSansSC-common.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+  unicode-range: U+4E00-9FFF;
+}
+@font-face {
+  font-family: "Arknights Noto Sans SC";
+  src: url("/fonts/subset/NotoSansSC-ext.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+  unicode-range: U+3400-4DBF, U+20000-2A6DF;
 }
 
 @font-face {
   font-family: "Arknights Noto Serif SC";
-  src: url("/fonts/NotoSerifSC-Regular.woff2") format("woff2");
+  src: url("/fonts/subset/NotoSerifSC-latin.woff2") format("woff2");
   font-weight: 400;
   font-style: normal;
   font-display: swap;
+  unicode-range: U+0020-00FF, U+2000-206F, U+2E80-2EFF, U+3000-303F, U+FF00-FFEF;
+}
+@font-face {
+  font-family: "Arknights Noto Serif SC";
+  src: url("/fonts/subset/NotoSerifSC-common.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+  unicode-range: U+4E00-9FFF;
+}
+@font-face {
+  font-family: "Arknights Noto Serif SC";
+  src: url("/fonts/subset/NotoSerifSC-ext.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+  unicode-range: U+3400-4DBF, U+20000-2A6DF;
 }
 
 @font-face {
   font-family: "Arknights LXGW WenKai";
-  src: url("/fonts/LXGWWenKai-Regular.woff2") format("woff2");
+  src: url("/fonts/subset/LXGWWenKai-latin.woff2") format("woff2");
   font-weight: 400;
   font-style: normal;
   font-display: swap;
+  unicode-range: U+0020-00FF, U+2000-206F, U+2E80-2EFF, U+3000-303F, U+FF00-FFEF;
+}
+@font-face {
+  font-family: "Arknights LXGW WenKai";
+  src: url("/fonts/subset/LXGWWenKai-common.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+  unicode-range: U+4E00-9FFF;
+}
+@font-face {
+  font-family: "Arknights LXGW WenKai";
+  src: url("/fonts/subset/LXGWWenKai-ext.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+  unicode-range: U+3400-4DBF, U+20000-2A6DF;
 }
 
 :root,
@@ -39,15 +90,58 @@
   --color-secondary: 0 0% 95%;
   --color-secondary-foreground: 0 0% 12%;
   --color-muted: 0 0% 92%;
-  --color-muted-foreground: 0 0% 38%;
+  --color-muted-foreground: 0 0% 36%;
   --color-accent: 0 0% 93%;
   --color-accent-foreground: 0 0% 12%;
   --color-destructive: 0 84.2% 60.2%;
   --color-destructive-foreground: 0 0% 100%;
-  --color-border: 0 0% 88%;
-  --color-input: 0 0% 88%;
+  --color-success: 142 72% 35%;
+  --color-success-foreground: 0 0% 100%;
+  --color-warning: 38 92% 50%;
+  --color-warning-foreground: 0 0% 100%;
+  --color-border: 0 0% 86%;
+  --color-input: 0 0% 86%;
   --color-ring: 0 0% 12%;
   --radius: 0.5rem;
+
+  /* ============================================================= */
+  /* Liquid Glass design tokens (v1)                                */
+  /* ---                                                            */
+  /* Three-tier material stack modelled on iOS 26 Liquid Glass:     */
+  /*   thin     → floating toolbars / pills (low blur, low opacity) */
+  /*   regular  → bottom-nav-like islands (mid blur, mid opacity)   */
+  /*   thick    → sheets / dialogs that must obscure page content   */
+  /*                                                                */
+  /* All utility classes below read from these variables so a theme */
+  /* can retune the whole system by overriding the tokens.          */
+  /* ============================================================= */
+  --glass-blur-thin: 18px;
+  --glass-blur-regular: 28px;
+  --glass-blur-thick: 40px;
+  --glass-saturate: 180%;
+
+  --glass-opacity-thin: 0.55;
+  --glass-opacity-regular: 0.7;
+  --glass-opacity-thick: 0.82;
+
+  /* RGB channel for the inner edge-of-glass highlight so we can control
+     alpha separately per theme. Light themes keep a bright highlight;
+     dark themes dim it so the edge doesn't look like a hairline border. */
+  --glass-highlight-rgb: 255 255 255;
+  --glass-highlight-alpha: 0.12;
+
+  --glass-shadow-soft: 0 20px 48px -22px hsl(0 0% 0% / 0.18);
+  --glass-shadow-lifted: 0 32px 72px -28px hsl(0 0% 0% / 0.28);
+
+  --radius-sheet: 28px;
+  --radius-pane: 22px;
+  --radius-row: 14px;
+
+  /* iOS-standard spring curves. `spring` is the default "soft spring" used
+     for sheets and controls; `spring-snappy` overshoots slightly and is
+     reserved for short, delightful motions like button press rebound. */
+  --ease-spring: cubic-bezier(0.32, 0.72, 0, 1);
+  --ease-spring-snappy: cubic-bezier(0.34, 1.56, 0.64, 1);
 }
 
 :root[data-theme-color="book"] {
@@ -129,14 +223,30 @@
   --color-secondary: 0 0% 18%;
   --color-secondary-foreground: 0 0% 96%;
   --color-muted: 0 0% 24%;
-  --color-muted-foreground: 0 0% 70%;
+  --color-muted-foreground: 0 0% 74%;
   --color-accent: 0 0% 22%;
   --color-accent-foreground: 0 0% 96%;
   --color-destructive: 0 62.8% 30.6%;
   --color-destructive-foreground: 0 0% 96%;
-  --color-border: 0 0% 24%;
-  --color-input: 0 0% 24%;
+  --color-success: 142 58% 55%;
+  --color-success-foreground: 0 0% 12%;
+  --color-warning: 40 85% 62%;
+  --color-warning-foreground: 0 0% 12%;
+  --color-border: 0 0% 26%;
+  --color-input: 0 0% 26%;
   --color-ring: 0 0% 65%;
+
+  /* Dark-mode retuning of the glass tokens. The background is already
+     very dark so we push opacity up — otherwise the sheet looks like a
+     ghostly frame rather than a material. Highlight alpha drops because
+     a bright 12% edge reads as a hairline border on near-black glass. */
+  --glass-opacity-thin: 0.5;
+  --glass-opacity-regular: 0.62;
+  --glass-opacity-thick: 0.78;
+  --glass-highlight-rgb: 255 255 255;
+  --glass-highlight-alpha: 0.06;
+  --glass-shadow-soft: 0 20px 48px -22px hsl(0 0% 0% / 0.55);
+  --glass-shadow-lifted: 0 32px 72px -28px hsl(0 0% 0% / 0.7);
 }
 
 .dark[data-theme-color="book"],
@@ -224,11 +334,16 @@ html, body, #root {
 body {
   background-color: hsl(var(--color-background));
   color: hsl(var(--color-foreground));
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'HarmonyOS Sans SC', 'Microsoft YaHei', 'Roboto', 'Oxygen',
     'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
     sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  /* 我们打包的 woff2 子集只含 400 weight。允许浏览器对 700 做合成粗体，
+     避免退回到 text-shadow 这类 hack。实际 macOS/iOS/Windows 上通常还会
+     再落回到系统的 PingFang / 微软雅黑 的真粗体。 */
+  font-synthesis: weight;
 }
 
 /* 页面统一左右留白与最大宽度 */
@@ -237,25 +352,78 @@ body {
   max-width: 68rem; /* ~1088px，阅读更舒适 */
   margin-left: auto;
   margin-right: auto;
-  padding-left: 1rem;  /* 16px */
-  padding-right: 1rem; /* 16px */
+  padding-left: max(1rem, env(safe-area-inset-left, 0px));
+  padding-right: max(1rem, env(safe-area-inset-right, 0px));
 }
 
 @media (min-width: 768px) {
-  .container { padding-left: 1.25rem; padding-right: 1.25rem; }
+  .container {
+    padding-left: max(1.25rem, env(safe-area-inset-left, 0px));
+    padding-right: max(1.25rem, env(safe-area-inset-right, 0px));
+  }
 }
 @media (min-width: 1024px) {
-  .container { padding-left: 1.5rem; padding-right: 1.5rem; }
+  .container {
+    padding-left: max(1.5rem, env(safe-area-inset-left, 0px));
+    padding-right: max(1.5rem, env(safe-area-inset-right, 0px));
+  }
 }
 
 /* 阅读器主题与排版优化 */
 .reader-surface {
-  background: hsl(var(--color-background));
-  color: hsl(var(--color-foreground));
+  --reader-bg: hsl(var(--color-background));
+  --reader-fg: hsl(var(--color-foreground));
+  --reader-accent: hsl(var(--color-primary));
+  background: var(--reader-bg);
+  color: var(--reader-fg);
+  transition: background-color 0.3s ease, color 0.3s ease;
+}
+
+.reader-surface[data-reader-theme="sepia"] {
+  --reader-bg: #f5ecd7;
+  --reader-fg: #4a3a20;
+  --reader-accent: #8c5a2e;
+}
+
+.reader-surface[data-reader-theme="green"] {
+  --reader-bg: #d7ebd2;
+  --reader-fg: #22301d;
+  --reader-accent: #2f6f33;
+}
+
+.reader-surface[data-reader-theme="dark"] {
+  --reader-bg: #0e1014;
+  --reader-fg: #d9d9d9;
+  --reader-accent: #6aa6ff;
+}
+
+.reader-surface[data-reader-theme="paper"] {
+  --reader-bg: #fafafa;
+  --reader-fg: #1a1a1a;
+  --reader-accent: #1f4fa8;
+}
+
+/* Aligned foreground for bits that used to pull from the global theme. */
+.reader-surface[data-reader-theme="sepia"] .reader-text,
+.reader-surface[data-reader-theme="green"] .reader-text,
+.reader-surface[data-reader-theme="dark"] .reader-text,
+.reader-surface[data-reader-theme="paper"] .reader-text {
+  color: var(--reader-fg);
+}
+
+.reader-surface[data-reader-theme="sepia"] .reader-character-name,
+.reader-surface[data-reader-theme="green"] .reader-character-name,
+.reader-surface[data-reader-theme="dark"] .reader-character-name,
+.reader-surface[data-reader-theme="paper"] .reader-character-name,
+.reader-surface[data-reader-theme="sepia"] .reader-header,
+.reader-surface[data-reader-theme="green"] .reader-header,
+.reader-surface[data-reader-theme="dark"] .reader-header,
+.reader-surface[data-reader-theme="paper"] .reader-header {
+  color: var(--reader-accent);
 }
 
 .reader-content {
-  max-width: 48rem;
+  max-width: var(--reader-max-width, 48rem);
   margin-left: auto;
   margin-right: auto;
   padding: 2rem 1.5rem;
@@ -274,30 +442,19 @@ body {
 }
 
 .reader-character-name {
-  font-weight: 600;
+  font-weight: 700;
   color: hsl(var(--color-primary));
-  margin-bottom: 0.2rem;
+  margin-bottom: 0.35rem;
   display: block;
   font-size: 1.05em;
-}
-
-:root[data-theme-color="default"] .reader-character-name,
-:root.dark[data-theme-color="default"] .reader-character-name,
-.dark[data-theme-color="default"] .reader-character-name {
-  font-weight: 900;
-  letter-spacing: 0.02em;
-  text-shadow:
-    0.02em 0 currentColor,
-    -0.02em 0 currentColor,
-    0 0.02em currentColor,
-    0 -0.02em currentColor;
+  letter-spacing: 0.01em;
 }
 
 .reader-narration {
-  font-style: italic;
-  color: hsl(var(--color-muted-foreground) / 0.8);
+  color: hsl(var(--color-muted-foreground) / 0.9);
   padding-left: 1rem;
-  border-left: 3px solid hsl(var(--color-muted) / 0.3);
+  border-left: 3px solid hsl(var(--color-muted) / 0.45);
+  letter-spacing: 0.02em;
 }
 
 .reader-summary {
@@ -370,6 +527,10 @@ body {
   gap: 0.5rem;
   margin-bottom: 0.35rem;
   color: hsl(var(--color-foreground) / 0.9);
+}
+
+.reader-decision-option > span:nth-child(2) {
+  flex: 1;
 }
 
 .reader-decision-option:last-child {
@@ -455,17 +616,43 @@ body {
 
 .reader-search-highlight {
   position: relative;
-  box-shadow: 0 0 0 2px hsl(var(--color-primary) / 0.45);
+  /* Double-ring emphasis — primary color glow with a soft fill so the hit
+   * reads instantly even on dense pages. */
+  background: hsl(var(--color-primary) / 0.1);
+  box-shadow:
+    0 0 0 2px hsl(var(--color-primary) / 0.55),
+    0 0 0 6px hsl(var(--color-primary) / 0.18);
+  border-radius: 0.5rem;
+  transition: background 0.4s ease, box-shadow 0.4s ease;
+}
+
+/* Attention pulse played once after navigation so the user can catch the
+ * hit location even if the smooth-scroll lands them in the middle of a
+ * tall paragraph. Applied via data attribute so it auto-removes without
+ * interfering with the steady-state `.reader-search-highlight` styling.
+ */
+.reader-search-highlight[data-search-pulse="true"] {
+  animation: reader-search-pulse 1.6s ease-out 1;
+}
+
+@keyframes reader-search-pulse {
+  0%   { box-shadow: 0 0 0 0 hsl(var(--color-primary) / 0.0),   0 0 0 0 hsl(var(--color-primary) / 0.0); }
+  20%  { box-shadow: 0 0 0 3px hsl(var(--color-primary) / 0.75), 0 0 0 10px hsl(var(--color-primary) / 0.25); }
+  60%  { box-shadow: 0 0 0 3px hsl(var(--color-primary) / 0.55), 0 0 0 14px hsl(var(--color-primary) / 0.0); }
+  100% { box-shadow: 0 0 0 2px hsl(var(--color-primary) / 0.55), 0 0 0 6px  hsl(var(--color-primary) / 0.18); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .reader-search-highlight[data-search-pulse="true"] {
+    animation: none;
+  }
 }
 
 .reader-search-highlight::after {
-  content: "";
-  position: absolute;
-  inset: -4px;
-  border-radius: inherit;
-  background: linear-gradient(120deg, hsl(var(--color-primary) / 0.2), transparent 60%);
-  pointer-events: none;
-  z-index: -1;
+  /* Legacy halo overlay is now expressed via the double box-shadow above;
+     keep this rule as a no-op to avoid inheriting stale gradients in case
+     a parent stylesheet re-enables ::after. */
+  content: none;
 }
 
 .reader-character-highlight {
@@ -475,9 +662,18 @@ body {
 
 .reader-subtitle {
   margin-bottom: 1.5rem;
-  font-style: italic;
-  color: hsl(var(--color-foreground));
+  color: hsl(var(--color-foreground) / 0.9);
   text-align: center;
+  letter-spacing: 0.12em;
+  font-weight: 500;
+}
+
+.reader-ellipsis {
+  margin-bottom: 1.5rem;
+  text-align: center;
+  color: hsl(var(--color-muted-foreground) / 0.6);
+  letter-spacing: 0.5em;
+  user-select: none;
 }
 
 .reader-sticker {
@@ -487,6 +683,9 @@ body {
   background: hsl(var(--color-accent) / 0.15);
   color: hsl(var(--color-foreground) / 0.95);
   white-space: pre-line;
+  font-family: "JetBrains Mono", "Sarasa Mono SC", ui-monospace, monospace;
+  letter-spacing: 0.04em;
+  border: 1px solid hsl(var(--color-primary) / 0.18);
 }
 
 .reader-header {
@@ -496,6 +695,24 @@ body {
   letter-spacing: 0.04em;
   text-align: center;
   color: hsl(var(--color-primary));
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 1rem;
+}
+
+.reader-header::before,
+.reader-header::after {
+  content: "";
+  display: block;
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    hsl(var(--color-border)) 40%,
+    hsl(var(--color-border)) 60%,
+    transparent
+  );
 }
 
 .reader-scroll {
@@ -641,12 +858,462 @@ input[type="range"]::-moz-range-thumb {
   box-shadow: 0 10px 24px rgba(8, 47, 73, 0.35);
 }
 
+/*
+ * On touch devices, auto-hide the thumb but don't hide entirely — the user
+ * should still see a transient position indicator while scrolling, and the
+ * drag area is disabled by `pointer-events: none` in the default style.
+ */
 @media (pointer: coarse) {
-  .scroll-area__track {
-    display: none;
+  .scroll-area__thumb {
+    cursor: default;
+    width: 0.3rem;
   }
 }
 
 .touch-action-none {
   touch-action: none;
 }
+
+/* ===== 性能优化：视口外段落跳过布局 ===== */
+.reader-segment {
+  content-visibility: auto;
+  contain-intrinsic-size: 1px 120px;
+}
+
+/* ===== 三种段落高亮的互斥优先级 ===== */
+/* 搜索命中 > 角色高亮 > 划线收藏，避免渐变与边框叠加造成视觉糊 */
+.reader-search-highlight.reader-character-highlight {
+  /* 搜索命中时抑制角色高亮的左边框 */
+  border-left: none;
+  background: none;
+}
+.reader-search-highlight.reader-highlighted {
+  /* When the user also has this segment highlighted, trust the outer ring
+     — suppress the highlight background fill to avoid double-layering. */
+  background: hsl(var(--color-primary) / 0.08);
+}
+.reader-character-highlight.reader-highlighted:not(.reader-search-highlight) {
+  /* 角色高亮优先于划线收藏背景 */
+  background: linear-gradient(135deg, hsl(var(--color-primary) / 0.18), transparent 65%);
+}
+
+/* ===== 尊重 prefers-reduced-motion ===== */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+  .reader-scroll {
+    scroll-behavior: auto;
+  }
+}
+
+/* ============================================================= */
+/* 素材系统 (v1.11)                                               */
+/* ============================================================= */
+
+.asset-image-slot {
+  background: hsl(var(--color-muted) / 0.25);
+}
+
+.asset-image {
+  /* 避免 Safari 老式加载时闪一下黑色。 */
+  background: transparent;
+}
+
+/* 默认"柔和"tint：降饱和 + 与主题色混色，让素材融入纸质阅读风。
+   只用在封面/插画这种"装饰"区域；头像不要加 filter，会让每个头像
+   都变成独立合成层，400+ 一屏时滚动严重掉帧。 */
+.asset-tinted {
+  filter: saturate(0.85);
+}
+.asset-tinted--strong {
+  filter: saturate(0.7) brightness(0.96);
+}
+.dark .asset-tinted {
+  filter: saturate(0.78) brightness(0.94);
+}
+.dark .asset-tinted--strong {
+  filter: saturate(0.6) brightness(0.86);
+}
+
+/* 极简模式：隐藏所有装饰素材与封面区块。 */
+:root[data-minimal="true"] .asset-image-slot,
+:root[data-minimal="true"] .story-card-cover,
+:root[data-minimal="true"] .reader-segment-image,
+:root[data-minimal="true"] .reader-header-cover,
+:root[data-minimal="true"] .character-avatar {
+  display: none !important;
+}
+:root[data-minimal="true"] .reader-dialogue {
+  padding-left: 0 !important;
+}
+
+/* 阅读器内插画段：不使用任何容器装饰，原始图片居中展示。
+ * 横图、方图、竖图都按自身尺寸呈现，最大不超过正文栏宽度。
+ */
+.reader-segment-image {
+  margin: 1.25rem 0;
+  /* 抵消 `.reader-segment` 的右内边距，让图片相对正文栏真正居中 */
+  padding-right: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  overflow: visible;
+}
+.reader-segment-image > .asset-image-slot {
+  width: auto;
+  max-width: 100%;
+  background: transparent;
+}
+.reader-segment-image .asset-image {
+  border-radius: 0;
+}
+.reader-segment-image-caption {
+  margin-top: 0.5rem;
+  margin-bottom: 0.5rem;
+  font-size: 0.85rem;
+  color: hsl(var(--color-muted-foreground));
+  text-align: center;
+}
+
+/* 章节 header 背景化 */
+.reader-header-cover {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  margin: 1.5rem 0 1rem;
+  border-radius: 1rem;
+  overflow: hidden;
+  border: 1px solid hsl(var(--color-border) / 0.6);
+}
+.reader-header-cover::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    180deg,
+    transparent 35%,
+    hsl(var(--color-background) / 0.88) 100%
+  );
+}
+.reader-header-cover__label {
+  position: absolute;
+  left: 1.25rem;
+  right: 1.25rem;
+  bottom: 1rem;
+  z-index: 2;
+  color: hsl(var(--color-primary));
+  font-size: 1.1rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-shadow: 0 1px 2px hsl(var(--color-background) / 0.6);
+}
+
+/* 卡片封面 */
+.story-card {
+  position: relative;
+  border-radius: 1rem;
+  overflow: hidden;
+  border: 1px solid hsl(var(--color-border));
+  background: hsl(var(--color-card));
+  transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+  /* 视口外卡片跳过绘制/布局。每张卡的 memory-bg 都有 filter: blur(14px)，
+     一屏 10+ 张会生成等量的独立合成层，把 WKWebView 的合成器挤爆——导致
+     bottom-nav-glass 的 backdrop-filter 在滚动停止后无法刷新采样，玻璃
+     效果"失焦失效、hover 触发 repaint 才恢复"。
+     加上 content-visibility + contain 后，真正在视口里的卡片数 ≤ 10，
+     合成器压力降一个数量级，导航背景就能稳定刷新。 */
+  content-visibility: auto;
+  contain-intrinsic-size: 1px 88px;
+  contain: layout paint style;
+}
+.story-card:hover {
+  border-color: hsl(var(--color-primary) / 0.5);
+}
+.story-card-cover {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  background: hsl(var(--color-secondary) / 0.4);
+}
+.story-card-cover::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    160deg,
+    transparent 30%,
+    hsl(var(--color-card) / 0.65) 100%
+  );
+  pointer-events: none;
+}
+.story-card-body {
+  padding: 0.9rem 1rem 1rem;
+}
+.story-card-code {
+  display: inline-block;
+  padding: 0.12rem 0.55rem;
+  border-radius: 9999px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  background: hsl(var(--color-primary) / 0.12);
+  color: hsl(var(--color-primary));
+}
+.story-card-meta {
+  font-size: 0.75rem;
+  color: hsl(var(--color-muted-foreground));
+}
+
+/* 卡片背景：密录用精二立绘，其他类别复用 StoryThumbnail 的多级兜底
+   链。效果统一——毛玻璃 + 左侧卡片色渐变淡出，保证标题可读。 */
+.story-card-memory-bg {
+  overflow: hidden;
+  border-radius: inherit;
+  /* 把整块 blur + 缩放的背景 contain 成独立合成岛，避免它的图层
+     变化传播到父级，挤压 bottom-nav-glass 的 backdrop-filter 采样。 */
+  contain: strict;
+  transform: translateZ(0);
+}
+.story-card-memory-bg .asset-image,
+.story-card-memory-bg img {
+  object-fit: cover !important;
+  object-position: right 25%;
+  filter: blur(14px) saturate(1.05);
+  transform: scale(1.12);
+  opacity: 0.55;
+  /* 让图片留在自己的合成层里，而不是每次 paint 时重算一次 blur。 */
+  will-change: transform;
+}
+/* 隐藏装饰性 fallback：
+   - `.asset-image-fallback`：AssetImage（精二立绘加载中/失败）
+   - `.story-thumbnail-fallback`：StoryThumbnail 的纯渐变兜底
+   避免加载失败时冒出一个不协调的色块，卡片背景就保持干净的 card 底色。 */
+.story-card-memory-bg .asset-image-fallback,
+.story-card-memory-bg .story-thumbnail-fallback {
+  opacity: 0 !important;
+}
+.story-card-memory-overlay {
+  border-radius: inherit;
+  background: linear-gradient(
+    90deg,
+    hsl(var(--color-card) / 0.96) 0%,
+    hsl(var(--color-card) / 0.88) 40%,
+    hsl(var(--color-card) / 0.45) 100%
+  );
+}
+
+/* 浮岛 Glass BottomNav
+ *
+ * 重要：macOS WKWebView 在滚动停止后会"冻结" backdrop-filter 的采样，
+ * 导致导航背景看起来凭空消失，直到有什么触发重绘（比如 hover）才恢复。
+ * 解决方案是强制把导航提到独立的合成层上，让合成器持续刷新它。
+ *   - translateZ(0)：提层
+ *   - will-change: backdrop-filter, transform：告诉浏览器这层要频繁刷新
+ *   - isolation: isolate：隔绝上层 stacking context 的影响，避免某些
+ *     Safari 版本在祖先含 filter/transform 时把 backdrop-filter 当成无效
+ */
+.bottom-nav-glass {
+  position: fixed;
+  left: max(0.75rem, env(safe-area-inset-left, 0px));
+  right: max(0.75rem, env(safe-area-inset-right, 0px));
+  bottom: max(0.5rem, env(safe-area-inset-bottom, 0px));
+  border-radius: 28px;
+  border: 1px solid hsl(var(--color-foreground) / 0.08);
+  background: hsl(var(--color-background) / var(--glass-opacity-regular));
+  backdrop-filter: blur(var(--glass-blur-regular)) saturate(var(--glass-saturate));
+  -webkit-backdrop-filter: blur(var(--glass-blur-regular)) saturate(var(--glass-saturate));
+  box-shadow:
+    inset 0 1px 0 rgb(var(--glass-highlight-rgb) / var(--glass-highlight-alpha)),
+    var(--glass-shadow-soft);
+  transform: translateZ(0);
+  will-change: backdrop-filter, transform;
+  isolation: isolate;
+}
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .bottom-nav-glass {
+    background: hsl(var(--color-background) / 0.96);
+  }
+}
+.bottom-nav-pill {
+  transition: background-color 0.2s ease, color 0.2s ease, transform 0.15s ease;
+}
+.bottom-nav-pill[aria-selected="true"] {
+  background: hsl(var(--color-primary) / 0.14);
+  color: hsl(var(--color-primary));
+}
+
+/* 人物统计网格：视口外的卡片跳过绘制/布局。400+ 行的面板，
+   没有这个会整屏 repaint；加上之后滚动几乎没额外成本。 */
+.character-grid-cell {
+  content-visibility: auto;
+  contain-intrinsic-size: 1px 72px;
+  contain: layout paint style;
+}
+
+/* 对话段头像槽 */
+.reader-dialogue {
+  position: relative;
+  padding-left: 3rem;
+}
+.reader-dialogue-avatar {
+  position: absolute;
+  left: 0;
+  top: 0.2rem;
+  width: 2.25rem;
+  height: 2.25rem;
+}
+@media (max-width: 640px) {
+  .reader-dialogue {
+    padding-left: 2.6rem;
+  }
+  .reader-dialogue-avatar {
+    width: 2rem;
+    height: 2rem;
+  }
+}
+
+/* ============================================================= */
+/* Liquid Glass utilities                                         */
+/* ============================================================= */
+
+/*
+ * Base glass surface. Pair with one of `.glass-thin/.glass-regular/.glass-thick`
+ * (default is regular) to set blur + opacity, and with a radius utility
+ * (Tailwind's `rounded-*` or one of `.glass-sheet/.glass-pane/.glass-capsule`).
+ *
+ * Layering model:
+ *   background  → theme-tinted wash so content behind shows through
+ *   backdrop    → native blur + saturate for the real glass refraction
+ *   inner edge  → 1px inset highlight (light reflection on curved edge)
+ *   outer shadow → soft lift so the surface reads as "floating"
+ *
+ * The `@supports` fallback lands us on a near-opaque surface if the user's
+ * browser cannot composite `backdrop-filter` (older Android WebView, some
+ * EU browsers) so we never render a washed-out panel that shows the page
+ * bleeding through unblurred.
+ */
+.glass {
+  background: hsl(var(--color-background) / var(--glass-opacity-regular));
+  backdrop-filter: blur(var(--glass-blur-regular)) saturate(var(--glass-saturate));
+  -webkit-backdrop-filter: blur(var(--glass-blur-regular)) saturate(var(--glass-saturate));
+  border: 1px solid hsl(var(--color-foreground) / 0.08);
+  box-shadow:
+    inset 0 1px 0 rgb(var(--glass-highlight-rgb) / var(--glass-highlight-alpha)),
+    var(--glass-shadow-soft);
+}
+
+.glass-thin {
+  background: hsl(var(--color-background) / var(--glass-opacity-thin));
+  backdrop-filter: blur(var(--glass-blur-thin)) saturate(var(--glass-saturate));
+  -webkit-backdrop-filter: blur(var(--glass-blur-thin)) saturate(var(--glass-saturate));
+}
+
+.glass-regular {
+  background: hsl(var(--color-background) / var(--glass-opacity-regular));
+  backdrop-filter: blur(var(--glass-blur-regular)) saturate(var(--glass-saturate));
+  -webkit-backdrop-filter: blur(var(--glass-blur-regular)) saturate(var(--glass-saturate));
+}
+
+.glass-thick {
+  background: hsl(var(--color-background) / var(--glass-opacity-thick));
+  backdrop-filter: blur(var(--glass-blur-thick)) saturate(var(--glass-saturate));
+  -webkit-backdrop-filter: blur(var(--glass-blur-thick)) saturate(var(--glass-saturate));
+  box-shadow:
+    inset 0 1px 0 rgb(var(--glass-highlight-rgb) / var(--glass-highlight-alpha)),
+    var(--glass-shadow-lifted);
+}
+
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .glass,
+  .glass-thin,
+  .glass-regular,
+  .glass-thick {
+    background: hsl(var(--color-background) / 0.96);
+  }
+}
+
+/* Shape shortcuts so components can express intent, not pixels. */
+.glass-sheet { border-radius: var(--radius-sheet); }
+.glass-pane { border-radius: var(--radius-pane); }
+.glass-row { border-radius: var(--radius-row); }
+.glass-capsule { border-radius: 9999px; }
+
+/*
+ * Inset-grouped list row styling à la iOS Settings. Stack rows inside a
+ * `.glass.glass-pane` container and they visually merge into one slab,
+ * separated only by a hairline divider. No border per row.
+ */
+.glass-list {
+  display: flex;
+  flex-direction: column;
+}
+.glass-list > * + * {
+  border-top: 1px solid hsl(var(--color-foreground) / 0.06);
+}
+
+/*
+ * Section header label used above a `.glass-pane` group, mirroring the
+ * "SECTION" labels in iOS Settings. Kept tiny + uppercase so it defers
+ * to the content below.
+ */
+.glass-section-label {
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  color: hsl(var(--color-muted-foreground));
+  padding: 0 0.25rem 0.5rem;
+}
+
+/*
+ * Segmented control item — a pill that sits inside a `.glass-thin` track.
+ * Active state uses an opaque "chip" that looks as if it floats on top
+ * of the glass, matching iOS 26 segmented controls.
+ */
+.glass-segment-track {
+  display: inline-flex;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 9999px;
+  background: hsl(var(--color-foreground) / 0.06);
+  border: 1px solid hsl(var(--color-foreground) / 0.06);
+}
+.glass-segment-item {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.35rem 0.85rem;
+  border-radius: 9999px;
+  font-size: 0.82rem;
+  color: hsl(var(--color-muted-foreground));
+  transition: background-color 0.18s ease, color 0.18s ease;
+}
+.glass-segment-item[aria-selected="true"],
+.glass-segment-item[data-active="true"] {
+  background: hsl(var(--color-background));
+  color: hsl(var(--color-foreground));
+  box-shadow:
+    inset 0 1px 0 rgb(var(--glass-highlight-rgb) / var(--glass-highlight-alpha)),
+    0 2px 6px -2px hsl(0 0% 0% / 0.2);
+}
+
+/*
+ * Overlay scrim behind a sheet. Darker + faintly blurred so the
+ * transition from page → sheet feels like a layered glass stack rather
+ * than a flat modal dim.
+ */
+.glass-scrim {
+  background: hsl(0 0% 0% / 0.32);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+}
+
+/* iOS-default spring used by sheet slide-in/out and pill press rebound. */
+.ease-spring { transition-timing-function: var(--ease-spring); }
+.ease-spring-snappy { transition-timing-function: var(--ease-spring-snappy); }

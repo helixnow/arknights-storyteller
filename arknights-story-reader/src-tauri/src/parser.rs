@@ -15,8 +15,20 @@ lazy_static! {
         Regex::new(r"(?i)<p[^>]*>").expect("invalid paragraph tag regex");
 }
 
+/// Normalize a `char_XXX_name#N` token to `char_XXX_name`. Strips `#` skin
+/// variant suffixes so the frontend can directly map to the avatar repo.
+fn normalize_char_id(raw: &str) -> String {
+    let trimmed = raw.trim().trim_matches('"').trim_start_matches('$');
+    let without_skin = trimmed.split('#').next().unwrap_or(trimmed);
+    without_skin.to_string()
+}
+
 pub fn parse_story_text(content: &str) -> ParsedStoryContent {
     let mut segments = Vec::new();
+    // Tracks the most recent [Character(name="char_xxx")] declaration so
+    // dialogue lines below it can carry the speaker's charId. ArknightsAVG
+    // scripts always declare speaker *before* the dialogue line.
+    let mut current_char_id: Option<String> = None;
 
     for raw_line in content.lines() {
         let line = raw_line.trim();
@@ -25,7 +37,22 @@ pub fn parse_story_text(content: &str) -> ParsedStoryContent {
         }
 
         if line.starts_with('[') {
-            if let Some(segment) = parse_command_line(line) {
+            if let Some(cmd_end) = line.find(']') {
+                let inside = &line[1..cmd_end];
+                let (cmd, _) = split_command_and_attrs(inside);
+                let cmd_lower = cmd.to_ascii_lowercase();
+                if cmd_lower == "character" {
+                    // Update the current speaker's charId without emitting a
+                    // segment. Empty or missing `name` clears the state.
+                    let attrs = parse_attributes(inside);
+                    current_char_id = attrs
+                        .get("name")
+                        .map(|s| normalize_char_id(s))
+                        .filter(|s| s.starts_with("char_"));
+                    continue;
+                }
+            }
+            if let Some(segment) = parse_command_line(line, current_char_id.as_deref()) {
                 segments.push(segment);
             }
             continue;
@@ -40,7 +67,7 @@ pub fn parse_story_text(content: &str) -> ParsedStoryContent {
     ParsedStoryContent { segments }
 }
 
-fn parse_command_line(line: &str) -> Option<StorySegment> {
+fn parse_command_line(line: &str, current_char_id: Option<&str>) -> Option<StorySegment> {
     let end = line.find(']')?;
     let inside = &line[1..end];
     let remainder = line[end + 1..].trim();
@@ -66,10 +93,15 @@ fn parse_command_line(line: &str) -> Option<StorySegment> {
                     alignment: None,
                 });
             }
+            // `[name="xxx"]` 是对话显示名，权威来源。不要继承上一条
+            // `[Character(name="char_...")]` 的 charId——脚本常常在同一
+            // `[Character]` 还没翻页的情况下切换说话人（尤其罗德岛多人同场）。
+            // 让前端通过 `character_table` 用 `character_name` 反查 charId。
             Some(StorySegment::Dialogue {
                 character_name,
                 text,
                 position: None,
+                character_id: None,
             })
         }
         "multiline" => {
@@ -78,10 +110,12 @@ fn parse_command_line(line: &str) -> Option<StorySegment> {
             if text.is_empty() {
                 return None;
             }
+            // 同 `name`：显示名权威，不继承 current_char_id。
             Some(StorySegment::Dialogue {
                 character_name,
                 text,
                 position: None,
+                character_id: None,
             })
         }
         "decision" => {
@@ -142,9 +176,32 @@ fn parse_command_line(line: &str) -> Option<StorySegment> {
                 .filter(|s| !s.is_empty());
             Some(StorySegment::System { speaker, text })
         }
-        // 非文本指令一律忽略
-        "background" | "image" | "imagetween" | "character" | "playmusic" | "stopmusic"
-        | "playsound" | "delay" | "camerashake" | "blocker" => None,
+        // 非文本指令一律忽略（但 Image/PlayMusic 已在上方单独处理）。
+        // Background 被有意忽略：它是 AVG 的场景切换信号，一章会出现几十条，
+        // 当成 16:9 大图渲染会把正文切得稀碎；真正值得渲染的是 `[Image]`。
+        "background" | "imagetween" | "character" | "stopmusic" | "playsound" | "delay"
+        | "camerashake" | "blocker" => None,
+        "image" => {
+            // 原始形如：[Image(image="avg_8_34",screenadapt="coverall",fadetime=2)]
+            let token = attrs
+                .get("image")
+                .map(|s| s.trim().trim_matches('"').to_string())
+                .filter(|s| !s.is_empty())?;
+            let caption = attrs
+                .get("caption")
+                .or_else(|| attrs.get("text"))
+                .map(|s| clean_text(s))
+                .filter(|s| !s.is_empty());
+            Some(StorySegment::Image { token, caption })
+        }
+        "playmusic" => {
+            let key = attrs
+                .get("key")
+                .or_else(|| attrs.get("intro"))
+                .map(|s| s.trim().trim_matches('"').to_string())
+                .filter(|s| !s.is_empty())?;
+            Some(StorySegment::Music { key })
+        }
         "subtitle" => {
             let text = attrs
                 .get("text")
@@ -168,8 +225,8 @@ fn parse_command_line(line: &str) -> Option<StorySegment> {
             }
             Some(StorySegment::Header { title })
         }
-        "dialog" => parse_dialog_like(&attrs, remainder),
-        "voicewithin" => parse_dialog_like(&attrs, remainder),
+        "dialog" => parse_dialog_like(&attrs, remainder, current_char_id),
+        "voicewithin" => parse_dialog_like(&attrs, remainder, current_char_id),
         "narration" => {
             let text = if remainder.is_empty() {
                 attrs.get("text").map(|t| clean_text(t)).unwrap_or_default()
@@ -325,7 +382,11 @@ fn has_meaningful_content(text: &str) -> bool {
     true
 }
 
-fn parse_dialog_like(attrs: &HashMap<String, String>, remainder: &str) -> Option<StorySegment> {
+fn parse_dialog_like(
+    attrs: &HashMap<String, String>,
+    remainder: &str,
+    current_char_id: Option<&str>,
+) -> Option<StorySegment> {
     let text = if remainder.is_empty() {
         attrs.get("text").map(|t| clean_text(t)).unwrap_or_default()
     } else {
@@ -335,7 +396,31 @@ fn parse_dialog_like(attrs: &HashMap<String, String>, remainder: &str) -> Option
         return None;
     }
 
-    if let Some(character_name) = resolve_speaker(attrs) {
+    // Prefer explicit name/head/avatarid from attrs; fall back to the most
+    // recent [Character] declaration so dialog lines without their own speaker
+    // still inherit context.
+    let resolved = resolve_speaker(attrs);
+    let (character_name, character_id) = match resolved {
+        Some(name) => (Some(name), attrs
+            .get("head")
+            .or_else(|| attrs.get("name"))
+            .map(|s| normalize_char_id(s))
+            .filter(|s| s.starts_with("char_"))
+            .or_else(|| current_char_id.map(|s| s.to_string()))),
+        None => {
+            // No explicit speaker attr on this command — try the current speaker
+            // tracked from the last [Character] instruction.
+            if let Some(cid) = current_char_id {
+                // For display, try to humanize the charId; caller may replace
+                // with localized name client-side via character_table.
+                (Some(humanize_identifier(cid)), Some(cid.to_string()))
+            } else {
+                (None, None)
+            }
+        }
+    };
+
+    if let Some(name) = character_name {
         let position = attrs.get("isavatarright").and_then(|v| {
             if is_truthy(v) {
                 Some("right".to_string())
@@ -344,9 +429,10 @@ fn parse_dialog_like(attrs: &HashMap<String, String>, remainder: &str) -> Option
             }
         });
         Some(StorySegment::Dialogue {
-            character_name,
+            character_name: name,
             text,
             position,
+            character_id,
         })
     } else {
         Some(StorySegment::Narration { text })

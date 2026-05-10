@@ -5,6 +5,15 @@
     <!-- 仅在 Android 9 及以下需要此权限以保存文件到公共下载文件夹 -->
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
 
+    <!--
+      Legacy external-storage write permission. Only needed on Android 9 and
+      below (API 28-) for MediaStore inserts. API 29+ uses Scoped Storage and
+      requires no runtime permission to save into shared Pictures.
+    -->
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
+
     <!-- AndroidTV support -->
     <uses-feature android:name="android.software.leanback" android:required="false" />
 
@@ -18,7 +27,8 @@
             android:launchMode="singleTask"
             android:label="@string/main_activity_title"
             android:name=".MainActivity"
-            android:exported="true">
+            android:exported="true"
+            android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

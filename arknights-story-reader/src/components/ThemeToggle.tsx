@@ -1,30 +1,37 @@
-import { Moon, Sun } from "lucide-react";
+import { Moon, Sun, MonitorSmartphone } from "lucide-react";
 import { useTheme } from "@/components/theme-provider";
 import { Button } from "@/components/ui/button";
 
+/**
+ * Cycles between light → dark → system → light. The system mode respects the
+ * OS-level appearance preference and updates live as it changes (handled by
+ * ThemeProvider). The previous version hard-flipped between light/dark only,
+ * which conflicted with the `defaultTheme="system"` setting in App.tsx.
+ */
 export function ThemeToggle() {
   const { theme, setTheme } = useTheme();
 
   const handleToggle = () => {
-    const newTheme = theme === "light" ? "dark" : "light";
-    console.log("[ThemeToggle] 当前主题:", theme, "切换到:", newTheme);
-    setTheme(newTheme);
+    const next = theme === "light" ? "dark" : theme === "dark" ? "system" : "light";
+    setTheme(next);
   };
 
-  console.log("[ThemeToggle] 渲染 - 当前主题:", theme);
+  const label =
+    theme === "light" ? "切换到深色模式" : theme === "dark" ? "切换到跟随系统" : "切换到浅色模式";
 
   return (
     <Button
       variant="ghost"
       size="icon"
       onClick={handleToggle}
+      aria-label={label}
+      title={label}
       className="relative"
     >
-      <Sun className="h-[1.2rem] w-[1.2rem] rotate-0 scale-100 transition-all dark:-rotate-90 dark:scale-0" />
-      <Moon className="absolute h-[1.2rem] w-[1.2rem] rotate-90 scale-0 transition-all dark:rotate-0 dark:scale-100 pointer-events-none" />
-      <span className="sr-only">Toggle theme</span>
+      {theme === "light" && <Sun className="h-[1.2rem] w-[1.2rem]" />}
+      {theme === "dark" && <Moon className="h-[1.2rem] w-[1.2rem]" />}
+      {theme === "system" && <MonitorSmartphone className="h-[1.2rem] w-[1.2rem]" />}
+      <span className="sr-only">切换主题</span>
     </Button>
   );
 }
-
-

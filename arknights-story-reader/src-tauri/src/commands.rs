@@ -4,8 +4,9 @@ use crate::models::{
     CharacterHandbook, CharacterHandbookByName, CharacterPotentialRanks, CharacterPotentialToken,
     CharacterSkins, CharacterSkills, CharacterTalents, CharacterTrait, CharacterVoice,
     Furniture, FurnitureSearchResult, FurnitureTheme, ParsedStoryContent, RoguelikeCharm,
-    RoguelikeRelic, RoguelikeStage, SearchDebugResponse, SearchResult, StoryCategory, StoryEntry,
-    StoryIndexStatus, SubProfessionInfo, TeamPowerInfo,
+    RoguelikeRelic, RoguelikeStage, SearchDebugResponse, SearchResult, SearchResultsPage,
+    SegmentSearchPage, StoryCategory, StoryEntry, StoryIndexStatus, SubProfessionInfo,
+    TeamPowerInfo,
 };
 use crate::parser::parse_story_text;
 use serde::{Deserialize, Serialize};
@@ -741,4 +742,85 @@ pub async fn get_character_handbooks_by_names(
     })
     .await
     .map_err(|err| format!("Failed to get character handbooks by names: {}", err))?
+}
+
+// ==================== Main 分支独有功能 ====================
+
+#[tauri::command]
+pub async fn search_stories_ex(
+    state: State<'_, AppState>,
+    query: String,
+) -> Result<SearchResultsPage, String> {
+    let service = clone_service(&state);
+    tauri::async_runtime::spawn_blocking(move || service.search_stories_ex(&query))
+        .await
+        .map_err(|err| format!("Failed to join search_ex task: {}", err))?
+}
+
+#[tauri::command]
+pub async fn search_segments(
+    state: State<'_, AppState>,
+    query: String,
+) -> Result<SegmentSearchPage, String> {
+    let service = clone_service(&state);
+    tauri::async_runtime::spawn_blocking(move || service.search_segments(&query))
+        .await
+        .map_err(|err| format!("Failed to join search_segments task: {}", err))?
+}
+
+/// 素材 URL 解析：返回一条按优先级排序的候选列表，前端 `<AssetImage>`
+/// 依次尝试。不做网络请求，不做缓存（WebView 自己会缓存）。
+#[tauri::command]
+pub async fn resolve_asset_urls(kind: String, token: String) -> Result<Vec<String>, String> {
+    let kind_enum: crate::asset_service::AssetKind = match kind.as_str() {
+        "avatar" => crate::asset_service::AssetKind::Avatar,
+        "portrait" => crate::asset_service::AssetKind::Portrait,
+        "image" => crate::asset_service::AssetKind::Image,
+        "background" => crate::asset_service::AssetKind::Background,
+        "activity_kv" | "activityKv" => crate::asset_service::AssetKind::ActivityKv,
+        "activity_logo" | "activityLogo" => crate::asset_service::AssetKind::ActivityLogo,
+        "chapter_cover" | "chapterCover" => crate::asset_service::AssetKind::ChapterCover,
+        other => return Err(format!("unknown asset kind: {}", other)),
+    };
+    Ok(crate::asset_service::resolve(kind_enum, &token))
+}
+
+/// 拿到一份干员 name↔charId 快照，前端启动时调用一次并缓存在内存。
+#[tauri::command]
+pub async fn get_character_index(
+    state: State<'_, AppState>,
+) -> Result<crate::character_table::CharacterIndex, String> {
+    // Best-effort refresh from live data directory if present.
+    let path_opt = {
+        let guard = lock_service(&state.data_service);
+        guard.character_table_path()
+    };
+    if let Some(path) = path_opt {
+        crate::character_table::refresh_from_file(&path);
+    }
+    Ok(crate::character_table::snapshot())
+}
+
+/// 根据 storyId 返回 prev/next 剧情条目（按 storyGroup + storySort 推导）。
+#[tauri::command]
+pub async fn get_story_neighbors(
+    state: State<'_, AppState>,
+    story_id: String,
+) -> Result<crate::models::StoryNeighbors, String> {
+    let service = clone_service(&state);
+    tauri::async_runtime::spawn_blocking(move || service.get_story_neighbors(&story_id))
+        .await
+        .map_err(|err| format!("Failed to join neighbors task: {}", err))?
+}
+
+/// 返回 storyId 所在的章节 / 活动显示名（例如 "黑暗时代·上"）。
+#[tauri::command]
+pub async fn get_story_category_name(
+    state: State<'_, AppState>,
+    story_id: String,
+) -> Result<Option<String>, String> {
+    let service = clone_service(&state);
+    tauri::async_runtime::spawn_blocking(move || service.get_story_category_name(&story_id))
+        .await
+        .map_err(|err| format!("Failed to join category name task: {}", err))?
 }

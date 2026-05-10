@@ -116,12 +116,15 @@ export const CustomScrollArea = forwardRef<HTMLDivElement, CustomScrollAreaProps
 
       resizeObserver.observe(viewport);
 
+      // 只监听 viewport 直接子节点的增删（整篇剧情/列表切换等）。
+      // 早期版本用 `subtree: true`，每张图加载完都会触发一次子树变动，
+      // 在人物统计这种 400+ 卡片的面板里会把主线程打爆。
       const mutationObserver = new MutationObserver(() => {
         if (frame) cancelAnimationFrame(frame);
         frame = requestAnimationFrame(updateThumbMetrics);
       });
 
-      mutationObserver.observe(viewport, { childList: true, subtree: true, characterData: false });
+      mutationObserver.observe(viewport, { childList: true, subtree: false });
 
       return () => {
         viewport.removeEventListener("scroll", handleScroll);

@@ -1,6 +1,6 @@
 [package]
 name = "story-teller"
-version = "1.11.2"
+version = "1.11.3"
 description = "Story Teller - A beautiful story reader app"
 authors = ["you"]
 edition = "2021"
@@ -31,6 +31,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
 rusqlite = { version = "0.30", features = ["bundled", "vtab"] }
 unicode-normalization = "0.1"
+jieba-rs = { version = "0.7", default-features = false, features = ["default-dict"] }
 chrono = "0.4"
 sha2 = "0.10"
 

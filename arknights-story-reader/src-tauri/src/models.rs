@@ -159,6 +159,53 @@ pub struct SearchDebugResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchResultsPage {
+    pub results: Vec<SearchResult>,
+    #[serde(rename = "totalMatched")]
+    pub total_matched: usize,
+    pub truncated: bool,
+    #[serde(default)]
+    pub facets: std::collections::BTreeMap<String, usize>,
+}
+
+/// A single segment hit from the segment-level index.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SegmentHit {
+    #[serde(rename = "storyId")]
+    pub story_id: String,
+    #[serde(rename = "storyName")]
+    pub story_name: String,
+    pub category: String,
+    #[serde(rename = "segmentIndex")]
+    pub segment_index: usize,
+    #[serde(rename = "segmentType")]
+    pub segment_type: String,
+    #[serde(rename = "characterName")]
+    pub character_name: Option<String>,
+    #[serde(rename = "matchedText")]
+    pub matched_text: String,
+    #[serde(rename = "matchTarget")]
+    pub match_target: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SegmentSearchPage {
+    pub hits: Vec<SegmentHit>,
+    #[serde(rename = "totalMatched")]
+    pub total_matched: usize,
+    pub truncated: bool,
+}
+
+/// prev/next 邻接关系；前端阅读器底部导航使用。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StoryNeighbors {
+    #[serde(rename = "prev")]
+    pub prev: Option<StoryEntry>,
+    #[serde(rename = "next")]
+    pub next: Option<StoryEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoryIndexStatus {
     pub ready: bool,
     pub total: usize,

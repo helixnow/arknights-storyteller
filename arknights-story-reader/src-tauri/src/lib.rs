@@ -2,9 +2,13 @@ mod commands;
 mod data_service;
 mod models;
 mod parser;
+mod asset_service;
+mod character_table;
 
 #[cfg(target_os = "android")]
 mod apk_updater;
+#[cfg(target_os = "android")]
+mod image_sharer;
 
 use commands::AppState;
 use data_service::DataService;
@@ -27,6 +31,7 @@ pub fn run() {
     #[cfg(target_os = "android")]
     {
         builder = builder.plugin(crate::apk_updater::init());
+        builder = builder.plugin(crate::image_sharer::init());
     }
 
     builder
@@ -86,8 +91,14 @@ pub fn run() {
             commands::get_story_index_status,
             commands::build_story_index,
             commands::search_stories,
+            commands::search_stories_ex,
+            commands::search_segments,
             commands::search_stories_with_progress,
             commands::search_stories_debug,
+            commands::resolve_asset_urls,
+            commands::get_character_index,
+            commands::get_story_neighbors,
+            commands::get_story_category_name,
             commands::android_update_method1_plugin_direct,
             commands::android_update_method2_http_download,
             commands::android_update_method3_frontend_download,

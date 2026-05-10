@@ -3,12 +3,13 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use jieba_rs::Jieba;
 use reqwest::blocking::Client;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
-use sha2::{Sha256, Digest};
 use tauri::{AppHandle, Emitter};
 use unicode_normalization::UnicodeNormalization;
 use zip::ZipArchive;
@@ -19,11 +20,11 @@ use crate::models::{
     CharacterHandbook, CharacterHandbookByName, CharacterPotentialRanks, CharacterPotentialToken,
     CharacterSkins, CharacterSkills, CharacterTalents, CharacterTrait, CharacterVoice,
     EquipmentInfo, Furniture, FurnitureSearchResult, FurnitureTheme, HandbookStory,
-    HandbookStorySection, PotentialRank, RoguelikeCharm, RoguelikeRelic, RoguelikeStage, SearchDebugResponse,
-    SearchResult, SkinInfo, SkillInfo, SkillLevel, SkillSPData, StoryCategory, StoryEntry,
-    StoryIndexStatus, StorySegment, SubProfessionInfo, TalentCandidate, TalentInfo,
-    TalentUnlockCondition, TeamPowerInfo, TraitCandidate, TraitInfo, TraitUnlockCondition,
-    VoiceLine,
+    HandbookStorySection, PotentialRank, RoguelikeCharm, RoguelikeRelic, RoguelikeStage,
+    SearchDebugResponse, SearchResult, SearchResultsPage, SegmentHit, SegmentSearchPage,
+    SkinInfo, SkillInfo, SkillLevel, SkillSPData, StoryCategory, StoryEntry, StoryIndexStatus,
+    StorySegment, SubProfessionInfo, TalentCandidate, TalentInfo, TalentUnlockCondition,
+    TeamPowerInfo, TraitCandidate, TraitInfo, TraitUnlockCondition, VoiceLine,
 };
 use crate::parser::parse_story_text;
 
@@ -32,7 +33,103 @@ const REPO_DOWNLOAD_URL: &str = "https://codeload.github.com/Kengxxiao/Arknights
 const DEFAULT_BRANCH: &str = "master";
 const VERSION_FILE: &str = "version.json";
 const SEARCH_RESULT_LIMIT: usize = 500;
-const INDEX_VERSION: i32 = 2; // bump when FTS schema changes
+/// Bump when any of: FTS schema, tokenizer rules, flatten_segments format.
+/// v3 = migrated to jieba word segmentation (2025-05).
+/// v4 = added segment-level FTS table `story_segment_index` (2025-05).
+/// v5 = parser recognises [Image]/[Background]/[PlayMusic]; dialogue carries
+///      characterId; requires full rebuild.
+const INDEX_VERSION: i32 = 5;
+
+/// Shared jieba instance. The default dictionary is embedded in the crate
+/// (default-dict feature) and loading it costs ~10-30ms so we do it once per
+/// process and reuse. We also inject a small Arknights-specific user
+/// dictionary so operator names and faction terms aren't split into chars.
+fn jieba() -> &'static Jieba {
+    static INSTANCE: OnceLock<Jieba> = OnceLock::new();
+    INSTANCE.get_or_init(|| {
+        let mut j = Jieba::new();
+        // Register Arknights-specific proper nouns as high-frequency single
+        // tokens. Extend `ARKNIGHTS_USER_WORDS` when observed mis-splits
+        // appear. Names not in this list still work via the per-char
+        // fallback emitted by `tokenize_for_fts`, just with weaker phrase
+        // recall.
+        for (word, freq) in ARKNIGHTS_USER_WORDS {
+            j.add_word(word, Some(*freq), Some("nr"));
+        }
+        j
+    })
+}
+
+/// Curated Arknights user dictionary. Pairs of `(word, freq)` — higher freq
+/// biases jieba to keep the word whole. 10_000 is enough to dominate almost
+/// any ambiguous split in the default dict.
+const ARKNIGHTS_USER_WORDS: &[(&str, usize)] = &[
+    // Factions / organizations
+    ("罗德岛", 10_000),
+    ("整合运动", 8_000),
+    ("萨尔贡", 5_000),
+    ("莱塔尼亚", 5_000),
+    ("卡西米尔", 5_000),
+    ("乌萨斯", 5_000),
+    ("玻利瓦尔", 5_000),
+    ("哥伦比亚", 5_000),
+    ("维多利亚", 5_000),
+    ("炎国", 5_000),
+    ("黎博利", 3_000),
+    ("莱茵生命", 3_000),
+    ("企鹅物流", 3_000),
+    ("德拉克", 3_000),
+    // Lore terms
+    ("源石", 3_000),
+    ("源石尘", 3_000),
+    ("源石技艺", 3_000),
+    ("矿石病", 3_000),
+    ("感染者", 3_000),
+    ("天灾", 3_000),
+    ("移动城市", 3_000),
+    ("干员密录", 3_000),
+    // Operator / character names — seeded with the most common; unseen
+    // names still tokenize per-char. Add more as QA catches them.
+    ("凯尔希", 8_000),
+    ("阿米娅", 8_000),
+    ("博士", 8_000),
+    ("德克萨斯", 5_000),
+    ("能天使", 5_000),
+    ("推进之王", 5_000),
+    ("艾雅法拉", 5_000),
+    ("银灰", 5_000),
+    ("赫默", 5_000),
+    ("麦哲伦", 5_000),
+    ("菲亚梅塔", 5_000),
+    ("伊芙利特", 5_000),
+    ("斯卡蒂", 5_000),
+    ("幽灵鲨", 5_000),
+    ("安洁莉娜", 5_000),
+    ("夜莺", 5_000),
+    ("闪灵", 5_000),
+    ("初雪", 5_000),
+    ("星熊", 5_000),
+    ("泥岩", 5_000),
+    ("霜华", 5_000),
+    ("塔露拉", 5_000),
+    ("浮士德", 5_000),
+    ("梅菲斯特", 5_000),
+    ("帕特里西娅", 5_000),
+    ("克洛丝", 5_000),
+    ("安赛尔", 5_000),
+    ("杰西卡", 5_000),
+    ("红豆", 5_000),
+    ("缠丸", 5_000),
+    ("特蕾西娅", 5_000),
+    ("远山", 5_000),
+    ("临光", 5_000),
+    ("送葬人", 5_000),
+    ("艾丽妮", 5_000),
+    ("陈sir", 5_000),
+    ("陈博士", 5_000),
+    ("可颂", 5_000),
+    ("空弦", 5_000),
+];
 
 #[derive(Clone, serde::Serialize)]
 struct SyncProgress {
@@ -44,6 +141,14 @@ struct SyncProgress {
 
 #[derive(Clone, serde::Serialize)]
 pub struct SearchProgress {
+    phase: String,
+    current: usize,
+    total: usize,
+    message: String,
+}
+
+#[derive(Clone, serde::Serialize)]
+pub struct IndexProgress {
     phase: String,
     current: usize,
     total: usize,
@@ -121,21 +226,6 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn compute_file_sha256(path: &Path) -> Result<String, String> {
-    let mut file = fs::File::open(path).map_err(|e| format!("打开文件失败: {}", e))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 8192];
-    loop {
-        let n = file.read(&mut buffer).map_err(|e| format!("读取文件失败: {}", e))?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buffer[..n]);
-    }
-    let result = hasher.finalize();
-    Ok(format!("{:x}", result))
-}
-
 fn is_common_punctuation(ch: char) -> bool {
     if ch.is_ascii_punctuation() {
         return true;
@@ -194,6 +284,88 @@ fn normalize_nfkc_lower_strip_marks(text: &str) -> String {
         .collect()
 }
 
+/// Aggressive normalization for fuzzy matching: NFKC + lowercase + strip marks
+/// + replace `{@nickname}` → `博士` + drop all whitespace / common punctuation.
+/// Used by the linear-scan fallback and by context extraction to keep index and
+/// raw-file search paths consistent (bug A3 / A2).
+fn normalize_for_fuzzy(text: &str) -> String {
+    let replaced = text.replace("{@nickname}", "博士");
+    normalize_nfkc_lower_strip_marks(&replaced)
+        .chars()
+        .filter(|ch| !ch.is_whitespace() && !is_common_punctuation(*ch))
+        .collect()
+}
+
+/// Split a raw user query into logical terms for AND matching in the fallback
+/// scanner. Quoted phrases are kept intact; the leading `-` marks NOT (ignored
+/// in fallback — fallback is advisory, not exhaustive). Returns already
+/// fuzzy-normalized terms.
+fn split_query_terms(query: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut buf = String::new();
+    let mut in_quotes = false;
+    for ch in query.chars() {
+        match ch {
+            '"' => {
+                if in_quotes {
+                    if !buf.is_empty() {
+                        let normalized = normalize_for_fuzzy(&buf);
+                        if !normalized.is_empty() {
+                            terms.push(normalized);
+                        }
+                        buf.clear();
+                    }
+                    in_quotes = false;
+                } else {
+                    if !buf.is_empty() {
+                        let normalized = normalize_for_fuzzy(&buf);
+                        if !normalized.is_empty() {
+                            terms.push(normalized);
+                        }
+                        buf.clear();
+                    }
+                    in_quotes = true;
+                }
+            }
+            c if c.is_whitespace() && !in_quotes => {
+                if !buf.is_empty() {
+                    let normalized = normalize_for_fuzzy(&buf);
+                    if !normalized.is_empty() {
+                        terms.push(normalized);
+                    }
+                    buf.clear();
+                }
+            }
+            _ => buf.push(ch),
+        }
+    }
+    if !buf.is_empty() {
+        let normalized = normalize_for_fuzzy(&buf);
+        if !normalized.is_empty() {
+            terms.push(normalized);
+        }
+    }
+
+    // Drop OR/NOT keywords and NOT prefixes — fallback only matches positive terms.
+    terms
+        .into_iter()
+        .filter_map(|t| {
+            if t == "or" {
+                None
+            } else if let Some(rest) = t.strip_prefix('-') {
+                if rest.is_empty() {
+                    None
+                } else {
+                    // Preserve as a positive term — NOT semantics handled only by FTS path.
+                    Some(rest.to_string())
+                }
+            } else {
+                Some(t)
+            }
+        })
+        .collect()
+}
+
 fn extract_numeric_parts(text: &str) -> Vec<i32> {
     let mut parts = Vec::new();
     let mut current = String::new();
@@ -249,6 +421,17 @@ impl DataService {
         self.data_dir
             .join("zh_CN/gamedata/excel/story_review_table.json")
             .exists()
+    }
+
+    /// 返回运行时 character_table.json 路径（若已同步），供 character_table
+    /// 模块刷新嵌入映射。
+    pub fn character_table_path(&self) -> Option<PathBuf> {
+        let p = self.data_dir.join("zh_CN/gamedata/excel/character_table.json");
+        if p.exists() {
+            Some(p)
+        } else {
+            None
+        }
     }
     pub fn new(app_data_dir: PathBuf) -> Self {
         Self {
@@ -313,10 +496,11 @@ impl DataService {
         let should_recreate = current_version < INDEX_VERSION;
 
         if should_recreate {
-            // Drop and recreate virtual table with new schema
+            // Drop and recreate virtual tables with current schema.
             conn.execute_batch(
                 "
                 DROP TABLE IF EXISTS story_index;
+                DROP TABLE IF EXISTS story_segment_index;
                 CREATE VIRTUAL TABLE story_index USING fts5(
                     story_id UNINDEXED,
                     story_name,
@@ -327,9 +511,19 @@ impl DataService {
                     tokenize = 'unicode61 remove_diacritics 2',
                     prefix='2 3 4'
                 );
+                CREATE VIRTUAL TABLE story_segment_index USING fts5(
+                    story_id UNINDEXED,
+                    segment_index UNINDEXED,
+                    segment_type UNINDEXED,
+                    character_name,
+                    tokenized_text,
+                    raw_text UNINDEXED,
+                    tokenize = 'unicode61 remove_diacritics 2',
+                    prefix='2 3'
+                );
                 ",
             )
-            .map_err(|e| format!("Failed to (re)create story index: {}", e))?;
+            .map_err(|e| format!("Failed to (re)create indexes: {}", e))?;
 
             conn.execute(
                 "INSERT INTO story_index_meta (key, value) VALUES ('index_version', ?1)
@@ -338,7 +532,7 @@ impl DataService {
             )
             .map_err(|e| format!("Failed to update index version: {}", e))?;
         } else {
-            // Ensure table exists (fresh install)
+            // Ensure tables exist (fresh install / first open after boot).
             conn.execute_batch(
                 "
                 CREATE VIRTUAL TABLE IF NOT EXISTS story_index USING fts5(
@@ -351,9 +545,19 @@ impl DataService {
                     tokenize = 'unicode61 remove_diacritics 2',
                     prefix='2 3 4'
                 );
+                CREATE VIRTUAL TABLE IF NOT EXISTS story_segment_index USING fts5(
+                    story_id UNINDEXED,
+                    segment_index UNINDEXED,
+                    segment_type UNINDEXED,
+                    character_name,
+                    tokenized_text,
+                    raw_text UNINDEXED,
+                    tokenize = 'unicode61 remove_diacritics 2',
+                    prefix='2 3'
+                );
                 ",
             )
-            .map_err(|e| format!("Failed to ensure story index table: {}", e))?;
+            .map_err(|e| format!("Failed to ensure index tables: {}", e))?;
         }
 
         Ok(())
@@ -374,8 +578,6 @@ impl DataService {
             "ROGUELIKE" => "肉鸽".to_string(),
             "SIDESTORY" => "支线".to_string(),
             "NONE" => "干员密录".to_string(),
-            "RECORD" => "主线笔记".to_string(),
-            "RUNE" => "危机合约".to_string(),
             _ => entry_type.to_string(),
         }
     }
@@ -454,91 +656,8 @@ impl DataService {
             }
         }
 
-        self.extend_index_with_additional_sources(&mut stories, &mut seen_ids);
-
         stories.sort_by(|a, b| a.story.story_id.cmp(&b.story.story_id));
         Ok(stories)
-    }
-
-    fn extend_index_with_additional_sources(
-        &self,
-        stories: &mut Vec<IndexedStory>,
-        seen_ids: &mut HashSet<String>,
-    ) {
-        match self.get_roguelike_stories_grouped() {
-            Ok(groups) => {
-                for (group_name, entries) in groups {
-                    let category_name = if group_name.trim().is_empty() {
-                        "肉鸽".to_string()
-                    } else {
-                        group_name.clone()
-                    };
-                    for story in entries {
-                        if story.story_txt.trim().is_empty() {
-                            continue;
-                        }
-                        if seen_ids.insert(story.story_id.clone()) {
-                            stories.push(IndexedStory {
-                                category_name: category_name.clone(),
-                                entry_type: "ROGUELIKE".to_string(),
-                                story,
-                            });
-                        }
-                    }
-                }
-            }
-            Err(err) => {
-                eprintln!("[INDEX] Skip roguelike stories: {}", err);
-            }
-        }
-
-        match self.get_record_stories_grouped() {
-            Ok(groups) => {
-                for (chapter_name, entries) in groups {
-                    let category_name = if chapter_name.trim().is_empty() {
-                        "主线笔记".to_string()
-                    } else {
-                        chapter_name.clone()
-                    };
-                    for story in entries {
-                        if story.story_txt.trim().is_empty() {
-                            continue;
-                        }
-                        if seen_ids.insert(story.story_id.clone()) {
-                            stories.push(IndexedStory {
-                                category_name: category_name.clone(),
-                                entry_type: "RECORD".to_string(),
-                                story,
-                            });
-                        }
-                    }
-                }
-            }
-            Err(err) => {
-                eprintln!("[INDEX] Skip record stories: {}", err);
-            }
-        }
-
-        match self.get_rune_stories() {
-            Ok(entries) => {
-                let category_name = "危机合约".to_string();
-                for story in entries {
-                    if story.story_txt.trim().is_empty() {
-                        continue;
-                    }
-                    if seen_ids.insert(story.story_id.clone()) {
-                        stories.push(IndexedStory {
-                            category_name: category_name.clone(),
-                            entry_type: "RUNE".to_string(),
-                            story,
-                        });
-                    }
-                }
-            }
-            Err(err) => {
-                eprintln!("[INDEX] Skip rune stories: {}", err);
-            }
-        }
     }
 
     fn flatten_segments(segments: &[StorySegment]) -> String {
@@ -559,55 +678,198 @@ impl DataService {
                     parts.push(text.clone());
                 }
                 StorySegment::Decision { options, .. } => {
-                    parts.push(options.join(" / "));
+                    // Use newline separator so each option is tokenized/indexed
+                    // independently — users searching an option verbatim should
+                    // still be able to hit the story. (bug A9)
+                    parts.push(options.join("\n"));
                 }
                 StorySegment::Header { title } => {
                     parts.push(title.clone());
+                }
+                StorySegment::Image { caption, .. } => {
+                    if let Some(cap) = caption {
+                        if !cap.trim().is_empty() {
+                            parts.push(cap.clone());
+                        }
+                    }
+                }
+                StorySegment::Music { .. } => {
+                    // BGM 指令不参与全文索引。
                 }
             }
         }
         parts.join("\n")
     }
 
+    /// Mirror the frontend's in-reader segment post-processing so the indices
+    /// we store in `story_segment_index` line up with what the UI scrolls to
+    /// when the user taps a search result. The two normalizations must stay
+    /// in sync; if the reader's logic changes, bump `INDEX_VERSION` too.
+    fn post_process_segments_for_index(segments: &[StorySegment]) -> Vec<StorySegment> {
+        let cleaned: Vec<StorySegment> = segments
+            .iter()
+            .flat_map(|seg| -> Vec<StorySegment> {
+                match seg {
+                    StorySegment::Dialogue {
+                        character_name,
+                        text,
+                        position,
+                        character_id,
+                    } => {
+                        let normalized = text
+                            .replace("\r\n", "\n")
+                            .split('\n')
+                            .map(|l| l.trim())
+                            .filter(|l| !l.is_empty())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if normalized.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![StorySegment::Dialogue {
+                                character_name: character_name.clone(),
+                                text: normalized,
+                                position: position.clone(),
+                                character_id: character_id.clone(),
+                            }]
+                        }
+                    }
+                    StorySegment::Narration { text } => {
+                        let normalized = text
+                            .replace("\r\n", "\n")
+                            .split('\n')
+                            .map(|l| l.trim())
+                            .filter(|l| !l.is_empty())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if normalized.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![StorySegment::Narration { text: normalized }]
+                        }
+                    }
+                    StorySegment::Decision { options, values } => {
+                        let opts: Vec<String> = options
+                            .iter()
+                            .map(|o| o.trim().to_string())
+                            .filter(|o| !o.is_empty())
+                            .collect();
+                        if opts.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![StorySegment::Decision {
+                                options: opts,
+                                values: values.clone(),
+                            }]
+                        }
+                    }
+                    // BGM 指令目前前端不渲染，直接丢弃。Image 段保留。
+                    StorySegment::Music { .. } => Vec::new(),
+                    other => vec![other.clone()],
+                }
+            })
+            .collect();
+
+        let mut merged: Vec<StorySegment> = Vec::with_capacity(cleaned.len());
+        for seg in cleaned {
+            if let StorySegment::Dialogue {
+                character_name,
+                text,
+                position,
+                character_id,
+            } = &seg
+            {
+                if let Some(StorySegment::Dialogue {
+                    character_name: prev_name,
+                    text: prev_text,
+                    position: _,
+                    character_id: prev_cid,
+                }) = merged.last_mut()
+                {
+                    if prev_name == character_name {
+                        let joined = format!("{}\n{}", prev_text, text).replace("\n\n", "\n");
+                        *prev_text = joined;
+                        // keep first position, prefer existing cid else adopt new one
+                        let _ = position;
+                        if prev_cid.is_none() && character_id.is_some() {
+                            *prev_cid = character_id.clone();
+                        }
+                        continue;
+                    }
+                }
+            }
+            merged.push(seg);
+        }
+        merged
+    }
+
+    /// Tokenize free text for the FTS index.
+    ///
+    /// v3 uses jieba word segmentation for CJK text, producing multi-char
+    /// tokens for meaningful words (e.g. `凯尔希` / `罗德岛`). To preserve the
+    /// ability to search by a single character, each CJK word longer than 1
+    /// char is additionally emitted as its component characters — duplicate
+    /// emission is cheap and keeps recall roughly equivalent to the old
+    /// per-char scheme while drastically reducing phrase brittleness.
+    ///
+    /// ASCII alphanumeric runs are emitted as a single lowercase token.
+    /// Punctuation and whitespace act as separators and are discarded.
     fn tokenize_for_fts(text: &str) -> Vec<String> {
-        let text = normalize_nfkc_lower_strip_marks(text);
-        let mut tokens = Vec::new();
-        let mut ascii_buffer = String::new();
+        let normalized = normalize_nfkc_lower_strip_marks(text);
+        if normalized.is_empty() {
+            return Vec::new();
+        }
 
-        for ch in text.chars() {
-            if ch.is_ascii_alphanumeric() {
-                ascii_buffer.push(ch.to_ascii_lowercase());
+        let segments = jieba().cut(&normalized, false);
+        let mut tokens: Vec<String> = Vec::with_capacity(segments.len() * 2);
+        for seg in segments {
+            // Trim and skip pure-whitespace/punctuation segments.
+            let trimmed = seg.trim();
+            if trimmed.is_empty() {
                 continue;
             }
 
-            if !ascii_buffer.is_empty() {
-                let token = std::mem::take(&mut ascii_buffer);
-                tokens.push(token);
-            }
-
-            if ch.is_whitespace() {
+            // Fast path: pure ASCII alnum → keep as-is.
+            if trimmed.chars().all(|c| c.is_ascii_alphanumeric()) {
+                tokens.push(trimmed.to_string());
                 continue;
             }
 
-            if is_common_punctuation(ch) {
+            // Drop pure punctuation/symbol segments.
+            if trimmed
+                .chars()
+                .all(|c| is_common_punctuation(c) || c.is_whitespace())
+            {
                 continue;
             }
 
-            if ch.is_alphanumeric() {
-                let token: String = ch.to_lowercase().collect();
-                if !token.is_empty() {
-                    tokens.push(token);
+            let cjk_chars: Vec<char> = trimmed.chars().filter(|c| is_cjk(*c)).collect();
+            let is_all_cjk = cjk_chars.len() == trimmed.chars().filter(|c| !c.is_whitespace()).count();
+
+            if is_all_cjk && cjk_chars.len() >= 2 {
+                // Multi-char CJK word: store both the word and each char so a
+                // single-char query (`凯`) still matches, and so does the word
+                // (`凯尔希`). Byte size impact is ~2x per CJK word.
+                tokens.push(cjk_chars.iter().collect());
+                for ch in &cjk_chars {
+                    tokens.push(ch.to_string());
                 }
                 continue;
             }
 
-            tokens.push(ch.to_string());
+            // Single-char CJK, or mixed CJK+ASCII (rare): emit char by char
+            // so queries remain permissive.
+            for ch in trimmed.chars() {
+                if ch.is_whitespace() || is_common_punctuation(ch) {
+                    continue;
+                }
+                if ch.is_ascii_alphanumeric() {
+                    tokens.push(ch.to_ascii_lowercase().to_string());
+                } else {
+                    tokens.push(ch.to_string());
+                }
+            }
         }
-
-        if !ascii_buffer.is_empty() {
-            tokens.push(ascii_buffer);
-        }
-
         tokens
     }
 
@@ -615,149 +877,245 @@ impl DataService {
         Self::tokenize_for_fts(text).join(" ")
     }
 
-    // Build a more expressive FTS query:
-    // - Normalize (NFKC + lowercase + strip marks)
-    // - Chinese contiguous sequences (len>=2) -> quoted phrase of spaced characters: "凯 尔 希"
-    // - ASCII terms -> add * suffix for prefix match
-    // - Support simple NOT via leading '-' and OR keyword, default AND
+    // Build an FTS query using jieba word segmentation.
+    //
+    // For each user-supplied term:
+    // - ASCII alnum runs → add `*` suffix for prefix match
+    // - CJK text → split via jieba; words that are actually in the index
+    //   (multi-char word OR single char) are AND-joined. This is both more
+    //   lenient (recall) and more precise than the previous bigram hack:
+    //   e.g. "凯尔希阿米娅" now decomposes to `凯尔希 AND 阿米娅`.
+    // - Mixed tokens are split at ASCII/CJK boundaries.
+    //
+    // Quoted phrases bypass segmentation and are matched verbatim (after
+    // character-level normalization) so users can pin exact sequences.
+    //
+    // Supports:
+    //   * quoted phrase: `"foo bar"`
+    //   * NOT: leading `-` on a term
+    //   * OR: literal `or` token between terms
+    //   * otherwise: implicit AND
     fn build_fts_query_advanced(raw_query: &str) -> Option<String> {
         let q = normalize_nfkc_lower_strip_marks(raw_query.trim());
         if q.is_empty() {
             return None;
         }
 
-        // Simple tokenizer that respects quoted phrases
-        let mut terms: Vec<(String, bool, bool)> = Vec::new(); // (term, is_not, is_or_before)
+        #[derive(Clone)]
+        struct UserTerm {
+            text: String,
+            is_not: bool,
+            is_or_before: bool,
+            is_quoted: bool,
+        }
+
+        let mut terms: Vec<UserTerm> = Vec::new();
         let mut buf = String::new();
         let mut in_quotes = false;
         let mut prev_was_or = false;
-        let mut chars = q.chars().peekable();
-        while let Some(ch) = chars.next() {
+        let flush_bare = |buf: &mut String,
+                          terms: &mut Vec<UserTerm>,
+                          prev_was_or: &mut bool| {
+            if buf.is_empty() {
+                return;
+            }
+            let t = std::mem::take(buf);
+            if t == "or" {
+                *prev_was_or = true;
+                return;
+            }
+            let is_not = t.starts_with('-');
+            let content = if is_not { t.trim_start_matches('-').to_string() } else { t };
+            if !content.is_empty() {
+                terms.push(UserTerm {
+                    text: content,
+                    is_not,
+                    is_or_before: *prev_was_or,
+                    is_quoted: false,
+                });
+                *prev_was_or = false;
+            }
+        };
+
+        for ch in q.chars() {
             match ch {
                 '"' => {
                     if in_quotes {
                         in_quotes = false;
-                        let t = std::mem::take(&mut buf);
-                        if !t.is_empty() {
-                            terms.push((t, false, prev_was_or));
+                        if !buf.is_empty() {
+                            let phrase = std::mem::take(&mut buf);
+                            terms.push(UserTerm {
+                                text: phrase,
+                                is_not: false,
+                                is_or_before: prev_was_or,
+                                is_quoted: true,
+                            });
                             prev_was_or = false;
                         }
                     } else {
-                        if !buf.trim().is_empty() {
-                            let t = std::mem::take(&mut buf);
-                            if t == "or" {
-                                prev_was_or = true;
-                            } else {
-                                let is_not = t.starts_with('-');
-                                let content = if is_not {
-                                    t.trim_start_matches('-').to_string()
-                                } else {
-                                    t
-                                };
-                                if !content.is_empty() {
-                                    terms.push((content, is_not, prev_was_or));
-                                    prev_was_or = false;
-                                }
-                            }
-                        }
+                        flush_bare(&mut buf, &mut terms, &mut prev_was_or);
                         in_quotes = true;
                     }
                 }
                 c if c.is_whitespace() && !in_quotes => {
-                    if !buf.is_empty() {
-                        let t = std::mem::take(&mut buf);
-                        if t == "or" {
-                            prev_was_or = true;
-                        } else {
-                            let is_not = t.starts_with('-');
-                            let content = if is_not {
-                                t.trim_start_matches('-').to_string()
-                            } else {
-                                t
-                            };
-                            if !content.is_empty() {
-                                terms.push((content, is_not, prev_was_or));
-                                prev_was_or = false;
-                            }
-                        }
-                    }
+                    flush_bare(&mut buf, &mut terms, &mut prev_was_or);
                 }
                 _ => buf.push(ch),
             }
         }
-        if !buf.is_empty() {
-            let t = std::mem::take(&mut buf);
-            if t == "or" {
-                // dangling OR, ignore
-            } else {
-                let is_not = t.starts_with('-');
-                let content = if is_not {
-                    t.trim_start_matches('-').to_string()
-                } else {
-                    t
-                };
-                if !content.is_empty() {
-                    terms.push((content, is_not, prev_was_or));
-                }
-            }
-        }
-
+        flush_bare(&mut buf, &mut terms, &mut prev_was_or);
         if terms.is_empty() {
             return None;
         }
 
-        fn to_phrase_if_cjk(s: &str) -> String {
-            let mut has_cjk = false;
-            let mut all_cjk = true;
-            for ch in s.chars() {
-                if is_cjk(ch) {
-                    has_cjk = true;
-                } else if !ch.is_whitespace() {
-                    all_cjk = false;
+        fn is_fts_special(c: char) -> bool {
+            matches!(c, '"' | '*' | ':' | '(' | ')' | '+' | '-' | '^' | '\\')
+        }
+
+        fn sanitize(s: &str) -> String {
+            s.chars()
+                .map(|c| if is_fts_special(c) || c.is_control() { ' ' } else { c })
+                .collect::<String>()
+                .trim()
+                .to_string()
+        }
+
+        /// Convert a non-quoted term into an FTS clause.
+        /// Returns an empty string if nothing meaningful remains.
+        fn term_to_clause(raw: &str) -> String {
+            let s = sanitize(raw);
+            if s.is_empty() {
+                return String::new();
+            }
+
+            // Pure ASCII alnum → prefix match.
+            if s.chars().all(|c| c.is_ascii_alphanumeric()) {
+                return format!("{}*", s);
+            }
+
+            // Run through jieba, but only keep tokens the indexer would also
+            // emit (ASCII alnum, CJK words, single CJK chars).
+            let segs = jieba().cut(&s, false);
+            let mut tokens: Vec<String> = Vec::new();
+            for seg in segs {
+                let trimmed = seg.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if trimmed.chars().all(|c| c.is_ascii_alphanumeric()) {
+                    tokens.push(format!("{}*", trimmed));
+                    continue;
+                }
+                if trimmed
+                    .chars()
+                    .all(|c| is_common_punctuation(c) || c.is_whitespace())
+                {
+                    continue;
+                }
+                // Pure CJK word → wrap as phrase token.
+                let cjk_chars: Vec<char> = trimmed.chars().filter(|c| is_cjk(*c)).collect();
+                if cjk_chars.len() == trimmed.chars().filter(|c| !c.is_whitespace()).count()
+                    && !cjk_chars.is_empty()
+                {
+                    let word: String = cjk_chars.iter().collect();
+                    tokens.push(format!("\"{}\"", word));
+                    continue;
+                }
+                // Mixed (rare) — split into whatever atoms make sense.
+                for ch in trimmed.chars() {
+                    if ch.is_whitespace() || is_common_punctuation(ch) {
+                        continue;
+                    }
+                    if ch.is_ascii_alphanumeric() {
+                        tokens.push(format!("{}*", ch.to_ascii_lowercase()));
+                    } else if is_cjk(ch) {
+                        tokens.push(format!("\"{}\"", ch));
+                    }
                 }
             }
-            if has_cjk && all_cjk {
-                let parts: Vec<String> = s
-                    .chars()
-                    .filter(|c| !c.is_whitespace())
-                    .map(|c| if c == '"' { ' ' } else { c })
-                    .map(|c| c.to_string())
-                    .collect();
-                let spaced = parts.join(" ");
-                format!("\"{}\"", spaced)
-            } else if s.chars().all(|c| c.is_ascii_alphanumeric()) {
-                format!("{}*", s)
+            if tokens.is_empty() {
+                String::new()
+            } else if tokens.len() == 1 {
+                tokens.into_iter().next().unwrap()
             } else {
-                // mixed or others: quote as is
-                let escaped = s.replace('"', "");
-                format!("\"{}\"", escaped)
+                format!("({})", tokens.join(" AND "))
             }
         }
 
-        let mut parts: Vec<String> = Vec::new();
-        for (i, (raw, is_not, is_or)) in terms.into_iter().enumerate() {
-            if raw.is_empty() {
+        /// A quoted phrase must match verbatim. Split only on whitespace and
+        /// wrap the concatenated run as a single FTS phrase — the indexer
+        /// stored both the jieba word and each constituent char, so a CJK
+        /// run is still findable as long as jieba happens to cut it the same
+        /// way. For best precision users should quote exact short phrases.
+        fn quoted_to_clause(raw: &str) -> String {
+            let s = sanitize(raw);
+            if s.is_empty() {
+                return String::new();
+            }
+            if s.chars().all(|c| c.is_ascii_alphanumeric() || c.is_whitespace()) {
+                // ASCII phrase: `"foo bar"` → `"foo bar"` (FTS keeps order).
+                return format!("\"{}\"", s);
+            }
+            // For mixed / CJK phrases, try the jieba cut and join words.
+            // This matches index records because indexing also runs jieba.
+            let segs = jieba()
+                .cut(&s, false)
+                .into_iter()
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty() && !t.chars().all(is_common_punctuation))
+                .collect::<Vec<_>>();
+            if segs.is_empty() {
+                return String::new();
+            }
+            format!("\"{}\"", segs.join(" "))
+        }
+
+        // FTS5 semantics require positive terms on the left of a NOT. If
+        // the user writes `-X Y` we must emit `Y NOT X`, not `NOT X AND Y`.
+        // We also need at least one positive term — a query that's purely
+        // negations returns nothing by definition.
+        let mut positives: Vec<(String, bool)> = Vec::new(); // (clause, or_flag)
+        let mut negatives: Vec<String> = Vec::new();
+        for term in terms {
+            let clause = if term.is_quoted {
+                quoted_to_clause(&term.text)
+            } else {
+                term_to_clause(&term.text)
+            };
+            if clause.is_empty() {
                 continue;
             }
-            let mut piece = to_phrase_if_cjk(&raw);
-            if is_not {
-                piece = format!("NOT {}", piece);
+            if term.is_not {
+                negatives.push(clause);
+            } else {
+                positives.push((clause, term.is_or_before));
             }
-            if i > 0 {
-                if is_or {
-                    parts.push("OR".to_string());
-                } else {
-                    parts.push("AND".to_string());
-                }
-            }
-            parts.push(piece);
         }
 
-        if parts.is_empty() {
-            None
-        } else {
-            Some(parts.join(" "))
+        if positives.is_empty() {
+            // Purely-negative queries are meaningless in FTS5. Rather than
+            // throwing a syntax error we return None and let the caller
+            // short-circuit to "no results".
+            return None;
         }
+
+        // Assemble positives with their AND/OR connectives.
+        let mut assembled = String::new();
+        for (i, (clause, or_flag)) in positives.iter().enumerate() {
+            if i > 0 {
+                assembled.push_str(if *or_flag { " OR " } else { " AND " });
+            }
+            assembled.push_str(clause);
+        }
+
+        // Append any NOT clauses — one per negation, left-to-right.
+        for neg in negatives {
+            // Wrap the positive accumulator so the NOT doesn't bind to only
+            // the last positive term under FTS5's precedence rules.
+            assembled = format!("({}) NOT {}", assembled, neg);
+        }
+
+        Some(assembled)
     }
 
     fn extract_meta_value(conn: &Connection, key: &str) -> Result<Option<String>, String> {
@@ -825,6 +1183,20 @@ impl DataService {
         };
         self.write_version(&info)?;
 
+        // Auto-rebuild the FTS index so the next search is immediately fast
+        // instead of silently falling back to linear scan (bug A5).
+        emit_progress(&app, "索引", 0, 1, "正在重建全文索引");
+        let index_service = self.clone();
+        let index_app = app.clone();
+        std::thread::spawn(move || {
+            if let Err(err) = index_service.rebuild_story_index_with_progress(&index_app) {
+                eprintln!("[SYNC] auto rebuild index failed: {}", err);
+                emit_progress(&index_app, "索引", 1, 1, "索引重建失败，可稍后在设置中手动重试");
+            } else {
+                emit_progress(&index_app, "索引", 1, 1, "全文索引已重建");
+            }
+        });
+
         eprintln!("[SYNC] === 同步完成 ===");
         emit_progress(&app, "完成", 1, 1, "同步完成");
         Ok(())
@@ -882,11 +1254,8 @@ impl DataService {
     }
 
     fn create_http_client() -> Result<Client, String> {
-        use std::time::Duration;
         Client::builder()
             .user_agent("arknights-story-reader")
-            .connect_timeout(Duration::from_secs(20))
-            .timeout(Duration::from_secs(300))
             .build()
             .map_err(|e| format!("Failed to create http client: {}", e))
     }
@@ -977,23 +1346,10 @@ impl DataService {
         zip_file
             .flush()
             .map_err(|e| format!("Failed to flush zip file: {}", e))?;
-        drop(zip_file);
-
-        // 验证下载完整性：若声明了 Content-Length，校验实际下载大小
-        if total_bytes > 0 && downloaded != total_bytes {
-            let _ = fs::remove_file(&zip_path);
-            return Err(format!(
-                "下载不完整：期望 {} 字节，实际 {} 字节",
-                total_bytes, downloaded
-            ));
-        }
 
         emit_progress(app, "下载", 100, 100, "下载完成");
-        
-        // 解压并清理临时文件（即使失败也要尝试清理）
-        let extract_result = self.extract_zip_at(&zip_path, parent_dir, app);
+        self.extract_zip_at(&zip_path, parent_dir, app)?;
         fs::remove_file(&zip_path).ok();
-        extract_result?;
 
         Ok(())
     }
@@ -1006,8 +1362,6 @@ impl DataService {
     ) -> Result<(), String> {
         emit_progress(app, "解压", 0, 100, "正在解压数据");
         let extract_root = parent_dir.join("ArknightsGameData_extract");
-        
-        // 清理旧的解压目录（如果存在）
         if extract_root.exists() {
             fs::remove_dir_all(&extract_root)
                 .map_err(|e| format!("Failed to clean extract dir: {}", e))?;
@@ -1104,6 +1458,19 @@ impl DataService {
             fetched_at: timestamp,
         };
         self.write_version(&info)?;
+
+        // Auto-rebuild the FTS index (bug A5, same as sync_data).
+        emit_progress(app, "索引", 0, 1, "正在重建全文索引");
+        let index_service = self.clone();
+        let index_app = app.clone();
+        std::thread::spawn(move || {
+            if let Err(err) = index_service.rebuild_story_index_with_progress(&index_app) {
+                eprintln!("[IMPORT] auto rebuild index failed: {}", err);
+                emit_progress(&index_app, "索引", 1, 1, "索引重建失败，可稍后在设置中手动重试");
+            } else {
+                emit_progress(&index_app, "索引", 1, 1, "全文索引已重建");
+            }
+        });
 
         emit_progress(app, "完成", 100, 100, "导入完成");
         Ok(())
@@ -1220,6 +1587,7 @@ impl DataService {
     }
 
     /// 获取所有活动
+    #[allow(dead_code)]
     pub fn get_activities(&self) -> Result<Vec<Activity>, String> {
         if !self.is_installed() {
             return Err("NOT_INSTALLED".to_string());
@@ -1315,6 +1683,7 @@ impl DataService {
     }
 
     /// 获取主线剧情
+    #[allow(dead_code)]
     fn get_main_stories(&self) -> Result<Vec<StoryEntry>, String> {
         let story_review_file = self
             .data_dir
@@ -1352,48 +1721,11 @@ impl DataService {
 
     /// 读取剧情文本
     pub fn read_story_text(&self, story_path: &str) -> Result<String, String> {
-        let base_dir = self.data_dir.join("zh_CN/gamedata/story");
+        let full_path = self
+            .data_dir
+            .join("zh_CN/gamedata/story")
+            .join(format!("{}.txt", story_path));
 
-        // 首先检查是否为目录（月度聊天类型）
-        let dir_path = base_dir.join(story_path);
-        if dir_path.is_dir() {
-            // 读取目录下的所有 .txt 文件并按顺序拼接
-            let mut story_files = Vec::new();
-            if let Ok(entries) = fs::read_dir(&dir_path) {
-                for entry in entries.flatten() {
-                    let file_name = entry.file_name().to_string_lossy().to_string();
-                    if file_name.ends_with(".txt") {
-                        story_files.push(file_name);
-                    }
-                }
-            }
-
-            // 排序文件（按 _1, _2, _3 等顺序）
-            story_files.sort();
-
-            if story_files.is_empty() {
-                return Err(format!("No story files found in directory: {}", story_path));
-            }
-
-            // 按顺序读取并拼接所有文件
-            let mut combined_content = String::new();
-            for (idx, file_name) in story_files.iter().enumerate() {
-                let file_path = dir_path.join(file_name);
-                let content = fs::read_to_string(&file_path)
-                    .map_err(|e| format!("Failed to read story file {}: {}", file_name, e))?;
-
-                if idx > 0 {
-                    // 在文件之间添加分隔符（保持剧情连续性）
-                    combined_content.push_str("\n\n");
-                }
-                combined_content.push_str(&content);
-            }
-
-            return Ok(combined_content);
-        }
-
-        // 如果不是目录，按原逻辑读取单个文件
-        let full_path = base_dir.join(format!("{}.txt", story_path));
         fs::read_to_string(&full_path).map_err(|e| format!("Failed to read story file: {}", e))
     }
 
@@ -1440,10 +1772,32 @@ impl DataService {
     }
 
     /// 重建剧情全文索引
+    #[allow(dead_code)]
     pub fn rebuild_story_index(&self) -> Result<(), String> {
+        self.rebuild_story_index_inner(None)
+    }
+
+    /// 重建索引并发出 `index-progress` 事件
+    pub fn rebuild_story_index_with_progress(&self, app: &AppHandle) -> Result<(), String> {
+        self.rebuild_story_index_inner(Some(app))
+    }
+
+    fn rebuild_story_index_inner(&self, app: Option<&AppHandle>) -> Result<(), String> {
         if !self.is_installed() {
             return Err("NOT_INSTALLED".to_string());
         }
+
+        let emit = |phase: &str, cur: usize, total: usize, msg: &str| {
+            if let Some(app) = app {
+                let progress = IndexProgress {
+                    phase: phase.to_string(),
+                    current: cur,
+                    total,
+                    message: msg.to_string(),
+                };
+                let _ = app.emit("index-progress", progress);
+            }
+        };
 
         let mut conn = self.open_index_connection()?;
         Self::init_index_tables(&conn)?;
@@ -1454,9 +1808,11 @@ impl DataService {
 
         tx.execute("DELETE FROM story_index", [])
             .map_err(|e| format!("Failed to clear story index: {}", e))?;
+        tx.execute("DELETE FROM story_segment_index", [])
+            .map_err(|e| format!("Failed to clear story segment index: {}", e))?;
 
         let indexed_stories = self.collect_stories_for_index()?;
-        let mut insert_stmt = tx
+        let mut story_insert_stmt = tx
             .prepare(
                 "
             INSERT INTO story_index (
@@ -1470,10 +1826,27 @@ impl DataService {
         ",
             )
             .map_err(|e| format!("Failed to prepare story index insert: {}", e))?;
+        let mut segment_insert_stmt = tx
+            .prepare(
+                "
+            INSERT INTO story_segment_index (
+                story_id,
+                segment_index,
+                segment_type,
+                character_name,
+                tokenized_text,
+                raw_text
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        ",
+            )
+            .map_err(|e| format!("Failed to prepare segment index insert: {}", e))?;
 
         let mut total = 0usize;
+        let mut segment_total = 0usize;
 
-        for indexed in &indexed_stories {
+        emit("收集", 0, indexed_stories.len(), "加载剧情清单");
+
+        for (idx, indexed) in indexed_stories.iter().enumerate() {
             let story_id = &indexed.story.story_id;
             let story_name = &indexed.story.story_name;
             let story_path = &indexed.story.story_txt;
@@ -1490,7 +1863,12 @@ impl DataService {
             };
 
             let parsed = parse_story_text(&raw_text);
-            let flattened = Self::flatten_segments(&parsed.segments);
+            // Post-process segments the same way the frontend reader does so
+            // that the segment indices we store match what the UI will scroll
+            // to. Specifically: drop empty segments and merge consecutive
+            // same-speaker dialogue.
+            let processed = Self::post_process_segments_for_index(&parsed.segments);
+            let flattened = Self::flatten_segments(&processed);
 
             let combined_raw = if flattened.trim().is_empty() {
                 story_name.clone()
@@ -1506,7 +1884,7 @@ impl DataService {
             let category_label =
                 Self::format_category_label(&indexed.entry_type, &indexed.category_name);
 
-            insert_stmt
+            story_insert_stmt
                 .execute(params![
                     story_id,
                     story_name,
@@ -1522,9 +1900,68 @@ impl DataService {
                 ])
                 .map_err(|e| format!("Failed to insert story into index: {}", e))?;
             total += 1;
+
+            // Per-segment insertion: only meaningful textual segments are
+            // indexed. Header/Decision are useful for navigation so we still
+            // index their text where applicable.
+            for (seg_idx, segment) in processed.iter().enumerate() {
+                let (seg_type, character_name, raw_text): (&str, Option<&str>, String) = match segment {
+                    StorySegment::Dialogue { character_name, text, .. } => {
+                        ("dialogue", Some(character_name.as_str()), text.clone())
+                    }
+                    StorySegment::Narration { text } => ("narration", None, text.clone()),
+                    StorySegment::System { speaker, text } => {
+                        ("system", speaker.as_deref(), text.clone())
+                    }
+                    StorySegment::Subtitle { text, .. } => ("subtitle", None, text.clone()),
+                    StorySegment::Sticker { text, .. } => ("sticker", None, text.clone()),
+                    StorySegment::Header { title } => ("header", None, title.clone()),
+                    StorySegment::Decision { options, .. } => {
+                        ("decision", None, options.join("\n"))
+                    }
+                    StorySegment::Image { caption, .. } => {
+                        // 插画段 caption 如有文字可索引；否则跳过。
+                        let cap = caption.clone().unwrap_or_default();
+                        ("image", None, cap)
+                    }
+                    StorySegment::Music { .. } => ("music", None, String::new()),
+                };
+                if raw_text.trim().is_empty() {
+                    continue;
+                }
+                let seg_tokenized = Self::build_tokenized_content(&raw_text);
+                if seg_tokenized.trim().is_empty() {
+                    continue;
+                }
+                let character_norm = character_name
+                    .map(|c| Self::build_tokenized_content(c))
+                    .unwrap_or_default();
+                segment_insert_stmt
+                    .execute(params![
+                        story_id,
+                        seg_idx as i64,
+                        seg_type,
+                        character_norm,
+                        seg_tokenized,
+                        raw_text,
+                    ])
+                    .map_err(|e| format!("Failed to insert segment into index: {}", e))?;
+                segment_total += 1;
+            }
+
+            // Batch progress events to avoid flooding the frontend bus.
+            if (idx + 1) % 16 == 0 || idx + 1 == indexed_stories.len() {
+                emit(
+                    "构建",
+                    idx + 1,
+                    indexed_stories.len(),
+                    story_name,
+                );
+            }
         }
 
-        drop(insert_stmt);
+        drop(story_insert_stmt);
+        drop(segment_insert_stmt);
 
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1551,8 +1988,25 @@ impl DataService {
         )
         .map_err(|e| format!("Failed to update index total: {}", e))?;
 
+        tx.execute(
+            "
+            INSERT INTO story_index_meta (key, value)
+            VALUES ('segment_total', ?1)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        ",
+            params![segment_total.to_string()],
+        )
+        .map_err(|e| format!("Failed to update segment index total: {}", e))?;
+
         tx.commit()
             .map_err(|e| format!("Failed to commit story index rebuild: {}", e))?;
+
+        emit(
+            "完成",
+            total,
+            total,
+            &format!("已索引 {} 篇 / {} 段", total, segment_total),
+        );
 
         Ok(())
     }
@@ -1599,41 +2053,56 @@ impl DataService {
 
         let Some(fts_query) = Self::build_fts_query_advanced(query) else {
             return Ok(Some(Vec::new()));
-        };
-
+        };        // bm25() column weights: `story_id`(UNINDEXED)=0, `story_name`=10,
+        // `category`(UNINDEXED)=0, `tokenized_content`=1, `story_code`=5,
+        // `raw_content`(UNINDEXED)=0. Higher = more relevant. (bug C1)
         let query_sql = format!(
             "
             SELECT story_id, story_name, category, raw_content,
-                   snippet(story_index, -1, '', '', '...', 24) as snip
+                   snippet(story_index, 3, '', '', '...', 24) as snip
             FROM story_index
             WHERE story_index MATCH ?1
-            ORDER BY bm25(story_index)
+            ORDER BY bm25(story_index, 0.0, 10.0, 0.0, 1.0, 5.0, 0.0)
             LIMIT {}
         ",
             SEARCH_RESULT_LIMIT
         );
 
-        let mut stmt = conn
-            .prepare(&query_sql)
-            .map_err(|e| format!("Failed to prepare story index query: {}", e))?;
+        let mut stmt = match conn.prepare(&query_sql) {
+            Ok(stmt) => stmt,
+            Err(err) => {
+                eprintln!("[INDEX] prepare failed: {}", err);
+                return Ok(None);
+            }
+        };
 
-        let rows = stmt
-            .query_map(params![fts_query], |row| {
-                let story_id: String = row.get(0)?;
-                let story_name: String = row.get(1)?;
-                let category: String = row.get(2)?;
-                let raw_content: String = row.get(3)?;
-                let snip: String = row.get(4).unwrap_or_else(|_| String::new());
-                Ok((story_id, story_name, category, raw_content, snip))
-            })
-            .map_err(|e| format!("Failed to execute story index query: {}", e))?;
+        let rows = match stmt.query_map(params![fts_query], |row| {
+            let story_id: String = row.get(0)?;
+            let story_name: String = row.get(1)?;
+            let category: String = row.get(2)?;
+            let raw_content: String = row.get(3)?;
+            let snip: String = row.get(4).unwrap_or_else(|_| String::new());
+            Ok((story_id, story_name, category, raw_content, snip))
+        }) {
+            Ok(rows) => rows,
+            Err(err) => {
+                // FTS5 syntax errors surface here — surface gracefully rather
+                // than propagating to frontend (bug B1).
+                eprintln!(
+                    "[INDEX] execute failed for query '{}' → '{}': {}",
+                    query, fts_query, err
+                );
+                return Ok(None);
+            }
+        };
 
-        let query_lower = query.to_lowercase();
+        // Fuzzy-normalized query for context extraction.
+        let context_probe = normalize_for_fuzzy(query);
         let mut results = Vec::new();
         for row in rows {
             if let Ok((story_id, story_name, category, raw_content, snip)) = row {
                 // 优先使用原始内容提取上下文，避免 tokenized_content 导致的空格断字
-                let mut matched_text = self.extract_context(&raw_content, &query_lower);
+                let mut matched_text = self.extract_context(&raw_content, &context_probe);
                 if matched_text.trim().is_empty() && !snip.trim().is_empty() {
                     // 兜底：少数情况下 extract_context 未命中，回退 snippet 再做一次去空格优化
                     let cleaned = snip
@@ -1659,43 +2128,17 @@ impl DataService {
             }
         }
 
-        // 搜索家具（如果还没达到限制）
-        if results.len() < SEARCH_RESULT_LIMIT {
-            if let Ok(furnitures) = self.get_all_furnitures() {
-                let query_norm = normalize_nfkc_lower_strip_marks(query);
-                
-                for furniture in furnitures {
-                    if results.len() >= SEARCH_RESULT_LIMIT {
-                        break;
-                    }
-
-                    let name_norm = normalize_nfkc_lower_strip_marks(&furniture.name);
-                    let desc_norm = normalize_nfkc_lower_strip_marks(&furniture.description);
-
-                    if name_norm.contains(&query_norm) || desc_norm.contains(&query_norm) {
-                        let matched_text = if name_norm.contains(&query_norm) {
-                            furniture.name.clone()
-                        } else {
-                            furniture.description.clone()
-                        };
-
-                        results.push(SearchResult {
-                            story_id: format!("furniture_{}", furniture.id),
-                            story_name: furniture.name.clone(),
-                            matched_text,
-                            category: "家具".to_string(),
-                        });
-                    }
-                }
-            }
-        }
-
         Ok(Some(results))
     }
 
     fn search_stories_fallback(&self, query: &str) -> Result<Vec<SearchResult>, String> {
         let mut results = Vec::new();
-        let query_norm = normalize_nfkc_lower_strip_marks(query);
+        let terms = split_query_terms(query);
+        if terms.is_empty() {
+            return Ok(results);
+        }
+        // Primary term for context extraction + raw query for display fallback.
+        let primary_term = terms[0].clone();
 
         let stories = self.collect_stories_for_index()?;
 
@@ -1704,8 +2147,18 @@ impl DataService {
             let category_label =
                 Self::format_category_label(&indexed.entry_type, &indexed.category_name);
 
-            let story_name_norm = normalize_nfkc_lower_strip_marks(&story.story_name);
-            if story_name_norm.contains(&query_norm) {
+            let story_name_norm = normalize_for_fuzzy(&story.story_name);
+            let code_norm = story
+                .story_code
+                .as_ref()
+                .map(|s| normalize_for_fuzzy(s))
+                .unwrap_or_default();
+
+            // Fast path: title/code AND-hit.
+            let title_hits = terms
+                .iter()
+                .all(|t| story_name_norm.contains(t) || (!code_norm.is_empty() && code_norm.contains(t)));
+            if title_hits {
                 results.push(SearchResult {
                     story_id: story.story_id.clone(),
                     story_name: story.story_name.clone(),
@@ -1719,10 +2172,12 @@ impl DataService {
             }
 
             if let Ok(content) = self.read_story_text(&story.story_txt) {
-                let content_norm = normalize_nfkc_lower_strip_marks(&content);
-                if content_norm.contains(&query_norm) {
-                    // Use original content for extracting visible context
-                    let matched_text = self.extract_context(&content, &query_norm);
+                // Normalize the content with the same rules used for terms so that
+                // `{@nickname}` → `博士`, whitespace and punctuation differences are neutralized.
+                let content_norm = normalize_for_fuzzy(&content);
+                let body_hits = terms.iter().all(|t| content_norm.contains(t));
+                if body_hits {
+                    let matched_text = self.extract_context(&content, &primary_term);
                     results.push(SearchResult {
                         story_id: story.story_id.clone(),
                         story_name: story.story_name.clone(),
@@ -1736,75 +2191,411 @@ impl DataService {
             }
         }
 
-        // 搜索家具（如果还没达到限制）
-        if results.len() < SEARCH_RESULT_LIMIT {
-            if let Ok(furnitures) = self.get_all_furnitures() {
-                for furniture in furnitures {
-                    if results.len() >= SEARCH_RESULT_LIMIT {
-                        break;
-                    }
-
-                    let name_norm = normalize_nfkc_lower_strip_marks(&furniture.name);
-                    let desc_norm = normalize_nfkc_lower_strip_marks(&furniture.description);
-
-                    if name_norm.contains(&query_norm) || desc_norm.contains(&query_norm) {
-                        let matched_text = if name_norm.contains(&query_norm) {
-                            furniture.name.clone()
-                        } else {
-                            furniture.description.clone()
-                        };
-
-                        results.push(SearchResult {
-                            story_id: format!("furniture_{}", furniture.id),
-                            story_name: furniture.name.clone(),
-                            matched_text,
-                            category: "家具".to_string(),
-                        });
-                    }
-                }
-            }
-        }
-
         Ok(results)
     }
 
     /// 搜索剧情（混合：索引优先 + 线性扫描补全，防止遗漏）
+    ///
+    /// When the FTS index exists and returns a non-empty result set (or an
+    /// empty set from a well-formed query against an up-to-date corpus), we
+    /// trust it and skip the O(N*segments) linear scan. The scan only runs
+    /// as a fallback when the index is missing, corrupt, or returned an
+    /// error — otherwise a single query over 1900+ stories can easily take
+    /// 30s+ on lower-end devices.
     pub fn search_stories(&self, query: &str) -> Result<Vec<SearchResult>, String> {
         let trimmed = query.trim();
         if trimmed.is_empty() {
             return Ok(Vec::new());
         }
 
-        // 先走索引
-        let mut combined: Vec<SearchResult> = match self.search_stories_with_index(trimmed) {
-            Ok(Some(results)) => results,
-            Ok(None) => Vec::new(),
+        match self.search_stories_with_index(trimmed) {
+            // Index returned authoritative results — don't waste time on
+            // linear scan. FTS5 with jieba is a superset of plain contains()
+            // matching at this point.
+            Ok(Some(results)) => Ok(results),
+            // Index not ready (never built, was cleared, or empty table).
+            // Fall through to the slower scanner so the user can still get
+            // *something* on first launch. The scanner caps at
+            // SEARCH_RESULT_LIMIT and doesn't attempt to enumerate every
+            // story — practical budget is single-digit seconds on a typical
+            // machine.
+            Ok(None) => self.search_stories_fallback(trimmed),
             Err(err) => {
                 eprintln!(
                     "[INDEX] Failed to search using index ({}), fallback to linear scan",
                     err
                 );
-                Vec::new()
+                self.search_stories_fallback(trimmed)
+            }
+        }
+    }
+
+    /// Extended search: returns total match count (before truncation) and per-
+    /// category facet counts so the frontend can offer filter chips and a
+    /// "N 条已显示 / M 条匹配" hint. The underlying logic mirrors
+    /// `search_stories` (FTS + linear scan, deduped), but it also runs a
+    /// separate `COUNT(*)` on the FTS side for accurate totals.
+    pub fn search_stories_ex(&self, query: &str) -> Result<SearchResultsPage, String> {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return Ok(SearchResultsPage {
+                results: Vec::new(),
+                total_matched: 0,
+                truncated: false,
+                facets: Default::default(),
+            });
+        }
+
+        let results = self.search_stories(trimmed)?;
+
+        // Compute total via FTS (best effort — if the index is unavailable we
+        // fall back to `results.len()` which is at least a lower bound).
+        let total_matched = self
+            .count_fts_matches(trimmed)
+            .unwrap_or_else(|_| results.len());
+        let total_matched = total_matched.max(results.len());
+
+        // Build facets from the returned subset. Categories are formatted as
+        // `<Type> | <Specific Name>` (see `format_category_label`); aggregating
+        // by full string produces one chip per chapter which is unusable.
+        // Instead we bucket by the type prefix so users get a handful of broad
+        // filters (主线 / 活动 / 支线 / 肉鸽 / 干员密录).
+        let mut facets: std::collections::BTreeMap<String, usize> = Default::default();
+        for r in &results {
+            let key = r
+                .category
+                .split(" | ")
+                .next()
+                .unwrap_or(&r.category)
+                .trim()
+                .to_string();
+            *facets.entry(key).or_insert(0) += 1;
+        }
+
+        Ok(SearchResultsPage {
+            results,
+            total_matched,
+            truncated: total_matched > SEARCH_RESULT_LIMIT,
+            facets,
+        })
+    }
+
+    fn count_fts_matches(&self, query: &str) -> Result<usize, String> {
+        let Some(conn) = self.try_open_index_connection()? else {
+            return Ok(0);
+        };
+        let Some(fts_query) = Self::build_fts_query_advanced(query) else {
+            return Ok(0);
+        };
+        let total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM story_index WHERE story_index MATCH ?1",
+                params![fts_query],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        Ok(total.max(0) as usize)
+    }
+
+    /// Segment-level search: returns precise `(story_id, segment_index)`
+    /// hits ordered by bm25 so the frontend can jump directly to the matching
+    /// paragraph without running the fuzzy `findFocusSegmentIndex` fallback.
+    ///
+    /// When the segment index table hasn't been built (pre-v4 database or
+    /// first-run before sync completes), this returns an empty page and the
+    /// caller should fall back to `search_stories_ex`.
+    pub fn search_segments(&self, query: &str) -> Result<SegmentSearchPage, String> {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return Ok(SegmentSearchPage {
+                hits: Vec::new(),
+                total_matched: 0,
+                truncated: false,
+            });
+        }
+
+        let Some(conn) = self.try_open_index_connection()? else {
+            return Ok(SegmentSearchPage {
+                hits: Vec::new(),
+                total_matched: 0,
+                truncated: false,
+            });
+        };
+        Self::init_index_tables(&conn)?;
+
+        // Bail out if the segment table exists but is empty (e.g. after
+        // schema bump while rebuild is still running in the background).
+        let seg_total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM story_segment_index", [], |row| {
+                row.get(0)
+            })
+            .unwrap_or(0);
+        if seg_total == 0 {
+            return Ok(SegmentSearchPage {
+                hits: Vec::new(),
+                total_matched: 0,
+                truncated: false,
+            });
+        }
+
+        let Some(fts_query) = Self::build_fts_query_advanced(trimmed) else {
+            return Ok(SegmentSearchPage {
+                hits: Vec::new(),
+                total_matched: 0,
+                truncated: false,
+            });
+        };
+
+        // bm25 column weights: story_id(UNINDEXED)=0, segment_index(UNINDEXED)=0,
+        // segment_type(UNINDEXED)=0, character_name=6, tokenized_text=1,
+        // raw_text(UNINDEXED)=0. Boost character name matches so searching an
+        // operator floats dialogue hits featuring that operator to the top.
+        let query_sql = format!(
+            "
+            SELECT s.story_id,
+                   s.segment_index,
+                   s.segment_type,
+                   s.character_name,
+                   s.raw_text,
+                   snippet(story_segment_index, 4, '', '', '...', 16) AS snip
+            FROM story_segment_index AS s
+            WHERE story_segment_index MATCH ?1
+            ORDER BY bm25(story_segment_index, 0.0, 0.0, 0.0, 6.0, 1.0, 0.0)
+            LIMIT {}
+            ",
+            SEARCH_RESULT_LIMIT
+        );
+
+        let mut stmt = match conn.prepare(&query_sql) {
+            Ok(s) => s,
+            Err(err) => {
+                eprintln!("[SEG-INDEX] prepare failed: {}", err);
+                return Ok(SegmentSearchPage {
+                    hits: Vec::new(),
+                    total_matched: 0,
+                    truncated: false,
+                });
             }
         };
 
-        // 线性扫描补全（去重 by story_id）
-        let mut seen = std::collections::HashSet::new();
-        for r in &combined {
-            seen.insert(r.story_id.clone());
+        // Pre-fetch story_id → (story_name, category) for labels.
+        let label_map = self.collect_story_labels().unwrap_or_default();
+
+        let rows = match stmt.query_map(params![fts_query], |row| {
+            let story_id: String = row.get(0)?;
+            let segment_index: i64 = row.get(1)?;
+            let segment_type: String = row.get(2)?;
+            let character_name: String = row.get(3).unwrap_or_default();
+            let raw_text: String = row.get(4).unwrap_or_default();
+            let snip: String = row.get(5).unwrap_or_default();
+            Ok((story_id, segment_index, segment_type, character_name, raw_text, snip))
+        }) {
+            Ok(r) => r,
+            Err(err) => {
+                eprintln!("[SEG-INDEX] query failed for '{}': {}", fts_query, err);
+                return Ok(SegmentSearchPage {
+                    hits: Vec::new(),
+                    total_matched: 0,
+                    truncated: false,
+                });
+            }
+        };
+
+        let context_probe = normalize_for_fuzzy(trimmed);
+        let mut hits: Vec<SegmentHit> = Vec::new();
+        let mut seen: std::collections::HashSet<(String, usize)> = Default::default();
+        for row in rows {
+            let Ok((story_id, segment_index, segment_type, character_norm, raw_text, _snip)) = row
+            else {
+                continue;
+            };
+            // Did the query actually hit the segment body / speaker? Used
+            // for the UI's "按说话人命中" badge. "mixed" is our honest
+            // fallback when jieba tokenised the query and neither the body
+            // nor the speaker contain the full probe verbatim — in that
+            // case we show no badge rather than falsely accusing one
+            // column of being the culprit.
+            let body_norm = normalize_for_fuzzy(&raw_text);
+            let speaker_norm = normalize_for_fuzzy(&character_norm);
+            let body_hit = !context_probe.is_empty() && body_norm.contains(&context_probe);
+            let speaker_hit = !context_probe.is_empty() && speaker_norm.contains(&context_probe);
+            let match_target = if body_hit {
+                "body"
+            } else if speaker_hit {
+                "speaker"
+            } else {
+                "mixed"
+            };
+
+            // Build the preview. When the body actually contains the term we
+            // center the preview around the match; otherwise we show the
+            // whole segment (trimmed) so the user gets meaningful context
+            // even for short "好 / 嗯 / mon3tr" segments.
+            let matched_text = if body_hit {
+                let extracted = self.extract_context(&raw_text, &context_probe);
+                if extracted.trim().is_empty() {
+                    Self::clip_preview(&raw_text, 240)
+                } else {
+                    extracted
+                }
+            } else {
+                Self::clip_preview(&raw_text, 240)
+            };
+            let (story_name, category) = label_map
+                .get(&story_id)
+                .cloned()
+                .unwrap_or_else(|| (story_id.clone(), String::new()));
+            let character_name = if character_norm.trim().is_empty() {
+                None
+            } else {
+                // The stored value is the tokenized (space-separated) form;
+                // strip spaces for display since the UI shows short names.
+                Some(character_norm.split_whitespace().collect::<String>())
+            };
+            let seg_idx = segment_index.max(0) as usize;
+            seen.insert((story_id.clone(), seg_idx));
+            hits.push(SegmentHit {
+                story_id,
+                story_name,
+                category,
+                segment_index: seg_idx,
+                segment_type,
+                character_name,
+                matched_text,
+                match_target: match_target.to_string(),
+            });
         }
 
-        let fallback_results = self.search_stories_fallback(trimmed)?;
-        for r in fallback_results {
-            if seen.insert(r.story_id.clone()) {
-                combined.push(r);
-                if combined.len() >= SEARCH_RESULT_LIMIT {
-                    break;
+        // Merge story-name / story-code hits from the story-level index so
+        // exact title lookups like `大地惊雷` still surface as a clickable
+        // result even though the title itself isn't stored as a segment.
+        // Each such hit is presented as a pseudo-"header" segment at index 0
+        // so the reader lands on the beginning of the story when clicked.
+        if let Ok(story_rows) = self.story_level_title_hits(&fts_query, trimmed, &label_map) {
+            let remaining = SEARCH_RESULT_LIMIT.saturating_sub(hits.len());
+            for hit in story_rows.into_iter().take(remaining) {
+                let key = (hit.story_id.clone(), hit.segment_index);
+                if !seen.contains(&key) {
+                    seen.insert(key);
+                    hits.push(hit);
                 }
             }
         }
 
-        Ok(combined)
+        // Skip the COUNT(*) round-trip when we clearly aren't truncated —
+        // `rows.len() < LIMIT` implies every matching row is in `hits`.
+        // Only when the LIMIT kicked in do we need the authoritative total
+        // to drive the "已显示 X / Y" hint in the UI.
+        let total_matched = if hits.len() >= SEARCH_RESULT_LIMIT {
+            let total: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM story_segment_index WHERE story_segment_index MATCH ?1",
+                    params![fts_query.clone()],
+                    |row| row.get(0),
+                )
+                .unwrap_or(hits.len() as i64);
+            hits.len().max(total.max(0) as usize)
+        } else {
+            hits.len()
+        };
+
+        Ok(SegmentSearchPage {
+            hits,
+            total_matched,
+            truncated: total_matched > SEARCH_RESULT_LIMIT,
+        })
+    }
+
+    /// Cheap helper: build the `storyId -> (storyName, category)` map once per
+    /// call. Called by `search_segments` to attach display labels.
+    fn collect_story_labels(&self) -> Result<HashMap<String, (String, String)>, String> {
+        let indexed = self.collect_stories_for_index()?;
+        let mut map = HashMap::with_capacity(indexed.len());
+        for item in indexed {
+            let label = Self::format_category_label(&item.entry_type, &item.category_name);
+            map.insert(item.story.story_id.clone(), (item.story.story_name.clone(), label));
+        }
+        Ok(map)
+    }
+
+    /// Produce segment-style hits derived from the story-level index, used
+    /// so that searches for story titles / codes still surface relevant
+    /// entries even when the actual title text doesn't appear in any
+    /// segment body. Each pseudo-hit lands on segment index 0 (the start of
+    /// the story). `fts_query` is the already-compiled FTS query string.
+    ///
+    /// We deliberately do NOT use FTS5 `{col}:` scoping here — the
+    /// `story_name` column is stored raw (no pre-tokenization), so unicode61
+    /// only produces a single-CJK-run token per title. Scoping-by-column
+    /// would therefore fail for any multi-word title query. Instead we rely
+    /// on the existing bm25 column weighting (story_name × 10) to push
+    /// genuine title matches to the top, and then post-filter the results
+    /// so only rows whose title or code actually contains the user's query
+    /// survive. This catches exact title lookups like `大地惊雷` even when
+    /// no body segment matches.
+    fn story_level_title_hits(
+        &self,
+        fts_query: &str,
+        query_raw: &str,
+        label_map: &HashMap<String, (String, String)>,
+    ) -> Result<Vec<SegmentHit>, String> {
+        let Some(conn) = self.try_open_index_connection()? else {
+            return Ok(Vec::new());
+        };
+        let sql = "
+            SELECT story_id, story_name, category, story_code
+            FROM story_index
+            WHERE story_index MATCH ?1
+            ORDER BY bm25(story_index, 0.0, 10.0, 0.0, 1.0, 5.0, 0.0)
+            LIMIT 50
+        ";
+        let mut stmt = match conn.prepare(sql) {
+            Ok(s) => s,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let rows = match stmt.query_map(params![fts_query], |row| {
+            let story_id: String = row.get(0)?;
+            let story_name: String = row.get(1)?;
+            let category: String = row.get(2)?;
+            let story_code: String = row.get(3).unwrap_or_default();
+            Ok((story_id, story_name, category, story_code))
+        }) {
+            Ok(r) => r,
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        // Post-filter: the row's title or code must contain the user's
+        // query under fuzzy normalization (NFKC + lower + punct-strip).
+        // This weeds out body-only matches that bm25 happened to rank high.
+        let probe = normalize_for_fuzzy(query_raw);
+        if probe.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut hits = Vec::new();
+        for row in rows {
+            let Ok((story_id, story_name, category, story_code)) = row else { continue };
+            let name_norm = normalize_for_fuzzy(&story_name);
+            let code_norm = normalize_for_fuzzy(&story_code);
+            if !name_norm.contains(&probe) && !code_norm.contains(&probe) {
+                continue;
+            }
+            let (story_name, category) = label_map
+                .get(&story_id)
+                .cloned()
+                .unwrap_or((story_name, category));
+            hits.push(SegmentHit {
+                story_id,
+                story_name: story_name.clone(),
+                category,
+                segment_index: 0,
+                segment_type: "header".to_string(),
+                character_name: None,
+                matched_text: story_name,
+                match_target: "title".to_string(),
+            });
+        }
+        Ok(hits)
     }
 
     pub fn search_stories_with_debug(&self, query: &str) -> Result<SearchDebugResponse, String> {
@@ -1939,14 +2730,26 @@ impl DataService {
         emit_search_progress(app, "线性扫描", 0, total.max(1), "开始遍历");
 
         let mut results = Vec::new();
-        let query_norm = normalize_nfkc_lower_strip_marks(trimmed);
+        let terms = split_query_terms(trimmed);
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let primary_term = terms[0].clone();
         for (idx, indexed) in stories.iter().enumerate() {
             let story = &indexed.story;
             let category_label =
                 Self::format_category_label(&indexed.entry_type, &indexed.category_name);
 
-            let story_name_norm = normalize_nfkc_lower_strip_marks(&story.story_name);
-            if story_name_norm.contains(&query_norm) {
+            let story_name_norm = normalize_for_fuzzy(&story.story_name);
+            let code_norm = story
+                .story_code
+                .as_ref()
+                .map(|s| normalize_for_fuzzy(s))
+                .unwrap_or_default();
+            let title_hits = terms
+                .iter()
+                .all(|t| story_name_norm.contains(t) || (!code_norm.is_empty() && code_norm.contains(t)));
+            if title_hits {
                 results.push(SearchResult {
                     story_id: story.story_id.clone(),
                     story_name: story.story_name.clone(),
@@ -1954,9 +2757,9 @@ impl DataService {
                     category: category_label.clone(),
                 });
             } else if let Ok(content) = self.read_story_text(&story.story_txt) {
-                let content_norm = normalize_nfkc_lower_strip_marks(&content);
-                if content_norm.contains(&query_norm) {
-                    let matched_text = self.extract_context(&content, &query_norm);
+                let content_norm = normalize_for_fuzzy(&content);
+                if terms.iter().all(|t| content_norm.contains(t)) {
+                    let matched_text = self.extract_context(&content, &primary_term);
                     results.push(SearchResult {
                         story_id: story.story_id.clone(),
                         story_name: story.story_name.clone(),
@@ -1992,57 +2795,177 @@ impl DataService {
         Err(format!("Story {} 不存在", story_id))
     }
 
+    /// Return the previous/next story in the same storyGroup ordered by
+    /// storySort. If the story is the first/last, the corresponding field is
+    /// None. Derived purely from `story_review_table.json`; no extra index.
+    pub fn get_story_neighbors(&self, story_id: &str) -> Result<crate::models::StoryNeighbors, String> {
+        let stories = self.collect_stories_for_index()?;
+        let mut target_group: Option<String> = None;
+        let mut target_sort: i32 = 0;
+        for indexed in &stories {
+            if indexed.story.story_id == story_id {
+                target_group = Some(indexed.story.story_group.clone());
+                target_sort = indexed.story.story_sort;
+                break;
+            }
+        }
+        let Some(group) = target_group else {
+            return Ok(crate::models::StoryNeighbors::default());
+        };
+
+        // Collect same-group stories, sort by sort ascending.
+        let mut group_stories: Vec<StoryEntry> = stories
+            .into_iter()
+            .filter(|x| x.story.story_group == group)
+            .map(|x| x.story)
+            .collect();
+        group_stories.sort_by_key(|s| s.story_sort);
+
+        let pos = group_stories
+            .iter()
+            .position(|s| s.story_id == story_id);
+        let Some(pos) = pos else {
+            return Ok(crate::models::StoryNeighbors::default());
+        };
+
+        let _ = target_sort;
+        let prev = if pos > 0 {
+            Some(group_stories[pos - 1].clone())
+        } else {
+            None
+        };
+        let next = if pos + 1 < group_stories.len() {
+            Some(group_stories[pos + 1].clone())
+        } else {
+            None
+        };
+        Ok(crate::models::StoryNeighbors { prev, next })
+    }
+
+    /// 查找指定 storyId 所在的 **章节 / 活动** 名。
+    /// 返回如 "黑暗时代·上"、"和光同尘" 等；找不到返回 None。
+    pub fn get_story_category_name(&self, story_id: &str) -> Result<Option<String>, String> {
+        let stories = self.collect_stories_for_index()?;
+        for indexed in stories {
+            if indexed.story.story_id == story_id {
+                let name = indexed.category_name.trim();
+                return Ok(if name.is_empty() {
+                    None
+                } else {
+                    Some(name.to_string())
+                });
+            }
+        }
+        Ok(None)
+    }
+
     /// 提取匹配文本的上下文
+    ///
+    /// Return a clean preview of the segment body, collapsing any
+    /// `\r\n` / `\n` runs to a single space and truncating to `max_chars`
+    /// Unicode scalar values (appending "…" if we clipped). Used when the
+    /// query matched a non-body column (speaker/title) so the preview
+    /// should just show the whole short segment rather than the empty
+    /// output of `extract_context`.
+    fn clip_preview(raw: &str, max_chars: usize) -> String {
+        let flattened = raw
+            .replace('\r', " ")
+            .replace('\n', " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let chars: Vec<char> = flattened.chars().collect();
+        if chars.len() <= max_chars {
+            flattened
+        } else {
+            let mut s: String = chars.iter().take(max_chars).collect();
+            s.push('…');
+            s
+        }
+    }
+
+    /// 使用归一化后文本查找匹配位置，再把"归一化字符索引"映射回"原文字节位置"，
+    /// 避免 NFKC/去标点造成的字节长度变化导致越界或错位（bug A1）。
     fn extract_context(&self, content: &str, query: &str) -> String {
         if content.is_empty() || query.is_empty() {
             return String::new();
         }
 
-        let content_lower = normalize_nfkc_lower_strip_marks(content);
-
-        if let Some(pos) = content_lower.find(query) {
-            return Self::build_context_snippet(content, pos, query.len());
+        // Normalize both sides with the fuzzy pipeline for consistency with the
+        // linear-scan fallback. `query` is expected to already be fuzzy-normalized
+        // by the caller, but re-normalizing is idempotent and cheap.
+        let query_norm = normalize_for_fuzzy(query);
+        if query_norm.is_empty() {
+            return String::new();
         }
 
-        for token in query.split_whitespace().filter(|t| !t.is_empty()) {
-            if let Some(pos) = content_lower.find(token) {
-                return Self::build_context_snippet(content, pos, token.len());
+        // Build a parallel mapping: for each normalized char, remember the
+        // original char index it came from. This lets us map a match position
+        // back to the original content without byte-length surprises.
+        let mut norm_chars: Vec<char> = Vec::with_capacity(content.len());
+        let mut origin_char_for_norm: Vec<usize> = Vec::with_capacity(content.len());
+        for (orig_idx, ch) in content.replace("{@nickname}", "博士").chars().enumerate() {
+            // The replace above shifts indices for any passage containing
+            // `{@nickname}`, but for the common case it is benign. We still
+            // compute the best-effort mapping using the *current* char
+            // position after the textual substitution — users search "博士"
+            // and expect the snippet to show "博士" as well.
+            for normalized in ch.to_lowercase() {
+                let nfkc: String = normalized.nfkc().collect();
+                for nch in nfkc.chars() {
+                    if unicode_normalization::char::canonical_combining_class(nch) != 0 {
+                        continue;
+                    }
+                    if nch.is_whitespace() || is_common_punctuation(nch) {
+                        continue;
+                    }
+                    norm_chars.push(nch);
+                    origin_char_for_norm.push(orig_idx);
+                }
+            }
+        }
+
+        let norm_text: String = norm_chars.iter().collect();
+        if norm_text.is_empty() {
+            return String::new();
+        }
+
+        // Try full query first, then each whitespace-delimited token as a
+        // second-chance match. `query_norm` is already stripped of whitespace
+        // via normalize_for_fuzzy so the split is mostly irrelevant; kept for
+        // symmetry with how callers historically passed multi-token queries.
+        let mut probes = Vec::new();
+        probes.push(query_norm.as_str());
+
+        for probe in probes {
+            if probe.is_empty() {
+                continue;
+            }
+            if let Some(pos_byte) = norm_text.find(probe) {
+                // Byte position in `norm_text` → norm char index.
+                let norm_char_index = norm_text[..pos_byte].chars().count();
+                if norm_char_index >= origin_char_for_norm.len() {
+                    continue;
+                }
+                let origin_char_start = origin_char_for_norm[norm_char_index];
+                let probe_char_len = probe.chars().count();
+                // Original snippet window around the matched characters.
+                let origin_chars: Vec<char> = content.chars().collect();
+                if origin_chars.is_empty() {
+                    return String::new();
+                }
+                let window = 50usize;
+                let snippet_start = origin_char_start.saturating_sub(window);
+                let snippet_end = (origin_char_start + probe_char_len + window).min(origin_chars.len());
+                let snippet: String = origin_chars[snippet_start..snippet_end].iter().collect();
+                if snippet.is_empty() {
+                    continue;
+                }
+                return format!("...{}...", snippet.trim());
             }
         }
 
         String::new()
-    }
-
-    fn build_context_snippet(content: &str, byte_start: usize, pattern_bytes: usize) -> String {
-        let prefix = match content.get(..byte_start) {
-            Some(slice) => slice,
-            None => return String::new(),
-        };
-
-        let byte_end = byte_start.saturating_add(pattern_bytes).min(content.len());
-        let matched_slice = match content.get(byte_start..byte_end) {
-            Some(slice) => slice,
-            None => "",
-        };
-
-        let start_char_index = prefix.chars().count();
-        let matched_char_len = matched_slice.chars().count();
-
-        let chars: Vec<char> = content.chars().collect();
-        if chars.is_empty() {
-            return String::new();
-        }
-
-        let window = 50usize;
-        let snippet_start = start_char_index.saturating_sub(window);
-        let snippet_end = (start_char_index + matched_char_len + window).min(chars.len());
-
-        let snippet: String = chars[snippet_start..snippet_end].iter().collect();
-        if snippet.is_empty() {
-            return String::new();
-        }
-
-        format!("...{}...", snippet.trim())
     }
 
     pub fn get_main_stories_grouped(&self) -> Result<Vec<(String, Vec<StoryEntry>)>, String> {
@@ -2242,14 +3165,13 @@ impl DataService {
             .map_err(|e| format!("Failed to parse story review meta data: {}", e))?;
 
         let mut path_desc_map: HashMap<String, String> = HashMap::new();
-
-        // 从 meta 中收集 contentPath 映射
+        // 广义扫描：meta 中所有含 contentPath 的对象都尝试收集（兼容结构变动）
         fn collect_content_paths(map: &mut HashMap<String, String>, val: &Value) {
             match val {
                 Value::Object(obj) => {
                     if let Some(cp) = obj.get("contentPath").and_then(|x| x.as_str()) {
                         let lower = cp.to_ascii_lowercase();
-                        if lower.starts_with("obt/roguelike/") || lower.starts_with("obt/rogue/") {
+                        if lower.starts_with("obt/roguelike/") {
                             let desc = obj
                                 .get("desc")
                                 .and_then(|x| x.as_str())
@@ -2277,172 +3199,31 @@ impl DataService {
         }
         collect_content_paths(&mut path_desc_map, &meta_value);
 
-        // 1. 使用 story_table 作为权威来源，枚举所有 Obt/Roguelike 文本（ro1~ro5的关卡剧情）
+        // 使用 story_table 作为权威来源，枚举所有 Obt/Roguelike 文本
         let story_table_file = self.data_dir.join("zh_CN/gamedata/excel/story_table.json");
         let story_table_content = fs::read_to_string(&story_table_file)
             .map_err(|e| format!("Failed to read story table file: {}", e))?;
         let table_obj: HashMap<String, Value> = serde_json::from_str(&story_table_content)
             .map_err(|e| format!("Failed to parse story table: {}", e))?;
 
-        // 2. 使用 roguelike_topic_table 获取 Obt/Rogue 下的剧情（月度聊天、终章、挑战等）
-        let roguelike_topic_file = self
-            .data_dir
-            .join("zh_CN/gamedata/excel/roguelike_topic_table.json");
-        let roguelike_topic_content = fs::read_to_string(&roguelike_topic_file)
-            .map_err(|e| format!("Failed to read roguelike topic file: {}", e))?;
-        let roguelike_topic_value: Value = serde_json::from_str(&roguelike_topic_content)
-            .map_err(|e| format!("Failed to parse roguelike topic data: {}", e))?;
-
         let mut grouped: HashMap<String, Vec<StoryEntry>> = HashMap::new();
         let mut counters: HashMap<String, i32> = HashMap::new();
 
-        // Helper: 递归提取所有包含剧情路径的字段，同时提取友好标题
-        fn extract_story_data_from_value(
-            val: &Value,
-            story_data: &mut Vec<(String, Option<String>)>,
-            path_desc_map: &mut HashMap<String, String>,
-        ) {
-            match val {
-                Value::Object(obj) => {
-                    // 检查是否包含 textId/chatStoryId/avgId 等剧情路径字段
-                    let mut story_path: Option<String> = None;
-                    let mut title: Option<String> = None;
-
-                    if let Some(text_id) = obj.get("textId").and_then(|v| v.as_str()) {
-                        story_path = Some(text_id.to_string());
-                    } else if let Some(chat_id) = obj.get("chatStoryId").and_then(|v| v.as_str()) {
-                        story_path = Some(chat_id.to_string());
-                    } else if let Some(chat_id) = obj.get("chatId").and_then(|v| v.as_str()) {
-                        story_path = Some(chat_id.to_string());
-                    } else if let Some(avg_id) = obj.get("avgId").and_then(|v| v.as_str()) {
-                        story_path = Some(avg_id.to_string());
-                    }
-
-                    // 提取标题
-                    if let Some(name) = obj.get("endbookName").and_then(|v| v.as_str()) {
-                        title = Some(name.to_string());
-                    } else if let Some(name) = obj.get("teamName").and_then(|v| v.as_str()) {
-                        title = Some(name.to_string());
-                    } else if let Some(name) = obj.get("chatDesc").and_then(|v| v.as_str()) {
-                        title = Some(name.to_string());
-                    } else if let Some(name) = obj.get("title").and_then(|v| v.as_str()) {
-                        title = Some(name.to_string());
-                    }
-
-                    if let Some(path) = story_path {
-                        let lower = path.to_ascii_lowercase();
-                        if lower.starts_with("obt/rogue/")
-                            || lower.starts_with("obt/roguelike/")
-                            || lower.starts_with("month_chat_rogue_")
-                        {
-                            story_data.push((path.clone(), title.clone()));
-                            // 同时更新映射表
-                            if let Some(t) = &title {
-                                if !t.is_empty() && !t.trim().is_empty() {
-                                    path_desc_map.insert(lower.clone(), t.clone());
-                                }
-                            }
-                        }
-                    }
-
-                    // 继续递归
-                    for v in obj.values() {
-                        extract_story_data_from_value(v, story_data, path_desc_map);
-                    }
-                }
-                Value::Array(arr) => {
-                    for v in arr {
-                        extract_story_data_from_value(v, story_data, path_desc_map);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        // 从 roguelike_topic_table 中提取剧情数据
-        let mut roguelike_story_data = Vec::new();
-        extract_story_data_from_value(
-            &roguelike_topic_value,
-            &mut roguelike_story_data,
-            &mut path_desc_map,
-        );
-
-        // 辅助函数：为给定路径查找最佳匹配的标题
-        // 例如 "obt/rogue/month_chat_rogue_1_1/month_chat_rogue_1_1_1.txt"
-        // 应该能找到 "month_chat_rogue_1_1" 的标题
-        let find_title_for_path = |path: &str, map: &HashMap<String, String>| -> Option<String> {
-            let lower = path.to_ascii_lowercase();
-
-            // 首先尝试精确匹配
-            if let Some(title) = map.get(&lower) {
-                return Some(title.clone());
-            }
-
-            // 对于 month_chat 类型的路径，尝试查找父级标题
-            // 例如 "obt/rogue/month_chat_rogue_1_1/month_chat_rogue_1_1_1.txt" -> "month_chat_rogue_1_1"
-            if lower.contains("month_chat_rogue_") {
-                let parts: Vec<&str> = lower.split('/').collect();
-                if parts.len() >= 3 {
-                    let parent_id = parts[2]; // month_chat_rogue_1_1
-                    if let Some(title) = map.get(parent_id) {
-                        return Some(title.clone());
-                    }
-                }
-            }
-
-            None
-        };
-
-        // 处理 story_table 中的条目
         for (key, _v) in table_obj.into_iter() {
             let lower = key.to_ascii_lowercase();
-            // 支持两个肉鸽目录：obt/roguelike/ 和 obt/rogue/
-            if !lower.starts_with("obt/roguelike/") && !lower.starts_with("obt/rogue/") {
+            if !lower.starts_with("obt/roguelike/") {
                 continue;
             }
-
-            // 跳过月度聊天的分片文件（这些会在后面的文件系统扫描中作为合并条目添加）
-            if lower.contains("/month_chat_rogue_") {
-                continue;
-            }
-
-            // 智能提取分组键
-            // obt/roguelike/ro1/... -> RO1
-            // obt/rogue/month_chat_rogue_1_1/... -> MONTH_CHAT_ROGUE_1
-            // obt/rogue/rogue_2/endbook/... -> ROGUE_2
-            let group_key = if lower.starts_with("obt/roguelike/") {
-                // roguelike 目录：使用第三段作为分组键
-                lower
-                    .split('/')
-                    .nth(2)
-                    .map(|s| s.to_uppercase())
-                    .unwrap_or_else(|| "ROGUE".to_string())
-            } else {
-                // rogue 目录：需要特殊处理多层结构
-                let parts: Vec<&str> = lower.split('/').collect();
-                if parts.len() >= 3 {
-                    let third_part = parts[2];
-                    // month_chat_rogue_1_1 -> MONTH_CHAT_ROGUE_1
-                    if third_part.starts_with("month_chat_rogue_") {
-                        // 提取到倒数第二个下划线之前
-                        let prefix = third_part.rsplitn(2, '_').nth(1).unwrap_or(third_part);
-                        prefix.to_uppercase()
-                    } else if third_part.starts_with("rogue_") {
-                        // rogue_2, rogue_3, ... -> ROGUE_2, ROGUE_3, ...
-                        third_part.to_uppercase()
-                    } else {
-                        third_part.to_uppercase()
-                    }
-                } else {
-                    "ROGUE".to_string()
-                }
-            };
-
+            let group_key = lower
+                .split('/')
+                .nth(2)
+                .map(|s| s.to_uppercase())
+                .unwrap_or_else(|| "ROGUE".to_string());
             let sort = counters
                 .entry(group_key.clone())
                 .and_modify(|x| *x += 1)
                 .or_insert(1);
-            let name = find_title_for_path(&key, &path_desc_map).unwrap_or_else(|| {
+            let name = path_desc_map.get(&lower).cloned().unwrap_or_else(|| {
                 // 取最后一段作为兜底标题
                 key.split('/').last().unwrap_or(&key).to_string()
             });
@@ -2471,156 +3252,6 @@ impl DataService {
             grouped.entry(group_key).or_default().push(entry);
         }
 
-        // 处理 roguelike_topic_table 中提取的剧情数据
-        for (story_id, explicit_title) in roguelike_story_data {
-            let lower = story_id.to_ascii_lowercase();
-
-            // 跳过月度聊天的分片文件（这些会在后面的文件系统扫描中作为合并条目添加）
-            if lower.contains("/month_chat_rogue_") || lower.starts_with("month_chat_rogue_") {
-                continue;
-            }
-
-            // 智能提取分组键（同样的逻辑）
-            let group_key = if lower.starts_with("obt/roguelike/") {
-                lower
-                    .split('/')
-                    .nth(2)
-                    .map(|s| s.to_uppercase())
-                    .unwrap_or_else(|| "ROGUE".to_string())
-            } else {
-                let parts: Vec<&str> = lower.split('/').collect();
-                if parts.len() >= 3 {
-                    let third_part = parts[2];
-                    if third_part.starts_with("month_chat_rogue_") {
-                        let prefix = third_part.rsplitn(2, '_').nth(1).unwrap_or(third_part);
-                        prefix.to_uppercase()
-                    } else if third_part.starts_with("rogue_") {
-                        third_part.to_uppercase()
-                    } else {
-                        third_part.to_uppercase()
-                    }
-                } else {
-                    "ROGUE".to_string()
-                }
-            };
-
-            let sort = counters
-                .entry(group_key.clone())
-                .and_modify(|x| *x += 1)
-                .or_insert(1);
-
-            // 优先使用显式标题，否则查找映射（包括父级标题），最后回退到文件名
-            let name = explicit_title
-                .filter(|s| !s.trim().is_empty())
-                .or_else(|| find_title_for_path(&story_id, &path_desc_map))
-                .unwrap_or_else(|| story_id.split('/').last().unwrap_or(&story_id).to_string());
-
-            let entry = StoryEntry {
-                story_id: story_id.clone(),
-                story_name: name,
-                story_code: None,
-                story_group: group_key.clone(),
-                story_sort: *sort,
-                avg_tag: None,
-                story_txt: lower.clone(),
-                story_info: None,
-                story_review_type: "ROGUELIKE".to_string(),
-                unlock_type: "NONE".to_string(),
-                story_dependence: None,
-                story_can_show: None,
-                story_can_enter: None,
-                stage_count: None,
-                required_stages: None,
-                cost_item_type: None,
-                cost_item_id: None,
-                cost_item_count: None,
-            };
-
-            grouped.entry(group_key).or_default().push(entry);
-        }
-
-        // 扫描文件系统中的月度聊天文件（不在 story_table 中）
-        // 月度聊天通常分成多个部分，需要合并成一个条目
-        let rogue_dir = self.data_dir.join("zh_CN/gamedata/story/obt/rogue");
-        if rogue_dir.exists() {
-            if let Ok(entries) = fs::read_dir(&rogue_dir) {
-                for entry in entries.flatten() {
-                    let dir_name = entry.file_name().to_string_lossy().to_string();
-                    if !dir_name.starts_with("month_chat_rogue_") {
-                        continue;
-                    }
-
-                    // 收集该目录下的所有 .txt 文件并排序
-                    let mut story_files = Vec::new();
-                    if let Ok(files) = fs::read_dir(entry.path()) {
-                        for story_file in files.flatten() {
-                            let file_name = story_file.file_name().to_string_lossy().to_string();
-                            if file_name.ends_with(".txt") {
-                                story_files.push(file_name);
-                            }
-                        }
-                    }
-
-                    // 排序文件（按 _1, _2, _3 等顺序）
-                    story_files.sort();
-
-                    if story_files.is_empty() {
-                        continue;
-                    }
-
-                    // 使用第一个文件构造基础路径来查找标题
-                    let base_story_id = format!(
-                        "Obt/Rogue/{}/{}",
-                        dir_name,
-                        story_files[0].trim_end_matches(".txt")
-                    );
-
-                    // 提取分组键
-                    let group_key = {
-                        let prefix = dir_name.rsplitn(2, '_').nth(1).unwrap_or(&dir_name);
-                        prefix.to_uppercase()
-                    };
-
-                    let sort = counters
-                        .entry(group_key.clone())
-                        .and_modify(|x| *x += 1)
-                        .or_insert(1);
-
-                    // 查找标题（使用目录名或第一个文件）
-                    let name = find_title_for_path(&base_story_id, &path_desc_map)
-                        .unwrap_or_else(|| dir_name.clone());
-
-                    // 创建一个合并的 story_id，包含所有部分
-                    // 格式：Obt/Rogue/month_chat_rogue_1_1 (将在读取时自动拼接所有部分)
-                    let merged_story_id = format!("Obt/Rogue/{}", dir_name);
-                    let lower = merged_story_id.to_ascii_lowercase();
-
-                    let entry = StoryEntry {
-                        story_id: merged_story_id.clone(),
-                        story_name: name,
-                        story_code: None,
-                        story_group: group_key.clone(),
-                        story_sort: *sort,
-                        avg_tag: None,
-                        story_txt: lower.clone(),
-                        story_info: None,
-                        story_review_type: "ROGUELIKE".to_string(),
-                        unlock_type: "NONE".to_string(),
-                        story_dependence: None,
-                        story_can_show: None,
-                        story_can_enter: None,
-                        stage_count: None,
-                        required_stages: None,
-                        cost_item_type: None,
-                        cost_item_id: None,
-                        cost_item_count: None,
-                    };
-
-                    grouped.entry(group_key).or_default().push(entry);
-                }
-            }
-        }
-
         let mut out: Vec<(String, Vec<StoryEntry>)> = grouped
             .into_iter()
             .map(|(name, mut stories)| {
@@ -2637,121 +3268,19 @@ impl DataService {
             return Err("NOT_INSTALLED".to_string());
         }
 
-        // 从 handbook_info_table.json 读取干员密录数据
-        let handbook_file = self
+        let story_review_file = self
             .data_dir
-            .join("zh_CN/gamedata/excel/handbook_info_table.json");
+            .join("zh_CN/gamedata/excel/story_review_table.json");
 
-        let handbook_content = fs::read_to_string(&handbook_file)
-            .map_err(|e| format!("Failed to read handbook file: {}", e))?;
+        let content = fs::read_to_string(&story_review_file)
+            .map_err(|e| format!("Failed to read story review file: {}", e))?;
 
-        let handbook_data: Value = serde_json::from_str(&handbook_content)
-            .map_err(|e| format!("Failed to parse handbook data: {}", e))?;
+        let data: HashMap<String, Value> = serde_json::from_str(&content)
+            .map_err(|e| format!("Failed to parse story review data: {}", e))?;
 
-        // 同时读取 character_table.json 获取干员名字
-        let character_file = self
-            .data_dir
-            .join("zh_CN/gamedata/excel/character_table.json");
-
-        let character_content = fs::read_to_string(&character_file)
-            .map_err(|e| format!("Failed to read character file: {}", e))?;
-
-        let character_data: Value = serde_json::from_str(&character_content)
-            .map_err(|e| format!("Failed to parse character data: {}", e))?;
-
-        let mut stories = Vec::new();
-
-        // 遍历所有干员的 handbookAvgList
-        if let Some(handbook_dict) = handbook_data.get("handbookDict").and_then(|v| v.as_object()) {
-            for (char_id, handbook_value) in handbook_dict.iter() {
-                if let Some(avg_list) = handbook_value
-                    .get("handbookAvgList")
-                    .and_then(|v| v.as_array())
-                {
-                    // 获取干员名字
-                    let char_name = character_data
-                        .get(char_id)
-                        .and_then(|v| v.get("name"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("未知干员");
-
-                    // 处理每个密录集合
-                    for story_set in avg_list {
-                        let story_set_name = story_set
-                            .get("storySetName")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-
-                        if let Some(avg_stories) = story_set.get("avgList").and_then(|v| v.as_array()) {
-                            for (idx, avg_story) in avg_stories.iter().enumerate() {
-                                // 构建 StoryEntry
-                                let story_id = avg_story
-                                    .get("storyId")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-
-                                let story_intro = avg_story
-                                    .get("storyIntro")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("");
-
-                                let story_txt = avg_story
-                                    .get("storyTxt")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string());
-
-                                let story_info = avg_story
-                                    .get("storyInfo")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string());
-
-                                // 构建显示名称：干员名 - 密录名（不包含简介）
-                                let display_name = format!("{} - {}", char_name, story_set_name);
-                                
-                                // 将简介放到avgTag字段显示为小字
-                                let avg_tag_text = if !story_intro.is_empty() {
-                                    story_intro.to_string()
-                                } else {
-                                    "干员密录".to_string()
-                                };
-
-                                let story = StoryEntry {
-                                    story_review_type: "MEMORY".to_string(),
-                                    story_id,
-                                    story_group: char_name.to_string(), // 使用干员名作为分组
-                                    story_sort: idx as i32,
-                                    story_dependence: None,
-                                    story_can_show: Some(1),
-                                    story_code: None, // 不显示 charId
-                                    story_name: display_name,
-                                    story_info,
-                                    story_can_enter: Some(1),
-                                    story_txt: story_txt.unwrap_or_default(),
-                                    avg_tag: Some(avg_tag_text), // 使用简介作为标签
-                                    unlock_type: "NONE".to_string(),
-                                    cost_item_type: Some("NONE".to_string()),
-                                    cost_item_id: None,
-                                    cost_item_count: Some(0),
-                                    stage_count: Some(0),
-                                    required_stages: None,
-                                };
-
-                                stories.push(story);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 按干员名字排序
-        stories.sort_by(|a, b| a.story_group.cmp(&b.story_group));
-
+        let stories = self.parse_stories_by_entry_type(&data, "NONE")?;
         Ok(stories)
     }
-
-    /// 获取主线笔记剧情（按章节分组）
     pub fn get_record_stories_grouped(&self) -> Result<Vec<(String, Vec<StoryEntry>)>, String> {
         if !self.is_installed() {
             return Err("NOT_INSTALLED".to_string());
@@ -5232,5 +5761,132 @@ mod tests {
         assert_eq!(content, "test summary");
 
         let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn normalize_for_fuzzy_strips_whitespace_and_punctuation() {
+        assert_eq!(normalize_for_fuzzy("凯尔希 阿米娅"), "凯尔希阿米娅");
+        assert_eq!(normalize_for_fuzzy("凯尔希，阿米娅！"), "凯尔希阿米娅");
+        assert_eq!(normalize_for_fuzzy("Kal'tsit"), "kaltsit");
+        // NFKC folds full-width alphanumerics to half-width.
+        assert_eq!(normalize_for_fuzzy("ＡＢＣ１２３"), "abc123");
+    }
+
+    #[test]
+    fn normalize_for_fuzzy_replaces_nickname() {
+        assert_eq!(
+            normalize_for_fuzzy("{@nickname}，你好"),
+            "博士你好"
+        );
+    }
+
+    #[test]
+    fn split_query_terms_basic() {
+        let terms = split_query_terms("凯尔希 阿米娅");
+        assert_eq!(terms, vec!["凯尔希", "阿米娅"]);
+    }
+
+    #[test]
+    fn split_query_terms_quoted_phrase() {
+        let terms = split_query_terms("\"凯尔希 阿米娅\"");
+        // Quoted phrase collapses internal whitespace because of fuzzy normalization.
+        assert_eq!(terms, vec!["凯尔希阿米娅"]);
+    }
+
+    #[test]
+    fn split_query_terms_drops_or_and_not_prefix() {
+        let terms = split_query_terms("凯尔希 or 阿米娅 -博士");
+        // `or` is dropped and NOT prefix becomes a positive term in fallback.
+        assert_eq!(terms, vec!["凯尔希", "阿米娅", "博士"]);
+    }
+
+    #[test]
+    fn fts_query_escapes_specials_and_is_nonempty() {
+        let q = DataService::build_fts_query_advanced("凯尔希*").expect("non-empty");
+        assert!(!q.contains('*') || q.ends_with('*'));
+        // The phrase must still contain the CJK word token.
+        assert!(q.contains("凯尔希"));
+    }
+
+    #[test]
+    fn fts_query_long_cjk_uses_jieba_words() {
+        let q = DataService::build_fts_query_advanced("凯尔希阿米娅").expect("non-empty");
+        // jieba splits `凯尔希阿米娅` into two names → AND of two phrases.
+        assert!(q.contains("AND"));
+        assert!(q.contains("凯尔希") || q.contains("凯"));
+        assert!(q.contains("阿米娅") || q.contains("阿"));
+    }
+
+    #[test]
+    fn fts_query_short_cjk_word_is_phrase() {
+        let q = DataService::build_fts_query_advanced("凯尔希").expect("non-empty");
+        // Should emit a single phrase clause (no connector).
+        assert!(q.contains("凯尔希"));
+        assert!(!q.contains("AND"));
+    }
+
+    #[test]
+    fn fts_query_ascii_gets_prefix_star() {
+        let q = DataService::build_fts_query_advanced("prts").expect("non-empty");
+        assert_eq!(q.trim(), "prts*");
+    }
+
+    #[test]
+    fn fts_query_pure_punctuation_returns_none() {
+        assert!(DataService::build_fts_query_advanced("()**").is_none());
+    }
+
+    #[test]
+    fn fts_query_or_connective() {
+        let q = DataService::build_fts_query_advanced("阿米娅 or 凯尔希").expect("non-empty");
+        assert!(q.contains("OR"));
+    }
+
+    #[test]
+    fn fts_query_not_prefix() {
+        let q = DataService::build_fts_query_advanced("-凯尔希 博士").expect("non-empty");
+        assert!(q.contains("NOT"));
+        // The positive term must come BEFORE the NOT clause — otherwise FTS5
+        // rejects the query with "unable to use function MATCH".
+        let not_idx = q.find("NOT").unwrap();
+        let bodhi_idx = q.find("博士").unwrap();
+        assert!(
+            bodhi_idx < not_idx,
+            "positive term must precede NOT; got: {}",
+            q
+        );
+    }
+
+    #[test]
+    fn fts_query_pure_negation_returns_none() {
+        // A query that's only exclusions can't be expressed in FTS5 —
+        // we return None so the caller short-circuits to empty results.
+        assert!(DataService::build_fts_query_advanced("-凯尔希").is_none());
+        assert!(DataService::build_fts_query_advanced("-凯尔希 -博士").is_none());
+    }
+
+    #[test]
+    fn fts_query_or_is_applied_before_and() {
+        // `凯尔希 or 阿米娅 博士` should group the first two with OR and
+        // AND on the third. We don't enforce parenthesization, but at
+        // minimum both OR and AND must be present.
+        let q = DataService::build_fts_query_advanced("凯尔希 or 阿米娅 博士").expect("non-empty");
+        assert!(q.contains("OR"));
+        assert!(q.contains("AND"));
+    }
+
+    #[test]
+    fn tokenize_for_fts_emits_word_and_chars() {
+        let tokens = DataService::tokenize_for_fts("凯尔希 博士");
+        assert!(tokens.iter().any(|t| t == "凯尔希"));
+        assert!(tokens.iter().any(|t| t == "凯"));
+        assert!(tokens.iter().any(|t| t == "博士"));
+    }
+
+    #[test]
+    fn tokenize_for_fts_ascii_keeps_runs() {
+        let tokens = DataService::tokenize_for_fts("PRTS system");
+        assert!(tokens.iter().any(|t| t == "prts"));
+        assert!(tokens.iter().any(|t| t == "system"));
     }
 }
