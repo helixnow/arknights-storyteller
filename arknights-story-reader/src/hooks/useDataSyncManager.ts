@@ -29,7 +29,7 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
       setRemoteVersion(remote);
       setHasUpdate(needUpdate);
     } catch (err) {
-      logger.error("useDataSyncManager", 加载版本信息失败:", err);
+      logger.error("useDataSyncManager", "加载版本信息失败:", err);
       setError((err instanceof Error ? err.message : "加载版本信息失败") ?? "加载版本信息失败");
     } finally {
       setLoadingInfo(false);
@@ -126,7 +126,7 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
           setProgress({ phase: "索引", current: 1, total: 1, message: "索引完成" });
           try { window.dispatchEvent(new CustomEvent("app:rebuild-story-index")); } catch {}
         } catch (e) {
-          logger.warn("useDataSyncManager", 导入后自动建立索引失败", e);
+          logger.warn("useDataSyncManager", "导入后自动建立索引失败", e);
         }
         
         // 清空搜索缓存
@@ -137,7 +137,7 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
         await loadVersionInfo();
       } catch (err) {
         const message = err instanceof Error ? err.message : "导入失败";
-        logger.error("useDataSyncManager", 导入失败:", message, err);
+        logger.error("useDataSyncManager", "导入失败:", message, err);
         setError(message);
       } finally {
         setImporting(false);

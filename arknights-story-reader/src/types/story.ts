@@ -67,6 +67,7 @@ export type StorySegment =
 export interface DialogueSegment {
   type: 'dialogue';
   characterName: string;
+  characterId?: string | null;
   text: string;
   position?: 'left' | 'right' | null;
 }
@@ -489,4 +490,25 @@ export interface CharacterHandbookByName {
   charId: string;
   charName: string;
   handbook: CharacterHandbook;
+}
+
+/** 干员名 ↔ charId 映射（后端 character_table 快照）。 */
+export interface CharacterIndex {
+  charIdToName: Record<string, string>;
+  nameToCharId: Record<string, string>;
+}
+
+/** 素材种类——对应 Rust `AssetKind`。 */
+export type AssetKind =
+  | 'avatar'
+  | 'portrait'
+  | 'image'
+  | 'background'
+  | 'activity_kv'
+  | 'activity_logo'
+  | 'chapter_cover';
+
+export interface StoryPreviewToken {
+  kind: 'image' | 'background';
+  token: string;
 }

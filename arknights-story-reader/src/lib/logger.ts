@@ -17,6 +17,10 @@ function formatMessage(tag: string, ...args: unknown[]): unknown[] {
 }
 
 export const logger = {
+  init(_enableDebug?: boolean) {
+    // no-op: log level is controlled by import.meta.env.DEV
+  },
+
   debug(tag: string, ...args: unknown[]) {
     if (shouldLog("debug")) {
       console.debug(...formatMessage(tag, ...args));

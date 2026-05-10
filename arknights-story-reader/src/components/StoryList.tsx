@@ -107,7 +107,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
         [story.storyId]: normalized.length > 0 ? normalized : "",
       }));
     } catch (err) {
-      logger.warn("StoryList", 加载简介失败:", story.storyId, err);
+      logger.warn("StoryList", "加载简介失败:", story.storyId, err);
     } finally {
       setSummaryLoadingIds((prev) => {
         const next = { ...prev };
@@ -382,7 +382,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
         if (cancelled) return;
 
         if (!installed) {
-          logger.debug("StoryList", 未安装，打开同步对话框");
+          logger.debug("StoryList", "未安装，打开同步对话框");
           setSyncDialogOpen(true);
           setLoading(false);
           return;
@@ -390,7 +390,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
         await loadMainStories();
       } catch (e) {
         if (cancelled) return;
-        logger.error("StoryList", isInstalled 失败，回退到同步对话框:", e);
+        logger.error("StoryList", "isInstalled 失败，回退到同步对话框:", e);
         setError("未安装或网络缓慢，请先同步数据");
         setSyncDialogOpen(true);
         setLoading(false);
@@ -401,7 +401,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
   }, []);
 
   const loadMainStories = async () => {
-    logger.debug("StoryList", 开始加载主线剧情");
+    logger.debug("StoryList", "开始加载主线剧情");
     try {
       setLoading(true);
       setError(null);
@@ -414,15 +414,15 @@ export function StoryList({ onSelectStory }: StoryListProps) {
         });
 
       const grouped = await withTimeout(api.getMainStoriesGrouped());
-      logger.debug("StoryList", 主线章节数:", grouped.length);
-      logger.debug("StoryList", 前3个章节:", grouped.slice(0, 3).map(([name, stories]) => ({
+      logger.debug("StoryList", "主线章节数:", grouped.length);
+      logger.debug("StoryList", "前3个章节:", grouped.slice(0, 3).map(([name, stories]) => ({
         name,
         storyCount: stories.length
       })));
       setMainGrouped(grouped);
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : "加载失败";
-      logger.error("StoryList", 加载主线剧情失败:", errorMsg, err);
+      logger.error("StoryList", "加载主线剧情失败:", errorMsg, err);
       // 未安装或超时，提示同步
       if (
         errorMsg.includes("NOT_INSTALLED") ||
@@ -441,7 +441,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
 
   const loadActivities = async () => {
     if (activityLoaded) return;
-    logger.debug("StoryList", 开始加载活动剧情");
+    logger.debug("StoryList", "开始加载活动剧情");
     try {
       setActivityLoading(true);
       setError(null);
@@ -454,8 +454,8 @@ export function StoryList({ onSelectStory }: StoryListProps) {
         });
 
       const grouped = await withTimeout(api.getActivityStoriesGrouped());
-      logger.debug("StoryList", 活动数:", grouped.length);
-      logger.debug("StoryList", 前3个活动:", grouped.slice(0, 3).map(([name, stories]) => ({
+      logger.debug("StoryList", "活动数:", grouped.length);
+      logger.debug("StoryList", "前3个活动:", grouped.slice(0, 3).map(([name, stories]) => ({
         name,
         storyCount: stories.length
       })));
@@ -463,7 +463,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
       setActivityLoaded(true);
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : "加载失败";
-      logger.error("StoryList", 加载活动剧情失败:", errorMsg, err);
+      logger.error("StoryList", "加载活动剧情失败:", errorMsg, err);
       if (errorMsg.includes("NOT_INSTALLED") || errorMsg.includes("No such file") || errorMsg === "TIMEOUT") {
         setError("未安装或网络缓慢，请先同步数据");
         setSyncDialogOpen(true);
@@ -496,7 +496,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
 
   const loadSidestories = async () => {
     if (sidestoryLoaded) return;
-    logger.debug("StoryList", 开始加载支线剧情");
+    logger.debug("StoryList", "开始加载支线剧情");
     try {
       setSidestoryLoading(true);
       setError(null);
@@ -507,12 +507,12 @@ export function StoryList({ onSelectStory }: StoryListProps) {
            .catch((e) => { clearTimeout(t); reject(e); });
         });
       const grouped = await withTimeout(api.getSidestoryStoriesGrouped());
-      logger.debug("StoryList", 支线项目数:", grouped.length);
+      logger.debug("StoryList", "支线项目数:", grouped.length);
       setSidestoryGrouped(grouped);
       setSidestoryLoaded(true);
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : "加载失败";
-      logger.error("StoryList", 加载支线剧情失败:", errorMsg, err);
+      logger.error("StoryList", "加载支线剧情失败:", errorMsg, err);
       if (errorMsg.includes("NOT_INSTALLED") || errorMsg.includes("No such file") || errorMsg === "TIMEOUT") {
         setError("未安装或网络缓慢，请先同步数据");
         setSyncDialogOpen(true);
@@ -526,7 +526,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
 
   const loadRoguelike = async () => {
     if (roguelikeLoaded) return;
-    logger.debug("StoryList", 开始加载肉鸽剧情");
+    logger.debug("StoryList", "开始加载肉鸽剧情");
     try {
       setRoguelikeLoading(true);
       setError(null);
@@ -537,12 +537,12 @@ export function StoryList({ onSelectStory }: StoryListProps) {
            .catch((e) => { clearTimeout(t); reject(e); });
         });
       const grouped = await withTimeout(api.getRoguelikeStoriesGrouped());
-      logger.debug("StoryList", 肉鸽项目数:", grouped.length);
+      logger.debug("StoryList", "肉鸽项目数:", grouped.length);
       setRoguelikeGrouped(grouped);
       setRoguelikeLoaded(true);
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : "加载失败";
-      logger.error("StoryList", 加载肉鸽剧情失败:", errorMsg, err);
+      logger.error("StoryList", "加载肉鸽剧情失败:", errorMsg, err);
       if (errorMsg.includes("NOT_INSTALLED") || errorMsg.includes("No such file") || errorMsg === "TIMEOUT") {
         setError("未安装或网络缓慢，请先同步数据");
         setSyncDialogOpen(true);
@@ -557,7 +557,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
 
   const loadMemories = async () => {
     if (memoryLoaded) return;
-    logger.debug("StoryList", 开始加载干员密录");
+    logger.debug("StoryList", "开始加载干员密录");
     try {
       setMemoryLoading(true);
       setError(null);
@@ -570,12 +570,12 @@ export function StoryList({ onSelectStory }: StoryListProps) {
         });
 
       const data = await withTimeout(api.getMemoryStories());
-      logger.debug("StoryList", 干员密录加载成功，数量:", data.length);
+      logger.debug("StoryList", "干员密录加载成功，数量:", data.length);
       setMemoryStories(data);
       setMemoryLoaded(true);
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : "加载失败";
-      logger.error("StoryList", 加载干员密录失败:", errorMsg, err);
+      logger.error("StoryList", "加载干员密录失败:", errorMsg, err);
       if (errorMsg.includes("NOT_INSTALLED") || errorMsg.includes("No such file") || errorMsg === "TIMEOUT") {
         setError("未安装或网络缓慢，请先同步数据");
         setSyncDialogOpen(true);
@@ -589,7 +589,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
 
   const loadRecord = async () => {
     if (recordLoaded) return;
-    logger.debug("StoryList", 开始加载主线笔记");
+    logger.debug("StoryList", "开始加载主线笔记");
     try {
       setRecordLoading(true);
       const withTimeout = async <T,>(promise: Promise<T>, ms = 30000) => {
@@ -599,12 +599,12 @@ export function StoryList({ onSelectStory }: StoryListProps) {
         return Promise.race([promise, timeout]);
       };
       const grouped = await withTimeout(api.getRecordStoriesGrouped());
-      logger.debug("StoryList", 主线笔记项目数:", grouped.length);
+      logger.debug("StoryList", "主线笔记项目数:", grouped.length);
       setRecordGrouped(grouped);
       setRecordLoaded(true);
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : "加载失败";
-      logger.error("StoryList", 加载主线笔记失败:", errorMsg, err);
+      logger.error("StoryList", "加载主线笔记失败:", errorMsg, err);
       if (errorMsg.includes("NOT_INSTALLED") || errorMsg.includes("No such file") || errorMsg === "TIMEOUT") {
         setError("未安装或网络缓慢，请先同步数据");
         setSyncDialogOpen(true);
@@ -618,7 +618,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
 
   const loadRune = async () => {
     if (runeLoaded) return;
-    logger.debug("StoryList", 开始加载危机合约");
+    logger.debug("StoryList", "开始加载危机合约");
     try {
       setRuneLoading(true);
       const withTimeout = async <T,>(promise: Promise<T>, ms = 30000) => {
@@ -628,12 +628,12 @@ export function StoryList({ onSelectStory }: StoryListProps) {
         return Promise.race([promise, timeout]);
       };
       const stories = await withTimeout(api.getRuneStories());
-      logger.debug("StoryList", 危机合约文本数:", stories.length);
+      logger.debug("StoryList", "危机合约文本数:", stories.length);
       setRuneStories(stories);
       setRuneLoaded(true);
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : "加载失败";
-      logger.error("StoryList", 加载危机合约失败:", errorMsg, err);
+      logger.error("StoryList", "加载危机合约失败:", errorMsg, err);
       if (errorMsg.includes("NOT_INSTALLED") || errorMsg.includes("No such file") || errorMsg === "TIMEOUT") {
         setError("未安装或网络缓慢，请先同步数据");
         setSyncDialogOpen(true);
@@ -646,9 +646,9 @@ export function StoryList({ onSelectStory }: StoryListProps) {
   };
 
   const handleSyncSuccess = async () => {
-    logger.debug("StoryList", 同步成功回调触发");
+    logger.debug("StoryList", "同步成功回调触发");
     await loadMainStories();
-    logger.debug("StoryList", 关闭同步对话框");
+    logger.debug("StoryList", "关闭同步对话框");
     setSyncDialogOpen(false);
   };
 
@@ -671,7 +671,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
       <div className="flex flex-col items-center justify-center h-screen gap-4 p-4">
         <div className="text-[hsl(var(--color-destructive))] text-center">{error}</div>
         <Button onClick={() => {
-          logger.debug("StoryList", (错误页面) 点击同步数据按钮");
+          logger.debug("StoryList", "(错误页面) 点击同步数据按钮");
           setSyncDialogOpen(true);
         }}>
           <RefreshCw className="mr-2 h-4 w-4" />

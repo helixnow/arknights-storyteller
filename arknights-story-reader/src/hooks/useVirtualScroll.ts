@@ -24,7 +24,7 @@ interface UseVirtualScrollResult {
  * 轻量级虚拟滚动 hook，仅渲染可视窗口内的项，大幅降低长列表 DOM 开销
  */
 export function useVirtualScroll(
-  scrollContainerRef: React.RefObject<HTMLElement>,
+  scrollContainerRef: React.RefObject<HTMLElement | null>,
   options: UseVirtualScrollOptions
 ): UseVirtualScrollResult {
   const { itemCount, estimatedItemSize, overscan = 3, enabled = true } = options;
