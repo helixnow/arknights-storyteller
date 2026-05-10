@@ -1,5 +1,9 @@
 #[cfg(target_os = "android")]
 mod apk_updater;
+#[cfg(target_os = "android")]
+mod image_sharer;
+mod asset_service;
+mod character_table;
 mod commands;
 mod data_service;
 mod models;
@@ -56,6 +60,7 @@ pub fn run() {
     #[cfg(target_os = "android")]
     {
         builder = builder.plugin(crate::apk_updater::init());
+        builder = builder.plugin(crate::image_sharer::init());
     }
 
     builder
@@ -100,6 +105,9 @@ pub fn run() {
             commands::search_segments,
             commands::search_stories_with_progress,
             commands::search_stories_debug,
+            commands::resolve_asset_urls,
+            commands::get_character_index,
+            commands::get_story_neighbors,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

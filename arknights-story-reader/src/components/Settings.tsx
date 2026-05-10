@@ -5,8 +5,9 @@ import { CustomScrollArea } from "@/components/ui/custom-scroll-area";
 import { useTheme } from "@/components/theme-provider";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
-import { AlertCircle, CheckCircle, Download, Loader2, RefreshCw, Upload } from "lucide-react";
+import { AlertCircle, CheckCircle, Download, Eye, EyeOff, ImageOff, Loader2, RefreshCw, Upload } from "lucide-react";
 import { useDataSyncManager } from "@/hooks/useDataSyncManager";
+import { useAppPreferences } from "@/hooks/useAppPreferences";
 import { getVersion as getAppVersion } from "@tauri-apps/api/app";
 import {
   detectRuntimePlatform,
@@ -52,6 +53,7 @@ const THEME_COLOR_OPTIONS = [
 
 export function Settings() {
   const { themeColor, setThemeColor } = useTheme();
+  const { minimalMode, setMinimalMode, inlineImages, setInlineImages } = useAppPreferences();
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [appVersion, setAppVersion] = useState<string>("");
   const [updateStatus, setUpdateStatus] = useState<
@@ -561,6 +563,62 @@ export function Settings() {
 
           <Card className="motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-500" style={{ animationDelay: "70ms" }}>
             <CardHeader>
+              <CardTitle>素材与外观</CardTitle>
+              <CardDescription>控制封面、头像、插画等装饰性素材</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <SettingsRow
+                title="极简模式"
+                subtitle="隐藏全部封面、头像与插画，回到纯文本阅读"
+                control={
+                  <Toggle
+                    on={minimalMode}
+                    onChange={(v) => setMinimalMode(v)}
+                    label={minimalMode ? "已开启" : "未开启"}
+                  />
+                }
+              />
+              <SettingsRow
+                title="阅读器内插画"
+                subtitle="剧情中 [Image] 段落是否渲染；关闭可降低流量消耗"
+                control={
+                  <Toggle
+                    on={inlineImages}
+                    onChange={(v) => setInlineImages(v)}
+                    label={inlineImages ? "已启用" : "已关闭"}
+                  />
+                }
+              />
+              <div className="text-xs text-[hsl(var(--color-muted-foreground))] leading-relaxed">
+                素材来自公开社区镜像：
+                <span className="ml-1">
+                  yuanyan3060/ArknightsGameResource · fexli/ArknightsResource · PuppiizSunniiz/Arknight-Images
+                </span>
+              </div>
+              <div className="flex gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setMinimalMode(!minimalMode)}
+                >
+                  {minimalMode ? <Eye className="h-4 w-4 mr-1.5" /> : <EyeOff className="h-4 w-4 mr-1.5" />}
+                  {minimalMode ? "显示全部素材" : "切换极简模式"}
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setInlineImages(false)}
+                  disabled={!inlineImages}
+                >
+                  <ImageOff className="h-4 w-4 mr-1.5" />
+                  关闭插画
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card className="motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-500" style={{ animationDelay: "90ms" }}>
+            <CardHeader>
               <CardTitle>缓存与索引</CardTitle>
               <CardDescription>统一管理本地索引与人物统计</CardDescription>
             </CardHeader>
@@ -581,13 +639,13 @@ export function Settings() {
                   variant="outline"
                   onClick={handleRefreshCharacters}
                 >
-                  <RefreshCw className="h-4 w-4 mr-2" /> 刷新人角色统计
+                  <RefreshCw className="h-4 w-4 mr-2" /> 刷新人物统计
                 </Button>
               </div>
             </CardContent>
           </Card>
 
-            <Card className="motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-500" style={{ animationDelay: "80ms" }}>
+            <Card className="motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-500" style={{ animationDelay: "120ms" }}>
               <CardHeader>
                 <CardTitle>关于</CardTitle>
                 <CardDescription>应用信息</CardDescription>
@@ -595,7 +653,7 @@ export function Settings() {
               <CardContent className="space-y-2">
                 <div className="flex justify-between">
                   <span className="text-[hsl(var(--color-muted-foreground))]">版本</span>
-                  <span>1.11</span>
+                  <span className="font-mono text-sm">{appVersion || "—"}</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-[hsl(var(--color-muted-foreground))]">作者</span>
@@ -615,5 +673,60 @@ export function Settings() {
         </CustomScrollArea>
       </main>
     </div>
+  );
+}
+
+function SettingsRow({
+  title,
+  subtitle,
+  control,
+}: {
+  title: string;
+  subtitle?: string;
+  control: React.ReactNode;
+}) {
+  return (
+    <div className="flex items-center justify-between gap-4">
+      <div className="min-w-0">
+        <div className="text-sm font-medium">{title}</div>
+        {subtitle && (
+          <div className="text-xs text-[hsl(var(--color-muted-foreground))] mt-0.5">{subtitle}</div>
+        )}
+      </div>
+      <div className="flex-shrink-0">{control}</div>
+    </div>
+  );
+}
+
+function Toggle({
+  on,
+  onChange,
+  label,
+}: {
+  on: boolean;
+  onChange: (v: boolean) => void;
+  label?: string;
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={on}
+      onClick={() => onChange(!on)}
+      className={cn(
+        "relative inline-flex h-6 w-11 flex-shrink-0 items-center rounded-full border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--color-ring))] focus-visible:ring-offset-2 focus-visible:ring-offset-[hsl(var(--color-card))]",
+        on
+          ? "bg-[hsl(var(--color-primary))] border-[hsl(var(--color-primary))]"
+          : "bg-[hsl(var(--color-secondary))] border-[hsl(var(--color-border))]"
+      )}
+      aria-label={label}
+    >
+      <span
+        className={cn(
+          "inline-block h-5 w-5 transform rounded-full bg-[hsl(var(--color-card))] shadow transition-transform",
+          on ? "translate-x-5" : "translate-x-0.5"
+        )}
+      />
+    </button>
   );
 }

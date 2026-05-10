@@ -10,7 +10,7 @@ import type {
 } from "@/types/story";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import { Search, X, BookOpen, MessageSquare } from "lucide-react";
+import { Search, X, BookOpen, MessageSquare, MoreHorizontal } from "lucide-react";
 import { CustomScrollArea } from "@/components/ui/custom-scroll-area";
 import { cn } from "@/lib/utils";
 import { useToast } from "@/components/ui/toast";
@@ -42,6 +42,17 @@ const CACHE_KEY = "arknights-story-search-cache-v2";
 const SEGMENT_CACHE_KEY = "arknights-story-segment-cache-v1";
 const DEBUG_STATE_KEY = "arknights-story-search-debug";
 const SEARCH_MODE_KEY = "arknights-story-search-mode";
+
+const HOT_KEYWORDS = [
+  "凯尔希",
+  "罗德岛",
+  "整合运动",
+  "博士",
+  "源石",
+  "阿米娅",
+  "感染者",
+  "特蕾西娅",
+];
 
 const SEGMENT_TYPE_LABEL: Record<SegmentHit["segmentType"], string> = {
   dialogue: "对话",
@@ -139,6 +150,8 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     used: false,
   });
   const [version, setVersion] = useState<string>("");
+  const [moreOpen, setMoreOpen] = useState(false);
+  const moreMenuRef = useRef<HTMLDivElement | null>(null);
   const toast = useToast();
 
   // Load version for cache keying.
@@ -281,11 +294,22 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     try {
       setOpeningStoryId(hit.storyId);
       const story = await api.getStoryEntry(hit.storyId);
-      onSelectSegment(story, {
-        segmentIndex: hit.segmentIndex,
-        preview: hit.matchedText,
-        query,
-      });
+      // Title-level hits synthesised from the story-name index shouldn't
+      // pulse-highlight a fake first paragraph — the match isn't actually
+      // at that segment. Open the story plainly instead, letting the
+      // reader restore the user's last reading progress. Pass empty
+      // query/snippet so the reader skips focus search too — otherwise
+      // searching a story title might accidentally highlight some
+      // unrelated body segment that happens to contain the same word.
+      if (hit.matchTarget === "title") {
+        onSelectResult(story, { query: "", snippet: null });
+      } else {
+        onSelectSegment(story, {
+          segmentIndex: hit.segmentIndex,
+          preview: hit.matchedText,
+          query,
+        });
+      }
     } catch (err) {
       console.error("Open segment failed:", err);
       toast.error("打开剧情失败");
@@ -393,17 +417,70 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     return () => window.removeEventListener("app:rebuild-story-index", handler);
   }, [handleBuildIndex]);
 
-  const renderIndexStatusText = () => {
-    if (!indexStatus) return "索引状态获取中...";
+  // Close the ⋯ popover on outside click or Escape.
+  useEffect(() => {
+    if (!moreOpen) return;
+    const onDocClick = (e: MouseEvent) => {
+      if (!moreMenuRef.current) return;
+      if (!moreMenuRef.current.contains(e.target as Node)) {
+        setMoreOpen(false);
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setMoreOpen(false);
+    };
+    document.addEventListener("mousedown", onDocClick);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDocClick);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [moreOpen]);
+
+  const isFirstScreen = !searched && query.trim() === "";
+
+  const triggerHotKeyword = (keyword: string) => {
+    setQuery(keyword);
+    setTimeout(() => handleSearch({ queryOverride: keyword }), 0);
+  };
+
+  const renderIndexStatusRow = () => {
+    if (!indexStatus) {
+      return (
+        <div className="text-xs text-[hsl(var(--color-muted-foreground))]">索引状态获取中...</div>
+      );
+    }
+    if (buildingIndex) {
+      return (
+        <div className="text-xs text-[hsl(var(--color-muted-foreground))]">
+          {indexProgress
+            ? `${indexProgress.phase} ${indexProgress.current}/${indexProgress.total}${indexProgress.message ? ` · ${indexProgress.message}` : ""}`
+            : "索引建立中，请稍候…"}
+        </div>
+      );
+    }
     if (!indexStatus.ready) {
-      return "全文索引尚未建立，当前使用逐条扫描，建议先建立索引以提升搜索速度。";
+      return (
+        <div className="text-xs text-[hsl(var(--color-muted-foreground))]">
+          全文索引尚未建立，当前使用逐条扫描，建议先建立索引以提升搜索速度。
+        </div>
+      );
     }
-    let extra = "";
-    if (indexStatus.lastBuiltAt) {
-      const date = new Date(indexStatus.lastBuiltAt * 1000);
-      extra = `，更新于 ${date.toLocaleString()}`;
-    }
-    return `全文索引已建立，共 ${indexStatus.total} 篇${extra}`;
+    return (
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-xs text-[hsl(var(--color-muted-foreground))]">
+          索引已就绪 · {indexStatus.total} 篇
+        </div>
+        <button
+          type="button"
+          onClick={() => void handleBuildIndex()}
+          disabled={buildingIndex}
+          className="text-xs text-[hsl(var(--color-muted-foreground))] underline hover:text-[hsl(var(--color-foreground))] disabled:opacity-50"
+        >
+          重建
+        </button>
+      </div>
+    );
   };
 
   return (
@@ -435,6 +512,59 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
               <Search className="mr-2 h-4 w-4" />
               搜索
             </Button>
+            <div className="relative" ref={moreMenuRef}>
+              <Button
+                variant="outline"
+                size="icon"
+                aria-label="更多"
+                aria-haspopup="menu"
+                aria-expanded={moreOpen}
+                onClick={() => setMoreOpen((prev) => !prev)}
+              >
+                <MoreHorizontal className="h-4 w-4" />
+              </Button>
+              {moreOpen && (
+                <div
+                  role="menu"
+                  className="absolute right-0 top-full z-20 mt-1 w-56 rounded-md border border-[hsl(var(--color-border))] bg-[hsl(var(--color-background))] shadow-lg p-1 motion-safe:animate-in motion-safe:fade-in-0 motion-safe:zoom-in-95 motion-safe:duration-150"
+                >
+                  <label className="flex items-center justify-between gap-3 rounded-sm px-2 py-2 text-sm cursor-pointer hover:bg-[hsl(var(--color-accent))]">
+                    <span className="flex flex-col">
+                      <span>调试日志</span>
+                      <span className="text-[11px] text-[hsl(var(--color-muted-foreground))]">
+                        显示匹配过程记录
+                      </span>
+                    </span>
+                    <input
+                      type="checkbox"
+                      checked={debugMode}
+                      onChange={() => {
+                        setDebugMode((prev) => !prev);
+                        setDebugLogs([]);
+                        setDebugExpanded(false);
+                      }}
+                      className="h-4 w-4 accent-[hsl(var(--color-primary))]"
+                    />
+                  </label>
+                  <div className="my-1 h-px bg-[hsl(var(--color-border))]" />
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      setMoreOpen(false);
+                      void handleBuildIndex();
+                    }}
+                    disabled={buildingIndex}
+                    className="w-full rounded-sm px-2 py-2 text-left text-sm hover:bg-[hsl(var(--color-accent))] disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    <div>刷新索引</div>
+                    <div className="text-[11px] text-[hsl(var(--color-muted-foreground))]">
+                      {indexStatus?.ready ? "重新建立全文索引" : "建立全文索引"}
+                    </div>
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
 
           {/* 搜索模式切换：整篇 vs 段落 */}
@@ -509,28 +639,27 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
             </div>
           )}
 
-          <div className="mt-3 flex flex-wrap items-start gap-3">
-            <div className="text-xs text-[hsl(var(--color-muted-foreground))] flex-1 min-w-[12rem]">
-              {buildingIndex
-                ? indexProgress
-                  ? `${indexProgress.phase} ${indexProgress.current}/${indexProgress.total}${indexProgress.message ? ` · ${indexProgress.message}` : ""}`
-                  : "索引建立中，请稍候…"
-                : renderIndexStatusText()}
+          {isFirstScreen && (
+            <div className="mt-3 space-y-2">
+              <div className="text-xs text-[hsl(var(--color-muted-foreground))]">热门关键词</div>
+              <div className="flex flex-wrap items-center gap-2">
+                {HOT_KEYWORDS.map((h) => (
+                  <Button
+                    key={h}
+                    variant="outline"
+                    size="sm"
+                    onClick={() => triggerHotKeyword(h)}
+                    disabled={searching}
+                    className="h-7 rounded-full px-3 text-xs"
+                  >
+                    {h}
+                  </Button>
+                ))}
+              </div>
             </div>
-            <div className="flex items-center gap-2">
-              <Button
-                variant={debugMode ? "default" : "outline"}
-                size="sm"
-                onClick={() => {
-                  setDebugMode((prev) => !prev);
-                  setDebugLogs([]);
-                  setDebugExpanded(false);
-                }}
-              >
-                调试日志
-              </Button>
-            </div>
-          </div>
+          )}
+
+          <div className="mt-3">{renderIndexStatusRow()}</div>
 
           {buildingIndex && indexProgress && indexProgress.total > 0 && (
             <div className="mt-2 h-1 w-full overflow-hidden rounded-full bg-[hsl(var(--color-secondary))]">
@@ -584,11 +713,8 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
           {/* 搜索中实时进度条 */}
           {searching && progress && (
             <div className="mt-3 space-y-1">
-              <div className="flex items-center justify-between text-[11px] text-[hsl(var(--color-muted-foreground))]">
-                <span>{progress.phase}</span>
-                <span className="font-mono">
-                  {progress.current}/{progress.total}
-                </span>
+              <div className="text-right text-[11px] text-[hsl(var(--color-muted-foreground))] font-mono">
+                {progress.phase} {progress.current}/{progress.total}
               </div>
               <div className="h-1 w-full overflow-hidden rounded-full bg-[hsl(var(--color-secondary))]">
                 <div
@@ -637,7 +763,10 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
                     </span>
                   )}
                 </div>
-                {segmentPage.hits.map((hit, index) => (
+                {segmentPage.hits.map((hit, index) => {
+                  const speakerOnly = hit.matchTarget === "speaker";
+                  const titleOnly = hit.matchTarget === "title";
+                  return (
                   <button
                     key={`${hit.storyId}-${hit.segmentIndex}-${index}`}
                     onClick={() => openSegment(hit)}
@@ -655,17 +784,43 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
                         {hit.segmentIndex}
                       </span>
                     </div>
-                    <div className="text-xs text-[hsl(var(--color-muted-foreground))] mb-2">
-                      {hit.category}
-                      {hit.characterName ? ` · ${hit.characterName}` : ""}
+                    <div className="flex flex-wrap items-center gap-2 text-xs text-[hsl(var(--color-muted-foreground))] mb-2">
+                      <span className="truncate">{hit.category}</span>
+                      {hit.characterName && (
+                        <span
+                          className={cn(
+                            "inline-flex items-center rounded-full border px-2 py-0.5 text-[11px]",
+                            speakerOnly
+                              ? "border-[hsl(var(--color-primary)/0.5)] bg-[hsl(var(--color-primary)/0.1)] text-[hsl(var(--color-foreground))]"
+                              : "border-[hsl(var(--color-border))]"
+                          )}
+                        >
+                          {/* When the badge itself already calls out the
+                              speaker as the reason the row matched, skip
+                              the term highlight inside the chip — a double
+                              visual accent muddies the card. */}
+                          {speakerOnly ? hit.characterName : highlightMatches(hit.characterName, query)}
+                        </span>
+                      )}
+                      {speakerOnly && (
+                        <span className="inline-flex items-center rounded-full bg-[hsl(var(--color-primary)/0.12)] px-2 py-0.5 text-[10px] text-[hsl(var(--color-primary))]">
+                          按说话人命中
+                        </span>
+                      )}
+                      {titleOnly && (
+                        <span className="inline-flex items-center rounded-full bg-[hsl(var(--color-primary)/0.12)] px-2 py-0.5 text-[10px] text-[hsl(var(--color-primary))]">
+                          按剧情标题命中
+                        </span>
+                      )}
                     </div>
                     {hit.matchedText && (
-                      <div className="text-sm text-[hsl(var(--color-muted-foreground))] line-clamp-3">
+                      <div className="text-sm text-[hsl(var(--color-foreground))] whitespace-pre-wrap leading-relaxed">
                         {highlightMatches(hit.matchedText, query)}
                       </div>
                     )}
                   </button>
-                ))}
+                  );
+                })}
               </div>
             )}
 
@@ -716,8 +871,33 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
             )}
 
             {!searching && !searched && (
-              <div className="text-center text-[hsl(var(--color-muted-foreground))]">
-                输入关键词搜索剧情，支持空格 AND、<code>OR</code>、<code>-排除词</code>、引号短语
+              <div className="mx-auto max-w-md">
+                <details className="group rounded-lg border border-[hsl(var(--color-border))] bg-[hsl(var(--color-muted)/0.1)]">
+                  <summary className="flex cursor-pointer list-none items-center justify-between px-4 py-3 text-sm text-[hsl(var(--color-foreground))]">
+                    <span>搜索语法说明</span>
+                    <span className="text-xs text-[hsl(var(--color-muted-foreground))] transition-transform group-open:rotate-180">
+                      ▾
+                    </span>
+                  </summary>
+                  <div className="border-t border-[hsl(var(--color-border))] px-4 py-3 text-xs text-[hsl(var(--color-muted-foreground))] space-y-1.5">
+                    <div>
+                      <span className="font-mono text-[hsl(var(--color-foreground))]">空格</span>
+                      <span className="ml-2">多词默认 AND 关系，都要匹配</span>
+                    </div>
+                    <div>
+                      <span className="font-mono text-[hsl(var(--color-foreground))]">OR</span>
+                      <span className="ml-2">任一命中即可，例如 <code>凯尔希 OR 博士</code></span>
+                    </div>
+                    <div>
+                      <span className="font-mono text-[hsl(var(--color-foreground))]">-排除词</span>
+                      <span className="ml-2">在词前加减号排除，例如 <code>博士 -干员</code></span>
+                    </div>
+                    <div>
+                      <span className="font-mono text-[hsl(var(--color-foreground))]">"短语"</span>
+                      <span className="ml-2">用英文引号匹配精确短语</span>
+                    </div>
+                  </div>
+                </details>
               </div>
             )}
           </div>

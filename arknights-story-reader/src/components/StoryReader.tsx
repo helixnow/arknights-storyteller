@@ -1,5 +1,6 @@
 import {
   type CSSProperties,
+  type MouseEvent as ReactMouseEvent,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -14,31 +15,31 @@ import {
   ArrowLeft,
   BookmarkCheck,
   BookmarkPlus,
+  CheckSquare,
   ChevronLeft,
   ChevronRight,
   ListTree,
   Settings as SettingsIcon,
-  Trash2,
+  Share2,
   Star,
-  Check,
-  X,
 } from "lucide-react";
 import { useReaderSettings } from "@/hooks/useReaderSettings";
 import { ReaderSettingsPanel } from "@/components/ReaderSettings";
-import { useSidePanel } from "@/hooks/useSidePanel";
+import { StoryInsightsPanel } from "@/components/StoryInsightsPanel";
 import { useReadingProgress } from "@/hooks/useReadingProgress";
 import { useFavorites } from "@/hooks/useFavorites";
 import { useHighlights } from "@/hooks/useHighlights";
-import { useClueSets } from "@/hooks/useClueSets";
 import { useBackHandler } from "@/hooks/useBackHandler";
 import { useEdgeSwipeBack } from "@/hooks/useEdgeSwipeBack";
-import { useToast } from "@/components/ui/toast";
 import { cn } from "@/lib/utils";
+import { segmentDigest } from "@/lib/segmentDigest";
 import { CustomScrollArea } from "@/components/ui/custom-scroll-area";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { useAppPreferences } from "@/hooks/useAppPreferences";
-import type { StoryEntry } from "@/types/story";
-import { fnv1a64, normalizeForDigest, digestToHex64 } from "@/lib/clueCodecs";
+import type { StoryEntry, StoryNeighbors } from "@/types/story";
+import { ShareImageDialog } from "@/components/ShareImageDialog";
+import { AssetImage } from "@/components/AssetImage";
+import { CharacterAvatar } from "@/components/CharacterAvatar";
+import { bumpReadingStreak } from "@/components/HomePanel";
 
 interface ReaderSearchFocus {
   storyId: string;
@@ -54,7 +55,9 @@ interface StoryReaderProps {
   onBack: () => void;
   initialFocus?: ReaderSearchFocus | null;
   initialCharacter?: string;
-  initialJump?: { storyId: string; segmentIndex: number; digestHex?: string; preview?: string; issuedAt?: number } | null;
+  initialJump?: { storyId: string; segmentIndex: number; preview?: string; issuedAt?: number } | null;
+  /** 阅读器内点击 prev/next 时由父级切换到另一篇剧情。 */
+  onNavigateStory?: (next: StoryEntry) => void;
 }
 
 interface RenderableSegment {
@@ -91,12 +94,17 @@ function approximateSegmentLength(segment: StorySegment): number {
       return segment.options.reduce((acc, opt) => acc + opt.length + 2, 0);
     case "header":
       return segment.title.length + 8;
+    case "image":
+      // Rendered as 16:9 block; roughly equivalent to ~2 long paragraphs.
+      return 360;
+    case "music":
+      return 0;
     default:
       return 0;
   }
 }
 
-export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocus, initialCharacter, initialJump }: StoryReaderProps) {
+export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocus, initialCharacter, initialJump, onNavigateStory }: StoryReaderProps) {
   const [content, setContent] = useState<ParsedStoryContent | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -105,6 +113,10 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
   const [insightsOpen, setInsightsOpen] = useState(false);
   const [progressValue, setProgressValue] = useState(0);
   const [highlightSegmentIndex, setHighlightSegmentIndex] = useState<number | null>(null);
+  // Monotonic token used to trigger the one-shot search-highlight pulse
+  // animation. Bumped each time the reader jumps to a new hit; cleared
+  // after the pulse keyframes finish so the data attribute auto-removes.
+  const [searchPulseToken, setSearchPulseToken] = useState(0);
   const [bookmarkMode, setBookmarkMode] = useState(false);
   const [activeCharacter, setActiveCharacter] = useState<string | null>(null);
   const [storyEntry, setStoryEntry] = useState<StoryEntry | null>(null);
@@ -118,21 +130,39 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
   const jumpAppliedRef = useRef<number | null>(null);
 
   const { settings, updateSettings, resetSettings } = useReaderSettings();
-  const { showSummaries } = useAppPreferences();
+  const { showSummaries, minimalMode, inlineImages } = useAppPreferences();
   const { progress, updateProgress } = useReadingProgress(storyPath);
-  const { highlights, toggleHighlight, isHighlighted, clearHighlights } = useHighlights(storyPath);
   const { isFavorite, toggleFavorite } = useFavorites();
-  const toast = useToast();
-  const { addItem, removeItem, ensureDefaultSetId } = useClueSets();
+  const [neighbors, setNeighbors] = useState<StoryNeighbors>({ prev: null, next: null });
 
-  // Back-button priority inside the reader: insights drawer > settings
-  // panel > bookmark mode > fall through to outer handler (App closes reader).
+  // Multi-select state for "分享为图片". Keeps indices in insertion order so
+  // the exported image preserves the user's chosen emphasis; sorting happens
+  // at render time so the output is always read top-to-bottom.
+  const [selectedSegments, setSelectedSegments] = useState<number[]>([]);
+  const [selectMode, setSelectMode] = useState(false);
+  const [shareDialogOpen, setShareDialogOpen] = useState(false);
+
+  // Back-button stack. `useBackHandler` is LIFO — the most recently mounted
+  // handler that returns `true` wins, so the effective priority is "最近
+  // 打开的先关"（Android 硬返回键 / 浏览器 popstate）。Registering order
+  // doesn't determine priority; each hook simply adds to the stack when
+  // its guard flips to `true`. The fallthrough case (no handler consumes
+  // the event) lets the outer App handler close the reader.
+  useBackHandler(shareDialogOpen, () => {
+    setShareDialogOpen(false);
+    return true;
+  });
   useBackHandler(insightsOpen, () => {
     setInsightsOpen(false);
     return true;
   });
   useBackHandler(settingsOpen, () => {
     setSettingsOpen(false);
+    return true;
+  });
+  useBackHandler(selectMode, () => {
+    setSelectMode(false);
+    setSelectedSegments([]);
     return true;
   });
   useBackHandler(bookmarkMode, () => {
@@ -144,7 +174,10 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
   // the left edge. Only active when none of the inner modals are open so the
   // gesture doesn't accidentally fight the in-modal close animation.
   useEdgeSwipeBack(readerRootRef, {
-    enabled: !settingsOpen && !insightsOpen,
+    // Disable edge-swipe while any drawer or the multi-select toolbar is
+    // open — otherwise a stray swipe could tear down a half-captured
+    // selection / share preview.
+    enabled: !settingsOpen && !insightsOpen && !shareDialogOpen && !selectMode,
     onBack,
   });
 
@@ -152,6 +185,10 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
     if (!content) return [];
 
     const cleaned = content.segments.flatMap<StorySegment>((segment) => {
+      // Drop music segments here — inline music UI is out of scope (BGM
+      // playback will be opt-in later).
+      if (segment.type === "music") return [];
+
       if (segment.type === "dialogue" || segment.type === "narration") {
         const normalizedText = segment.text
           .replace(/\r\n/g, "\n")
@@ -184,6 +221,14 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
 
     const merged: StorySegment[] = [];
     cleaned.forEach((segment) => {
+      // De-dup consecutive Image segments with the same token (common in
+      // scripts that set the same background twice in a row).
+      if (segment.type === "image") {
+        const last = merged[merged.length - 1];
+        if (last && last.type === "image" && last.token === segment.token) {
+          return;
+        }
+      }
       if (segment.type === "dialogue") {
         const last = merged[merged.length - 1];
         if (last && last.type === "dialogue" && last.characterName === segment.characterName) {
@@ -200,10 +245,43 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
     return merged;
   }, [content]);
 
-  // Ensure default clue set exists early to guarantee subsequent add operations
-  useEffect(() => {
-    try { ensureDefaultSetId(); } catch {}
-  }, [ensureDefaultSetId]);
+  /**
+   * Content fingerprint for every segment. Fed to `useHighlights` so stored
+   * annotations realign to the same paragraph after a data sync shifts
+   * segment indices. Kept as part of the reader (not the hook) because it
+   * depends on the reader's own `processedSegments` post-processing — the
+   * hook would otherwise need to duplicate that work.
+   */
+  const segmentDigestMap = useMemo<string[]>(() => {
+    if (!processedSegments.length) return [];
+    return processedSegments.map((segment) => {
+      switch (segment.type) {
+        case "dialogue":
+          return segmentDigest(`${segment.characterName}\u0001${segment.text}`);
+        case "narration":
+        case "subtitle":
+        case "sticker":
+          return segmentDigest(segment.text);
+        case "system":
+          return segmentDigest(`${segment.speaker ?? ""}\u0001${segment.text}`);
+        case "decision":
+          return segmentDigest(segment.options.join("\u0001"));
+        case "header":
+          return segmentDigest(segment.title);
+        case "image":
+          return segmentDigest(`image\u0001${segment.token}`);
+        case "music":
+          return segmentDigest(`music\u0001${segment.key}`);
+        default:
+          return "";
+      }
+    });
+  }, [processedSegments]);
+
+  const { highlights, toggleHighlight, isHighlighted, clearHighlights } = useHighlights(
+    storyPath,
+    segmentDigestMap
+  );
 
   const highlightEntries = useMemo(
     () =>
@@ -338,41 +416,14 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
         return segment.speaker ? `${segment.speaker} ${segment.text}` : segment.text;
       case "decision":
         return segment.options.join(" ");
+      case "image":
+        return segment.caption ?? "";
+      case "music":
+        return "";
       default:
         return "";
     }
   }, []);
-
-  const getSegmentPreview = useCallback((segment: StorySegment) => {
-    switch (segment.type) {
-      case "dialogue": {
-        const primary = segment.text.split("\n")[0] ?? "";
-        return `${segment.characterName}: ${primary}`.replace(/\s+/g, " ").trim();
-      }
-      case "narration":
-      case "system":
-      case "subtitle":
-      case "sticker":
-        return (segment.text.split("\n")[0] ?? "").replace(/\s+/g, " ").trim();
-      default:
-        return "";
-    }
-  }, []);
-
-  const getSegmentDigestHex = useCallback((segment: StorySegment) => {
-    const text = getSegmentSearchText(segment);
-    const normalized = normalizeForDigest(text);
-    const d = fnv1a64(normalized);
-    return digestToHex64(d);
-  }, [getSegmentSearchText]);
-
-  // Pre-compute the digest for every segment once per story load so cross-
-  // version jump logic (initialJump from a share code) doesn't redo the hash
-  // for every render.
-  const segmentDigestMap = useMemo<string[]>(() => {
-    if (!processedSegments.length) return [];
-    return processedSegments.map((seg) => getSegmentDigestHex(seg));
-  }, [processedSegments, getSegmentDigestHex]);
 
   const findFocusSegmentIndex = useCallback(
     (focus: ReaderSearchFocus): number | null => {
@@ -530,6 +581,10 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
       const data = await api.getStoryContent(storyPath);
       setContent(data);
       setCurrentPage(0);
+      // Bump reading streak when user actually opens a story.
+      try {
+        bumpReadingStreak();
+      } catch {}
     } catch (err) {
       setError(err instanceof Error ? err.message : "加载失败");
     } finally {
@@ -553,6 +608,23 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
       }
     })();
     return () => { mounted = false; };
+  }, [storyId]);
+
+  // 加载 prev/next
+  useEffect(() => {
+    let mounted = true;
+    setNeighbors({ prev: null, next: null });
+    (async () => {
+      try {
+        const n = await api.getStoryNeighbors(storyId);
+        if (mounted) setNeighbors(n);
+      } catch {
+        // ignore
+      }
+    })();
+    return () => {
+      mounted = false;
+    };
   }, [storyId]);
 
   useEffect(() => {
@@ -721,6 +793,10 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
 
       if (options?.highlightSearch) {
         setHighlightSegmentIndex(index);
+        // Trigger the pulse animation — bumping the token forces React to
+        // re-render the `data-search-pulse` attribute even if the same
+        // segment is re-selected.
+        setSearchPulseToken((prev) => prev + 1);
       } else if (options?.highlightSearch === false) {
         setHighlightSegmentIndex(null);
       }
@@ -744,36 +820,17 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
     [processedSegments, scrollToSegment, settings.readingMode, totalPages, pageBoundaries]
   );
 
-  // 优先处理 share code 跳转（initialJump）
+  // 优先处理初始段落跳转（搜索结果点击、人物面板等）
   useEffect(() => {
     if (!initialJump || !processedSegments.length) return;
     const token = initialJump.issuedAt ?? Date.now();
     if (jumpAppliedRef.current === token) return;
 
     let target = initialJump.segmentIndex;
-    const hex = (initialJump.digestHex || "").toLowerCase();
-    const hasDigest = hex !== "" && !/^0+$/.test(hex);
-    if (hasDigest && target >= 0 && target < processedSegments.length) {
-      const digest = (segmentDigestMap[target] || "").toLowerCase();
-      if (digest !== hex) {
-        const want = hex;
-        const range = 12;
-        let found: number | null = null;
-        for (
-          let i = Math.max(0, target - range);
-          i <= Math.min(processedSegments.length - 1, target + range);
-          i++
-        ) {
-          if ((segmentDigestMap[i] || "").toLowerCase() === want) {
-            found = i;
-            break;
-          }
-        }
-        if (found !== null) target = found;
-      }
-    }
 
-    if ((!hasDigest || target < 0 || target >= processedSegments.length) && initialJump.preview) {
+    // 如果段号落在合理范围外，或者附带了预览文本，先用 preview 精确定位
+    // 作为更稳妥的兜底（避免因数据更新后段号整体偏移而跳错位置）。
+    if ((target < 0 || target >= processedSegments.length) && initialJump.preview) {
       const idx = findFocusSegmentIndex({ storyId, query: "", snippet: initialJump.preview });
       if (idx !== null) target = idx;
     }
@@ -786,7 +843,6 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
   }, [
     initialJump,
     processedSegments,
-    segmentDigestMap,
     findFocusSegmentIndex,
     jumpToSegment,
     storyId,
@@ -857,41 +913,36 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
     [activeCharacter, jumpToSegment]
   );
 
-  // Auto-sync highlight <-> default clue set
-  const addSegmentToDefault = useCallback((index: number) => {
-    const seg = processedSegments[index];
-    if (!seg) return;
-    const setId = ensureDefaultSetId();
-    const preview = getSegmentPreview(seg);
-    const digestHex = segmentDigestMap[index] ?? getSegmentDigestHex(seg);
-    addItem(setId, { storyId, segmentIndex: index, preview, digestHex });
-  }, [addItem, ensureDefaultSetId, getSegmentDigestHex, getSegmentPreview, processedSegments, segmentDigestMap, storyId]);
+  // Toggle multi-select entry for an index. Kept separate from the
+  // highlight store so "分享为图片" can compose an ad-hoc selection without
+  // polluting the user's persistent highlights.
+  const toggleSegmentSelection = useCallback((index: number) => {
+    setSelectedSegments((prev) =>
+      prev.includes(index) ? prev.filter((i) => i !== index) : [...prev, index]
+    );
+  }, []);
 
-  const removeSegmentFromDefault = useCallback((index: number) => {
-    const setId = ensureDefaultSetId();
-    removeItem(setId, storyId, index);
-  }, [ensureDefaultSetId, removeItem, storyId]);
+  const clearSelection = useCallback(() => {
+    setSelectedSegments([]);
+  }, []);
+
+  // Flip to share mode: preserves any existing selection so the user can
+  // turn the page in paged-mode and keep accumulating picks across pages.
+  // The explicit "清空" / "取消" controls still reset the selection.
+  const enterSelectMode = useCallback(() => {
+    setSelectMode(true);
+    setInsightsOpen(false);
+    setBookmarkMode(false);
+  }, []);
+
+  const exitSelectMode = useCallback(() => {
+    setSelectMode(false);
+    setSelectedSegments([]);
+  }, []);
 
   const handleToggleHighlightUnified = useCallback((index: number) => {
-    const before = isHighlighted(index);
     toggleHighlight(index);
-    if (!before) {
-      addSegmentToDefault(index);
-      // First-time nudge: tell the user where the highlight went. Persisted
-      // so we don't keep nagging after the user is already aware.
-      const key = "arknights-highlight-intro-shown";
-      try {
-        if (!localStorage.getItem(key)) {
-          toast.success("已加入默认线索集「我的线索集」，可在底部「线索集」Tab 查看或分享");
-          localStorage.setItem(key, "1");
-        }
-      } catch {
-        /* ignore */
-      }
-    } else {
-      removeSegmentFromDefault(index);
-    }
-  }, [addSegmentToDefault, isHighlighted, removeSegmentFromDefault, toast, toggleHighlight]);
+  }, [toggleHighlight]);
 
   const clearCharacterHighlight = useCallback(() => {
     setActiveCharacter(null);
@@ -899,11 +950,8 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
   }, []);
 
   const handleClearHighlightsUnified = useCallback(() => {
-    const setId = ensureDefaultSetId();
-    // Remove all current highlights from default set
-    highlights.forEach((idx) => removeItem(setId, storyId, idx));
     clearHighlights();
-  }, [clearHighlights, ensureDefaultSetId, highlights, removeItem, storyId]);
+  }, [clearHighlights]);
 
   const handleJumpToSegment = useCallback(
     (index: number) => {
@@ -913,21 +961,88 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
     [jumpToSegment]
   );
 
+  // Auto-clear the pulse token shortly after it fires so the CSS animation
+  // attribute detaches. The underlying ring remains (static highlight)
+  // until the user navigates to a new hit or closes the search focus.
+  useEffect(() => {
+    if (searchPulseToken === 0) return;
+    const id = window.setTimeout(() => setSearchPulseToken(0), 1800);
+    return () => window.clearTimeout(id);
+  }, [searchPulseToken]);
+
+  /**
+   * Lazily assemble the payload passed to `<ShareImageDialog />`. Kept as a
+   * memo so the dialog reactively re-renders whenever the user toggles a
+   * segment, but we avoid the work unless the dialog is actually open.
+   */
+  const selectedShareSegments = useMemo(
+    () =>
+      selectedSegments
+        .map((idx) => ({ index: idx, segment: processedSegments[idx] }))
+        .filter((entry): entry is { index: number; segment: StorySegment } => Boolean(entry.segment)),
+    [selectedSegments, processedSegments]
+  );
+
   const renderSegment = useCallback(
     ({ segment, index }: RenderableSegment, isLast: boolean) => {
       const spacing = isLast ? "0" : readerSpacing;
       const highlightable = isSegmentHighlightable(segment);
       const annotationHighlight = highlightable ? isHighlighted(index) : false;
       const searchHighlighted = highlightSegmentIndex === index;
+      // When true, the segment is the freshly-navigated-to search hit —
+      // attach `data-search-pulse` so the CSS keyframe runs once.
+      const searchPulseActive = searchHighlighted && searchPulseToken > 0;
       const characterHighlighted =
         highlightable && segment.type === "dialogue" && activeCharacter === segment.characterName;
       const highlighted = annotationHighlight || searchHighlighted;
-      const showHighlightButton = highlightable && bookmarkMode;
+      const showHighlightButton = highlightable && bookmarkMode && !selectMode;
+      const isSelected = selectedSegments.includes(index);
+      const selectable = selectMode && segment.type !== "decision"; // selecting a decision block is awkward; skip
 
       const segmentStyle: CSSProperties = { marginBottom: spacing };
       if (!showHighlightButton) {
         segmentStyle.paddingRight = "1.25rem";
       }
+
+      const handleSegmentClick = (event: ReactMouseEvent<HTMLDivElement>) => {
+        if (!selectable) return;
+        // Don't swallow clicks that originate from interactive children
+        // (e.g. decision options, embedded buttons).
+        const target = event.target as HTMLElement;
+        if (target.closest("button")) return;
+        event.preventDefault();
+        toggleSegmentSelection(index);
+      };
+
+      const handleSegmentKey = (event: React.KeyboardEvent<HTMLDivElement>) => {
+        if (!selectable) return;
+        // Space / Enter toggle selection. Arrow keys / Esc are intentionally
+        // left to bubble so the reader's own shortcuts still work.
+        if (event.key === " " || event.key === "Enter") {
+          event.preventDefault();
+          toggleSegmentSelection(index);
+        }
+      };
+
+      // Props shared across every segment variant below. `role`/`tabIndex`
+      // are only populated when the paragraph is actually selectable so
+      // Tab navigation outside of select mode stays on real buttons.
+      const segmentA11yProps: React.HTMLAttributes<HTMLDivElement> = selectable
+        ? {
+            role: "button",
+            tabIndex: 0,
+            "aria-pressed": isSelected,
+            "aria-label": isSelected ? "取消选中此段" : "选中此段用于分享",
+            onKeyDown: handleSegmentKey,
+          }
+        : {};
+
+      const selectionClass = selectable
+        ? cn(
+            "reader-segment-selectable cursor-pointer rounded-md transition-shadow",
+            isSelected && "ring-2 ring-[hsl(var(--color-primary))] ring-offset-2 ring-offset-transparent"
+          )
+        : "";
 
       const highlightButton = showHighlightButton ? (
         <button
@@ -945,22 +1060,35 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
       ) : null;
 
       if (segment.type === "dialogue") {
+        const showAvatar = !minimalMode && !selectMode;
         return (
           <div
             key={index}
             data-segment-index={index}
           className={cn(
-            "reader-paragraph reader-dialogue reader-segment pr-10 motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-500",
+            "reader-paragraph reader-dialogue reader-segment pr-10",
             annotationHighlight && "reader-highlighted",
             searchHighlighted && "reader-search-highlight",
-            characterHighlighted && "reader-character-highlight"
+            characterHighlighted && "reader-character-highlight",
+            selectionClass
           )}
+          onClick={handleSegmentClick}
+          {...segmentA11yProps}
+          data-search-pulse={searchPulseActive ? "true" : undefined}
           style={{
             ...segmentStyle,
             textAlign: segment.position === "right" ? ("right" as CSSProperties["textAlign"]) : undefined,
           }}
         >
           {highlightButton}
+          {showAvatar && (
+            <CharacterAvatar
+              charId={segment.characterId ?? undefined}
+              name={segment.characterName}
+              size={36}
+              className="reader-dialogue-avatar"
+            />
+          )}
           <div className="reader-character-name">{segment.characterName}</div>
           <div className="reader-text">{renderLines(segment.text)}</div>
         </div>
@@ -973,10 +1101,14 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
             key={index}
             data-segment-index={index}
             className={cn(
-              "reader-narration reader-segment pr-10 motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-500",
+              "reader-narration reader-segment pr-10",
               annotationHighlight && "reader-highlighted",
-              searchHighlighted && "reader-search-highlight"
+              searchHighlighted && "reader-search-highlight",
+              selectionClass
             )}
+            onClick={handleSegmentClick}
+            {...segmentA11yProps}
+            data-search-pulse={searchPulseActive ? "true" : undefined}
             style={segmentStyle}
           >
             {highlightButton}
@@ -992,9 +1124,10 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
             key={index}
             data-segment-index={index}
             className={cn(
-              "reader-decision motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-500",
+              "reader-decision",
               searchHighlighted && "reader-search-highlight"
             )}
+            data-search-pulse={searchPulseActive ? "true" : undefined}
             style={{ marginBottom: spacing }}
           >
             <div className="reader-decision-title">选择：</div>
@@ -1003,7 +1136,7 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
               return (
                 <div
                   key={optionIndex}
-                  className="reader-decision-option motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-500"
+                  className="reader-decision-option"
                   style={{ animationDelay: `${optionIndex * 60}ms` }}
                 >
                   <span className="reader-decision-bullet">{optionIndex + 1}</span>
@@ -1026,10 +1159,14 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
             key={index}
             data-segment-index={index}
             className={cn(
-              "reader-system reader-segment pr-10 motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-500",
+              "reader-system reader-segment pr-10",
               annotationHighlight && "reader-highlighted",
-              searchHighlighted && "reader-search-highlight"
+              searchHighlighted && "reader-search-highlight",
+              selectionClass
             )}
+            onClick={handleSegmentClick}
+            {...segmentA11yProps}
+            data-search-pulse={searchPulseActive ? "true" : undefined}
             style={segmentStyle}
           >
             {highlightButton}
@@ -1053,10 +1190,14 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
             key={index}
             data-segment-index={index}
             className={cn(
-              "reader-subtitle reader-segment pr-10 motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-500",
+              "reader-subtitle reader-segment pr-10",
               annotationHighlight && "reader-highlighted",
-              searchHighlighted && "reader-search-highlight"
+              searchHighlighted && "reader-search-highlight",
+              selectionClass
             )}
+            onClick={handleSegmentClick}
+            {...segmentA11yProps}
+            data-search-pulse={searchPulseActive ? "true" : undefined}
             style={{ ...segmentStyle, textAlign: alignment }}
           >
             {highlightButton}
@@ -1077,10 +1218,14 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
             key={index}
             data-segment-index={index}
             className={cn(
-              "reader-sticker reader-segment pr-10 motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-500",
+              "reader-sticker reader-segment pr-10",
               annotationHighlight && "reader-highlighted",
-              searchHighlighted && "reader-search-highlight"
+              searchHighlighted && "reader-search-highlight",
+              selectionClass
             )}
+            onClick={handleSegmentClick}
+            {...segmentA11yProps}
+            data-search-pulse={searchPulseActive ? "true" : undefined}
             style={{ ...segmentStyle, textAlign: alignment }}
           >
             {highlightButton}
@@ -1094,17 +1239,80 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
           <div
             key={index}
             data-segment-index={index}
-            className="reader-header motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-500"
+            className={cn(
+              "reader-header-cover",
+              searchHighlighted && "reader-search-highlight",
+              selectionClass
+            )}
+            onClick={handleSegmentClick}
+            {...segmentA11yProps}
+            data-search-pulse={searchPulseActive ? "true" : undefined}
             style={{ marginBottom: spacing }}
           >
-            {segment.title}
+            {!minimalMode && (
+              <AssetImage
+                kind="chapter_cover"
+                token={storyEntry?.storyGroup ?? null}
+                alt={segment.title}
+                tint="tint"
+                className="absolute inset-0"
+              />
+            )}
+            <span className="reader-header-cover__label">{segment.title}</span>
           </div>
         );
       }
 
+      if (segment.type === "image") {
+        if (!inlineImages || minimalMode) return null;
+        return (
+          <div
+            key={index}
+            data-segment-index={index}
+            className={cn(
+              "reader-segment-image reader-segment",
+              searchHighlighted && "reader-search-highlight",
+              selectionClass
+            )}
+            data-search-pulse={searchPulseActive ? "true" : undefined}
+            style={{ marginBottom: spacing }}
+          >
+            <AssetImage
+              kind="image"
+              token={segment.token}
+              alt={segment.caption ?? "剧情插画"}
+              tint="soft"
+              className="h-full w-full"
+            />
+            {segment.caption ? (
+              <div className="reader-segment-image-caption">{segment.caption}</div>
+            ) : null}
+          </div>
+        );
+      }
+
+      if (segment.type === "music") {
+        return null;
+      }
+
       return null;
     },
-    [bookmarkMode, highlightSegmentIndex, isHighlighted, readerSpacing, renderLines, toggleHighlight]
+    [
+      activeCharacter,
+      bookmarkMode,
+      handleToggleHighlightUnified,
+      highlightSegmentIndex,
+      inlineImages,
+      isHighlighted,
+      minimalMode,
+      readerSpacing,
+      renderLines,
+      searchPulseToken,
+      selectMode,
+      selectedSegments,
+      storyEntry,
+      toggleSegmentSelection,
+    ]
   );
 
   if (loading) {
@@ -1142,11 +1350,11 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
   return (
     <div
       ref={readerRootRef}
-      className="h-full flex flex-col overflow-hidden reader-surface motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-500"
+      className="h-full flex flex-col overflow-hidden reader-surface"
       data-reader-theme={settings.theme}
       data-bookmark-mode={bookmarkMode ? "enabled" : "disabled"}
     >
-      <header className="flex-shrink-0 z-20 bg-[hsl(var(--color-background)/0.95)] backdrop-blur border-b motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-500">
+      <header className="flex-shrink-0 z-20 bg-[hsl(var(--color-background)/0.95)] backdrop-blur border-b">
         <div className="container flex items-center gap-2 h-16">
           <Button variant="ghost" size="icon" onClick={onBack} aria-label="返回剧情列表">
             <ArrowLeft className="h-5 w-5" />
@@ -1203,6 +1411,17 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
             <Button
               variant="ghost"
               size="icon"
+              onClick={() => (selectMode ? exitSelectMode() : enterSelectMode())}
+              aria-label={selectMode ? "退出多选" : "选段分享为图片"}
+              title={selectMode ? "退出多选" : "选段分享为图片"}
+              aria-pressed={selectMode}
+              className={cn(selectMode && "text-[hsl(var(--color-primary))]")}
+            >
+              <CheckSquare className="h-5 w-5" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
               onClick={() => setSettingsOpen(true)}
               aria-label="打开阅读设置"
             >
@@ -1250,7 +1469,7 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
         </CustomScrollArea>
       </main>
 
-      {settings.readingMode === "paged" && (
+      {settings.readingMode === "paged" && !selectMode && (
         <footer className="flex-shrink-0 bg-[hsl(var(--color-background)/0.95)] backdrop-blur border-t p-4">
           <div className="container flex items-center justify-between gap-3">
             <Button
@@ -1278,6 +1497,111 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
         </footer>
       )}
 
+      {/* 上/下一话导航 —— 基于 storyGroup + storySort 推导（仅在阅读且无选段/无抽屉时展示）。 */}
+      {!selectMode && !settingsOpen && !insightsOpen && !shareDialogOpen && (neighbors.prev || neighbors.next) && (
+        <div
+          className="flex-shrink-0 border-t border-[hsl(var(--color-border))] bg-[hsl(var(--color-background)/0.92)] backdrop-blur px-4 py-2"
+          style={{ paddingBottom: "calc(env(safe-area-inset-bottom, 0px) + 0.5rem)" }}
+        >
+          <div className="container grid grid-cols-2 gap-2">
+            <button
+              type="button"
+              disabled={!neighbors.prev}
+              onClick={() => neighbors.prev && onNavigateStory?.(neighbors.prev)}
+              className="flex items-center gap-2 rounded-lg px-3 py-2 text-left text-xs transition-colors hover:bg-[hsl(var(--color-accent))] disabled:opacity-40 disabled:cursor-not-allowed"
+              aria-label="上一话"
+            >
+              <ChevronLeft className="h-4 w-4 flex-shrink-0 text-[hsl(var(--color-muted-foreground))]" />
+              <div className="min-w-0">
+                <div className="text-[10px] uppercase tracking-widest text-[hsl(var(--color-muted-foreground))]">上一话</div>
+                <div className="truncate text-sm font-medium text-[hsl(var(--color-foreground))]">
+                  {neighbors.prev?.storyName ?? "—"}
+                </div>
+              </div>
+            </button>
+            <button
+              type="button"
+              disabled={!neighbors.next}
+              onClick={() => neighbors.next && onNavigateStory?.(neighbors.next)}
+              className="flex items-center justify-end gap-2 rounded-lg px-3 py-2 text-right text-xs transition-colors hover:bg-[hsl(var(--color-accent))] disabled:opacity-40 disabled:cursor-not-allowed"
+              aria-label="下一话"
+            >
+              <div className="min-w-0">
+                <div className="text-[10px] uppercase tracking-widest text-[hsl(var(--color-muted-foreground))]">下一话</div>
+                <div className="truncate text-sm font-medium text-[hsl(var(--color-foreground))]">
+                  {neighbors.next?.storyName ?? "—"}
+                </div>
+              </div>
+              <ChevronRight className="h-4 w-4 flex-shrink-0 text-[hsl(var(--color-muted-foreground))]" />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {selectMode && (
+        <footer
+          className="flex-shrink-0 bg-[hsl(var(--color-background)/0.95)] backdrop-blur border-t px-4 py-3 space-y-2"
+          style={{ paddingBottom: "calc(env(safe-area-inset-bottom, 0px) + 0.75rem)" }}
+        >
+          {/* Paged mode needs the page controls inside the select footer;
+              otherwise the user is stuck on one page while picking segments. */}
+          {settings.readingMode === "paged" && (
+            <div className="container flex items-center justify-between gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setCurrentPage((prev) => Math.max(0, prev - 1))}
+                disabled={currentPage === 0}
+                className="flex-1"
+              >
+                <ChevronLeft className="mr-2 h-4 w-4" />
+                上一页
+              </Button>
+              <div className="text-xs tabular-nums text-[hsl(var(--color-muted-foreground))] min-w-[4.5rem] text-center">
+                {currentPage + 1} / {totalPages}
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setCurrentPage((prev) => Math.min(totalPages - 1, prev + 1))}
+                disabled={currentPage >= totalPages - 1}
+                className="flex-1"
+              >
+                下一页
+                <ChevronRight className="ml-2 h-4 w-4" />
+              </Button>
+            </div>
+          )}
+          <div className="container flex items-center gap-2">
+            <div className="flex-1 min-w-0 text-sm">
+              <div className="font-medium">选段分享</div>
+              <div className="text-xs text-[hsl(var(--color-muted-foreground))]">
+                已选 {selectedSegments.length} 段 · 点击段落切换选中
+              </div>
+            </div>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={clearSelection}
+              disabled={selectedSegments.length === 0}
+            >
+              清空
+            </Button>
+            <Button variant="outline" size="sm" onClick={exitSelectMode}>
+              取消
+            </Button>
+            <Button
+              size="sm"
+              onClick={() => setShareDialogOpen(true)}
+              disabled={selectedSegments.length === 0}
+            >
+              <Share2 className="mr-2 h-4 w-4" />
+              生成图片
+            </Button>
+          </div>
+        </footer>
+      )}
+
       <StoryInsightsPanel
         open={insightsOpen}
         insights={insights}
@@ -1298,266 +1622,14 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
         onUpdateSettings={updateSettings}
         onReset={resetSettings}
       />
-    </div>
-  );
-}
 
-interface StoryInsightsPanelProps {
-  open: boolean;
-  insights: {
-    characters: Array<{ name: string; count: number; firstIndex: number }>;
-    decisions: Array<{ index: number; options: string[]; values?: string[] }>;
-    headers: Array<{ index: number; title: string }>;
-  };
-  highlightEntries: Array<{ index: number; label: string }>;
-  activeCharacter: string | null;
-  onClose: () => void;
-  onJumpToSegment: (index: number) => void;
-  onClearHighlights: () => void;
-  onRemoveHighlight: (index: number) => void;
-  onCharacterSelect: (name: string, firstIndex: number) => void;
-  onClearCharacter: () => void;
-}
-
-function StoryInsightsPanel({
-  open,
-  insights,
-  highlightEntries,
-  activeCharacter,
-  onClose,
-  onJumpToSegment,
-  onClearHighlights,
-  onRemoveHighlight,
-  onCharacterSelect,
-  onClearCharacter,
-}: StoryInsightsPanelProps) {
-  const { rendered, state } = useSidePanel({ open, onClose });
-  if (!rendered) return null;
-
-  return (
-    <div
-      className="fixed inset-0 z-50 flex"
-      role="dialog"
-      aria-modal="true"
-      aria-label="剧情导览"
-    >
-      <div
-        data-state={state}
-        className="absolute inset-0 bg-black/45 transition-opacity duration-200 data-[state=closed]:opacity-0 data-[state=open]:opacity-100"
-        onClick={onClose}
+      <ShareImageDialog
+        open={shareDialogOpen}
+        onClose={() => setShareDialogOpen(false)}
+        storyName={storyName}
+        segments={selectedShareSegments}
       />
-      <aside
-        data-state={state}
-        className="ml-auto h-full w-3/4 max-w-sm sm:max-w-md relative transform transition-transform duration-200 ease-out data-[state=closed]:translate-x-full data-[state=open]:translate-x-0"
-      >
-        <Card className="relative z-10 h-full rounded-none sm:rounded-l-2xl flex flex-col shadow-2xl border-l border-[hsl(var(--color-border))] bg-[hsl(var(--color-card))] overflow-hidden">
-          <CardHeader className="sticky top-0 z-10 bg-[hsl(var(--color-card))] border-b flex-shrink-0 px-5 sm:px-6 py-4 space-y-0">
-            <div className="flex items-start justify-between gap-3">
-              <div className="min-w-0">
-                <div className="text-[11px] uppercase tracking-widest text-[hsl(var(--color-muted-foreground))]">
-                  Story Guide
-                </div>
-                <CardTitle className="text-lg font-semibold mt-1">剧情导览</CardTitle>
-              </div>
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={onClose}
-                aria-label="关闭剧情导览"
-                title="关闭"
-              >
-                <X className="h-4 w-4" />
-              </Button>
-            </div>
-            <p className="mt-2 text-sm text-[hsl(var(--color-muted-foreground))] leading-relaxed">
-              快速定位关键角色与抉择节点，辅助你以导演视角重温剧情。
-            </p>
-          </CardHeader>
-          <CardContent className="flex-1 min-h-0 p-0">
-            <CustomScrollArea
-              className="h-full"
-              viewportClassName="reader-scroll"
-              hideTrackWhenIdle={false}
-              trackOffsetTop="4.5rem"
-            >
-              <div className="px-5 sm:px-6 py-6 space-y-8">
-                {insights.headers.length > 0 && (
-                  <section>
-                    <div className="flex items-center justify-between mb-3">
-                      <h3 className="text-[11px] font-semibold uppercase tracking-widest text-[hsl(var(--color-muted-foreground))]">
-                        章节目录
-                      </h3>
-                      <span className="text-xs text-[hsl(var(--color-muted-foreground))]">
-                        {insights.headers.length} 节
-                      </span>
-                    </div>
-                    <div className="space-y-1">
-                      {insights.headers.map((h) => (
-                        <button
-                          key={`toc-${h.index}`}
-                          type="button"
-                          className="w-full rounded-lg border border-transparent px-3 py-2 text-left text-sm transition-colors hover:border-[hsl(var(--color-border))] hover:bg-[hsl(var(--color-accent))] active:scale-[0.99] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--color-ring))] focus-visible:ring-offset-2 focus-visible:ring-offset-[hsl(var(--color-card))]"
-                          onClick={() => onJumpToSegment(h.index)}
-                        >
-                          {h.title}
-                        </button>
-                      ))}
-                    </div>
-                  </section>
-                )}
-
-                <section>
-                  <div className="flex items-center justify-between mb-3">
-                    <h3 className="text-[11px] font-semibold uppercase tracking-widest text-[hsl(var(--color-muted-foreground))]">
-                      划线收藏
-                    </h3>
-                    {highlightEntries.length > 0 && (
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        className="text-xs h-auto px-2 py-1 text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-destructive))]"
-                        onClick={onClearHighlights}
-                      >
-                        清空
-                      </Button>
-                    )}
-                  </div>
-                  <div className="space-y-2">
-                    {highlightEntries.length === 0 && (
-                      <div className="text-xs text-[hsl(var(--color-muted-foreground))]">
-                        暂无划线内容
-                      </div>
-                    )}
-                    {highlightEntries.map((entry) => (
-                      <div
-                        key={entry.index}
-                        className="group flex items-start gap-2 rounded-lg border border-[hsl(var(--color-border))] bg-[hsl(var(--color-card))] p-3 shadow-sm transition-colors hover:border-[hsl(var(--color-primary)/0.5)]"
-                      >
-                        <button
-                          type="button"
-                          className="flex-1 text-left text-sm leading-relaxed transition-colors hover:text-[hsl(var(--color-primary))] focus-visible:outline-none focus-visible:text-[hsl(var(--color-primary))]"
-                          onClick={() => onJumpToSegment(entry.index)}
-                        >
-                          {entry.label}
-                        </button>
-                        <span
-                          className="inline-flex h-7 w-7 flex-shrink-0 items-center justify-center text-[hsl(var(--color-primary))]"
-                          title="已加入线索集"
-                          aria-label="已加入线索集"
-                        >
-                          <Check className="h-4 w-4" />
-                        </span>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="h-7 w-7 flex-shrink-0 text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-destructive))]"
-                          onClick={(event) => {
-                            event.preventDefault();
-                            event.stopPropagation();
-                            onRemoveHighlight(entry.index);
-                          }}
-                          aria-label="移除划线"
-                          title="移除划线"
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </Button>
-                      </div>
-                    ))}
-                  </div>
-                </section>
-
-                <section>
-                  <div className="flex items-center justify-between mb-3">
-                    <h3 className="text-[11px] font-semibold uppercase tracking-widest text-[hsl(var(--color-muted-foreground))]">
-                      角色出场
-                    </h3>
-                    {activeCharacter && (
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        className="text-xs h-auto px-2 py-1 text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-destructive))]"
-                        onClick={onClearCharacter}
-                      >
-                        清除高亮
-                      </Button>
-                    )}
-                  </div>
-                  <div className="space-y-2">
-                    {insights.characters.length === 0 && (
-                      <div className="text-xs text-[hsl(var(--color-muted-foreground))]">
-                        暂无角色统计
-                      </div>
-                    )}
-                    {insights.characters.map((character) => {
-                      const active = activeCharacter === character.name;
-                      return (
-                        <button
-                          key={character.name}
-                          type="button"
-                          aria-pressed={active}
-                          onClick={() => onCharacterSelect(character.name, character.firstIndex)}
-                          className={cn(
-                            "w-full flex items-center justify-between rounded-lg border px-3 py-2 text-left transition-colors active:scale-[0.99] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--color-ring))] focus-visible:ring-offset-2 focus-visible:ring-offset-[hsl(var(--color-card))]",
-                            active
-                              ? "border-[hsl(var(--color-primary))] bg-[hsl(var(--color-accent))] text-[hsl(var(--color-primary))]"
-                              : "border-[hsl(var(--color-border))] bg-[hsl(var(--color-card))] hover:border-[hsl(var(--color-primary)/0.5)] hover:bg-[hsl(var(--color-accent))]"
-                          )}
-                        >
-                          <div className="font-medium truncate pr-2">{character.name}</div>
-                          <div className="text-xs tabular-nums text-[hsl(var(--color-muted-foreground))] flex-shrink-0">
-                            {character.count} 次
-                          </div>
-                        </button>
-                      );
-                    })}
-                  </div>
-                </section>
-
-                <section>
-                  <h3 className="text-[11px] font-semibold uppercase tracking-widest text-[hsl(var(--color-muted-foreground))] mb-3">
-                    抉择片段
-                  </h3>
-                  <div className="space-y-3">
-                    {insights.decisions.length === 0 && (
-                      <div className="text-xs text-[hsl(var(--color-muted-foreground))]">
-                        尚未出现抉择
-                      </div>
-                    )}
-                    {insights.decisions.map((decision, idx) => (
-                      <div
-                        key={`${decision.index}-${idx}`}
-                        className="rounded-xl border border-[hsl(var(--color-border))] bg-[hsl(var(--color-card))] p-3 shadow-sm transition-colors hover:border-[hsl(var(--color-primary)/0.5)]"
-                      >
-                        <div className="flex items-center justify-between mb-2">
-                          <span className="text-sm font-medium">抉择 {idx + 1}</span>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="text-xs h-auto px-2 py-1"
-                            onClick={() => onJumpToSegment(decision.index)}
-                          >
-                            前往
-                          </Button>
-                        </div>
-                        <div className="space-y-1 text-xs text-[hsl(var(--color-muted-foreground))]">
-                          {decision.options.map((option, optionIndex) => (
-                            <div key={optionIndex} className="flex gap-2">
-                              <span className="text-[hsl(var(--color-primary))] tabular-nums">
-                                {optionIndex + 1}.
-                              </span>
-                              <span className="flex-1">{option}</span>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </section>
-              </div>
-            </CustomScrollArea>
-          </CardContent>
-        </Card>
-      </aside>
     </div>
   );
 }
+

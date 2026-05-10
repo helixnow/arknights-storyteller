@@ -54,14 +54,16 @@ export interface ParsedStoryContent {
 }
 
 // 剧情段落类型
-export type StorySegment = 
+export type StorySegment =
   | DialogueSegment
   | NarrationSegment
   | DecisionSegment
   | SystemSegment
   | SubtitleSegment
   | StickerSegment
-  | HeaderSegment;
+  | HeaderSegment
+  | ImageSegment
+  | MusicSegment;
 
 // 对话段落
 export interface DialogueSegment {
@@ -69,6 +71,8 @@ export interface DialogueSegment {
   characterName: string;
   text: string;
   position?: 'left' | 'right' | null;
+  /** 后端解析出的 charId，例如 `char_010_chen`。可用于拼头像 URL。 */
+  characterId?: string | null;
 }
 
 // 旁白段落
@@ -107,6 +111,19 @@ export interface HeaderSegment {
   title: string;
 }
 
+/** 剧情插画段（`[Image]` / `[Background]` 指令产生）。 */
+export interface ImageSegment {
+  type: 'image';
+  token: string;
+  caption?: string | null;
+}
+
+/** BGM 指令段，默认前端不渲染。 */
+export interface MusicSegment {
+  type: 'music';
+  key: string;
+}
+
 // 剧情分类
 export interface StoryCategory {
   id: string;
@@ -140,6 +157,14 @@ export interface SegmentHit {
   segmentType: "dialogue" | "narration" | "system" | "subtitle" | "sticker" | "header" | "decision";
   characterName?: string | null;
   matchedText: string;
+  /**
+   * 命中所在的字段：
+   *   - `body`：搜索词出现在段落正文
+   *   - `speaker`：只在说话人/角色名里命中（正文本身可能很短）
+   *   - `title`：整篇剧情标题或 storyCode 命中（聚合到 header 段展示）
+   *   - `mixed`：分词后零件命中，无法归因到具体列（不显示 badge）
+   */
+  matchTarget: "body" | "speaker" | "title" | "mixed";
 }
 
 export interface SegmentSearchPage {
@@ -158,3 +183,25 @@ export interface StoryIndexStatus {
   total: number;
   lastBuiltAt?: number | null;
 }
+
+/** 同一 storyGroup 内的前后剧情。 */
+export interface StoryNeighbors {
+  prev?: StoryEntry | null;
+  next?: StoryEntry | null;
+}
+
+/** 干员名 ↔ charId 映射（后端 character_table 快照）。 */
+export interface CharacterIndex {
+  charIdToName: Record<string, string>;
+  nameToCharId: Record<string, string>;
+}
+
+/** 素材种类——对应 Rust `AssetKind`。 */
+export type AssetKind =
+  | 'avatar'
+  | 'portrait'
+  | 'image'
+  | 'background'
+  | 'activity_kv'
+  | 'activity_logo'
+  | 'chapter_cover';

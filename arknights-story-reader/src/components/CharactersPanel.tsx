@@ -7,6 +7,7 @@ import { Input } from "@/components/ui/input";
 import { Collapsible } from "@/components/ui/collapsible";
 import { ArrowLeft, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { CharacterAvatar } from "@/components/CharacterAvatar";
 
 interface CharactersPanelProps {
   onOpenStory: (story: StoryEntry, character: string) => void;
@@ -21,6 +22,11 @@ interface CharacterAggregate {
   name: string;
   total: number;
   perStory: CharacterStatsPerStory[];
+}
+
+interface CharacterQuote {
+  text: string;
+  storyName: string;
 }
 
 type GroupCategory = "main" | "activity" | "memory" | "other";
@@ -56,6 +62,9 @@ export function CharactersPanel({ onOpenStory }: CharactersPanelProps) {
   const [cacheUsed, setCacheUsed] = useState(false);
   const [cacheBuiltAt, setCacheBuiltAt] = useState<number | null>(null);
   const [version, setVersion] = useState<string | null>(null);
+  const [quotes, setQuotes] = useState<CharacterQuote[]>([]);
+  const [loadingQuotes, setLoadingQuotes] = useState(false);
+  const quotesRunRef = useRef(0);
 
   const CACHE_PREFIX = "arknights-characters-cache";
   const getCacheKey = useCallback((v: string) => `${CACHE_PREFIX}:${v}`, []);
@@ -296,6 +305,50 @@ export function CharactersPanel({ onOpenStory }: CharactersPanelProps) {
     return Array.from(buckets.values()).sort((a, b) => a.order - b.order);
   }, [groupInfoByStoryId, selectedAgg]);
 
+  useEffect(() => {
+    if (!selected || !selectedAgg) {
+      quotesRunRef.current += 1;
+      setQuotes([]);
+      setLoadingQuotes(false);
+      return;
+    }
+    const runId = ++quotesRunRef.current;
+    setLoadingQuotes(true);
+    setQuotes([]);
+
+    const perStory = selectedAgg.perStory;
+    Promise.all(
+      perStory.map(async ({ story }) => {
+        try {
+          const content = await api.getStoryContent(story.storyTxt);
+          const hits: CharacterQuote[] = [];
+          content.segments.forEach((seg) => {
+            if (seg.type === "dialogue" && seg.characterName === selected) {
+              const text = seg.text.trim();
+              if (text.length > 0) {
+                hits.push({ text, storyName: story.storyName });
+              }
+            }
+          });
+          return hits;
+        } catch {
+          return [] as CharacterQuote[];
+        }
+      })
+    )
+      .then((all) => {
+        if (runId !== quotesRunRef.current) return;
+        const flat = all.flat();
+        flat.sort((a, b) => b.text.length - a.text.length);
+        setQuotes(flat.slice(0, 3));
+        setLoadingQuotes(false);
+      })
+      .catch(() => {
+        if (runId !== quotesRunRef.current) return;
+        setLoadingQuotes(false);
+      });
+  }, [selected, selectedAgg]);
+
   return (
     <div className="h-full flex flex-col">
       <header className="px-4 py-3 border-b border-[hsl(var(--color-border))] flex items-center gap-3">
@@ -349,12 +402,13 @@ export function CharactersPanel({ onOpenStory }: CharactersPanelProps) {
                 <button
                   key={c.name}
                   className={cn(
-                    "flex items-center justify-between rounded-lg border border-[hsl(var(--color-border))] bg-[hsl(var(--color-card))] p-3 text-left hover:bg-[hsl(var(--color-accent))] transition-colors"
+                    "flex items-center gap-3 rounded-lg border border-[hsl(var(--color-border))] bg-[hsl(var(--color-card))] p-3 text-left hover:bg-[hsl(var(--color-accent))] transition-colors"
                   )}
                   onClick={() => setSelected(c.name)}
                 >
-                  <div className="font-medium truncate">{c.name}</div>
-                  <div className="text-xs text-[hsl(var(--color-muted-foreground))]">{c.total} 次</div>
+                  <CharacterAvatar name={c.name} size={40} />
+                  <div className="font-medium truncate flex-1 min-w-0">{c.name}</div>
+                  <div className="text-xs text-[hsl(var(--color-muted-foreground))] shrink-0">{c.total} 次</div>
                 </button>
               ))}
               {!loading && filteredCharacters.length === 0 && (
@@ -367,9 +421,53 @@ export function CharactersPanel({ onOpenStory }: CharactersPanelProps) {
 
           {selected && selectedAgg && (
             <div className="space-y-4">
-              <div className="text-sm text-[hsl(var(--color-muted-foreground))]">
-                共计 {selectedAgg.total} 次发言，涉及 {selectedAgg.perStory.length} 个章节/关卡
+              <div className="flex items-center gap-4">
+                <CharacterAvatar name={selected} size={80} tint="none" />
+                <div className="min-w-0">
+                  <div className="text-lg font-semibold truncate">{selectedAgg.name}</div>
+                  <div className="text-sm text-[hsl(var(--color-muted-foreground))]">
+                    共计 {selectedAgg.total} 次发言，涉及 {selectedAgg.perStory.length} 个章节/关卡
+                  </div>
+                </div>
               </div>
+
+              {loadingQuotes && (
+                <div
+                  className="rounded-lg border border-[hsl(var(--color-border))] bg-[hsl(var(--color-card))] p-4 space-y-2"
+                  style={{ minHeight: 80 }}
+                >
+                  <div className="h-3 w-24 rounded bg-[hsl(var(--color-secondary))] animate-pulse" />
+                  <div className="h-3 w-full rounded bg-[hsl(var(--color-secondary))] animate-pulse" />
+                  <div className="h-3 w-3/4 rounded bg-[hsl(var(--color-secondary))] animate-pulse" />
+                </div>
+              )}
+
+              {!loadingQuotes && quotes.length > 0 && (
+                <div
+                  className="rounded-lg border border-[hsl(var(--color-border))] bg-[hsl(var(--color-card))] p-4 space-y-3"
+                  style={{ minHeight: 80 }}
+                >
+                  <div className="text-sm font-medium">金句</div>
+                  {quotes.map((quote, i) => (
+                    <blockquote
+                      key={i}
+                      className="relative pl-6 text-sm leading-relaxed text-[hsl(var(--color-foreground))]"
+                    >
+                      <span
+                        aria-hidden="true"
+                        className="absolute left-0 top-0 text-2xl leading-none text-[hsl(var(--color-muted-foreground))] select-none"
+                      >
+                        “
+                      </span>
+                      <div className="whitespace-pre-wrap break-words">{quote.text}</div>
+                      <div className="mt-1 text-xs text-[hsl(var(--color-muted-foreground))]">
+                        —— {selectedAgg.name} · {quote.storyName}
+                      </div>
+                    </blockquote>
+                  ))}
+                </div>
+              )}
+
           {groupedByChapter.map((group, idx) => {
             const key = group.groupName;
             const q = (groupSearch[key] ?? "").trim().toLowerCase();

@@ -1,7 +1,7 @@
-import { Book, Search, Settings, Users2, ListChecks } from "lucide-react";
+import { Book, Home, Search, Settings, Users2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
-type Tab = "stories" | "characters" | "search" | "clues" | "settings";
+type Tab = "home" | "stories" | "characters" | "search" | "settings";
 
 interface BottomNavProps {
   activeTab: Tab;
@@ -9,8 +9,8 @@ interface BottomNavProps {
 }
 
 const NAV_ITEMS: Array<{ id: Tab; label: string; Icon: typeof Book }> = [
+  { id: "home", label: "首页", Icon: Home },
   { id: "stories", label: "剧情", Icon: Book },
-  { id: "clues", label: "线索集", Icon: ListChecks },
   { id: "characters", label: "人物", Icon: Users2 },
   { id: "search", label: "搜索", Icon: Search },
   { id: "settings", label: "设置", Icon: Settings },
@@ -21,13 +21,12 @@ export function BottomNav({ activeTab, onTabChange }: BottomNavProps) {
     <nav
       role="navigation"
       aria-label="主导航"
-      className="fixed bottom-0 left-0 right-0 bg-[hsl(var(--color-background)/0.95)] backdrop-blur border-t motion-safe:animate-in motion-safe:slide-in-from-bottom-10 motion-safe:duration-500"
-      style={{ paddingBottom: "env(safe-area-inset-bottom, 0px)" }}
+      className="bottom-nav-glass motion-safe:animate-in motion-safe:slide-in-from-bottom-8 motion-safe:duration-500"
     >
       <div
         role="tablist"
         aria-orientation="horizontal"
-        className="container flex items-stretch justify-around"
+        className="flex items-stretch justify-between px-1 py-1"
       >
         {NAV_ITEMS.map(({ id, label, Icon }) => {
           const active = activeTab === id;
@@ -40,14 +39,14 @@ export function BottomNav({ activeTab, onTabChange }: BottomNavProps) {
               aria-controls={`tab-panel-${id}`}
               onClick={() => onTabChange(id)}
               className={cn(
-                "flex flex-col items-center justify-center gap-1 flex-1 min-h-[56px] py-2 transition-colors select-none",
+                "bottom-nav-pill flex flex-col items-center justify-center gap-0.5 flex-1 min-h-[52px] rounded-3xl px-2 py-1.5 select-none",
                 active
                   ? "text-[hsl(var(--color-primary))]"
-                  : "text-[hsl(var(--color-muted-foreground))]"
+                  : "text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-foreground))]"
               )}
             >
               <Icon className="h-5 w-5" strokeWidth={active ? 2.4 : 2} />
-              <span className="text-xs">{label}</span>
+              <span className="text-[11px] leading-tight">{label}</span>
             </button>
           );
         })}

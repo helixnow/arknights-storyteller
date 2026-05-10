@@ -1,16 +1,19 @@
-import { useState, useEffect } from "react";
+import { useEffect, useRef, useState } from "react";
 
 export const FONT_FAMILIES = [
   {
-    value: "'Arknights Noto Serif SC', 'Noto Serif SC', 'Source Han Serif SC', serif",
+    value:
+      "'Arknights Noto Serif SC', 'Noto Serif SC', 'Source Han Serif SC', 'Songti SC', 'SimSun', serif",
     label: "内置 · 思源宋体",
   },
   {
-    value: "'Arknights Noto Sans SC', 'Noto Sans SC', 'Source Han Sans SC', sans-serif",
+    value:
+      "'Arknights Noto Sans SC', 'Noto Sans SC', 'Source Han Sans SC', 'PingFang SC', 'HarmonyOS Sans SC', 'Microsoft YaHei', sans-serif",
     label: "内置 · 思源黑体",
   },
   {
-    value: "'Arknights LXGW WenKai', 'LXGW WenKai', 'Noto Serif SC', serif",
+    value:
+      "'Arknights LXGW WenKai', 'LXGW WenKai', 'Kaiti SC', 'STKaiti', 'KaiTi', 'Noto Serif SC', serif",
     label: "内置 · 霞鹜文楷",
   },
   { value: "system", label: "系统默认" },
@@ -37,9 +40,10 @@ export interface ReaderSettings {
 }
 
 const DEFAULT_SETTINGS: ReaderSettings = {
-  fontFamily: "'Arknights Noto Serif SC', 'Noto Serif SC', 'Source Han Serif SC', serif",
-  fontSize: 18,
-  lineHeight: 1.8,
+  fontFamily:
+    "'Arknights Noto Serif SC', 'Noto Serif SC', 'Source Han Serif SC', 'Songti SC', 'SimSun', serif",
+  fontSize: 19,
+  lineHeight: 1.7,
   letterSpacing: 0,
   paragraphSpacing: 0.7, // rem
   pageWidth: 100, // 100%
@@ -67,8 +71,35 @@ export function useReaderSettings() {
     return DEFAULT_SETTINGS;
   });
 
+  // Persist on change, but coalesce bursts from slider drags so we don't
+  // hit localStorage 18 times while the user is pulling the font-size
+  // knob across its full range. A single flush on unmount covers the
+  // final value when the drawer closes mid-drag.
+  const persistTimerRef = useRef<number | null>(null);
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+    if (typeof window === "undefined") return;
+    if (persistTimerRef.current !== null) {
+      window.clearTimeout(persistTimerRef.current);
+    }
+    persistTimerRef.current = window.setTimeout(() => {
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+      } catch {
+        // ignore quota errors
+      }
+      persistTimerRef.current = null;
+    }, 200);
+    return () => {
+      if (persistTimerRef.current !== null) {
+        window.clearTimeout(persistTimerRef.current);
+        persistTimerRef.current = null;
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+        } catch {
+          // ignore quota errors
+        }
+      }
+    };
   }, [settings]);
 
   const updateSettings = (partial: Partial<ReaderSettings>) => {

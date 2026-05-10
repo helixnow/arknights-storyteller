@@ -5,19 +5,18 @@ import { StoryReader } from "@/components/StoryReader";
 import { SearchPanel } from "@/components/SearchPanel";
 import { Settings } from "@/components/Settings";
 import { BottomNav } from "@/components/BottomNav";
+import { HomePanel } from "@/components/HomePanel";
 import type { StoryEntry } from "@/types/story";
 import { FavoritesProvider } from "@/hooks/useFavorites";
-import { ClueSetsProvider } from "@/hooks/useClueSets";
 import { AppPreferencesProvider } from "@/hooks/useAppPreferences";
-import { ClueSetsPanel } from "@/components/ClueSetsPanel";
-import { ClueSetReader } from "@/components/ClueSetReader";
+import { CharacterResolverProvider } from "@/hooks/useCharacterResolver";
 import { KeepAlive } from "@/components/KeepAlive";
 import { CharactersPanel } from "@/components/CharactersPanel";
 import { useAppUpdater } from "@/hooks/useAppUpdater";
 import { useBackHandler } from "@/hooks/useBackHandler";
 import { ToastProvider } from "@/components/ui/toast";
 
-type Tab = "stories" | "characters" | "search" | "clues" | "settings";
+type Tab = "home" | "stories" | "characters" | "search" | "settings";
 
 interface ReaderFocus {
   storyId: string;
@@ -28,7 +27,7 @@ interface ReaderFocus {
 
 function App() {
   useAppUpdater();
-  const [activeTab, setActiveTab] = useState<Tab>("stories");
+  const [activeTab, setActiveTab] = useState<Tab>("home");
   const [readerVisible, setReaderVisible] = useState(false);
   const [readerStory, setReaderStory] = useState<StoryEntry | null>(null);
   const [readerFocus, setReaderFocus] = useState<ReaderFocus | null>(null);
@@ -36,11 +35,9 @@ function App() {
   const [readerInitialJump, setReaderInitialJump] = useState<{
     storyId: string;
     segmentIndex: number;
-    digestHex?: string;
     preview?: string;
     issuedAt: number;
   } | null>(null);
-  const [clueReaderSetId, setClueReaderSetId] = useState<string | null>(null);
 
   const readerActive = readerVisible && readerStory !== null;
 
@@ -88,11 +85,16 @@ function App() {
   );
 
   const handleOpenStoryJump = useCallback(
-    (story: StoryEntry, jump: { segmentIndex: number; digestHex?: string; preview?: string }) => {
+    (story: StoryEntry, jump: { segmentIndex: number; preview?: string }) => {
       setReaderStory(story);
       setReaderFocus(null);
       setReaderInitialCharacter(null);
-      setReaderInitialJump({ storyId: story.storyId, segmentIndex: jump.segmentIndex, digestHex: jump.digestHex, preview: jump.preview, issuedAt: Date.now() });
+      setReaderInitialJump({
+        storyId: story.storyId,
+        segmentIndex: jump.segmentIndex,
+        preview: jump.preview,
+        issuedAt: Date.now(),
+      });
       setActiveTab("stories");
       setReaderVisible(true);
     },
@@ -109,21 +111,24 @@ function App() {
     [readerActive]
   );
 
-  const handleReadClueSet = useCallback((setId: string) => {
-    setClueReaderSetId(setId);
+  const handleGoToTab = useCallback((tab: Tab) => {
+    setActiveTab(tab);
+    setReaderVisible(false);
   }, []);
 
   // Android/Browser back-button: close open full-screen layers before falling
-  // back to the system default. Priority: clue reader > story reader > ...
-  useBackHandler(Boolean(clueReaderSetId), () => {
-    setClueReaderSetId(null);
-    return true;
-  });
+  // back to the system default.
   useBackHandler(readerActive, () => {
     setReaderVisible(false);
     return true;
   });
 
+  const homeView = useMemo(
+    () => (
+      <HomePanel onSelectStory={handleSelectStory} onGoToTab={handleGoToTab} />
+    ),
+    [handleSelectStory, handleGoToTab]
+  );
   const storyListView = useMemo(
     () => <StoryList onSelectStory={handleSelectStory} />,
     [handleSelectStory]
@@ -148,10 +153,6 @@ function App() {
     [handleSearchResult, handleOpenSegmentResult]
   );
   const settingsView = useMemo(() => <Settings />, []);
-  const cluesView = useMemo(
-    () => <ClueSetsPanel onOpenStoryJump={handleOpenStoryJump} onReadSet={handleReadClueSet} />,
-    [handleOpenStoryJump, handleReadClueSet]
-  );
 
   const readerView = readerStory ? (
     <StoryReader
@@ -167,6 +168,13 @@ function App() {
         readerInitialJump && readerInitialJump.storyId === readerStory.storyId ? readerInitialJump : null
       }
       onBack={handleBackToList}
+      onNavigateStory={(next) => {
+        // When prev/next tapped inside reader, just swap stories in-place.
+        setReaderStory(next);
+        setReaderFocus(null);
+        setReaderInitialCharacter(null);
+        setReaderInitialJump(null);
+      }}
     />
   ) : null;
 
@@ -182,6 +190,9 @@ function App() {
   const appContent = (
     <div className="h-full flex flex-col overflow-hidden pt-[calc(env(safe-area-inset-top,0px)+20px)]">
       <div className="relative flex-1 overflow-hidden">
+        <KeepAlive active={!readerActive && activeTab === "home"} className="absolute inset-0">
+          {homeView}
+        </KeepAlive>
         <KeepAlive active={!readerActive && activeTab === "stories"} className="absolute inset-0">
           {storyListView}
         </KeepAlive>
@@ -194,9 +205,6 @@ function App() {
         <KeepAlive active={!readerActive && activeTab === "search"} className="absolute inset-0">
           {searchView}
         </KeepAlive>
-        <KeepAlive active={!readerActive && activeTab === "clues" && !clueReaderSetId} className="absolute inset-0">
-          {cluesView}
-        </KeepAlive>
         <KeepAlive active={!readerActive && activeTab === "settings"} className="absolute inset-0">
           {settingsView}
         </KeepAlive>
@@ -205,21 +213,8 @@ function App() {
             {readerView}
           </KeepAlive>
         )}
-        {clueReaderSetId && (
-          <KeepAlive active={Boolean(clueReaderSetId)} className="absolute inset-0">
-            <ClueSetReader
-              key={clueReaderSetId}
-              setId={clueReaderSetId}
-              onClose={() => setClueReaderSetId(null)}
-              onOpenStoryJump={(story, jump) => {
-                setClueReaderSetId(null);
-                handleOpenStoryJump(story, jump);
-              }}
-            />
-          </KeepAlive>
-        )}
       </div>
-      {!readerActive && !clueReaderSetId && <BottomNav activeTab={activeTab} onTabChange={handleTabChange} />}
+      {!readerActive && <BottomNav activeTab={activeTab} onTabChange={handleTabChange} />}
     </div>
   );
 
@@ -228,9 +223,7 @@ function App() {
       <ToastProvider>
         <FavoritesProvider>
           <AppPreferencesProvider>
-            <ClueSetsProvider>
-              {appContent}
-            </ClueSetsProvider>
+            <CharacterResolverProvider>{appContent}</CharacterResolverProvider>
           </AppPreferencesProvider>
         </FavoritesProvider>
       </ToastProvider>

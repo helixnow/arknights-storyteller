@@ -2,13 +2,21 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "@/services/api";
 import type { StoryEntry } from "@/types/story";
 import { Button } from "@/components/ui/button";
-import { BookOpen, RefreshCw, Star, FileText } from "lucide-react";
+import { RefreshCw, Star, FileText } from "lucide-react";
 import { SyncDialog } from "@/components/SyncDialog";
 import { Collapsible } from "@/components/ui/collapsible";
 import { CustomScrollArea } from "@/components/ui/custom-scroll-area";
 import { Input } from "@/components/ui/input";
 import { useFavorites } from "@/hooks/useFavorites";
 import { useAppPreferences } from "@/hooks/useAppPreferences";
+import { AssetImage } from "@/components/AssetImage";
+import { CharacterAvatar } from "@/components/CharacterAvatar";
+
+function extractCharIdFromStoryTxt(storyTxt: string | null | undefined): string | null {
+  if (!storyTxt) return null;
+  const match = storyTxt.match(/obt\/memory\/(char_[^/]+)/i);
+  return match ? match[1] : null;
+}
 
 const CATEGORY_TABS = [
   { id: "favorites" as const, label: "收藏" },
@@ -1088,6 +1096,16 @@ function StoryItem({
   const summaryLines =
     showSummary && summaryState === "ready" ? summaryContent.split("\n") : [];
 
+  const storyTxt = story.storyTxt ?? "";
+  const isMemoryStory =
+    storyTxt.startsWith("obt/memory/") || story.storyReviewType === "NONE";
+  const isMainStory =
+    storyTxt.startsWith("obt/main/") || story.storyReviewType === "MAIN_STORY";
+  const charId = isMemoryStory ? extractCharIdFromStoryTxt(storyTxt) : null;
+  const charName = isMemoryStory
+    ? story.storyName.split("·")[0]?.trim() || null
+    : null;
+
   return (
     <div
       role="button"
@@ -1099,13 +1117,63 @@ function StoryItem({
           onSelectStory(story);
         }
       }}
-      className="w-full flex items-center gap-3 p-3 rounded-lg border border-[hsl(var(--color-border))] hover:bg-[hsl(var(--color-accent))] transition-all duration-200 ease-out text-left cursor-pointer focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[hsl(var(--color-primary))] hover:-translate-y-0.5 motion-safe:animate-in motion-safe:fade-in-0"
+      className="story-card flex w-full gap-3 p-3 items-center text-left cursor-pointer transition-all duration-200 ease-out hover:-translate-y-0.5 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[hsl(var(--color-primary))] motion-safe:animate-in motion-safe:fade-in-0"
     >
-      <BookOpen className="h-4 w-4 text-[hsl(var(--color-muted-foreground))] flex-shrink-0" />
+      <div className="relative w-24 h-14 flex-shrink-0 rounded-md overflow-hidden bg-[hsl(var(--color-secondary)/0.4)]">
+        {isMemoryStory ? (
+          <div className="flex h-full w-full items-center justify-center">
+            <CharacterAvatar
+              charId={charId}
+              name={charName}
+              size={44}
+            />
+          </div>
+        ) : isMainStory ? (
+          <AssetImage
+            kind="chapter_cover"
+            token={story.storyGroup}
+            alt={story.storyName}
+          />
+        ) : (
+          <AssetImage
+            kind="activity_kv"
+            token={story.storyGroup}
+            alt={story.storyName}
+          />
+        )}
+      </div>
       <div className="flex-1 min-w-0">
-        <div className="font-medium truncate">{story.storyName}</div>
+        <div className="flex items-start justify-between gap-2">
+          <div className="min-w-0 flex-1 flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+            {story.storyCode && (
+              <span className="story-card-code flex-shrink-0">{story.storyCode}</span>
+            )}
+            <span className="font-medium truncate">{story.storyName}</span>
+          </div>
+          <button
+            type="button"
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              onToggleFavorite();
+            }}
+            aria-pressed={isFavorite}
+            aria-label={isFavorite ? "取消收藏" : "收藏"}
+            className={`flex-shrink-0 p-1 rounded-full transition-colors border ${
+              isFavorite
+                ? "text-[hsl(var(--color-primary))] border-[hsl(var(--color-primary)/0.4)] bg-[hsl(var(--color-primary)/0.08)]"
+                : "text-[hsl(var(--color-muted-foreground))] border-transparent hover:text-[hsl(var(--color-foreground))]"
+            }`}
+          >
+            <Star
+              className="h-4 w-4"
+              fill={isFavorite ? "currentColor" : "transparent"}
+              strokeWidth={isFavorite ? 0 : 2}
+            />
+          </button>
+        </div>
         {story.avgTag && (
-          <div className="text-xs text-[hsl(var(--color-muted-foreground))]">{story.avgTag}</div>
+          <div className="text-xs text-[hsl(var(--color-muted-foreground))] mt-0.5 truncate">{story.avgTag}</div>
         )}
         {showSummary && (
           <div
@@ -1129,32 +1197,6 @@ function StoryItem({
             )}
           </div>
         )}
-      </div>
-      <div className="flex items-center gap-2 flex-shrink-0">
-        {story.storyCode && (
-          <div className="text-xs text-[hsl(var(--color-muted-foreground))]">{story.storyCode}</div>
-        )}
-        <button
-          type="button"
-          onClick={(event) => {
-            event.preventDefault();
-            event.stopPropagation();
-            onToggleFavorite();
-          }}
-          aria-pressed={isFavorite}
-          aria-label={isFavorite ? "取消收藏" : "收藏"}
-          className={`p-1 rounded-full transition-colors border ${
-            isFavorite
-              ? "text-[hsl(var(--color-primary))] border-[hsl(var(--color-primary)/0.4)] bg-[hsl(var(--color-primary)/0.08)]"
-              : "text-[hsl(var(--color-muted-foreground))] border-transparent hover:text-[hsl(var(--color-foreground))]"
-          }`}
-        >
-          <Star
-            className="h-4 w-4"
-            fill={isFavorite ? "currentColor" : "transparent"}
-            strokeWidth={isFavorite ? 0 : 2}
-          />
-        </button>
       </div>
     </div>
   );

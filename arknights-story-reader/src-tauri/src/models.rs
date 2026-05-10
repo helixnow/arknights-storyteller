@@ -72,6 +72,7 @@ pub struct Chapter {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct Activity {
     pub id: String,
     pub name: String,
@@ -97,6 +98,9 @@ pub enum StorySegment {
         /// 可选的对话位置（例如右侧头像）
         #[serde(skip_serializing_if = "Option::is_none")]
         position: Option<String>,
+        /// 对应角色的 charId（例如 `char_010_chen`），前端可用它拼头像 URL。
+        #[serde(rename = "characterId", skip_serializing_if = "Option::is_none")]
+        character_id: Option<String>,
     },
     Narration {
         text: String,
@@ -124,6 +128,19 @@ pub enum StorySegment {
     },
     Header {
         title: String,
+    },
+    /// 剧情插画段（`[Image(image="avg_xxx")]`），前端可懒加载显示。
+    Image {
+        /// 原始 token，例如 `avg_8_34`、`g_13_I01`。
+        token: String,
+        /// 可选标题/描述。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
+    },
+    /// 剧情 BGM 指令（`[PlayMusic]`），前端默认忽略；开启设置后可用。
+    Music {
+        /// Music key，原文如 `$drift_loop`。
+        key: String,
     },
 }
 
@@ -184,6 +201,13 @@ pub struct SegmentHit {
     pub character_name: Option<String>,
     #[serde(rename = "matchedText")]
     pub matched_text: String,
+    /// Which column the FTS query actually hit. `body` means the term appears
+    /// in the segment text, `speaker` means only the character/speaker name
+    /// matched. The frontend uses this to render a "(按说话人命中)" badge so
+    /// the user isn't confused by short body text that doesn't literally
+    /// contain the search term.
+    #[serde(rename = "matchTarget")]
+    pub match_target: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,4 +230,13 @@ pub struct StoryIndexStatus {
     pub total: usize,
     #[serde(rename = "lastBuiltAt")]
     pub last_built_at: Option<i64>,
+}
+
+/// prev/next 邻接关系；前端阅读器底部导航使用。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StoryNeighbors {
+    #[serde(rename = "prev")]
+    pub prev: Option<StoryEntry>,
+    #[serde(rename = "next")]
+    pub next: Option<StoryEntry>,
 }

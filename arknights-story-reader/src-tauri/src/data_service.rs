@@ -28,7 +28,9 @@ const SEARCH_RESULT_LIMIT: usize = 500;
 /// Bump when any of: FTS schema, tokenizer rules, flatten_segments format.
 /// v3 = migrated to jieba word segmentation (2025-05).
 /// v4 = added segment-level FTS table `story_segment_index` (2025-05).
-const INDEX_VERSION: i32 = 4;
+/// v5 = parser recognises [Image]/[Background]/[PlayMusic]; dialogue carries
+///      characterId; requires full rebuild.
+const INDEX_VERSION: i32 = 5;
 
 /// Shared jieba instance. The default dictionary is embedded in the crate
 /// (default-dict feature) and loading it costs ~10-30ms so we do it once per
@@ -412,6 +414,17 @@ impl DataService {
             .join("zh_CN/gamedata/excel/story_review_table.json")
             .exists()
     }
+
+    /// 返回运行时 character_table.json 路径（若已同步），供 character_table
+    /// 模块刷新嵌入映射。
+    pub fn character_table_path(&self) -> Option<PathBuf> {
+        let p = self.data_dir.join("zh_CN/gamedata/excel/character_table.json");
+        if p.exists() {
+            Some(p)
+        } else {
+            None
+        }
+    }
     pub fn new(app_data_dir: PathBuf) -> Self {
         Self {
             data_dir: app_data_dir.join("ArknightsGameData"),
@@ -665,6 +678,16 @@ impl DataService {
                 StorySegment::Header { title } => {
                     parts.push(title.clone());
                 }
+                StorySegment::Image { caption, .. } => {
+                    if let Some(cap) = caption {
+                        if !cap.trim().is_empty() {
+                            parts.push(cap.clone());
+                        }
+                    }
+                }
+                StorySegment::Music { .. } => {
+                    // BGM 指令不参与全文索引。
+                }
             }
         }
         parts.join("\n")
@@ -679,7 +702,12 @@ impl DataService {
             .iter()
             .flat_map(|seg| -> Vec<StorySegment> {
                 match seg {
-                    StorySegment::Dialogue { character_name, text, position } => {
+                    StorySegment::Dialogue {
+                        character_name,
+                        text,
+                        position,
+                        character_id,
+                    } => {
                         let normalized = text
                             .replace("\r\n", "\n")
                             .split('\n')
@@ -694,6 +722,7 @@ impl DataService {
                                 character_name: character_name.clone(),
                                 text: normalized,
                                 position: position.clone(),
+                                character_id: character_id.clone(),
                             }]
                         }
                     }
@@ -726,6 +755,8 @@ impl DataService {
                             }]
                         }
                     }
+                    // BGM 指令目前前端不渲染，直接丢弃。Image 段保留。
+                    StorySegment::Music { .. } => Vec::new(),
                     other => vec![other.clone()],
                 }
             })
@@ -737,19 +768,24 @@ impl DataService {
                 character_name,
                 text,
                 position,
+                character_id,
             } = &seg
             {
                 if let Some(StorySegment::Dialogue {
                     character_name: prev_name,
                     text: prev_text,
                     position: _,
+                    character_id: prev_cid,
                 }) = merged.last_mut()
                 {
                     if prev_name == character_name {
                         let joined = format!("{}\n{}", prev_text, text).replace("\n\n", "\n");
                         *prev_text = joined;
-                        // keep first position
+                        // keep first position, prefer existing cid else adopt new one
                         let _ = position;
+                        if prev_cid.is_none() && character_id.is_some() {
+                            *prev_cid = character_id.clone();
+                        }
                         continue;
                     }
                 }
@@ -1543,6 +1579,7 @@ impl DataService {
     }
 
     /// 获取所有活动
+    #[allow(dead_code)]
     pub fn get_activities(&self) -> Result<Vec<Activity>, String> {
         if !self.is_installed() {
             return Err("NOT_INSTALLED".to_string());
@@ -1638,6 +1675,7 @@ impl DataService {
     }
 
     /// 获取主线剧情
+    #[allow(dead_code)]
     fn get_main_stories(&self) -> Result<Vec<StoryEntry>, String> {
         let story_review_file = self
             .data_dir
@@ -1726,6 +1764,7 @@ impl DataService {
     }
 
     /// 重建剧情全文索引
+    #[allow(dead_code)]
     pub fn rebuild_story_index(&self) -> Result<(), String> {
         self.rebuild_story_index_inner(None)
     }
@@ -1872,6 +1911,12 @@ impl DataService {
                     StorySegment::Decision { options, .. } => {
                         ("decision", None, options.join("\n"))
                     }
+                    StorySegment::Image { caption, .. } => {
+                        // 插画段 caption 如有文字可索引；否则跳过。
+                        let cap = caption.clone().unwrap_or_default();
+                        ("image", None, cap)
+                    }
+                    StorySegment::Music { .. } => ("music", None, String::new()),
                 };
                 if raw_text.trim().is_empty() {
                     continue;
@@ -2313,14 +2358,6 @@ impl DataService {
             SEARCH_RESULT_LIMIT
         );
 
-        let total: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM story_segment_index WHERE story_segment_index MATCH ?1",
-                params![fts_query.clone()],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-
         let mut stmt = match conn.prepare(&query_sql) {
             Ok(s) => s,
             Err(err) => {
@@ -2360,19 +2397,41 @@ impl DataService {
         let mut hits: Vec<SegmentHit> = Vec::new();
         let mut seen: std::collections::HashSet<(String, usize)> = Default::default();
         for row in rows {
-            let Ok((story_id, segment_index, segment_type, character_norm, raw_text, snip)) = row
+            let Ok((story_id, segment_index, segment_type, character_norm, raw_text, _snip)) = row
             else {
                 continue;
             };
-            let matched_text = {
+            // Did the query actually hit the segment body / speaker? Used
+            // for the UI's "按说话人命中" badge. "mixed" is our honest
+            // fallback when jieba tokenised the query and neither the body
+            // nor the speaker contain the full probe verbatim — in that
+            // case we show no badge rather than falsely accusing one
+            // column of being the culprit.
+            let body_norm = normalize_for_fuzzy(&raw_text);
+            let speaker_norm = normalize_for_fuzzy(&character_norm);
+            let body_hit = !context_probe.is_empty() && body_norm.contains(&context_probe);
+            let speaker_hit = !context_probe.is_empty() && speaker_norm.contains(&context_probe);
+            let match_target = if body_hit {
+                "body"
+            } else if speaker_hit {
+                "speaker"
+            } else {
+                "mixed"
+            };
+
+            // Build the preview. When the body actually contains the term we
+            // center the preview around the match; otherwise we show the
+            // whole segment (trimmed) so the user gets meaningful context
+            // even for short "好 / 嗯 / mon3tr" segments.
+            let matched_text = if body_hit {
                 let extracted = self.extract_context(&raw_text, &context_probe);
-                if !extracted.trim().is_empty() {
-                    extracted
-                } else if !snip.trim().is_empty() {
-                    snip.replace('\n', " ").replace("  ", " ")
+                if extracted.trim().is_empty() {
+                    Self::clip_preview(&raw_text, 240)
                 } else {
-                    raw_text.chars().take(120).collect()
+                    extracted
                 }
+            } else {
+                Self::clip_preview(&raw_text, 240)
             };
             let (story_name, category) = label_map
                 .get(&story_id)
@@ -2395,6 +2454,7 @@ impl DataService {
                 segment_type,
                 character_name,
                 matched_text,
+                match_target: match_target.to_string(),
             });
         }
 
@@ -2414,11 +2474,27 @@ impl DataService {
             }
         }
 
-        let computed_total = hits.len().max(total.max(0) as usize);
+        // Skip the COUNT(*) round-trip when we clearly aren't truncated —
+        // `rows.len() < LIMIT` implies every matching row is in `hits`.
+        // Only when the LIMIT kicked in do we need the authoritative total
+        // to drive the "已显示 X / Y" hint in the UI.
+        let total_matched = if hits.len() >= SEARCH_RESULT_LIMIT {
+            let total: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM story_segment_index WHERE story_segment_index MATCH ?1",
+                    params![fts_query.clone()],
+                    |row| row.get(0),
+                )
+                .unwrap_or(hits.len() as i64);
+            hits.len().max(total.max(0) as usize)
+        } else {
+            hits.len()
+        };
+
         Ok(SegmentSearchPage {
             hits,
-            total_matched: computed_total,
-            truncated: computed_total > SEARCH_RESULT_LIMIT,
+            total_matched,
+            truncated: total_matched > SEARCH_RESULT_LIMIT,
         })
     }
 
@@ -2508,6 +2584,7 @@ impl DataService {
                 segment_type: "header".to_string(),
                 character_name: None,
                 matched_text: story_name,
+                match_target: "title".to_string(),
             });
         }
         Ok(hits)
@@ -2710,8 +2787,78 @@ impl DataService {
         Err(format!("Story {} 不存在", story_id))
     }
 
+    /// Return the previous/next story in the same storyGroup ordered by
+    /// storySort. If the story is the first/last, the corresponding field is
+    /// None. Derived purely from `story_review_table.json`; no extra index.
+    pub fn get_story_neighbors(&self, story_id: &str) -> Result<crate::models::StoryNeighbors, String> {
+        let stories = self.collect_stories_for_index()?;
+        let mut target_group: Option<String> = None;
+        let mut target_sort: i32 = 0;
+        for indexed in &stories {
+            if indexed.story.story_id == story_id {
+                target_group = Some(indexed.story.story_group.clone());
+                target_sort = indexed.story.story_sort;
+                break;
+            }
+        }
+        let Some(group) = target_group else {
+            return Ok(crate::models::StoryNeighbors::default());
+        };
+
+        // Collect same-group stories, sort by sort ascending.
+        let mut group_stories: Vec<StoryEntry> = stories
+            .into_iter()
+            .filter(|x| x.story.story_group == group)
+            .map(|x| x.story)
+            .collect();
+        group_stories.sort_by_key(|s| s.story_sort);
+
+        let pos = group_stories
+            .iter()
+            .position(|s| s.story_id == story_id);
+        let Some(pos) = pos else {
+            return Ok(crate::models::StoryNeighbors::default());
+        };
+
+        let _ = target_sort;
+        let prev = if pos > 0 {
+            Some(group_stories[pos - 1].clone())
+        } else {
+            None
+        };
+        let next = if pos + 1 < group_stories.len() {
+            Some(group_stories[pos + 1].clone())
+        } else {
+            None
+        };
+        Ok(crate::models::StoryNeighbors { prev, next })
+    }
+
     /// 提取匹配文本的上下文
     ///
+    /// Return a clean preview of the segment body, collapsing any
+    /// `\r\n` / `\n` runs to a single space and truncating to `max_chars`
+    /// Unicode scalar values (appending "…" if we clipped). Used when the
+    /// query matched a non-body column (speaker/title) so the preview
+    /// should just show the whole short segment rather than the empty
+    /// output of `extract_context`.
+    fn clip_preview(raw: &str, max_chars: usize) -> String {
+        let flattened = raw
+            .replace('\r', " ")
+            .replace('\n', " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let chars: Vec<char> = flattened.chars().collect();
+        if chars.len() <= max_chars {
+            flattened
+        } else {
+            let mut s: String = chars.iter().take(max_chars).collect();
+            s.push('…');
+            s
+        }
+    }
+
     /// 使用归一化后文本查找匹配位置，再把"归一化字符索引"映射回"原文字节位置"，
     /// 避免 NFKC/去标点造成的字节长度变化导致越界或错位（bug A1）。
     fn extract_context(&self, content: &str, query: &str) -> String {

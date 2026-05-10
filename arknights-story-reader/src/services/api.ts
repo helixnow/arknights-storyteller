@@ -10,6 +10,9 @@ import type {
   StoryEntry,
   StoryIndexStatus,
   SearchDebugResponse,
+  AssetKind,
+  CharacterIndex,
+  StoryNeighbors,
 } from "@/types/story";
 
 export interface SyncProgress {
@@ -202,5 +205,25 @@ export const api = {
   getMemoryStories: async (): Promise<StoryEntry[]> => {
     console.log("[API] 调用 get_memory_stories");
     return invoke("get_memory_stories");
+  },
+
+  // ─────────────────────────────────────────────────────────
+  // 素材与人物映射（v1.11 新增）
+  // ─────────────────────────────────────────────────────────
+
+  /** 拿到一组候选 URL，前端按顺序 fallback。 */
+  resolveAssetUrls: async (kind: AssetKind, token: string): Promise<string[]> => {
+    if (!token) return [];
+    return invoke<string[]>("resolve_asset_urls", { kind, token });
+  },
+
+  /** 获取 charId ↔ 名称映射快照（启动时拉一次，缓存到内存）。 */
+  getCharacterIndex: async (): Promise<CharacterIndex> => {
+    return invoke<CharacterIndex>("get_character_index");
+  },
+
+  /** 根据 storyId 拿前后剧情。 */
+  getStoryNeighbors: async (storyId: string): Promise<StoryNeighbors> => {
+    return invoke<StoryNeighbors>("get_story_neighbors", { storyId });
   },
 };

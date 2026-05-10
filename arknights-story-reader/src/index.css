@@ -90,7 +90,7 @@
   --color-secondary: 0 0% 95%;
   --color-secondary-foreground: 0 0% 12%;
   --color-muted: 0 0% 92%;
-  --color-muted-foreground: 0 0% 38%;
+  --color-muted-foreground: 0 0% 36%;
   --color-accent: 0 0% 93%;
   --color-accent-foreground: 0 0% 12%;
   --color-destructive: 0 84.2% 60.2%;
@@ -99,8 +99,8 @@
   --color-success-foreground: 0 0% 100%;
   --color-warning: 38 92% 50%;
   --color-warning-foreground: 0 0% 100%;
-  --color-border: 0 0% 88%;
-  --color-input: 0 0% 88%;
+  --color-border: 0 0% 86%;
+  --color-input: 0 0% 86%;
   --color-ring: 0 0% 12%;
   --radius: 0.5rem;
 }
@@ -184,7 +184,7 @@
   --color-secondary: 0 0% 18%;
   --color-secondary-foreground: 0 0% 96%;
   --color-muted: 0 0% 24%;
-  --color-muted-foreground: 0 0% 70%;
+  --color-muted-foreground: 0 0% 74%;
   --color-accent: 0 0% 22%;
   --color-accent-foreground: 0 0% 96%;
   --color-destructive: 0 62.8% 30.6%;
@@ -193,8 +193,8 @@
   --color-success-foreground: 0 0% 12%;
   --color-warning: 40 85% 62%;
   --color-warning-foreground: 0 0% 12%;
-  --color-border: 0 0% 24%;
-  --color-input: 0 0% 24%;
+  --color-border: 0 0% 26%;
+  --color-input: 0 0% 26%;
   --color-ring: 0 0% 65%;
 }
 
@@ -283,11 +283,16 @@ html, body, #root {
 body {
   background-color: hsl(var(--color-background));
   color: hsl(var(--color-foreground));
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'HarmonyOS Sans SC', 'Microsoft YaHei', 'Roboto', 'Oxygen',
     'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
     sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  /* 我们打包的 woff2 子集只含 400 weight。允许浏览器对 700 做合成粗体，
+     避免退回到 text-shadow 这类 hack。实际 macOS/iOS/Windows 上通常还会
+     再落回到系统的 PingFang / 微软雅黑 的真粗体。 */
+  font-synthesis: weight;
 }
 
 /* 页面统一左右留白与最大宽度 */
@@ -386,23 +391,12 @@ body {
 }
 
 .reader-character-name {
-  font-weight: 600;
+  font-weight: 700;
   color: hsl(var(--color-primary));
-  margin-bottom: 0.2rem;
+  margin-bottom: 0.35rem;
   display: block;
   font-size: 1.05em;
-}
-
-:root[data-theme-color="default"] .reader-character-name,
-:root.dark[data-theme-color="default"] .reader-character-name,
-.dark[data-theme-color="default"] .reader-character-name {
-  font-weight: 900;
-  letter-spacing: 0.02em;
-  text-shadow:
-    0.02em 0 currentColor,
-    -0.02em 0 currentColor,
-    0 0.02em currentColor,
-    0 -0.02em currentColor;
+  letter-spacing: 0.01em;
 }
 
 .reader-narration {
@@ -571,17 +565,43 @@ body {
 
 .reader-search-highlight {
   position: relative;
-  box-shadow: 0 0 0 2px hsl(var(--color-primary) / 0.45);
+  /* Double-ring emphasis — primary color glow with a soft fill so the hit
+   * reads instantly even on dense pages. */
+  background: hsl(var(--color-primary) / 0.1);
+  box-shadow:
+    0 0 0 2px hsl(var(--color-primary) / 0.55),
+    0 0 0 6px hsl(var(--color-primary) / 0.18);
+  border-radius: 0.5rem;
+  transition: background 0.4s ease, box-shadow 0.4s ease;
+}
+
+/* Attention pulse played once after navigation so the user can catch the
+ * hit location even if the smooth-scroll lands them in the middle of a
+ * tall paragraph. Applied via data attribute so it auto-removes without
+ * interfering with the steady-state `.reader-search-highlight` styling.
+ */
+.reader-search-highlight[data-search-pulse="true"] {
+  animation: reader-search-pulse 1.6s ease-out 1;
+}
+
+@keyframes reader-search-pulse {
+  0%   { box-shadow: 0 0 0 0 hsl(var(--color-primary) / 0.0),   0 0 0 0 hsl(var(--color-primary) / 0.0); }
+  20%  { box-shadow: 0 0 0 3px hsl(var(--color-primary) / 0.75), 0 0 0 10px hsl(var(--color-primary) / 0.25); }
+  60%  { box-shadow: 0 0 0 3px hsl(var(--color-primary) / 0.55), 0 0 0 14px hsl(var(--color-primary) / 0.0); }
+  100% { box-shadow: 0 0 0 2px hsl(var(--color-primary) / 0.55), 0 0 0 6px  hsl(var(--color-primary) / 0.18); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .reader-search-highlight[data-search-pulse="true"] {
+    animation: none;
+  }
 }
 
 .reader-search-highlight::after {
-  content: "";
-  position: absolute;
-  inset: -4px;
-  border-radius: inherit;
-  background: linear-gradient(120deg, hsl(var(--color-primary) / 0.2), transparent 60%);
-  pointer-events: none;
-  z-index: -1;
+  /* Legacy halo overlay is now expressed via the double box-shadow above;
+     keep this rule as a no-op to avoid inheriting stale gradients in case
+     a parent stylesheet re-enables ::after. */
+  content: none;
 }
 
 .reader-character-highlight {
@@ -817,8 +837,9 @@ input[type="range"]::-moz-range-thumb {
   background: none;
 }
 .reader-search-highlight.reader-highlighted {
-  background: none;
-  box-shadow: 0 0 0 2px hsl(var(--color-primary) / 0.45);
+  /* When the user also has this segment highlighted, trust the outer ring
+     — suppress the highlight background fill to avoid double-layering. */
+  background: hsl(var(--color-primary) / 0.08);
 }
 .reader-character-highlight.reader-highlighted:not(.reader-search-highlight) {
   /* 角色高亮优先于划线收藏背景 */
@@ -835,5 +856,189 @@ input[type="range"]::-moz-range-thumb {
   }
   .reader-scroll {
     scroll-behavior: auto;
+  }
+}
+
+/* ============================================================= */
+/* 素材系统 (v1.11)                                               */
+/* ============================================================= */
+
+.asset-image-slot {
+  background: hsl(var(--color-muted) / 0.25);
+  transition: background-color 0.3s ease;
+}
+
+.asset-image {
+  will-change: opacity;
+  /* 避免 Safari 老式加载时闪一下黑色。 */
+  background: transparent;
+}
+
+/* 默认"柔和"tint：降饱和 + 与主题色混色，让素材融入纸质阅读风。 */
+.asset-tinted {
+  filter: saturate(0.78) contrast(1.03) brightness(0.98);
+}
+.asset-tinted--strong {
+  filter: saturate(0.6) contrast(1.05) brightness(0.94);
+}
+.dark .asset-tinted {
+  filter: saturate(0.72) brightness(0.9);
+}
+.dark .asset-tinted--strong {
+  filter: saturate(0.55) brightness(0.82);
+}
+
+/* 极简模式：隐藏所有装饰素材与封面区块。 */
+:root[data-minimal="true"] .asset-image-slot,
+:root[data-minimal="true"] .story-card-cover,
+:root[data-minimal="true"] .reader-segment-image,
+:root[data-minimal="true"] .reader-header-cover,
+:root[data-minimal="true"] .character-avatar {
+  display: none !important;
+}
+:root[data-minimal="true"] .reader-dialogue {
+  padding-left: 0 !important;
+}
+
+/* 阅读器内插画段 */
+.reader-segment-image {
+  margin: 1.25rem 0;
+  border-radius: 0.75rem;
+  overflow: hidden;
+  border: 1px solid hsl(var(--color-border) / 0.7);
+  background: hsl(var(--color-muted) / 0.35);
+  aspect-ratio: 16 / 9;
+}
+.reader-segment-image-caption {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+  color: hsl(var(--color-muted-foreground));
+  text-align: center;
+}
+
+/* 章节 header 背景化 */
+.reader-header-cover {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  margin: 1.5rem 0 1rem;
+  border-radius: 1rem;
+  overflow: hidden;
+  border: 1px solid hsl(var(--color-border) / 0.6);
+}
+.reader-header-cover::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    180deg,
+    transparent 35%,
+    hsl(var(--color-background) / 0.88) 100%
+  );
+}
+.reader-header-cover__label {
+  position: absolute;
+  left: 1.25rem;
+  right: 1.25rem;
+  bottom: 1rem;
+  z-index: 2;
+  color: hsl(var(--color-primary));
+  font-size: 1.1rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-shadow: 0 1px 2px hsl(var(--color-background) / 0.6);
+}
+
+/* 卡片封面 */
+.story-card {
+  position: relative;
+  border-radius: 1rem;
+  overflow: hidden;
+  border: 1px solid hsl(var(--color-border));
+  background: hsl(var(--color-card));
+  transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+}
+.story-card:hover {
+  border-color: hsl(var(--color-primary) / 0.5);
+}
+.story-card-cover {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  background: hsl(var(--color-secondary) / 0.4);
+}
+.story-card-cover::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    160deg,
+    transparent 30%,
+    hsl(var(--color-card) / 0.65) 100%
+  );
+  pointer-events: none;
+}
+.story-card-body {
+  padding: 0.9rem 1rem 1rem;
+}
+.story-card-code {
+  display: inline-block;
+  padding: 0.12rem 0.55rem;
+  border-radius: 9999px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  background: hsl(var(--color-primary) / 0.12);
+  color: hsl(var(--color-primary));
+}
+.story-card-meta {
+  font-size: 0.75rem;
+  color: hsl(var(--color-muted-foreground));
+}
+
+/* 浮岛 Glass BottomNav */
+.bottom-nav-glass {
+  position: fixed;
+  left: max(0.75rem, env(safe-area-inset-left, 0px));
+  right: max(0.75rem, env(safe-area-inset-right, 0px));
+  bottom: max(0.5rem, env(safe-area-inset-bottom, 0px));
+  border-radius: 28px;
+  border: 1px solid hsl(var(--color-foreground) / 0.08);
+  background: hsl(var(--color-background) / 0.62);
+  backdrop-filter: blur(22px) saturate(160%);
+  -webkit-backdrop-filter: blur(22px) saturate(160%);
+  box-shadow: 0 10px 30px hsl(var(--color-foreground) / 0.08);
+}
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .bottom-nav-glass {
+    background: hsl(var(--color-background) / 0.96);
+  }
+}
+.bottom-nav-pill {
+  transition: background-color 0.2s ease, color 0.2s ease, transform 0.15s ease;
+}
+.bottom-nav-pill[aria-selected="true"] {
+  background: hsl(var(--color-primary) / 0.14);
+  color: hsl(var(--color-primary));
+}
+
+/* 对话段头像槽 */
+.reader-dialogue {
+  position: relative;
+  padding-left: 3rem;
+}
+.reader-dialogue-avatar {
+  position: absolute;
+  left: 0;
+  top: 0.2rem;
+  width: 2.25rem;
+  height: 2.25rem;
+}
+@media (max-width: 640px) {
+  .reader-dialogue {
+    padding-left: 2.6rem;
+  }
+  .reader-dialogue-avatar {
+    width: 2rem;
+    height: 2rem;
   }
 }
