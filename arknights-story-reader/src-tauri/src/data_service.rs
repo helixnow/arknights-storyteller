@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use jieba_rs::Jieba;
 use reqwest::blocking::Client;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
@@ -26,102 +25,11 @@ const DEFAULT_BRANCH: &str = "master";
 const VERSION_FILE: &str = "version.json";
 const SEARCH_RESULT_LIMIT: usize = 500;
 /// Bump when any of: FTS schema, tokenizer rules, flatten_segments format.
-/// v3 = migrated to jieba word segmentation (2025-05).
+/// v6 = removed jieba, switched to char-level CJK tokenization (lighter binary).
 /// v4 = added segment-level FTS table `story_segment_index` (2025-05).
 /// v5 = parser recognises [Image]/[Background]/[PlayMusic]; dialogue carries
 ///      characterId; requires full rebuild.
-const INDEX_VERSION: i32 = 5;
-
-/// Shared jieba instance. The default dictionary is embedded in the crate
-/// (default-dict feature) and loading it costs ~10-30ms so we do it once per
-/// process and reuse. We also inject a small Arknights-specific user
-/// dictionary so operator names and faction terms aren't split into chars.
-fn jieba() -> &'static Jieba {
-    static INSTANCE: OnceLock<Jieba> = OnceLock::new();
-    INSTANCE.get_or_init(|| {
-        let mut j = Jieba::new();
-        // Register Arknights-specific proper nouns as high-frequency single
-        // tokens. Extend `ARKNIGHTS_USER_WORDS` when observed mis-splits
-        // appear. Names not in this list still work via the per-char
-        // fallback emitted by `tokenize_for_fts`, just with weaker phrase
-        // recall.
-        for (word, freq) in ARKNIGHTS_USER_WORDS {
-            j.add_word(word, Some(*freq), Some("nr"));
-        }
-        j
-    })
-}
-
-/// Curated Arknights user dictionary. Pairs of `(word, freq)` — higher freq
-/// biases jieba to keep the word whole. 10_000 is enough to dominate almost
-/// any ambiguous split in the default dict.
-const ARKNIGHTS_USER_WORDS: &[(&str, usize)] = &[
-    // Factions / organizations
-    ("罗德岛", 10_000),
-    ("整合运动", 8_000),
-    ("萨尔贡", 5_000),
-    ("莱塔尼亚", 5_000),
-    ("卡西米尔", 5_000),
-    ("乌萨斯", 5_000),
-    ("玻利瓦尔", 5_000),
-    ("哥伦比亚", 5_000),
-    ("维多利亚", 5_000),
-    ("炎国", 5_000),
-    ("黎博利", 3_000),
-    ("莱茵生命", 3_000),
-    ("企鹅物流", 3_000),
-    ("德拉克", 3_000),
-    // Lore terms
-    ("源石", 3_000),
-    ("源石尘", 3_000),
-    ("源石技艺", 3_000),
-    ("矿石病", 3_000),
-    ("感染者", 3_000),
-    ("天灾", 3_000),
-    ("移动城市", 3_000),
-    ("干员密录", 3_000),
-    // Operator / character names — seeded with the most common; unseen
-    // names still tokenize per-char. Add more as QA catches them.
-    ("凯尔希", 8_000),
-    ("阿米娅", 8_000),
-    ("博士", 8_000),
-    ("德克萨斯", 5_000),
-    ("能天使", 5_000),
-    ("推进之王", 5_000),
-    ("艾雅法拉", 5_000),
-    ("银灰", 5_000),
-    ("赫默", 5_000),
-    ("麦哲伦", 5_000),
-    ("菲亚梅塔", 5_000),
-    ("伊芙利特", 5_000),
-    ("斯卡蒂", 5_000),
-    ("幽灵鲨", 5_000),
-    ("安洁莉娜", 5_000),
-    ("夜莺", 5_000),
-    ("闪灵", 5_000),
-    ("初雪", 5_000),
-    ("星熊", 5_000),
-    ("泥岩", 5_000),
-    ("霜华", 5_000),
-    ("塔露拉", 5_000),
-    ("浮士德", 5_000),
-    ("梅菲斯特", 5_000),
-    ("帕特里西娅", 5_000),
-    ("克洛丝", 5_000),
-    ("安赛尔", 5_000),
-    ("杰西卡", 5_000),
-    ("红豆", 5_000),
-    ("缠丸", 5_000),
-    ("特蕾西娅", 5_000),
-    ("远山", 5_000),
-    ("临光", 5_000),
-    ("送葬人", 5_000),
-    ("艾丽妮", 5_000),
-    ("陈sir", 5_000),
-    ("陈博士", 5_000),
-    ("可颂", 5_000),
-    ("空弦", 5_000),
-];
+const INDEX_VERSION: i32 = 6;
 
 #[derive(Clone, serde::Serialize)]
 struct SyncProgress {
@@ -797,70 +705,33 @@ impl DataService {
 
     /// Tokenize free text for the FTS index.
     ///
-    /// v3 uses jieba word segmentation for CJK text, producing multi-char
-    /// tokens for meaningful words (e.g. `凯尔希` / `罗德岛`). To preserve the
-    /// ability to search by a single character, each CJK word longer than 1
-    /// char is additionally emitted as its component characters — duplicate
-    /// emission is cheap and keeps recall roughly equivalent to the old
-    /// per-char scheme while drastically reducing phrase brittleness.
-    ///
-    /// ASCII alphanumeric runs are emitted as a single lowercase token.
-    /// Punctuation and whitespace act as separators and are discarded.
+    /// Uses char-level tokenization for CJK text: each CJK character becomes
+    /// its own token. ASCII alphanumeric runs are emitted as a single lowercase
+    /// token. Punctuation and whitespace act as separators and are discarded.
     fn tokenize_for_fts(text: &str) -> Vec<String> {
         let normalized = normalize_nfkc_lower_strip_marks(text);
         if normalized.is_empty() {
             return Vec::new();
         }
 
-        let segments = jieba().cut(&normalized, false);
-        let mut tokens: Vec<String> = Vec::with_capacity(segments.len() * 2);
-        for seg in segments {
-            // Trim and skip pure-whitespace/punctuation segments.
-            let trimmed = seg.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
+        let mut tokens: Vec<String> = Vec::new();
+        let mut ascii_buf = String::new();
 
-            // Fast path: pure ASCII alnum → keep as-is.
-            if trimmed.chars().all(|c| c.is_ascii_alphanumeric()) {
-                tokens.push(trimmed.to_string());
-                continue;
-            }
-
-            // Drop pure punctuation/symbol segments.
-            if trimmed
-                .chars()
-                .all(|c| is_common_punctuation(c) || c.is_whitespace())
-            {
-                continue;
-            }
-
-            let cjk_chars: Vec<char> = trimmed.chars().filter(|c| is_cjk(*c)).collect();
-            let is_all_cjk = cjk_chars.len() == trimmed.chars().filter(|c| !c.is_whitespace()).count();
-
-            if is_all_cjk && cjk_chars.len() >= 2 {
-                // Multi-char CJK word: store both the word and each char so a
-                // single-char query (`凯`) still matches, and so does the word
-                // (`凯尔希`). Byte size impact is ~2x per CJK word.
-                tokens.push(cjk_chars.iter().collect());
-                for ch in &cjk_chars {
+        for ch in normalized.chars() {
+            if ch.is_ascii_alphanumeric() {
+                ascii_buf.push(ch.to_ascii_lowercase());
+            } else {
+                if !ascii_buf.is_empty() {
+                    tokens.push(std::mem::take(&mut ascii_buf));
+                }
+                if is_cjk(ch) {
                     tokens.push(ch.to_string());
                 }
-                continue;
+                // Skip punctuation, whitespace, symbols
             }
-
-            // Single-char CJK, or mixed CJK+ASCII (rare): emit char by char
-            // so queries remain permissive.
-            for ch in trimmed.chars() {
-                if ch.is_whitespace() || is_common_punctuation(ch) {
-                    continue;
-                }
-                if ch.is_ascii_alphanumeric() {
-                    tokens.push(ch.to_ascii_lowercase().to_string());
-                } else {
-                    tokens.push(ch.to_string());
-                }
-            }
+        }
+        if !ascii_buf.is_empty() {
+            tokens.push(ascii_buf);
         }
         tokens
     }
@@ -869,14 +740,11 @@ impl DataService {
         Self::tokenize_for_fts(text).join(" ")
     }
 
-    // Build an FTS query using jieba word segmentation.
+    // Build an FTS query using char-level CJK tokenization.
     //
     // For each user-supplied term:
     // - ASCII alnum runs → add `*` suffix for prefix match
-    // - CJK text → split via jieba; words that are actually in the index
-    //   (multi-char word OR single char) are AND-joined. This is both more
-    //   lenient (recall) and more precise than the previous bigram hack:
-    //   e.g. "凯尔希阿米娅" now decomposes to `凯尔希 AND 阿米娅`.
+    // - CJK text → split into individual characters, AND-joined
     // - Mixed tokens are split at ASCII/CJK boundaries.
     //
     // Quoted phrases bypass segmentation and are matched verbatim (after
@@ -985,46 +853,27 @@ impl DataService {
                 return format!("{}*", s);
             }
 
-            // Run through jieba, but only keep tokens the indexer would also
-            // emit (ASCII alnum, CJK words, single CJK chars).
-            let segs = jieba().cut(&s, false);
+            // Char-level tokenization: split CJK into individual chars,
+            // ASCII runs as prefix tokens.
             let mut tokens: Vec<String> = Vec::new();
-            for seg in segs {
-                let trimmed = seg.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                if trimmed.chars().all(|c| c.is_ascii_alphanumeric()) {
-                    tokens.push(format!("{}*", trimmed));
-                    continue;
-                }
-                if trimmed
-                    .chars()
-                    .all(|c| is_common_punctuation(c) || c.is_whitespace())
-                {
-                    continue;
-                }
-                // Pure CJK word → wrap as phrase token.
-                let cjk_chars: Vec<char> = trimmed.chars().filter(|c| is_cjk(*c)).collect();
-                if cjk_chars.len() == trimmed.chars().filter(|c| !c.is_whitespace()).count()
-                    && !cjk_chars.is_empty()
-                {
-                    let word: String = cjk_chars.iter().collect();
-                    tokens.push(format!("\"{}\"", word));
-                    continue;
-                }
-                // Mixed (rare) — split into whatever atoms make sense.
-                for ch in trimmed.chars() {
-                    if ch.is_whitespace() || is_common_punctuation(ch) {
-                        continue;
+            let mut ascii_buf = String::new();
+            for ch in s.chars() {
+                if ch.is_ascii_alphanumeric() {
+                    ascii_buf.push(ch.to_ascii_lowercase());
+                } else {
+                    if !ascii_buf.is_empty() {
+                        tokens.push(format!("{}*", std::mem::take(&mut ascii_buf)));
                     }
-                    if ch.is_ascii_alphanumeric() {
-                        tokens.push(format!("{}*", ch.to_ascii_lowercase()));
-                    } else if is_cjk(ch) {
+                    if is_cjk(ch) {
                         tokens.push(format!("\"{}\"", ch));
                     }
+                    // skip punctuation
                 }
             }
+            if !ascii_buf.is_empty() {
+                tokens.push(format!("{}*", ascii_buf));
+            }
+
             if tokens.is_empty() {
                 String::new()
             } else if tokens.len() == 1 {
@@ -1034,11 +883,8 @@ impl DataService {
             }
         }
 
-        /// A quoted phrase must match verbatim. Split only on whitespace and
-        /// wrap the concatenated run as a single FTS phrase — the indexer
-        /// stored both the jieba word and each constituent char, so a CJK
-        /// run is still findable as long as jieba happens to cut it the same
-        /// way. For best precision users should quote exact short phrases.
+        /// A quoted phrase must match verbatim. Split into char-level tokens
+        /// and wrap as an FTS phrase so order is preserved.
         fn quoted_to_clause(raw: &str) -> String {
             let s = sanitize(raw);
             if s.is_empty() {
@@ -1048,18 +894,29 @@ impl DataService {
                 // ASCII phrase: `"foo bar"` → `"foo bar"` (FTS keeps order).
                 return format!("\"{}\"", s);
             }
-            // For mixed / CJK phrases, try the jieba cut and join words.
-            // This matches index records because indexing also runs jieba.
-            let segs = jieba()
-                .cut(&s, false)
-                .into_iter()
-                .map(|t| t.trim().to_string())
-                .filter(|t| !t.is_empty() && !t.chars().all(is_common_punctuation))
-                .collect::<Vec<_>>();
-            if segs.is_empty() {
+            // For CJK phrases, emit each char as a token and wrap in quotes
+            // so FTS5 matches them in order.
+            let mut tokens: Vec<String> = Vec::new();
+            let mut ascii_buf = String::new();
+            for ch in s.chars() {
+                if ch.is_ascii_alphanumeric() {
+                    ascii_buf.push(ch.to_ascii_lowercase());
+                } else {
+                    if !ascii_buf.is_empty() {
+                        tokens.push(std::mem::take(&mut ascii_buf));
+                    }
+                    if is_cjk(ch) {
+                        tokens.push(ch.to_string());
+                    }
+                }
+            }
+            if !ascii_buf.is_empty() {
+                tokens.push(ascii_buf);
+            }
+            if tokens.is_empty() {
                 return String::new();
             }
-            format!("\"{}\"", segs.join(" "))
+            format!("\"{}\"", tokens.join(" "))
         }
 
         // FTS5 semantics require positive terms on the left of a NOT. If
