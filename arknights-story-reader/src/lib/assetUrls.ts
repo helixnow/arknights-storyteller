@@ -143,8 +143,6 @@ function chapterCoverCandidates(token: string): string[] {
   const raw = token.replace(/^main_/, "").trim();
   const nn = /^\d+$/.test(raw) ? raw.padStart(2, "0") : raw;
   return [
-    // 内置章节封面（打包在 public/bundled/mapreview/）
-    `/bundled/mapreview/main_${nn}-01.png`,
     `${FEXLI}/mapreview/main_${nn}-01.png`,
     `${FEXLI}/avgs/bg_main_${raw}.png`,
     `${FEXLI}/avgs/${raw}_i01.png`,

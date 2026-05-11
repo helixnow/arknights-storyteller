@@ -18,14 +18,7 @@
   font-display: swap;
   unicode-range: U+4E00-9FFF;
 }
-@font-face {
-  font-family: "Arknights Noto Sans SC";
-  src: url("/fonts/subset/NotoSansSC-ext.woff2") format("woff2");
-  font-weight: 400;
-  font-style: normal;
-  font-display: swap;
-  unicode-range: U+3400-4DBF, U+20000-2A6DF;
-}
+
 
 @font-face {
   font-family: "Arknights Noto Serif SC";
@@ -43,14 +36,7 @@
   font-display: swap;
   unicode-range: U+4E00-9FFF;
 }
-@font-face {
-  font-family: "Arknights Noto Serif SC";
-  src: url("/fonts/subset/NotoSerifSC-ext.woff2") format("woff2");
-  font-weight: 400;
-  font-style: normal;
-  font-display: swap;
-  unicode-range: U+3400-4DBF, U+20000-2A6DF;
-}
+
 
 @font-face {
   font-family: "Arknights LXGW WenKai";
@@ -68,14 +54,7 @@
   font-display: swap;
   unicode-range: U+4E00-9FFF;
 }
-@font-face {
-  font-family: "Arknights LXGW WenKai";
-  src: url("/fonts/subset/LXGWWenKai-ext.woff2") format("woff2");
-  font-weight: 400;
-  font-style: normal;
-  font-display: swap;
-  unicode-range: U+3400-4DBF, U+20000-2A6DF;
-}
+
 
 :root,
 :root[data-theme-color="default"] {

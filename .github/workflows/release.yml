@@ -155,7 +155,7 @@ jobs:
 
       - name: Build frontend with update feed
         env:
-          VITE_ANDROID_UPDATE_FEED: "https://api.github.com/repos/${{ github.repository }}/releases/latest"
+          VITE_ANDROID_UPDATE_FEED: "https://github.com/${{ github.repository }}/releases/latest/download/android-latest.json"
           VITE_ANDROID_ANNOUNCEMENTS_URL: "https://raw.githubusercontent.com/${{ github.repository }}/release/android-announcements.json"
         run: npm run build
         working-directory: arknights-story-reader
@@ -184,7 +184,7 @@ jobs:
           ANDROID_KEY_ALIAS: "${{ secrets.ANDROID_KEY_ALIAS }}"
           ANDROID_KEYSTORE_PASSWORD: "${{ secrets.ANDROID_KEYSTORE_PASSWORD }}"
           ANDROID_KEY_PASSWORD: "${{ secrets.ANDROID_KEY_PASSWORD }}"
-          VITE_ANDROID_UPDATE_FEED: "https://api.github.com/repos/${{ github.repository }}/releases/latest"
+          VITE_ANDROID_UPDATE_FEED: "https://github.com/${{ github.repository }}/releases/latest/download/android-latest.json"
           VITE_ANDROID_ANNOUNCEMENTS_URL: "https://raw.githubusercontent.com/${{ github.repository }}/release/android-announcements.json"
           SKIP_WEB_BUILD: "1"
         run: bash scripts/build-apk.sh
@@ -223,7 +223,7 @@ jobs:
           echo "  \"fileName\": \"$APK_NAME\"" >> "$JSON_PATH"
           echo "}" >> "$JSON_PATH"
           cat "$JSON_PATH"
-          gh release upload "$TAG" "$JSON_PATH#$JSON_PATH" --clobber
+          gh release upload "$TAG" "$JSON_PATH" --clobber
         working-directory: arknights-story-reader
 
       - name: Publish release
