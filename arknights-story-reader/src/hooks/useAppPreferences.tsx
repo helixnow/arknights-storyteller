@@ -85,12 +85,17 @@ function readPrefs(): Prefs {
 
 export function AppPreferencesProvider({ children }: { children: ReactNode }) {
   const [prefs, setPrefs] = useState<Prefs>(readPrefs);
-  const hydratedRef = useRef(false);
 
+  // 首帧的值就是刚从 localStorage 读出来的，回写没有意义；更糟的是：如果
+  // 读取因数据损坏 / 迁移中断回落到了 DEFAULT_PREFS，这次回写会立刻用默认值
+  // 覆盖掉尚未迁移或只读到一半的原始数据，连恢复的机会都不留。守卫不能用
+  // 「跳过第一次 effect」的布尔标记：StrictMode 开发模式下挂载期 effect 连跑
+  // 两次、ref 不会重置，第二次就把初始状态写回去了（收藏 / 高亮 hook 踩过
+  // 同一个坑）。改为与初始 state 做引用比较——用户任何真实改动都会产生新
+  // 对象，自然落盘。
+  const initialPrefsRef = useRef(prefs);
   useEffect(() => {
-    // 首帧的值就是刚从 localStorage 读出来的，回写一次没有意义。
-    if (!hydratedRef.current) {
-      hydratedRef.current = true;
+    if (prefs === initialPrefsRef.current) {
       return;
     }
     try {
