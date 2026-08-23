@@ -15,6 +15,10 @@ const buttonVariants = cva(
     "[&_svg]:pointer-events-none [&_svg]:shrink-0",
     // 全局 reduced-motion 只把动画时长压到 0，按下缩放会变成生硬的跳变。
     "active:scale-[0.97] motion-reduce:transition-none motion-reduce:active:scale-100",
+    // 触屏（coarse pointer）上用 ::after 把命中区域垫到 ≥44×44
+    //（iOS HIG / WCAG 2.5.8），sm、icon-pill 等小尺寸的视觉不变。
+    // 鼠标场景不扩，避免紧凑工具栏里相邻按钮的热区互相叠压。
+    "relative pointer-coarse:after:absolute pointer-coarse:after:left-1/2 pointer-coarse:after:top-1/2 pointer-coarse:after:h-full pointer-coarse:after:min-h-11 pointer-coarse:after:w-full pointer-coarse:after:min-w-11 pointer-coarse:after:-translate-x-1/2 pointer-coarse:after:-translate-y-1/2",
   ],
   {
     variants: {

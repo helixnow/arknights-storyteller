@@ -150,14 +150,22 @@ export interface SearchResultsPage {
   facets: Record<string, number>;
 }
 
-/** 段级搜索命中 */
+/** 段级搜索命中——对应 Rust `SegmentHit`。 */
 export interface SegmentHit {
   storyId: string;
   storyName: string;
   category: string;
   segmentIndex: number;
-  segmentType: "dialogue" | "narration" | "system" | "subtitle" | "sticker" | "header" | "decision";
-  characterName?: string | null;
+  /**
+   * 命中段落的类型，取值与 Rust `StorySegment::kind()` 一致。有正文的段落
+   * 都会进段级索引：`dialogue` / `narration` / `system` / `subtitle` /
+   * `sticker` / `header` / `decision`，以及带 caption 的 `image` 插画段；
+   * `music` 段没有正文，不会出现在命中里。后端模型是开放的 `String`，
+   * 这里保持 `string`，展示端（SearchPanel 的标签表）对未知值兜底显示原文。
+   */
+  segmentType: string;
+  /** 说话人显示名；旁白/字幕等无主段落为 null。后端总是序列化该字段。 */
+  characterName: string | null;
   matchedText: string;
   /**
    * 命中所在的字段：
@@ -186,10 +194,11 @@ export interface StoryIndexStatus {
   lastBuiltAt?: number | null;
 }
 
-/** 同一 storyGroup 内的前后剧情。 */
+/** 同一 storyGroup 内的前后剧情——对应 Rust `StoryNeighbors`。
+ *  两个字段后端总是序列化，位于组边界时对应侧为 null。 */
 export interface StoryNeighbors {
-  prev?: StoryEntry | null;
-  next?: StoryEntry | null;
+  prev: StoryEntry | null;
+  next: StoryEntry | null;
 }
 
 /** 剧情缩略图 token：对应后端 `get_story_preview_token` 的返回。`kind` 目前

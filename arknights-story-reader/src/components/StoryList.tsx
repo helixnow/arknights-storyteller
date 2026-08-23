@@ -376,6 +376,14 @@ const SUMMARY_MAX_INFLIGHT = 4;
 const summaryQueue: Array<() => void> = [];
 let summaryInflight = 0;
 
+/**
+ * 单条简介的最大请求次数（含首次）。失败后行组件的 effect 会因 loading
+ * 复位而立刻再触发一次——不设上限的话，持久性失败（文件缺失、数据损坏）
+ * 会变成「失败 → 清标记 → 立刻重发」的死循环，IPC 被无限打。上限内的
+ * 一次自动重试足以覆盖瞬时失败；重新同步数据时计数整体清零，可以重来。
+ */
+const SUMMARY_MAX_ATTEMPTS = 2;
+
 function runSummaryQueue() {
   while (summaryInflight < SUMMARY_MAX_INFLIGHT && summaryQueue.length > 0) {
     const task = summaryQueue.shift();
@@ -542,7 +550,9 @@ export function StoryList({ onSelectStory }: StoryListProps) {
   // 能保持稳定引用，effect 不会因为 state 变化重复触发。
   const loadedRef = useRef<Record<SectionKey, boolean>>(initialSectionFlags(false));
   const pendingRef = useRef<Partial<Record<SectionKey, Promise<void>>>>({});
-  const summaryRequestedRef = useRef<Set<string>>(new Set());
+  /** 每条简介已发起的请求次数 / 在途标记，配合 SUMMARY_MAX_ATTEMPTS 封顶。 */
+  const summaryAttemptsRef = useRef<Map<string, number>>(new Map());
+  const summaryInflightRef = useRef<Set<string>>(new Set());
 
   const {
     favoriteStories,
@@ -677,7 +687,8 @@ export function StoryList({ onSelectStory }: StoryListProps) {
   useEffect(() => {
     const handler = () => {
       loadedRef.current = initialSectionFlags(false);
-      summaryRequestedRef.current.clear();
+      summaryAttemptsRef.current.clear();
+      summaryInflightRef.current.clear();
       setSummaryCache({});
       setSummaryLoadingIds({});
       setOpenGroups({});
@@ -693,7 +704,14 @@ export function StoryList({ onSelectStory }: StoryListProps) {
 
   // 首页统计格 / 其他入口要求直接跳到收藏分类
   useEffect(() => {
-    const handler = () => setActiveCategory("favorites");
+    const handler = () => {
+      setActiveCategory("favorites");
+      // 入口语义是「去看收藏」而不是「回到上次在收藏里停的位置」。分类
+      // 真的变化时下面的归顶 effect 也会跑一次；这里显式回顶是为了覆盖
+      // 「本来就停在收藏分类、只是滚到了半截」的跳转。
+      const viewport = scrollRootRef.current;
+      if (viewport) viewport.scrollTop = 0;
+    };
     window.addEventListener("app:open-favorites", handler);
     return () => window.removeEventListener("app:open-favorites", handler);
   }, []);
@@ -723,8 +741,12 @@ export function StoryList({ onSelectStory }: StoryListProps) {
   const handleRequestSummary = useCallback(async (story: StoryEntry) => {
     const storyInfo = story.storyInfo;
     if (!storyInfo) return;
-    if (summaryRequestedRef.current.has(story.storyId)) return;
-    summaryRequestedRef.current.add(story.storyId);
+    // 同一条剧情可能同时出现在收藏和原分类里，两行都会来要简介。
+    if (summaryInflightRef.current.has(story.storyId)) return;
+    const attempts = summaryAttemptsRef.current.get(story.storyId) ?? 0;
+    if (attempts >= SUMMARY_MAX_ATTEMPTS) return;
+    summaryAttemptsRef.current.set(story.storyId, attempts + 1);
+    summaryInflightRef.current.add(story.storyId);
 
     setSummaryLoadingIds((prev) => ({ ...prev, [story.storyId]: true }));
     try {
@@ -736,9 +758,9 @@ export function StoryList({ onSelectStory }: StoryListProps) {
       }));
     } catch (err) {
       console.warn("[StoryList] 加载简介失败:", story.storyId, err);
-      // 允许下次重试
-      summaryRequestedRef.current.delete(story.storyId);
+      // 保留计数：行组件的 effect 会自动重试到上限为止，之后由占位文案兜底。
     } finally {
+      summaryInflightRef.current.delete(story.storyId);
       setSummaryLoadingIds((prev) => {
         const next = { ...prev };
         delete next[story.storyId];
@@ -762,6 +784,18 @@ export function StoryList({ onSelectStory }: StoryListProps) {
     setOpenGroups({});
     setBulkOpen(null);
   }, [hasSearch, activeCategory]);
+
+  // 切分类 / 改搜索词是「整个列表被换掉」的时刻：旧的滚动偏移只会被浏览器
+  // 随机夹在新内容的半截（KeepAlive 常驻挂载，容器从不重建）。统一归顶。
+  // 分批挂载保证的是同一列表内追加不动滚动，与这里不冲突。
+  const scrollResetKey = `${activeCategory}|${normalizedSearch}`;
+  const scrollResetRef = useRef(scrollResetKey);
+  useEffect(() => {
+    if (scrollResetRef.current === scrollResetKey) return;
+    scrollResetRef.current = scrollResetKey;
+    const viewport = scrollRootRef.current;
+    if (viewport && viewport.scrollTop !== 0) viewport.scrollTop = 0;
+  }, [scrollResetKey]);
 
   const isGroupOpen = useCallback(
     (key: string, fallbackOpen: boolean) => {
@@ -1052,7 +1086,8 @@ export function StoryList({ onSelectStory }: StoryListProps) {
     // 同步对话框不一定广播 `app:data-updated`，这里自己把共享缓存清掉。
     invalidateStoryCatalog();
     loadedRef.current = initialSectionFlags(false);
-    summaryRequestedRef.current.clear();
+    summaryAttemptsRef.current.clear();
+    summaryInflightRef.current.clear();
     setSummaryCache({});
     setSummaryLoadingIds({});
     // 并发发起：loadSection 内部有 in-flight 锁，主线不会被拉两次。
@@ -1590,7 +1625,31 @@ function RevealMore({
     <div ref={sentinelRef}>
       <button
         type="button"
-        onClick={onRevealAll}
+        onClick={(event) => {
+          /* 展开后本按钮随即卸载。键盘用户（Enter/Space 触发的 click 其
+             detail 为 0）的焦点会掉回 body、Tab 序列被打回文档开头，所以把
+             焦点交给顶替这个位置的第一条新内容——它正好就在原视口位置，
+             用户从原地继续。鼠标用户不动焦点，避免凭空亮出一圈 focus ring。 */
+          const fromKeyboard = event.detail === 0;
+          const wrapper = event.currentTarget.parentElement;
+          const parent = wrapper?.parentElement ?? null;
+          const index =
+            parent && wrapper
+              ? Array.prototype.indexOf.call(parent.children, wrapper)
+              : -1;
+          onRevealAll();
+          if (!fromKeyboard || !parent || index < 0) return;
+          // click 引发的 setState 在事件结束时同步 flush，rAF 时 DOM 已就绪。
+          requestAnimationFrame(() => {
+            const node = parent.children[index];
+            if (!(node instanceof HTMLElement)) return;
+            // 条目行自身可聚焦（tabindex）；分组则聚焦标题按钮。
+            const target = node.matches("[tabindex], button")
+              ? node
+              : node.querySelector<HTMLElement>("[aria-expanded], [tabindex], button");
+            target?.focus();
+          });
+        }}
         className="flex min-h-[44px] w-full items-center justify-center gap-2 rounded-2xl border border-dashed border-[hsl(var(--color-border))] px-3 text-xs text-[hsl(var(--color-muted-foreground))] transition-colors hover:border-[hsl(var(--color-primary)/0.5)] hover:text-[hsl(var(--color-foreground))] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-[hsl(var(--color-primary))]"
       >
         <ChevronsUpDown className="h-3.5 w-3.5" aria-hidden="true" />
@@ -1706,14 +1765,19 @@ function LoadErrorCard({
 
 function ListSkeleton({ rows = 4 }: { rows?: number }) {
   return (
-    <div className="space-y-3" aria-hidden="true">
+    <div className="space-y-3">
       {Array.from({ length: rows }).map((_, index) => (
         <div
           key={index}
+          aria-hidden="true"
           className="h-[88px] rounded-2xl border border-[hsl(var(--color-border))] bg-[hsl(var(--color-secondary)/0.4)] motion-safe:animate-pulse"
         />
       ))}
-      <div className="sr-only">加载中</div>
+      {/* 骨架行逐个 aria-hidden；这句提示绝不能一起藏掉，否则给读屏用户
+          准备的「加载中」恰好只有读屏听不到。role=status 让它出现即被播报。 */}
+      <p role="status" className="sr-only">
+        加载中
+      </p>
     </div>
   );
 }
@@ -1974,15 +2038,11 @@ const StoryItem = memo(function StoryItem({
           <div className="text-xs text-[hsl(var(--color-muted-foreground))] mt-0.5 truncate">{story.avgTag}</div>
         )}
         {progressPct > 0 && (
-          <div className="mt-1.5 flex items-center gap-2">
-            <div
-              className="h-1 flex-1 rounded-full bg-[hsl(var(--color-secondary))]"
-              role="progressbar"
-              aria-valuemin={0}
-              aria-valuemax={100}
-              aria-valuenow={progressPct}
-              aria-label={`阅读进度 ${progressPct}%`}
-            >
+          /* 进度已经写进卡片自身的 aria-label；这一行对读屏是第二、第三遍
+             重复，而且 role=progressbar 嵌在 role=button 里会被当成按钮内部
+             的独立控件播报。整行 aria-hidden，视觉不变。 */
+          <div className="mt-1.5 flex items-center gap-2" aria-hidden="true">
+            <div className="h-1 flex-1 rounded-full bg-[hsl(var(--color-secondary))]">
               <div
                 className="h-full rounded-full bg-[hsl(var(--color-primary)/0.8)]"
                 style={{ width: `${progressPct}%` }}

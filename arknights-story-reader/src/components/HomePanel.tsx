@@ -373,7 +373,10 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
             )}
 
             {!showSkeleton && refreshing && (
-              <div className="text-center text-sm text-[hsl(var(--color-muted-foreground))]">
+              <div
+                role="status"
+                className="text-center text-sm text-[hsl(var(--color-muted-foreground))]"
+              >
                 正在刷新…
               </div>
             )}
@@ -386,9 +389,12 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
 
 function HomeSkeleton() {
   return (
-    <div className="space-y-4" aria-hidden="true">
-      <div className="story-card h-44 w-full motion-safe:animate-pulse bg-[hsl(var(--color-secondary)/0.5)]" />
-      <div className="grid grid-cols-3 gap-2">
+    <div className="space-y-4">
+      <div
+        aria-hidden="true"
+        className="story-card h-44 w-full motion-safe:animate-pulse bg-[hsl(var(--color-secondary)/0.5)]"
+      />
+      <div aria-hidden="true" className="grid grid-cols-3 gap-2">
         {[0, 1, 2].map((i) => (
           <div
             key={i}
@@ -396,7 +402,7 @@ function HomeSkeleton() {
           />
         ))}
       </div>
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+      <div aria-hidden="true" className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         {[0, 1].map((i) => (
           <div
             key={i}
@@ -404,7 +410,11 @@ function HomeSkeleton() {
           />
         ))}
       </div>
-      <div className="sr-only">首页加载中</div>
+      {/* 装饰性骨架分块 aria-hidden；这句提示不能一起藏掉，否则给读屏用户
+          准备的「首页加载中」恰好只有读屏听不到。role=status 出现即被播报。 */}
+      <p role="status" className="sr-only">
+        首页加载中
+      </p>
     </div>
   );
 }

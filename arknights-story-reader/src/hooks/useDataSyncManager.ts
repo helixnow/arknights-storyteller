@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { api, type SyncProgress } from "@/services/api";
-import { devLog, devWarn } from "@/hooks/useAppUpdater";
+import { devLog, devWarn, redactSensitive } from "@/hooks/useAppUpdater";
 
 interface UseDataSyncManagerOptions {
   active: boolean;
@@ -66,6 +66,36 @@ export function acquireDataJob(kind: DataJobKind): (() => void) | null {
       notifyDataJobListeners();
     }
   };
+}
+
+/**
+ * 等到锁空闲后再抢。给「用户已经点头确认、但此刻恰好有任务在跑」的流程用：
+ * 立刻放弃会把用户的确认静默吞掉，无限等待又可能永远不结束，所以带超时，
+ * 超时返回 null 由调用方决定怎么收场。多个等待者被同一次释放唤醒时只有
+ * 先抢到的成功，其余继续等自己的超时。
+ */
+export function acquireDataJobWhenIdle(kind: DataJobKind, timeoutMs: number): Promise<(() => void) | null> {
+  const immediate = acquireDataJob(kind);
+  if (immediate) return Promise.resolve(immediate);
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (release: (() => void) | null) => {
+      if (settled) {
+        // 超时和释放通知赛跑时拿到的锁不能吞掉，得还回去。
+        release?.();
+        return;
+      }
+      settled = true;
+      unsubscribe();
+      window.clearTimeout(timer);
+      resolve(release);
+    };
+    const unsubscribe = subscribeDataJob(() => {
+      if (settled || getActiveDataJob() !== null) return;
+      finish(acquireDataJob(kind));
+    });
+    const timer = window.setTimeout(() => finish(null), timeoutMs);
+  });
 }
 
 function subscribeDataJob(listener: () => void): () => void {
@@ -139,7 +169,11 @@ export function localizeBackendError(error: unknown, fallback = "操作失败"):
   }
 
   // 不含中文说明是没被规则覆盖到的后端原文，补个中文前缀再展示。
-  return /[\u4e00-\u9fff]/.test(text) ? text : `${fallback}：${text}`;
+  // 原文透出前先脱敏：后端错误串里可能嵌着完整下载地址（reqwest 的报错习惯），
+  // 数据源地址不该出现在界面文案里，用户截图求助时会一并带出去。
+  // 注意「是否含中文」要看原文——脱敏占位符 `<链接>` 本身就是中文。
+  const safeText = redactSensitive(text);
+  return /[\u4e00-\u9fff]/.test(text) ? safeText : `${fallback}：${safeText}`;
 }
 
 function isTerminalProgress(progress: SyncProgress): boolean {

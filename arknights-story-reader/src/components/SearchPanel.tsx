@@ -462,6 +462,8 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
   // Tauri 的 invoke 没有 abort，只能靠它让迟到的旧结果失去写状态的资格。
   const searchSeqRef = useRef(0);
   const searchingRef = useRef(false);
+  /** 在途搜索查的词和模式：防抖 effect 靠它识别"同一条已经在路上"。 */
+  const inFlightRef = useRef<{ mode: SearchMode; query: string } | null>(null);
   /** 自动搜索失败过的 `${mode}:${query}`，避免 effect 反复重试同一个错误。 */
   const autoFailedRef = useRef<string | null>(null);
   const rowRefs = useRef(new Map<number, HTMLButtonElement>());
@@ -504,6 +506,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
    */
   const invalidateInFlight = useCallback(() => {
     searchSeqRef.current += 1;
+    inFlightRef.current = null;
     if (!searchingRef.current) return;
     searchingRef.current = false;
     setSearching(false);
@@ -582,11 +585,13 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     const settle = () => {
       if (isStale()) return;
       searchingRef.current = false;
+      inFlightRef.current = null;
       setSearching(false);
       setProgress(null);
     };
 
     autoFailedRef.current = null;
+    inFlightRef.current = { mode: activeMode, query: raw };
     setSearching(true);
     searchingRef.current = true;
     setSearchError(null);
@@ -694,6 +699,8 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
       setSearchError({ query: raw, message: detail });
       setPage(null);
       setSegmentPage(null);
+      // 结果已经清掉了，上一次成功留下的"已从缓存恢复"横幅不能继续挂着撒谎。
+      setFromCache({ used: false });
       if (auto) {
         autoFailedRef.current = `${activeMode}:${raw}`;
       } else {
@@ -933,6 +940,12 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     // 已经就是当前展示的结果，或者刚刚自动搜失败过，都别再发一遍。
     if (raw === lastQuery && searched && !searchError) return cancel();
     if (autoFailedRef.current === `${mode}:${raw}`) return cancel();
+    // 同一个词的搜索已经在路上（回车 / 历史词条 / 切模式触发的手动搜）：
+    // 再排一个计时器只会把它作废重发——手动搜的写历史、段落零命中回退
+    // 全都会跟着丢，后端还要白挨一次同样的查询。
+    // `searching` 在依赖里，手动搜一启动 cleanup 就会拆掉已排上的旧计时器。
+    if (searching && inFlightRef.current?.query === raw && inFlightRef.current.mode === mode)
+      return cancel();
 
     const cached =
       mode === "segment"
@@ -959,6 +972,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     lastQuery,
     searched,
     searchError,
+    searching,
     mode,
     cache,
     segmentCache,
@@ -1522,7 +1536,9 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
               <button
                 type="button"
                 className="inline-flex min-h-[44px] items-center px-2 underline hover:text-[hsl(var(--color-foreground))]"
-                onClick={() => void handleSearch({ forceRefresh: true })}
+                // 刷新的必须是横幅指向的那次搜索（lastQuery），而不是输入框里
+                // 可能已经改到一半的词。
+                onClick={() => void handleSearch({ queryOverride: lastQuery, forceRefresh: true })}
               >
                 刷新缓存
               </button>

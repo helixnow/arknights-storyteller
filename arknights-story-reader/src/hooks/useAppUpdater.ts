@@ -1,7 +1,7 @@
 import { useEffect } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
-import { acquireDataJob } from "@/hooks/useDataSyncManager";
+import { acquireDataJobWhenIdle } from "@/hooks/useDataSyncManager";
 
 const IS_DEV = import.meta.env.DEV;
 
@@ -389,6 +389,13 @@ export async function openAndroidInstallPermissionSettings(): Promise<void> {
  */
 let autoUpdateFlowStarted = false;
 
+/**
+ * 用户已确认安装、但任务锁被占（升级后首启很容易撞上自动索引重建，一跑就是
+ * 几分钟）时的最长等待。立刻放弃会把用户刚点的「安装」静默吞掉；无限等又会
+ * 让「立即安装」变成不知何时的突然重启。等不到就放弃，设置页里仍可手动安装。
+ */
+const INSTALL_LOCK_WAIT_MS = 5 * 60_000;
+
 export function useAppUpdater() {
   useEffect(() => {
     if (autoUpdateFlowStarted || !isTauriEnvironment()) return;
@@ -412,9 +419,14 @@ export function useAppUpdater() {
         }
 
         // 安装完会立刻重启进程：这时候若正在同步/导入，数据目录会写到一半被砍。
-        const releaseJob = acquireDataJob("update");
+        // 锁被占时等一会儿再装，而不是把用户刚点的确认静默丢掉。
+        const releaseJob = await acquireDataJobWhenIdle("update", INSTALL_LOCK_WAIT_MS);
         if (!releaseJob) {
-          devLog("[Updater] 有数据任务在跑，跳过本次自动安装");
+          devLog("[Updater] 数据任务长时间未结束，跳过本次自动安装");
+          return;
+        }
+        if (isCancelled()) {
+          releaseJob();
           return;
         }
         try {
@@ -457,9 +469,13 @@ export function useAppUpdater() {
           return;
         }
 
-        const releaseJob = acquireDataJob("update");
+        const releaseJob = await acquireDataJobWhenIdle("update", INSTALL_LOCK_WAIT_MS);
         if (!releaseJob) {
-          devLog("[Updater] 有数据任务在跑，跳过本次自动安装");
+          devLog("[Updater] 数据任务长时间未结束，跳过本次自动安装");
+          return;
+        }
+        if (isCancelled()) {
+          releaseJob();
           return;
         }
         let response: AndroidInstallResponse;

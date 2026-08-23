@@ -48,14 +48,17 @@ export function Collapsible({
       data-state={open ? "open" : "closed"}
       className="border border-[hsl(var(--color-border))] rounded-lg overflow-hidden motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-500"
     >
-      <div className="group flex items-center justify-between gap-2 bg-[hsl(var(--color-card))] transition-all duration-200 hover:bg-[hsl(var(--color-accent))] hover:-translate-y-0.5 px-4 py-2">
+      {/* reduced-motion 下全局规则只压时长，悬停上浮会变成生硬的跳位，这里直接取消位移。 */}
+      <div className="group flex items-center justify-between gap-2 bg-[hsl(var(--color-card))] transition-all duration-200 hover:bg-[hsl(var(--color-accent))] hover:-translate-y-0.5 motion-reduce:hover:translate-y-0 px-4 py-2">
         <button
           id={triggerId}
           type="button"
           onClick={toggle}
           aria-expanded={open}
           aria-controls={open ? contentId : undefined}
-          className="flex min-h-[44px] flex-1 items-center justify-between gap-2 bg-transparent p-0 text-left font-semibold text-[hsl(var(--color-foreground))] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-[hsl(var(--color-primary))]"
+          // ring-offset 颜色不写默认是 #fff，深色主题下焦点环会带一圈白边；
+          // 跟随触发器所在的卡片头部背景色。
+          className="flex min-h-[44px] flex-1 items-center justify-between gap-2 bg-transparent p-0 text-left font-semibold text-[hsl(var(--color-foreground))] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-offset-[hsl(var(--color-card))] focus-visible:ring-[hsl(var(--color-primary))]"
         >
           <span className="flex min-w-0 items-center gap-2">
             <span className="truncate">{title}</span>
