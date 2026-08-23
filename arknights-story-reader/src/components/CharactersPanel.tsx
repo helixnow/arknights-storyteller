@@ -3,6 +3,7 @@ import {
   useCallback,
   useDeferredValue,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -590,6 +591,45 @@ export function CharactersPanel({
 
   const handleSelectCharacter = useCallback((name: string) => setSelected(name), []);
 
+  // 网格和详情共用同一个滚动容器，面板又是 KeepAlive 常驻的——容器从不
+  // 重建，偏移一直留着。在网格里滚到深处再点开博士这类角色，详情会停在
+  // 旧偏移的半腰（几千行的关卡列表夹不回顶部），头像和金句根本看不见；
+  // 返回时网格位置又被详情里的滚动覆盖。进详情记下网格偏移并归顶，回
+  // 列表再还原。用 layout effect：在绘制前落位，不闪半截内容。
+  const scrollViewportRef = useRef<HTMLDivElement | null>(null);
+  const gridScrollTopRef = useRef(0);
+  const prevSelectedRef = useRef(selected);
+  useLayoutEffect(() => {
+    const prev = prevSelectedRef.current;
+    if (prev === selected) return;
+    prevSelectedRef.current = selected;
+    const viewport = scrollViewportRef.current;
+    if (!viewport) return;
+    if (selected !== null) {
+      // 只有「从网格进来」才记网格偏移；详情间切换（悬空重选等）只归顶。
+      if (prev === null) gridScrollTopRef.current = viewport.scrollTop;
+      viewport.scrollTop = 0;
+    } else {
+      // 卡片有 contain-intrinsic-size，本次提交里 scrollHeight 已就位，
+      // 直接还原不会被夹回 0。
+      viewport.scrollTop = gridScrollTopRef.current;
+    }
+  }, [selected]);
+
+  // 搜索词一变，网格就是「整个被换掉」：旧偏移只会被浏览器随机夹在新
+  // 结果的半截。和 StoryList 的处理对齐——关键词（归一化后）真的变了
+  // 就归顶。跟着 deferredSearch 走，重置正好落在列表真正重排的那次提交。
+  const normalizedDeferredSearch = normalizeForSearch(deferredSearch);
+  const searchScrollResetRef = useRef(normalizedDeferredSearch);
+  useLayoutEffect(() => {
+    if (searchScrollResetRef.current === normalizedDeferredSearch) return;
+    searchScrollResetRef.current = normalizedDeferredSearch;
+    // 详情盖着时网格没渲染，滚动位置是详情的，别动。
+    if (selected !== null) return;
+    const viewport = scrollViewportRef.current;
+    if (viewport && viewport.scrollTop !== 0) viewport.scrollTop = 0;
+  }, [normalizedDeferredSearch, selected]);
+
   // 人物详情是盖在网格上的全屏二级视图，必须占一层返回栈：否则 Android
   // 硬返回 / 手势返回会越过它落到 App 的 tab 兜底，整个 tab 直接跳回首页，
   // 而详情还留在原地（切回人物页时它仍开着）。与 `active` 相与：阅读器盖
@@ -784,6 +824,7 @@ export function CharactersPanel({
 
       <CustomScrollArea
         className="flex-1"
+        viewportRef={scrollViewportRef}
         trackOffsetTop="calc(3.25rem + 10px)"
         trackOffsetBottom="calc(4.5rem + env(safe-area-inset-bottom, 0px))"
       >

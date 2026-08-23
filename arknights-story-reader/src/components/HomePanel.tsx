@@ -138,7 +138,10 @@ function sameStreak(a: StreakInfo, b: StreakInfo): boolean {
 function sameRecentStories(a: RecentStory[], b: RecentStory[]): boolean {
   if (a.length !== b.length) return false;
   for (let i = 0; i < a.length; i += 1) {
-    if (a[i].entry.storyId !== b[i].entry.storyId) return false;
+    // entry 按引用比较而不是 storyId：storyCatalog 缓存命中时返回同一批对象，
+    // 常规刷新照样零重渲染；而数据重新同步后会解析出新对象（书名/编号/txt
+    // 路径都可能变了），只比 id 会让首页一直拿旧目录的条目去渲染和打开。
+    if (a[i].entry !== b[i].entry) return false;
     if (a[i].meta.percentage !== b[i].meta.percentage) return false;
     if (a[i].meta.updatedAt !== b[i].meta.updatedAt) return false;
   }
@@ -210,7 +213,10 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
       let hash = 0;
       for (let i = 0; i < t.length; i += 1) hash = (hash * 31 + t.charCodeAt(i)) >>> 0;
       const pick = allMain[hash % Math.max(allMain.length, 1)] ?? null;
-      setHighlight((prev) => (prev?.storyId === pick?.storyId ? prev : pick));
+      // 直接 set：缓存命中时 pick 与上一次是同一个对象，React 自动 bail out；
+      // 数据重新同步后是新对象，才应该重渲染。以前按 storyId 相同就保留旧
+      // 对象，同步后推荐卡会一直显示旧目录里的书名，点开走的也是旧路径。
+      setHighlight(pick);
 
       // 2) 最近阅读：progress 的 key 就是 storyTxt，反查成 StoryEntry。
       // 快照和剧情列表的进度徽标同源，两边不可能显示成不一样的百分比。
@@ -220,12 +226,20 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
 
       // 主线没覆盖到的才去问活动 / 支线 / 肉鸽 / 密录。新装或只读主线的
       // 用户因此能省掉四次 IPC；命中共享缓存时这里同样是零开销。
+      // 某一类读失败（多半是刚同步完、索引还在重建）就先用空结果顶上，
+      // 页面照常渲染；但要记下「这轮不完整」，见下面写 loadedFromRef 处。
+      let partial = false;
+      const orEmpty = <T,>(promise: Promise<T[]>): Promise<T[]> =>
+        promise.catch(() => {
+          partial = true;
+          return [];
+        });
       if (entries.some((entry) => !byPath.has(entry.storyPath))) {
         const [acts, sides, rogues, mems] = await Promise.all([
-          storyCatalog.grouped("activity").catch(() => []),
-          storyCatalog.grouped("sidestory").catch(() => []),
-          storyCatalog.grouped("roguelike").catch(() => []),
-          storyCatalog.memory().catch(() => []),
+          orEmpty(storyCatalog.grouped("activity")),
+          orEmpty(storyCatalog.grouped("sidestory")),
+          orEmpty(storyCatalog.grouped("roguelike")),
+          orEmpty(storyCatalog.memory()),
         ]);
         if (stale()) return;
         [acts, sides, rogues].forEach((grouped) =>
@@ -244,7 +258,11 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
         })
         .filter((x): x is RecentStory => x !== null);
       setRecentStories((prev) => (sameRecentStories(prev, matched) ? prev : matched));
-      loadedFromRef.current = snapshot;
+      // 有次级目录读失败时结果不完整，不能记成「已按此快照加载」——否则
+      // 进度快照没变的话，后续聚焦刷新全被顶部跳过逻辑拦下，瞬时失败里
+      // 缺掉的「最近阅读」卡片要等到用户再读点什么才会回来。留空让下一次
+      // 聚焦/可见性刷新重试（失败的请求不会进共享缓存，重试是真重试）。
+      loadedFromRef.current = partial ? null : snapshot;
       // 用挑推荐时的 `t` 而不是现在的 todayKey()：加载恰好跨过零点时两者
       // 会不同，记 `t` 能让下一次刷新发现日期变了、重挑今天的推荐。
       loadedDayRef.current = t;

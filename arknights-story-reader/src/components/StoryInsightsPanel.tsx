@@ -227,7 +227,10 @@ export function StoryInsightsPanel({
               <SheetSectionLabel>
                 章节目录 · <span className="font-normal opacity-70">共 {headers.length} 节</span>
               </SheetSectionLabel>
-              <SheetGroup padded={false}>
+              {/* 无内边距的列表组必须自己裁剪：行的 hover/按压底色、角色行的
+                  占比条都是方角且贴边绘制，不裁的话首末行的四个角会溢出
+                  `glass-pane` 的 22px 圆角，压到容器边框外面。 */}
+              <SheetGroup padded={false} className="overflow-hidden">
                 <div className="glass-list">{tocRows}</div>
               </SheetGroup>
             </section>
@@ -271,7 +274,7 @@ export function StoryInsightsPanel({
                 </p>
               </SheetGroup>
             ) : (
-              <SheetGroup padded={false}>
+              <SheetGroup padded={false} className="overflow-hidden">
                 <div className="glass-list">{highlightRows}</div>
               </SheetGroup>
             )}
@@ -307,7 +310,7 @@ export function StoryInsightsPanel({
                 </p>
               </SheetGroup>
             ) : (
-              <SheetGroup padded={false}>
+              <SheetGroup padded={false} className="overflow-hidden">
                 <div className="glass-list">{characterRows}</div>
               </SheetGroup>
             )}

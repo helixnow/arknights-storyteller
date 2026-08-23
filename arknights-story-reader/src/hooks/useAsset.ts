@@ -152,8 +152,10 @@ function getIndexGeneration(): number {
 /**
  * 同步拿到一条候选 URL 列表。零 IPC。
  *
- * - 对 avatar / portrait：索引未加载前返回空数组并把 `loading` 置真；
- *   索引落地（或被换成新快照）后自动重算。
+ * - 对 avatar / portrait：`char_` id 与 NPC 覆盖表不经索引就能解析，
+ *   立即返回候选（首选通常是本地打包文件）；名字/alias 类 token 在索引
+ *   未加载前返回空数组并把 `loading` 置真，索引落地（或被换成新快照）
+ *   后自动重算。
  * - 其他 kind：纯字符串拼接，随取随有。
  */
 export function useAsset(
@@ -168,14 +170,21 @@ export function useAsset(
     [needsIndex]
   );
   const generation = useSyncExternalStore(subscribe, getIndexGeneration, getIndexGeneration);
-  const pending = needsIndex && !indexReady;
 
   const candidates = useMemo(() => {
     if (!kind || !token) return EMPTY_CANDIDATES;
-    if (needsIndex && !indexReady) return EMPTY_CANDIDATES;
+    // 索引未落地也先解析：`char_` id / NPC 覆盖表不查索引，密录立绘、
+    // NPC 头像（本地文件）不必等 character_table 的 IPC——那次请求慢
+    // 或失败时，这些明明可解析的图会白白停在兜底上。名字类 token 此时
+    // 解析出的空数组会被缓存，但索引注入即清缓存 + bump generation，
+    // 不会有陈旧命中。
     return resolveCandidatesCached(kind, token);
     // `generation` 是索引快照的版本号：它变了就必须重算，哪怕 token 没动。
-  }, [kind, token, needsIndex, generation]);
+  }, [kind, token, generation]);
+
+  // 只有「解析结果为空 且 索引还没落地」才是在等索引；解析已经出结果的
+  // token（char_ id、NPC 覆盖表）跟索引无关，不该报 loading。
+  const pending = needsIndex && !indexReady && candidates.length === 0;
 
   return {
     url: candidates[0] ?? null,
