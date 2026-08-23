@@ -1,3 +1,4 @@
+import { useMemo } from "react";
 import { Button } from "@/components/ui/button";
 import { CustomScrollArea } from "@/components/ui/custom-scroll-area";
 import {
@@ -41,6 +42,10 @@ export interface StoryInsightsPanelProps {
  *   - Each insight group is an inset-grouped list (`.glass-list`) so rows
  *     stack without their own borders — hairline dividers only.
  *   - Row press highlight uses primary-tinted glass, not a hard ring.
+ *
+ * 抽屉挂在阅读器里，阅读器每滚一段就会重渲染一次。`insights` 本身由阅读器
+ * 缓存（只在段落变化时重算），这里再把派生数字和三段列表各自 memo 起来，
+ * 抽屉关着的时候父组件的高频渲染就不会顺带重建几百个节点。
  */
 export function StoryInsightsPanel({
   open,
@@ -55,6 +60,145 @@ export function StoryInsightsPanel({
   onClearCharacter,
 }: StoryInsightsPanelProps) {
   const { rendered, state } = useSidePanel({ open, onClose });
+  const { headers, characters, decisions } = insights;
+
+  /** 总发言量与最高发言数：占比条和小标题都要用，一次遍历算完。 */
+  const characterStats = useMemo(() => {
+    let totalLines = 0;
+    let topCount = 0;
+    characters.forEach((character) => {
+      totalLines += character.count;
+      if (character.count > topCount) topCount = character.count;
+    });
+    return { totalLines, topCount };
+  }, [characters]);
+
+  const tocRows = useMemo(
+    () =>
+      headers.map((h) => (
+        <button
+          key={`toc-${h.index}`}
+          type="button"
+          className={cn(
+            "w-full min-h-[44px] px-4 py-3 text-left text-sm transition-colors duration-150",
+            "hover:bg-[hsl(var(--color-foreground)/0.04)] active:bg-[hsl(var(--color-foreground)/0.08)]",
+            "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[hsl(var(--color-ring))]"
+          )}
+          onClick={() => onJumpToSegment(h.index)}
+        >
+          {h.title}
+        </button>
+      )),
+    [headers, onJumpToSegment]
+  );
+
+  const highlightRows = useMemo(
+    () =>
+      highlightEntries.map((entry) => (
+        <div key={entry.index} className="flex items-start gap-1 px-3 py-2.5">
+          <button
+            type="button"
+            className="flex-1 min-w-0 min-h-[44px] text-left text-sm leading-relaxed px-2 py-2 rounded-md transition-colors hover:text-[hsl(var(--color-primary))] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--color-ring))]"
+            onClick={() => onJumpToSegment(entry.index)}
+          >
+            {entry.label}
+          </button>
+          <Button
+            variant="ghost"
+            size="icon-pill"
+            className="h-11 w-11 flex-shrink-0 text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-destructive))]"
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              onRemoveHighlight(entry.index);
+            }}
+            aria-label="移除划线"
+            title="移除划线"
+          >
+            <Trash2 className="h-4 w-4" />
+          </Button>
+        </div>
+      )),
+    [highlightEntries, onJumpToSegment, onRemoveHighlight]
+  );
+
+  const characterRows = useMemo(
+    () =>
+      characters.map((character) => {
+        const isActive = activeCharacter === character.name;
+        // 相对话最多的那位取百分比：一眼能看出谁是这篇的主角。
+        const share =
+          characterStats.topCount > 0
+            ? Math.max(3, Math.round((character.count / characterStats.topCount) * 100))
+            : 0;
+        return (
+          <button
+            key={character.name}
+            type="button"
+            aria-pressed={isActive}
+            onClick={() => onCharacterSelect(character.name, character.firstIndex)}
+            className={cn(
+              "relative w-full min-h-[44px] overflow-hidden text-left transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[hsl(var(--color-ring))]",
+              isActive
+                ? "bg-[hsl(var(--color-primary)/0.12)] text-[hsl(var(--color-primary))]"
+                : "hover:bg-[hsl(var(--color-foreground)/0.04)] active:bg-[hsl(var(--color-foreground)/0.08)]"
+            )}
+          >
+            <span
+              aria-hidden="true"
+              className={cn(
+                "absolute inset-y-0 left-0 pointer-events-none",
+                isActive
+                  ? "bg-[hsl(var(--color-primary)/0.16)]"
+                  : "bg-[hsl(var(--color-primary)/0.07)]"
+              )}
+              style={{ width: `${share}%` }}
+            />
+            <span className="relative flex items-center gap-3 px-4 py-2.5">
+              <CharacterAvatar name={character.name} size={28} />
+              <span className="flex-1 min-w-0 font-medium truncate text-sm">
+                {character.name}
+              </span>
+              <span className="text-xs tabular-nums text-[hsl(var(--color-muted-foreground))] flex-shrink-0">
+                {character.count} 次
+              </span>
+            </span>
+          </button>
+        );
+      }),
+    [activeCharacter, characterStats.topCount, characters, onCharacterSelect]
+  );
+
+  const decisionCards = useMemo(
+    () =>
+      decisions.map((decision, idx) => (
+        <SheetGroup key={`${decision.index}-${idx}`} padded>
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-sm font-semibold">抉择 {idx + 1}</span>
+            <Button
+              variant="glass"
+              size="sm"
+              className="min-h-[44px] px-4 rounded-full text-xs"
+              onClick={() => onJumpToSegment(decision.index)}
+            >
+              前往
+            </Button>
+          </div>
+          <div className="space-y-1 text-sm text-[hsl(var(--color-muted-foreground))]">
+            {decision.options.map((option, optionIndex) => (
+              <div key={optionIndex} className="flex gap-2 leading-relaxed">
+                <span className="text-[hsl(var(--color-primary))] tabular-nums font-medium">
+                  {optionIndex + 1}.
+                </span>
+                <span className="flex-1">{option}</span>
+              </div>
+            ))}
+          </div>
+        </SheetGroup>
+      )),
+    [decisions, onJumpToSegment]
+  );
+
   if (!rendered) return null;
 
   return (
@@ -78,28 +222,13 @@ export function StoryInsightsPanel({
 
       <CustomScrollArea className="flex-1 min-h-0" viewportClassName="reader-scroll">
         <div className="px-4 pt-3 pb-8 space-y-5">
-          {insights.headers.length > 0 && (
+          {headers.length > 0 && (
             <section className="space-y-2">
               <SheetSectionLabel>
-                章节目录 · <span className="font-normal opacity-70">共 {insights.headers.length} 节</span>
+                章节目录 · <span className="font-normal opacity-70">共 {headers.length} 节</span>
               </SheetSectionLabel>
               <SheetGroup padded={false}>
-                <div className="glass-list">
-                  {insights.headers.map((h) => (
-                    <button
-                      key={`toc-${h.index}`}
-                      type="button"
-                      className={cn(
-                        "w-full min-h-[44px] px-4 py-3 text-left text-sm transition-colors duration-150",
-                        "hover:bg-[hsl(var(--color-foreground)/0.04)] active:bg-[hsl(var(--color-foreground)/0.08)]",
-                        "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[hsl(var(--color-ring))]"
-                      )}
-                      onClick={() => onJumpToSegment(h.index)}
-                    >
-                      {h.title}
-                    </button>
-                  ))}
-                </div>
+                <div className="glass-list">{tocRows}</div>
               </SheetGroup>
             </section>
           )}
@@ -143,33 +272,7 @@ export function StoryInsightsPanel({
               </SheetGroup>
             ) : (
               <SheetGroup padded={false}>
-                <div className="glass-list">
-                  {highlightEntries.map((entry) => (
-                    <div key={entry.index} className="flex items-start gap-1 px-3 py-2.5">
-                      <button
-                        type="button"
-                        className="flex-1 min-w-0 min-h-[44px] text-left text-sm leading-relaxed px-2 py-2 rounded-md transition-colors hover:text-[hsl(var(--color-primary))] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--color-ring))]"
-                        onClick={() => onJumpToSegment(entry.index)}
-                      >
-                        {entry.label}
-                      </button>
-                      <Button
-                        variant="ghost"
-                        size="icon-pill"
-                        className="h-11 w-11 flex-shrink-0 text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-destructive))]"
-                        onClick={(event) => {
-                          event.preventDefault();
-                          event.stopPropagation();
-                          onRemoveHighlight(entry.index);
-                        }}
-                        aria-label="移除划线"
-                        title="移除划线"
-                      >
-                        <Trash2 className="h-4 w-4" />
-                      </Button>
-                    </div>
-                  ))}
-                </div>
+                <div className="glass-list">{highlightRows}</div>
               </SheetGroup>
             )}
           </section>
@@ -180,8 +283,8 @@ export function StoryInsightsPanel({
                 <span>
                   角色出场 ·{" "}
                   <span className="font-normal opacity-70">
-                    {insights.characters.length > 0
-                      ? `${insights.characters.length} 位角色`
+                    {characters.length > 0
+                      ? `${characters.length} 位角色 · ${characterStats.totalLines} 句对话`
                       : "暂无角色统计"}
                   </span>
                 </span>
@@ -197,7 +300,7 @@ export function StoryInsightsPanel({
               </span>
             </SheetSectionLabel>
 
-            {insights.characters.length === 0 ? (
+            {characters.length === 0 ? (
               <SheetGroup padded>
                 <p className="text-sm text-[hsl(var(--color-muted-foreground))]">
                   暂无角色统计
@@ -205,35 +308,7 @@ export function StoryInsightsPanel({
               </SheetGroup>
             ) : (
               <SheetGroup padded={false}>
-                <div className="glass-list">
-                  {insights.characters.map((character) => {
-                    const active = activeCharacter === character.name;
-                    return (
-                      <button
-                        key={character.name}
-                        type="button"
-                        aria-pressed={active}
-                        onClick={() =>
-                          onCharacterSelect(character.name, character.firstIndex)
-                        }
-                        className={cn(
-                          "w-full min-h-[44px] flex items-center gap-3 px-4 py-2.5 text-left transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[hsl(var(--color-ring))]",
-                          active
-                            ? "bg-[hsl(var(--color-primary)/0.12)] text-[hsl(var(--color-primary))]"
-                            : "hover:bg-[hsl(var(--color-foreground)/0.04)] active:bg-[hsl(var(--color-foreground)/0.08)]"
-                        )}
-                      >
-                        <CharacterAvatar name={character.name} size={28} />
-                        <div className="flex-1 min-w-0 font-medium truncate text-sm">
-                          {character.name}
-                        </div>
-                        <div className="text-xs tabular-nums text-[hsl(var(--color-muted-foreground))] flex-shrink-0">
-                          {character.count} 次
-                        </div>
-                      </button>
-                    );
-                  })}
-                </div>
+                <div className="glass-list">{characterRows}</div>
               </SheetGroup>
             )}
           </section>
@@ -242,46 +317,18 @@ export function StoryInsightsPanel({
             <SheetSectionLabel>
               抉择片段 ·{" "}
               <span className="font-normal opacity-70">
-                {insights.decisions.length > 0
-                  ? `${insights.decisions.length} 个抉择点`
-                  : "尚未出现抉择"}
+                {decisions.length > 0 ? `${decisions.length} 个抉择点` : "尚未出现抉择"}
               </span>
             </SheetSectionLabel>
 
-            {insights.decisions.length === 0 ? (
+            {decisions.length === 0 ? (
               <SheetGroup padded>
                 <p className="text-sm text-[hsl(var(--color-muted-foreground))]">
                   尚未出现抉择
                 </p>
               </SheetGroup>
             ) : (
-              <div className="space-y-2">
-                {insights.decisions.map((decision, idx) => (
-                  <SheetGroup key={`${decision.index}-${idx}`} padded>
-                    <div className="flex items-center justify-between mb-2">
-                      <span className="text-sm font-semibold">抉择 {idx + 1}</span>
-                      <Button
-                        variant="glass"
-                        size="sm"
-                        className="min-h-[44px] px-4 rounded-full text-xs"
-                        onClick={() => onJumpToSegment(decision.index)}
-                      >
-                        前往
-                      </Button>
-                    </div>
-                    <div className="space-y-1 text-sm text-[hsl(var(--color-muted-foreground))]">
-                      {decision.options.map((option, optionIndex) => (
-                        <div key={optionIndex} className="flex gap-2 leading-relaxed">
-                          <span className="text-[hsl(var(--color-primary))] tabular-nums font-medium">
-                            {optionIndex + 1}.
-                          </span>
-                          <span className="flex-1">{option}</span>
-                        </div>
-                      ))}
-                    </div>
-                  </SheetGroup>
-                ))}
-              </div>
+              <div className="space-y-2">{decisionCards}</div>
             )}
           </section>
         </div>
