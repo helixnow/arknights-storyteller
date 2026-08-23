@@ -174,8 +174,10 @@ class ImageSharerPlugin(private val activity: Activity) : Plugin(activity) {
   private fun sanitizeFileName(input: String?): String? {
     val trimmed = input?.trim().orEmpty()
     if (trimmed.isEmpty()) return null
-    // Strip path separators / null bytes to keep MediaStore happy.
-    val cleaned = trimmed.replace(Regex("[\\\\/:*?\"<>|\\u0000]+"), "_")
+    // Strip path separators / null bytes to keep MediaStore happy and rule
+    // out traversal; cap the length so the filesystem never rejects the name.
+    val cleaned = trimmed.replace(Regex("[\\\\/:*?\"<>|\\u0000]+"), "_").take(120)
+    if (cleaned.all { it == '.' }) return null
     return if (cleaned.endsWith(".png", ignoreCase = true)) cleaned else "$cleaned.png"
   }
 
@@ -249,6 +251,11 @@ class ImageSharerPlugin(private val activity: Activity) : Plugin(activity) {
     // while a previous chooser is still holding the URI open.
     val unique = "${System.currentTimeMillis()}-$displayName"
     val out = File(dir, unique)
+    // Defense-in-depth on top of sanitizeFileName: refuse to write anything
+    // that would resolve outside the shared-images cache directory.
+    if (!out.canonicalPath.startsWith(dir.canonicalPath + File.separator)) {
+      throw IOException("非法文件名")
+    }
     FileOutputStream(out).use { it.write(bytes) }
     return out
   }

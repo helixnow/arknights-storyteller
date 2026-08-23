@@ -186,6 +186,10 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
       // 读取失败 ≠ 没装数据。把两者混为一谈会让用户去做一次根本没必要的
       // 同步，所以这里只标记失败，由界面给出「重试 / 去设置」。
       setLoadFailed(true);
+      // 这一轮没产出结果，得把「已按此快照加载」的标记作废。不然强制刷新
+      // （如同步后重建索引时）恰好失败、而进度快照又没变时，后续聚焦刷新
+      // 全被顶部的跳过逻辑拦下，本该转瞬即逝的错误卡会一直挂着。
+      loadedFromRef.current = null;
     } finally {
       window.clearTimeout(hintTimer);
       if (!stale()) setRefreshing(false);

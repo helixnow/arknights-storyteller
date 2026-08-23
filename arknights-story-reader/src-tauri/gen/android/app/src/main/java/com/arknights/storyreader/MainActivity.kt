@@ -26,25 +26,35 @@ class MainActivity : TauriActivity() {
         override fun handleOnBackPressed() {
           val currentWebView = webView
           if (currentWebView == null) {
-            isEnabled = false
-            onBackPressedDispatcher.onBackPressed()
+            dispatchDefaultBack()
             return
           }
           val script =
             "(() => { const e = new CustomEvent('app-back', { cancelable: true }); " +
               "window.dispatchEvent(e); return e.defaultPrevented; })();"
-          currentWebView.evaluateJavascript(script) { handled ->
-            // `handled` is the serialized JS return value ("true" / "false" / null)
-            val consumed = handled == "true"
-            if (!consumed) {
-              // Disable this callback and re-dispatch so the default exit logic runs.
-              runOnUiThread {
-                isEnabled = false
-                onBackPressedDispatcher.onBackPressed()
-                isEnabled = true
+          try {
+            currentWebView.evaluateJavascript(script) { handled ->
+              // `handled` is the serialized JS return value ("true" / "false" / null)
+              val consumed = handled == "true"
+              if (!consumed) {
+                runOnUiThread { dispatchDefaultBack() }
               }
             }
+          } catch (_: Exception) {
+            // evaluateJavascript throws if the WebView was already destroyed;
+            // never crash or swallow the back press in that case.
+            dispatchDefaultBack()
           }
+        }
+
+        // Disable this callback and re-dispatch so the default exit logic
+        // runs. Always re-enable afterwards: if the activity survives (e.g.
+        // another callback consumed the event, or the WebView attaches
+        // later), the bridge must keep working for the next back press.
+        private fun dispatchDefaultBack() {
+          isEnabled = false
+          onBackPressedDispatcher.onBackPressed()
+          isEnabled = true
         }
       }
     )
