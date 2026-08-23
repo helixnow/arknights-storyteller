@@ -1,8 +1,34 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type ReactNode,
+  type RefObject,
+} from "react";
 import { api } from "@/services/api";
 import type { StoryEntry } from "@/types/story";
 import { Button } from "@/components/ui/button";
-import { RefreshCw, Star, FileText } from "lucide-react";
+import {
+  ArrowDownToLine,
+  BookOpen,
+  ChevronsDownUp,
+  ChevronsUpDown,
+  FileText,
+  Inbox,
+  RefreshCw,
+  RotateCcw,
+  Search,
+  Settings2,
+  Star,
+  TriangleAlert,
+  WifiOff,
+  X,
+  type LucideIcon,
+} from "lucide-react";
 import { SyncDialog } from "@/components/SyncDialog";
 import { Collapsible } from "@/components/ui/collapsible";
 import { CustomScrollArea } from "@/components/ui/custom-scroll-area";
@@ -134,24 +160,111 @@ const GROUPED_CATEGORY_META: Record<
 
 const PROGRESS_KEY = "reading-progress";
 
-/** 阅读进度：storyTxt -> 0~1。列表项用它渲染细进度条。 */
-function readProgressPercentMap(): Record<string, number> {
-  if (typeof window === "undefined") return {};
+/** 到这个百分比就算读完。首页大卡、列表徽标共用一个口径。 */
+export const READ_FINISHED_PCT = 99;
+
+export interface ReadingProgressEntry {
+  storyPath: string;
+  /** 0~1 */
+  percentage: number;
+  updatedAt: number;
+}
+
+export interface ReadingProgressSnapshot {
+  /** storyTxt → 0~1。列表徽标按 key 查表，O(1)。 */
+  percent: Record<string, number>;
+  /** 按 updatedAt 倒序。首页「最近阅读」直接用这一份。 */
+  recent: ReadingProgressEntry[];
+}
+
+const EMPTY_PROGRESS: ReadingProgressSnapshot = { percent: {}, recent: [] };
+
+function clampRatio(value: unknown): number {
+  const num = Number(value ?? 0);
+  if (!Number.isFinite(num)) return 0;
+  return Math.min(1, Math.max(0, num));
+}
+
+function parseReadingProgress(raw: string | null): ReadingProgressSnapshot {
+  if (!raw) return EMPTY_PROGRESS;
   try {
-    const raw = window.localStorage.getItem(PROGRESS_KEY);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw) as Record<string, { percentage?: number }>;
-    const out: Record<string, number> = {};
-    for (const [path, value] of Object.entries(parsed)) {
+    const parsed = JSON.parse(raw) as Record<
+      string,
+      { percentage?: number; updatedAt?: number } | null
+    >;
+    if (!parsed || typeof parsed !== "object") return EMPTY_PROGRESS;
+
+    const percent: Record<string, number> = {};
+    const recent: ReadingProgressEntry[] = [];
+    for (const [storyPath, value] of Object.entries(parsed)) {
       if (!value || typeof value !== "object") continue;
-      const pct = Number(value.percentage ?? 0);
-      if (!Number.isFinite(pct) || pct <= 0) continue;
-      out[path] = Math.min(1, Math.max(0, pct));
+      const percentage = clampRatio(value.percentage);
+      const updatedAt = Number(value.updatedAt ?? 0);
+      if (percentage > 0) percent[storyPath] = percentage;
+      recent.push({
+        storyPath,
+        percentage,
+        updatedAt: Number.isFinite(updatedAt) ? updatedAt : 0,
+      });
     }
-    return out;
+    recent.sort((a, b) => b.updatedAt - a.updatedAt);
+    return { percent, recent };
   } catch {
-    return {};
+    return EMPTY_PROGRESS;
   }
+}
+
+let progressRaw: string | null = null;
+let progressSnapshot: ReadingProgressSnapshot = EMPTY_PROGRESS;
+let progressParsed = false;
+
+/**
+ * 阅读进度的共享快照：首页和剧情列表读同一份，口径不可能对不上。
+ *
+ * 用原始字符串做校验，内容没变就返回同一个对象引用。这一点比省下的
+ * `JSON.parse` 更重要：窗口聚焦 / 可见性变化 / 从阅读器返回都会触发刷新，
+ * 引用不变时 `setState` 直接被 React bail out，几千行的列表不会因为
+ * 「切了一下窗口」整体重渲染一次。
+ */
+export function getReadingProgress(): ReadingProgressSnapshot {
+  if (typeof window === "undefined") return EMPTY_PROGRESS;
+  let raw: string | null;
+  try {
+    raw = window.localStorage.getItem(PROGRESS_KEY);
+  } catch {
+    return progressSnapshot;
+  }
+  if (progressParsed && raw === progressRaw) return progressSnapshot;
+  progressRaw = raw;
+  progressParsed = true;
+  progressSnapshot = parseReadingProgress(raw);
+  return progressSnapshot;
+}
+
+/** 0~1 → 0~100 整数。读过一点点也至少显示 1%，免得看起来像没读。 */
+export function toReadPercent(value: number | null | undefined): number {
+  if (typeof value !== "number" || !(value > 0)) return 0;
+  return Math.min(100, Math.max(1, Math.round(value * 100)));
+}
+
+/** 联网状态。同步要连远端，离线时的提示和可用动作完全不一样。 */
+export function useOnlineStatus(): boolean {
+  const [online, setOnline] = useState(
+    () => typeof navigator === "undefined" || navigator.onLine !== false
+  );
+
+  useEffect(() => {
+    const update = () => setOnline(navigator.onLine !== false);
+    update();
+    window.addEventListener("online", update);
+    window.addEventListener("offline", update);
+    return () => {
+      window.removeEventListener("online", update);
+      window.removeEventListener("offline", update);
+    };
+  }, []);
+
+  return online;
 }
 
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
@@ -285,6 +398,90 @@ function scheduleSummary<T>(task: () => Promise<T>): Promise<T> {
   });
 }
 
+/**
+ * 分批挂载的批量大小。首屏只铺一屏多一点，其余靠滚动追加。
+ * 分组头很轻（一行文字 + 两个按钮），可以给得比条目大方一些。
+ */
+const ROWS_FIRST_CHUNK = 48;
+const ROWS_NEXT_CHUNK = 48;
+const GROUPS_FIRST_CHUNK = 24;
+const GROUPS_NEXT_CHUNK = 24;
+
+interface ProgressiveList {
+  /** 当前允许渲染的条数。 */
+  visible: number;
+  done: boolean;
+  remaining: number;
+  sentinelRef: RefObject<HTMLDivElement | null>;
+  revealAll: () => void;
+}
+
+/**
+ * 「只增不减」的分批挂载。
+ *
+ * 这里刻意没有上虚拟滚动：列表里混着可折叠分组、随简介开关变高的卡片，
+ * 外层还有 KeepAlive 常驻的滚动容器，虚拟化必须自己接管高度测量和滚动
+ * 恢复——任何一处算错，「切回剧情页停在原处」「搜索命中后跳过去」
+ * 「从首页跳收藏」这些既有行为就全废了。
+ *
+ * 分批挂载只在列表尾部追加节点：滚动高度单调增长，已经渲染出来的行永远
+ * 不会被回收，所以滚动位置、搜索结果、收藏跳转都不受影响；同时首屏的 DOM
+ * 节点数、缩略图 token 的 IPC 数都被压到「一屏」的量级——干员密录那种
+ * 上千条的扁平列表，冷启动时不再一次性排队上千次 IPC。
+ */
+function useProgressiveList(
+  total: number,
+  options: {
+    initial: number;
+    step: number;
+    /** 变化即从第一批重新开始（换分类、换搜索词）。 */
+    resetKey: string;
+    rootRef: RefObject<HTMLElement | null>;
+  }
+): ProgressiveList {
+  const { initial, step, resetKey, rootRef } = options;
+  const [count, setCount] = useState(initial);
+  const sentinelRef = useRef<HTMLDivElement | null>(null);
+
+  const resetKeyRef = useRef(resetKey);
+  if (resetKeyRef.current !== resetKey) {
+    resetKeyRef.current = resetKey;
+    if (count !== initial) setCount(initial);
+  }
+
+  const visible = Math.min(count, total);
+  const done = visible >= total;
+
+  useEffect(() => {
+    if (done) return;
+    const node = sentinelRef.current;
+    if (!node) return;
+
+    // 没有 IntersectionObserver 的环境直接放完，宁可慢一点也不能少内容。
+    if (typeof IntersectionObserver === "undefined") {
+      setCount(total);
+      return;
+    }
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          setCount((prev) => Math.min(prev + step, total));
+        }
+      },
+      // root 必须是真正的滚动容器：用默认视口的话，rootMargin 会被容器的
+      // overflow 裁掉，预取窗口形同虚设。
+      { root: rootRef.current, rootMargin: "800px 0px" }
+    );
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [done, rootRef, step, total, visible]);
+
+  const revealAll = useCallback(() => setCount(total), [total]);
+
+  return { visible, done, remaining: Math.max(0, total - visible), sentinelRef, revealAll };
+}
+
 interface StoryListProps {
   onSelectStory: (story: StoryEntry) => void;
 }
@@ -292,6 +489,9 @@ interface StoryListProps {
 function emptyGroups(): Record<GroupedKey, GroupedStories> {
   return { main: [], activity: [], sidestory: [], roguelike: [] };
 }
+
+/** 稳定的空分组列表，供「当前分类不是分组类」时占位，避免每次渲染新建数组。 */
+const NO_GROUPS: GroupedStories = [];
 
 function initialSectionFlags(value: boolean): Record<SectionKey, boolean> {
   return {
@@ -303,6 +503,17 @@ function initialSectionFlags(value: boolean): Record<SectionKey, boolean> {
   };
 }
 
+/** 加载失败的成因。每一种都对应一套不同的文案和可执行动作。 */
+type LoadErrorKind = "not-installed" | "timeout" | "unknown";
+
+interface LoadErrorState {
+  kind: LoadErrorKind;
+  /** 出错的数据块名字，用于「读取活动剧情超时」这类具体标题。 */
+  label: string;
+  /** 后端原文，只在无法归类时展示，方便用户反馈。 */
+  detail?: string;
+}
+
 export function StoryList({ onSelectStory }: StoryListProps) {
   const [groups, setGroups] = useState<Record<GroupedKey, GroupedStories>>(emptyGroups);
   const [memoryStories, setMemoryStories] = useState<StoryEntry[]>([]);
@@ -311,18 +522,21 @@ export function StoryList({ onSelectStory }: StoryListProps) {
     // 主线是默认分类，进来就在加载。
     main: true,
   }));
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<LoadErrorState | null>(null);
   const [syncDialogOpen, setSyncDialogOpen] = useState(false);
   const [installed, setInstalled] = useState<boolean | null>(null);
   const [activeCategory, setActiveCategory] = useState<Category>("main");
   const [searchTerm, setSearchTerm] = useState("");
   const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({});
-  const [progressMap, setProgressMap] = useState<Record<string, number>>(() =>
-    readProgressPercentMap()
-  );
+  /** 「展开全部 / 收起全部」的批量意图；null 表示按各分组自己的默认值来。 */
+  const [bulkOpen, setBulkOpen] = useState<boolean | null>(null);
+  const [progress, setProgress] = useState<ReadingProgressSnapshot>(getReadingProgress);
   const { showSummaries, setShowSummaries } = useAppPreferences();
   const [summaryCache, setSummaryCache] = useState<Record<string, string>>({});
   const [summaryLoadingIds, setSummaryLoadingIds] = useState<Record<string, boolean>>({});
+  const online = useOnlineStatus();
+  /** 分批挂载的 IntersectionObserver 需要真正的滚动容器当 root。 */
+  const scrollRootRef = useRef<HTMLDivElement | null>(null);
 
   // 每块数据是否已加载 / 在途的 Promise。用 ref 保存，这样 loadSection
   // 能保持稳定引用，effect 不会因为 state 变化重复触发。
@@ -341,14 +555,25 @@ export function StoryList({ onSelectStory }: StoryListProps) {
     toggleFavoriteGroup,
   } = useFavorites();
 
+  /**
+   * 把后端的失败原因归类。这里顺手把「数据目录被删/被换掉」的情况回写成
+   * `installed = false`：否则界面只会显示一句干巴巴的「加载失败」，而真正
+   * 该做的事（同步一次）藏在别处。
+   */
   const handleLoadError = useCallback((label: string, err: unknown) => {
-    const errorMsg = err instanceof Error ? err.message : "加载失败";
+    const errorMsg = err instanceof Error ? err.message : String(err ?? "");
     console.error(`[StoryList] 加载${label}失败:`, errorMsg, err);
-    if (isNotInstalledError(errorMsg)) {
-      setError("未安装或网络缓慢，请先同步数据");
-    } else {
-      setError("加载失败");
+
+    if (errorMsg === "TIMEOUT") {
+      setError({ kind: "timeout", label });
+      return;
     }
+    if (isNotInstalledError(errorMsg)) {
+      setError({ kind: "not-installed", label });
+      setInstalled(false);
+      return;
+    }
+    setError({ kind: "unknown", label, detail: errorMsg || undefined });
   }, []);
 
   const setSectionBusy = useCallback((key: SectionKey, busy: boolean) => {
@@ -425,7 +650,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
         if (cancelled) return;
         console.error("[StoryList] isInstalled 失败，回退到同步对话框:", e);
         setInstalled(false);
-        setError("未安装或网络缓慢，请先同步数据");
+        setError({ kind: "not-installed", label: "本地数据" });
         setSyncDialogOpen(true);
         setSectionBusy("main", false);
       }
@@ -478,7 +703,9 @@ export function StoryList({ onSelectStory }: StoryListProps) {
   // 唯一会变的时刻。（列表是 KeepAlive 常驻的，切 tab 不重新挂载，
   // 而 visibility:hidden 仍然占布局，IntersectionObserver 探测不到切换。）
   useEffect(() => {
-    const refresh = () => setProgressMap(readProgressPercentMap());
+    // 快照没变时 `getReadingProgress()` 返回同一个引用，setState 直接被
+    // React 丢弃——所以这几个高频事件不会引发任何重渲染。
+    const refresh = () => setProgress(getReadingProgress());
     refresh();
     window.addEventListener("focus", refresh);
     window.addEventListener("app:home-refresh", refresh);
@@ -533,19 +760,71 @@ export function StoryList({ onSelectStory }: StoryListProps) {
   // 搜索时默认展开所有命中分组；退出搜索或换分类时把用户的手动展开状态清掉。
   useEffect(() => {
     setOpenGroups({});
+    setBulkOpen(null);
   }, [hasSearch, activeCategory]);
 
   const isGroupOpen = useCallback(
     (key: string, fallbackOpen: boolean) => {
       const explicit = openGroups[key];
       if (explicit !== undefined) return explicit;
+      if (bulkOpen !== null) return bulkOpen;
       return hasSearch ? true : fallbackOpen;
     },
-    [hasSearch, openGroups]
+    [bulkOpen, hasSearch, openGroups]
   );
 
   const setGroupOpen = useCallback((key: string, open: boolean) => {
     setOpenGroups((prev) => ({ ...prev, [key]: open }));
+  }, []);
+
+  /** 批量展开 / 收起。逐条覆盖也要清掉，否则单独点过的分组不跟随。 */
+  const toggleBulkOpen = useCallback(() => {
+    setBulkOpen((prev) => !prev);
+    setOpenGroups({});
+  }, []);
+
+  /**
+   * 分组标题的键盘增强。Enter / Space 由 Collapsible 里的原生 `<button>`
+   * 负责（这也是不把标题做成 div 的原因），这里补上手风琴常见的方向键：
+   * 上下在标题间移动焦点，左右展开 / 收起。活动分类有两百多个分组，
+   * 靠 Tab 一格格走过去是不现实的。
+   *
+   * 只处理焦点落在标题按钮上的事件——条目行冒泡上来的按键不受影响。
+   */
+  const handleGroupListKeyDown = useCallback((event: ReactKeyboardEvent<HTMLDivElement>) => {
+    const target = event.target as HTMLElement | null;
+    if (!target || target.getAttribute("aria-expanded") === null) return;
+
+    const expanded = target.getAttribute("aria-expanded") === "true";
+    if (event.key === "ArrowRight" || event.key === "ArrowLeft") {
+      const shouldOpen = event.key === "ArrowRight";
+      if (expanded !== shouldOpen) {
+        event.preventDefault();
+        target.click();
+      }
+      return;
+    }
+
+    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+
+    const headers = Array.from(
+      event.currentTarget.querySelectorAll<HTMLElement>("[aria-expanded]")
+    );
+    const index = headers.indexOf(target);
+    if (index < 0) return;
+
+    const next =
+      event.key === "ArrowDown"
+        ? index + 1
+        : event.key === "ArrowUp"
+        ? index - 1
+        : event.key === "Home"
+        ? 0
+        : headers.length - 1;
+    const node = headers[Math.max(0, Math.min(headers.length - 1, next))];
+    if (!node || node === target) return;
+    event.preventDefault();
+    node.focus();
   }, []);
 
   const matchesSearch = useCallback(
@@ -746,6 +1025,26 @@ export function StoryList({ onSelectStory }: StoryListProps) {
   }, [activeCategory, favoriteCount, hasSearch, trimmedSearch, visibleStoryCount]);
 
   const openSync = useCallback(() => setSyncDialogOpen(true), []);
+  const clearSearch = useCallback(() => setSearchTerm(""), []);
+  const goToSettings = useCallback(() => {
+    window.dispatchEvent(new CustomEvent("app:go-tab", { detail: "settings" }));
+  }, []);
+  const goToFullTextSearch = useCallback(() => {
+    window.dispatchEvent(new CustomEvent("app:go-tab", { detail: "search" }));
+  }, []);
+  const browseMainStories = useCallback(() => setActiveCategory("main"), []);
+
+  /** 当前分类是否有数据块正在加载；重试按钮据此禁用。 */
+  const categoryBusy = CATEGORY_SECTIONS[activeCategory].some(
+    (section) => sectionLoading[section]
+  );
+
+  const retryActive = useCallback(() => {
+    setError(null);
+    // 主线要一起重来：收藏分组名依赖它的映射表。
+    void loadSection("main", true);
+    void loadCategory(activeCategory, true);
+  }, [activeCategory, loadCategory, loadSection]);
 
   const handleSyncSuccess = useCallback(async () => {
     setInstalled(true);
@@ -761,6 +1060,16 @@ export function StoryList({ onSelectStory }: StoryListProps) {
     setSyncDialogOpen(false);
   }, [activeCategory, loadCategory, loadSection]);
 
+  /**
+   * 行组件是 `memo` 的，所以传下去的回调必须是稳定引用，否则每次父级
+   * 重渲染（换一个字的搜索词、某一条简介回来了）都会把整屏卡片连同
+   * 缩略图一起重画。行内需要的 `story` 由行自己回传。
+   */
+  const handleToggleFavorite = useCallback(
+    (story: StoryEntry) => toggleFavorite(story),
+    [toggleFavorite]
+  );
+
   const renderStoryItem = useCallback(
     (story: StoryEntry, keyPrefix?: string) => (
       <StoryItem
@@ -768,23 +1077,23 @@ export function StoryList({ onSelectStory }: StoryListProps) {
         story={story}
         onSelectStory={onSelectStory}
         isFavorite={isFavorite(story.storyId)}
-        onToggleFavorite={() => toggleFavorite(story)}
+        onToggleFavorite={handleToggleFavorite}
         showSummary={showSummaries}
         summary={summaryCache[story.storyId]}
         summaryLoading={Boolean(summaryLoadingIds[story.storyId])}
         onRequestSummary={handleRequestSummary}
-        progress={progressMap[story.storyTxt]}
+        progress={progress.percent[story.storyTxt]}
       />
     ),
     [
       handleRequestSummary,
+      handleToggleFavorite,
       isFavorite,
       onSelectStory,
-      progressMap,
+      progress,
       showSummaries,
       summaryCache,
       summaryLoadingIds,
-      toggleFavorite,
     ]
   );
 
@@ -798,6 +1107,65 @@ export function StoryList({ onSelectStory }: StoryListProps) {
     [groups, installed, memoryStories.length, sectionLoading]
   );
 
+  /** 当前分组分类的列表（密录 / 收藏走各自的分支）。 */
+  const activeGroupedList =
+    activeCategory === "memory" || activeCategory === "favorites"
+      ? NO_GROUPS
+      : filteredGroups[activeCategory];
+
+  const groupReveal = useProgressiveList(activeGroupedList.length, {
+    initial: GROUPS_FIRST_CHUNK,
+    step: GROUPS_NEXT_CHUNK,
+    resetKey: `${activeCategory}|${normalizedSearch}`,
+    rootRef: scrollRootRef,
+  });
+
+  const memoryReveal = useProgressiveList(filteredMemoryStories.length, {
+    initial: ROWS_FIRST_CHUNK,
+    step: ROWS_NEXT_CHUNK,
+    resetKey: `memory|${normalizedSearch}`,
+    rootRef: scrollRootRef,
+  });
+
+  /** 只有真的存在多个分组时，「展开全部」才有意义。 */
+  const showBulkToggle =
+    installed === true &&
+    (activeCategory === "favorites"
+      ? favoriteGroupList.length + individualFavoriteGroups.length > 1
+      : activeGroupedList.length > 1);
+
+  /** 数据里根本没有这一类内容时的兜底：区分离线 / 在线给不同的下一步。 */
+  const renderMissingDataState = (label: string) => (
+    <EmptyState
+      icon={Inbox}
+      title={`本地数据里没有${label}`}
+      description={
+        online
+          ? "多半是本机数据包版本偏旧，重新同步一次通常就能补齐。"
+          : "当前设备离线，无法重新下载。可以导入一份离线 ZIP 数据包。"
+      }
+      actions={[
+        online
+          ? { label: "重新同步", onClick: openSync, icon: RefreshCw, variant: "default" }
+          : { label: "导入 ZIP", onClick: openSync, icon: ArrowDownToLine, variant: "default" },
+        { label: "重新加载", onClick: retryActive, icon: RotateCcw },
+      ]}
+    />
+  );
+
+  /** 搜索没命中：列表只匹配标题/编号，所以要把「去全文搜索」摆出来。 */
+  const renderNoSearchMatchState = (label: string) => (
+    <EmptyState
+      icon={Search}
+      title={`没有匹配“${trimmedSearch}”的${label}`}
+      description="这里只匹配标题与编号。要按正文内容找，请用底部「搜索」。"
+      actions={[
+        { label: "清除搜索", onClick: clearSearch, icon: X, variant: "default" },
+        { label: "去全文搜索", onClick: goToFullTextSearch, icon: Search },
+      ]}
+    />
+  );
+
   /** 四类分组的渲染完全同构，只有文案和收藏语义不同。 */
   const renderGroupedCategory = (key: GroupedKey) => {
     if (isSectionPending(key)) return <ListSkeleton />;
@@ -806,45 +1174,66 @@ export function StoryList({ onSelectStory }: StoryListProps) {
     const list = filteredGroups[key];
 
     if (list.length === 0) {
-      return (
-        <EmptyState
-          message={hasSearch ? meta.emptySearch : meta.emptyDefault}
-          actionLabel={hasSearch ? undefined : "去同步数据"}
-          onAction={hasSearch ? undefined : openSync}
-        />
-      );
+      if (hasSearch) return renderNoSearchMatchState(SECTION_LABELS[key]);
+      // 加载失败时上面那张错误卡已经解释过了，别再叠一句「没有数据」。
+      return error ? null : renderMissingDataState(SECTION_LABELS[key]);
     }
 
-    return list.map(([name, stories], index) => {
-      const fullStories = fullGroupMaps[key].get(name) ?? stories;
-      const groupId = `${meta.idPrefix}:${fullStories[0]?.storyGroup || name}`;
-      return (
-        <Collapsible
-          key={groupId}
-          title={name}
-          count={stories.length}
-          open={isGroupOpen(groupId, index === 0)}
-          onOpenChange={(open) => setGroupOpen(groupId, open)}
-          actions={
-            <GroupFavoriteButton
-              isFavorite={isGroupFavorite(groupId)}
-              onToggle={() =>
-                toggleFavoriteGroup({
-                  id: groupId,
-                  name,
-                  type: meta.favoriteType,
-                  stories: fullStories,
-                })
+    const shown = groupReveal.done ? list : list.slice(0, groupReveal.visible);
+
+    return (
+      <>
+        {shown.map(([name, stories], index) => {
+          const fullStories = fullGroupMaps[key].get(name) ?? stories;
+          const groupId = `${meta.idPrefix}:${fullStories[0]?.storyGroup || name}`;
+          const open = isGroupOpen(groupId, index === 0);
+          return (
+            <Collapsible
+              key={groupId}
+              title={name}
+              count={stories.length}
+              open={open}
+              onOpenChange={(next) => setGroupOpen(groupId, next)}
+              actions={
+                <GroupFavoriteButton
+                  isFavorite={isGroupFavorite(groupId)}
+                  onToggle={() =>
+                    toggleFavoriteGroup({
+                      id: groupId,
+                      name,
+                      type: meta.favoriteType,
+                      stories: fullStories,
+                    })
+                  }
+                  inactiveText={meta.favoriteInactive}
+                  activeText={meta.favoriteActive}
+                />
               }
-              inactiveText={meta.favoriteInactive}
-              activeText={meta.favoriteActive}
-            />
-          }
-        >
-          {stories.map((story) => renderStoryItem(story))}
-        </Collapsible>
-      );
-    });
+            >
+              {/* 折叠时连元素都不构造：活动分类有两百多个分组，光是把
+                  几千个 <StoryItem> 元素建出来再扔掉，每次输入一个搜索
+                  字符都要白烧一遍。 */}
+              {open ? (
+                <StoryRows
+                  stories={stories}
+                  listKey={`${groupId}|${normalizedSearch}`}
+                  renderStoryItem={renderStoryItem}
+                  rootRef={scrollRootRef}
+                />
+              ) : null}
+            </Collapsible>
+          );
+        })}
+        {!groupReveal.done && (
+          <RevealMore
+            sentinelRef={groupReveal.sentinelRef}
+            remaining={groupReveal.remaining}
+            unit="个分组"
+            onRevealAll={groupReveal.revealAll}
+          />
+        )}
+      </>
+    );
   };
 
   return (
@@ -853,6 +1242,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
         <CustomScrollArea
           className="h-full"
           viewportClassName="reader-scroll"
+          viewportRef={scrollRootRef}
           trackOffsetTop="calc(3.5rem + 10px)"
           trackOffsetBottom="calc(4.5rem + env(safe-area-inset-bottom, 0px))"
         >
@@ -877,19 +1267,35 @@ export function StoryList({ onSelectStory }: StoryListProps) {
                   </Button>
                 ))}
               </div>
-              {/* 顶部行：左侧摘要文本，右侧全局简介开关 */}
+              {/* 顶部行：左侧摘要文本（离线时带状态徽标），右侧是全局开关 */}
               <div className="flex items-center justify-between gap-3">
-                <span
-                  aria-live="polite"
-                  className="text-sm text-[hsl(var(--color-muted-foreground))]"
-                >
-                  {activeSummary}
+                <span className="flex min-w-0 items-center gap-2">
+                  <span
+                    aria-live="polite"
+                    className="truncate text-sm text-[hsl(var(--color-muted-foreground))]"
+                  >
+                    {activeSummary}
+                  </span>
+                  {!online && (
+                    <span
+                      title="设备当前离线，已同步的剧情仍可正常阅读"
+                      className="inline-flex flex-shrink-0 items-center gap-1 rounded-full border border-[hsl(var(--color-border))] px-2 py-0.5 text-[11px] text-[hsl(var(--color-muted-foreground))]"
+                    >
+                      <WifiOff className="h-3 w-3" aria-hidden="true" />
+                      离线
+                    </span>
+                  )}
                 </span>
-                <SummaryToggleButton
-                  enabled={showSummaries}
-                  onToggle={() => setShowSummaries(!showSummaries)}
-                  label="简介"
-                />
+                <div className="flex flex-shrink-0 items-center gap-2">
+                  {showBulkToggle && (
+                    <BulkToggleButton expanded={bulkOpen === true} onToggle={toggleBulkOpen} />
+                  )}
+                  <SummaryToggleButton
+                    enabled={showSummaries}
+                    onToggle={() => setShowSummaries(!showSummaries)}
+                    label="简介"
+                  />
+                </div>
               </div>
               {/* 第二行：搜索框独占一行 */}
               <div>
@@ -911,19 +1317,52 @@ export function StoryList({ onSelectStory }: StoryListProps) {
               </div>
             </div>
 
-            {error && (
-              <div className="flex flex-col items-start gap-3 rounded-2xl border border-[hsl(var(--color-destructive)/0.4)] bg-[hsl(var(--color-destructive)/0.06)] p-4">
-                <div className="text-sm text-[hsl(var(--color-destructive))]">{error}</div>
-                <Button className="min-h-[44px]" onClick={openSync}>
-                  <RefreshCw className="mr-2 h-4 w-4" />
-                  同步数据
-                </Button>
-              </div>
+            {/* 「没装数据」下面那块引导已经把话说全了，这里不再重复报一次警。 */}
+            {error && !(installed === false && error.kind === "not-installed") && (
+              <LoadErrorCard
+                error={error}
+                online={online}
+                busy={categoryBusy}
+                onRetry={retryActive}
+                onSync={openSync}
+                onOpenSettings={goToSettings}
+              />
             )}
 
+            {/* 没有本地数据时，列表区整块换成「怎么把数据装上」的引导：
+                这时候再铺一堆空分类的占位文案没有任何意义。 */}
+            {installed === false ? (
+              <EmptyState
+                icon={ArrowDownToLine}
+                title="本机还没有剧情数据"
+                description={
+                  online
+                    ? "首次使用需要同步一次剧情数据；装好之后可以完全离线阅读。"
+                    : "设备当前离线，无法从远端下载。可以先导入一份离线 ZIP 数据包，联网后再同步。"
+                }
+                actions={[
+                  online
+                    ? { label: "立即同步", onClick: openSync, icon: RefreshCw, variant: "default" }
+                    : {
+                        label: "导入 ZIP",
+                        onClick: openSync,
+                        icon: ArrowDownToLine,
+                        variant: "default",
+                      },
+                  { label: "打开设置", onClick: goToSettings, icon: Settings2 },
+                ]}
+              />
+            ) : (
             <div className="space-y-4">
               {activeCategory !== "memory" && activeCategory !== "favorites" && (
-                <div className="space-y-3">{renderGroupedCategory(activeCategory)}</div>
+                <div
+                  className="space-y-3"
+                  role="group"
+                  aria-label={`${CATEGORY_DESCRIPTIONS[activeCategory]}分组`}
+                  onKeyDown={handleGroupListKeyDown}
+                >
+                  {renderGroupedCategory(activeCategory)}
+                </div>
               )}
 
               {activeCategory === "memory" && (
@@ -931,13 +1370,26 @@ export function StoryList({ onSelectStory }: StoryListProps) {
                   {isSectionPending("memory") ? (
                     <ListSkeleton />
                   ) : filteredMemoryStories.length === 0 ? (
-                    <EmptyState
-                      message={hasSearch ? "没有匹配的密录剧情" : "暂无干员密录或需要同步"}
-                      actionLabel={hasSearch ? undefined : "去同步数据"}
-                      onAction={hasSearch ? undefined : openSync}
-                    />
+                    hasSearch ? (
+                      renderNoSearchMatchState("干员密录")
+                    ) : error ? null : (
+                      renderMissingDataState("干员密录")
+                    )
                   ) : (
-                    filteredMemoryStories.map((story) => renderStoryItem(story))
+                    <>
+                      {(memoryReveal.done
+                        ? filteredMemoryStories
+                        : filteredMemoryStories.slice(0, memoryReveal.visible)
+                      ).map((story) => renderStoryItem(story))}
+                      {!memoryReveal.done && (
+                        <RevealMore
+                          sentinelRef={memoryReveal.sentinelRef}
+                          remaining={memoryReveal.remaining}
+                          unit="篇密录"
+                          onRevealAll={memoryReveal.revealAll}
+                        />
+                      )}
+                    </>
                   )}
                 </div>
               )}
@@ -945,17 +1397,23 @@ export function StoryList({ onSelectStory }: StoryListProps) {
               {activeCategory === "favorites" &&
                 (favoriteCount > 0 ? (
                   favoriteGroupList.length > 0 || individualFavoriteGroups.length > 0 ? (
-                    <>
+                    <div
+                      className="space-y-4"
+                      role="group"
+                      aria-label="收藏分组"
+                      onKeyDown={handleGroupListKeyDown}
+                    >
                       {favoriteGroupList.map(
                         ({ groupId, displayName, allStories, visibleStories, type }, index) => {
                           const key = `favorite-group:${groupId}`;
+                          const open = isGroupOpen(key, index === 0);
                           return (
                             <Collapsible
                               key={key}
                               title={displayName}
                               count={visibleStories.length}
-                              open={isGroupOpen(key, index === 0)}
-                              onOpenChange={(open) => setGroupOpen(key, open)}
+                              open={open}
+                              onOpenChange={(next) => setGroupOpen(key, next)}
                               actions={
                                 <GroupFavoriteButton
                                   isFavorite
@@ -972,9 +1430,15 @@ export function StoryList({ onSelectStory }: StoryListProps) {
                                 />
                               }
                             >
-                              {visibleStories.map((story) =>
-                                renderStoryItem(story, "favorite-group")
-                              )}
+                              {open ? (
+                                <StoryRows
+                                  stories={visibleStories}
+                                  keyPrefix="favorite-group"
+                                  listKey={`${key}|${normalizedSearch}`}
+                                  renderStoryItem={renderStoryItem}
+                                  rootRef={scrollRootRef}
+                                />
+                              ) : null}
                             </Collapsible>
                           );
                         }
@@ -982,16 +1446,17 @@ export function StoryList({ onSelectStory }: StoryListProps) {
 
                       {individualFavoriteGroups.map(({ groupKey, displayName, stories }, index) => {
                         const key = `favorite-individual:${groupKey}`;
+                        const open = isGroupOpen(
+                          key,
+                          favoriteGroupList.length === 0 && index === 0
+                        );
                         return (
                           <Collapsible
                             key={key}
                             title={displayName}
                             count={stories.length}
-                            open={isGroupOpen(
-                              key,
-                              favoriteGroupList.length === 0 && index === 0
-                            )}
-                            onOpenChange={(open) => setGroupOpen(key, open)}
+                            open={open}
+                            onOpenChange={(next) => setGroupOpen(key, next)}
                             actions={
                               <GroupFavoriteButton
                                 isFavorite
@@ -1007,18 +1472,48 @@ export function StoryList({ onSelectStory }: StoryListProps) {
                               />
                             }
                           >
-                            {stories.map((story) => renderStoryItem(story, "favorite-individual"))}
+                            {open ? (
+                              <StoryRows
+                                stories={stories}
+                                keyPrefix="favorite-individual"
+                                listKey={`${key}|${normalizedSearch}`}
+                                renderStoryItem={renderStoryItem}
+                                rootRef={scrollRootRef}
+                              />
+                            ) : null}
                           </Collapsible>
                         );
                       })}
-                    </>
+                    </div>
+                  ) : hasSearch ? (
+                    renderNoSearchMatchState("收藏")
                   ) : (
-                    <EmptyState message={hasSearch ? "没有匹配的收藏" : "暂无收藏的剧情"} />
+                    <EmptyState
+                      icon={Star}
+                      title="收藏记录读不出来了"
+                      description="本机记录里还留着收藏计数，但内容已经对不上。重新收藏一次即可修复。"
+                      actions={[
+                        { label: "去看主线剧情", onClick: browseMainStories, icon: BookOpen },
+                      ]}
+                    />
                   )
                 ) : (
-                  <EmptyState message="暂无收藏的剧情，去剧情列表点星标就能收藏。" />
+                  <EmptyState
+                    icon={Star}
+                    title="还没有收藏任何剧情"
+                    description="条目右侧的星标可以单独收藏一章；分组标题右侧的星标能把整个章节或活动一次收进来。收藏会一直留在本机。"
+                    actions={[
+                      {
+                        label: "去看主线剧情",
+                        onClick: browseMainStories,
+                        icon: BookOpen,
+                        variant: "default",
+                      },
+                    ]}
+                  />
                 ))}
             </div>
+            )}
           </div>
         </CustomScrollArea>
       </main>
@@ -1029,6 +1524,182 @@ export function StoryList({ onSelectStory }: StoryListProps) {
         onClose={() => setSyncDialogOpen(false)}
         onSuccess={handleSyncSuccess}
       />
+    </div>
+  );
+}
+
+/**
+ * 一个分组内部的条目列表。分组通常只有十几条，超大分组（某些活动一口气
+ * 几十上百条）才会分批放出来——阈值以内连哨兵都不会渲染。
+ */
+function StoryRows({
+  stories,
+  keyPrefix,
+  listKey,
+  renderStoryItem,
+  rootRef,
+}: {
+  stories: StoryEntry[];
+  keyPrefix?: string;
+  /** 换搜索词 / 换分组时重新从第一批开始。 */
+  listKey: string;
+  renderStoryItem: (story: StoryEntry, keyPrefix?: string) => ReactNode;
+  rootRef: RefObject<HTMLElement | null>;
+}) {
+  const reveal = useProgressiveList(stories.length, {
+    initial: ROWS_FIRST_CHUNK,
+    step: ROWS_NEXT_CHUNK,
+    resetKey: listKey,
+    rootRef,
+  });
+
+  const shown = reveal.done ? stories : stories.slice(0, reveal.visible);
+
+  return (
+    <>
+      {shown.map((story) => renderStoryItem(story, keyPrefix))}
+      {!reveal.done && (
+        <RevealMore
+          sentinelRef={reveal.sentinelRef}
+          remaining={reveal.remaining}
+          unit="篇"
+          onRevealAll={reveal.revealAll}
+        />
+      )}
+    </>
+  );
+}
+
+/**
+ * 分批加载的哨兵。它同时是三样东西：滚动到附近就自动放出下一批的
+ * IntersectionObserver 目标、键盘用户可以直接按下的「全部展开」按钮、
+ * 以及「下面还有多少」的明确提示——列表不会假装自己已经到底了。
+ */
+function RevealMore({
+  sentinelRef,
+  remaining,
+  unit,
+  onRevealAll,
+}: {
+  sentinelRef: RefObject<HTMLDivElement | null>;
+  remaining: number;
+  unit: string;
+  onRevealAll: () => void;
+}) {
+  return (
+    <div ref={sentinelRef}>
+      <button
+        type="button"
+        onClick={onRevealAll}
+        className="flex min-h-[44px] w-full items-center justify-center gap-2 rounded-2xl border border-dashed border-[hsl(var(--color-border))] px-3 text-xs text-[hsl(var(--color-muted-foreground))] transition-colors hover:border-[hsl(var(--color-primary)/0.5)] hover:text-[hsl(var(--color-foreground))] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-[hsl(var(--color-primary))]"
+      >
+        <ChevronsUpDown className="h-3.5 w-3.5" aria-hidden="true" />
+        <span>
+          还有 {remaining} {unit} · 继续滚动自动加载，或点此全部展开
+        </span>
+      </button>
+    </div>
+  );
+}
+
+function BulkToggleButton({
+  expanded,
+  onToggle,
+}: {
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  const label = expanded ? "收起全部分组" : "展开全部分组";
+  const Icon = expanded ? ChevronsDownUp : ChevronsUpDown;
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      aria-pressed={expanded}
+      aria-label={label}
+      className="inline-flex min-h-[44px] flex-shrink-0 items-center gap-1.5 rounded-full border border-[hsl(var(--color-border))] px-3 py-1 text-xs text-[hsl(var(--color-muted-foreground))] transition-colors hover:bg-[hsl(var(--color-accent))] hover:text-[hsl(var(--color-foreground))]"
+    >
+      <Icon className="h-3.5 w-3.5" aria-hidden="true" />
+      <span className="whitespace-nowrap">{expanded ? "收起全部" : "展开全部"}</span>
+    </button>
+  );
+}
+
+/** 每种失败都有自己的说法和下一步，不再统一显示「加载失败」。 */
+function LoadErrorCard({
+  error,
+  online,
+  busy,
+  onRetry,
+  onSync,
+  onOpenSettings,
+}: {
+  error: LoadErrorState;
+  online: boolean;
+  busy: boolean;
+  onRetry: () => void;
+  onSync: () => void;
+  onOpenSettings: () => void;
+}) {
+  const copy =
+    error.kind === "timeout"
+      ? {
+          title: `读取${error.label}超时`,
+          description:
+            "后端还在扫描本地数据目录——刚同步完、正在重建索引时最容易碰上。等几秒再重试通常就好了。",
+        }
+      : error.kind === "not-installed"
+      ? {
+          title: "读不到本地剧情数据",
+          description: online
+            ? "数据目录不存在或已被清空，需要重新同步一次。"
+            : "数据目录不存在或已被清空。设备当前离线，可以先导入离线 ZIP 数据包。",
+        }
+      : {
+          title: `加载${error.label}失败`,
+          description: "本地数据可能不完整。先重试一次，仍然失败就重新同步一遍数据。",
+        };
+
+  return (
+    <div
+      role="alert"
+      className="space-y-3 rounded-2xl border border-[hsl(var(--color-destructive)/0.4)] bg-[hsl(var(--color-destructive)/0.06)] p-4"
+    >
+      <div className="flex items-start gap-3">
+        <TriangleAlert
+          className="mt-0.5 h-5 w-5 flex-shrink-0 text-[hsl(var(--color-destructive))]"
+          aria-hidden="true"
+        />
+        <div className="min-w-0 space-y-1">
+          <div className="text-sm font-medium text-[hsl(var(--color-destructive))]">
+            {copy.title}
+          </div>
+          <p className="text-sm text-[hsl(var(--color-muted-foreground))]">{copy.description}</p>
+          {error.detail && (
+            <p className="break-all text-xs text-[hsl(var(--color-muted-foreground)/0.8)]">
+              {error.detail}
+            </p>
+          )}
+        </div>
+      </div>
+      <div className="flex flex-wrap gap-2">
+        <Button className="min-h-[44px]" onClick={onRetry} disabled={busy}>
+          <RotateCcw className={`mr-2 h-4 w-4 ${busy ? "motion-safe:animate-spin" : ""}`} />
+          {busy ? "重试中…" : "重试"}
+        </Button>
+        <Button variant="outline" className="min-h-[44px]" onClick={onSync}>
+          {online ? (
+            <RefreshCw className="mr-2 h-4 w-4" />
+          ) : (
+            <ArrowDownToLine className="mr-2 h-4 w-4" />
+          )}
+          {online ? "同步数据" : "导入 ZIP"}
+        </Button>
+        <Button variant="outline" className="min-h-[44px]" onClick={onOpenSettings}>
+          <Settings2 className="mr-2 h-4 w-4" />
+          打开设置
+        </Button>
+      </div>
     </div>
   );
 }
@@ -1124,7 +1795,28 @@ function GroupFavoriteButton({
   );
 }
 
-function StoryItem({
+interface StoryItemProps {
+  story: StoryEntry;
+  onSelectStory: (story: StoryEntry) => void;
+  isFavorite: boolean;
+  onToggleFavorite: (story: StoryEntry) => void;
+  showSummary?: boolean;
+  summary?: string | null;
+  summaryLoading?: boolean;
+  onRequestSummary?: (story: StoryEntry) => void;
+  /** 阅读进度 0~1，来自共享的 `reading-progress` 快照。 */
+  progress?: number;
+}
+
+/**
+ * 列表行。`memo` 在这里是硬性要求，不是锦上添花：
+ *
+ * 一行要挂两个 `<StoryThumbnail>`（背景 + 缩略图），每个都带自己的
+ * token 解析与图片候选链。父级会因为搜索输入、某一条简介回来、收藏变化
+ * 而频繁重渲染，没有 `memo` 的话每次都要把整屏卡片连图片一起重画。
+ * 所有 props 要么是原语，要么是稳定引用，浅比较就足够。
+ */
+const StoryItem = memo(function StoryItem({
   story,
   onSelectStory,
   isFavorite,
@@ -1134,18 +1826,7 @@ function StoryItem({
   summaryLoading = false,
   onRequestSummary,
   progress,
-}: {
-  story: StoryEntry;
-  onSelectStory: (story: StoryEntry) => void;
-  isFavorite: boolean;
-  onToggleFavorite: () => void;
-  showSummary?: boolean;
-  summary?: string | null;
-  summaryLoading?: boolean;
-  onRequestSummary?: (story: StoryEntry) => void;
-  /** 阅读进度 0~1，来自 localStorage `reading-progress`。 */
-  progress?: number;
-}) {
+}: StoryItemProps) {
   useEffect(() => {
     if (!showSummary) return;
     if (!story.storyInfo) return;
@@ -1186,22 +1867,32 @@ function StoryItem({
     ? story.storyName.split("·")[0]?.trim() || null
     : null;
 
-  const progressPct =
-    typeof progress === "number" && progress > 0
-      ? Math.min(100, Math.max(1, Math.round(progress * 100)))
-      : 0;
+  const progressPct = toReadPercent(progress);
+  const finished = progressPct >= READ_FINISHED_PCT;
 
   return (
     <div
       role="button"
       tabIndex={0}
+      aria-label={[
+        story.storyCode,
+        story.storyName,
+        progressPct > 0 ? (finished ? "已读完" : `已读 ${progressPct}%`) : null,
+      ]
+        .filter(Boolean)
+        .join(" · ")}
       onClick={() => onSelectStory(story)}
       onKeyDown={(event) => {
+        // Space 必须 preventDefault，否则会连带把滚动容器翻一页。
         if (event.key === "Enter" || event.key === " ") {
           event.preventDefault();
           onSelectStory(story);
         }
       }}
+      /* `content-visibility` 让滚出视口的行跳过样式/布局/绘制，长列表里
+         省下的主线程时间比什么都实在；`auto` 的固有尺寸会记住上一次的
+         真实高度，所以滚动条不会来回跳。不支持的引擎直接忽略这两条。 */
+      style={{ contentVisibility: "auto", containIntrinsicSize: "auto 88px" }}
       className="story-card relative flex w-full gap-3 p-3 items-center text-left cursor-pointer overflow-hidden transition-all duration-200 ease-out hover:-translate-y-0.5 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[hsl(var(--color-primary))] motion-safe:animate-in motion-safe:fade-in-0"
     >
       {/* 卡片底层模糊背景：密录用干员立绘，其他类别复用 StoryThumbnail
@@ -1255,10 +1946,10 @@ function StoryItem({
             onClick={(event) => {
               event.preventDefault();
               event.stopPropagation();
-              onToggleFavorite();
+              onToggleFavorite(story);
             }}
             aria-pressed={isFavorite}
-            aria-label={isFavorite ? "取消收藏" : "收藏"}
+            aria-label={`${isFavorite ? "取消收藏" : "收藏"} ${story.storyName}`}
             /* 命中区固定 44×44（-my-2 抵消额外高度，避免撑开卡片行高），
                视觉上仍是那颗小星星——外层只负责触控，内层负责外观。 */
             className="-my-2 -mr-1 flex h-11 w-11 flex-shrink-0 items-center justify-center rounded-full"
@@ -1298,7 +1989,7 @@ function StoryItem({
               />
             </div>
             <span className="flex-shrink-0 text-[10px] tabular-nums text-[hsl(var(--color-muted-foreground))]">
-              {progressPct >= 99 ? "已读完" : `${progressPct}%`}
+              {finished ? "已读完" : `${progressPct}%`}
             </span>
           </div>
         )}
@@ -1327,25 +2018,61 @@ function StoryItem({
       </div>
     </div>
   );
+});
+
+interface EmptyStateAction {
+  label: string;
+  onClick: () => void;
+  icon?: LucideIcon;
+  variant?: "default" | "outline";
 }
 
+/**
+ * 空状态一律要说清三件事：现在是什么情况、为什么会这样、下一步点哪儿。
+ * 「暂无数据」这种话对用户没有任何帮助。
+ */
 function EmptyState({
-  message,
-  actionLabel,
-  onAction,
+  icon: Icon = Inbox,
+  title,
+  description,
+  actions = [],
 }: {
-  message: string;
-  actionLabel?: string;
-  onAction?: () => void;
+  icon?: LucideIcon;
+  title: string;
+  description?: string;
+  actions?: EmptyStateAction[];
 }) {
   return (
-    <div className="space-y-3 text-[hsl(var(--color-muted-foreground))] motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-300">
-      <div>{message}</div>
-      {actionLabel && onAction && (
-        <Button variant="outline" className="min-h-[44px]" onClick={onAction}>
-          <RefreshCw className="mr-2 h-4 w-4" />
-          {actionLabel}
-        </Button>
+    <div className="space-y-4 rounded-2xl border border-dashed border-[hsl(var(--color-border))] p-5 motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-300">
+      <div className="flex items-start gap-3">
+        <Icon
+          className="mt-0.5 h-5 w-5 flex-shrink-0 text-[hsl(var(--color-muted-foreground))]"
+          aria-hidden="true"
+        />
+        <div className="min-w-0 space-y-1">
+          <div className="text-sm font-medium text-[hsl(var(--color-foreground))]">{title}</div>
+          {description && (
+            <p className="text-sm text-[hsl(var(--color-muted-foreground))]">{description}</p>
+          )}
+        </div>
+      </div>
+      {actions.length > 0 && (
+        <div className="flex flex-wrap gap-2">
+          {actions.map((action) => {
+            const ActionIcon = action.icon;
+            return (
+              <Button
+                key={action.label}
+                variant={action.variant ?? "outline"}
+                className="min-h-[44px]"
+                onClick={action.onClick}
+              >
+                {ActionIcon && <ActionIcon className="mr-2 h-4 w-4" />}
+                {action.label}
+              </Button>
+            );
+          })}
+        </div>
       )}
     </div>
   );
