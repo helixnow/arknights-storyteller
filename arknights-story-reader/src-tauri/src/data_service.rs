@@ -48,7 +48,12 @@ const HTTP_OP_TIMEOUT: Duration = Duration::from_secs(60);
 /// v7 = segment post-processing de-dupes consecutive same-token `Image`
 ///      segments (matching what the reader renders) and roguelike stories
 ///      join the index; both shift stored segment indices.
-const INDEX_VERSION: i32 = 7;
+/// v8 = parser fixes change stored text and speakers: `]` inside quoted
+///      attribute values no longer truncates the tag (sticker text used to be
+///      dropped or mangled), single-quoted attributes are parsed (speaker
+///      names lose stray quotes, e.g. Magallan), and leftover junk after
+///      speaker-state commands is no longer indexed as narration.
+const INDEX_VERSION: i32 = 8;
 
 const META_TOTAL_COUNT: &str = "total_count";
 const META_SEGMENT_TOTAL: &str = "segment_total";
