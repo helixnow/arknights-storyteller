@@ -36,8 +36,10 @@ export function ThemeToggle() {
         <MonitorSmartphone className="h-[1.2rem] w-[1.2rem]" aria-hidden="true" />
       )}
       {/* 按钮本身的 aria-label 描述的是「下一步动作」，再补一个 live region
-          播报切换后的当前状态，读屏用户才知道点完落在了哪一档。 */}
-      <span className="sr-only" aria-live="polite">
+          播报切换后的当前状态，读屏用户才知道点完落在了哪一档。
+          aria-atomic 让读屏播报整句「当前主题：X」，否则只会念变化的
+          那个文本节点（"深色模式"），缺了上下文。 */}
+      <span className="sr-only" aria-live="polite" aria-atomic="true">
         当前主题：{current}
       </span>
     </Button>

@@ -58,7 +58,8 @@ export function digestToHex64(value: bigint): string {
 
 /**
  * 摘要缓存。同一篇剧情在阅读器里会反复卸载/重挂（返回列表再进来、换阅读
- * 模式），缓存能把整篇的重复计算省掉；按插入顺序淘汰，避免无限增长。
+ * 模式），缓存能把整篇的重复计算省掉；满了淘汰最久未使用的条目（LRU），
+ * 避免无限增长。
  */
 const DIGEST_CACHE_LIMIT = 4096;
 const digestCache = new Map<string, string>();
@@ -66,7 +67,13 @@ const digestCache = new Map<string, string>();
 /** 便捷封装：对文本做规范化 + 计算摘要 + 十六进制输出。 */
 export function segmentDigest(text: string): string {
   const cached = digestCache.get(text);
-  if (cached !== undefined) return cached;
+  if (cached !== undefined) {
+    // 命中即重插（LRU touch）：让常用条目排到淘汰队尾，反复进出同一篇
+    // 长剧情时不会被后来者按插入顺序挤掉。
+    digestCache.delete(text);
+    digestCache.set(text, cached);
+    return cached;
+  }
   const digest = digestToHex64(fnv1a64(normalizeForDigest(text)));
   if (digestCache.size >= DIGEST_CACHE_LIMIT) {
     const oldest = digestCache.keys().next();

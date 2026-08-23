@@ -28,9 +28,16 @@ function readStorage(): HighlightStore {
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
     if (raw) {
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === "object") {
-        return parsed as HighlightStore;
+      const parsed: unknown = JSON.parse(raw);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        // Keep only array values. A hand-edited / corrupted store must not
+        // be able to crash the `.map` over `store[storyPath]` downstream;
+        // per-element junk is filtered later by `normalizeEntry`.
+        const sanitized: HighlightStore = {};
+        for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+          if (Array.isArray(value)) sanitized[key] = value as HighlightLike[];
+        }
+        return sanitized;
       }
     }
   } catch {
@@ -39,12 +46,22 @@ function readStorage(): HighlightStore {
   return {};
 }
 
+function persistStore(store: HighlightStore): void {
+  try {
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
+  } catch {
+    // Quota / private mode: the write fails atomically, the previously
+    // stored value stays intact. Never write partial data.
+  }
+}
+
 function normalizeEntry(item: HighlightLike): HighlightEntry | null {
   if (typeof item === "number") {
     if (!Number.isFinite(item) || item < 0) return null;
     return { segmentIndex: Math.trunc(item) };
   }
   if (item && typeof item === "object" && typeof item.segmentIndex === "number") {
+    if (!Number.isFinite(item.segmentIndex)) return null;
     const segmentIndex = Math.trunc(item.segmentIndex);
     if (segmentIndex < 0) return null;
     return {
@@ -75,7 +92,8 @@ function normalizeEntry(item: HighlightLike): HighlightEntry | null {
  *   hottest path on rapid annotate / un-annotate.
  * - `setStore` persistence is debounced through a microtask so a burst of
  *   toggles (e.g. Ctrl-click on many rows) triggers one localStorage
- *   write, not one per toggle.
+ *   write, not one per toggle. A still-pending write is flushed on
+ *   unmount so navigating away right after a toggle never drops it.
  */
 export function useHighlights(storyPath: string, segmentDigests?: readonly string[]) {
   const [store, setStore] = useState<HighlightStore>(() => readStorage());
@@ -84,6 +102,8 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
   // clear land in the same microtask most of the time, so waiting one tick
   // lets us serialise only once per React commit.
   const persistTimerRef = useRef<number | null>(null);
+  // Latest store snapshot awaiting the debounced write; null when clean.
+  const pendingStoreRef = useRef<HighlightStore | null>(null);
   // 挂载时的第一次 effect 只会把刚读出来的内容原样写回，跳过它。
   const hydratedRef = useRef(false);
   useEffect(() => {
@@ -92,24 +112,39 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
       hydratedRef.current = true;
       return;
     }
+    pendingStoreRef.current = store;
     if (persistTimerRef.current !== null) {
       window.clearTimeout(persistTimerRef.current);
     }
     persistTimerRef.current = window.setTimeout(() => {
-      try {
-        window.localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
-      } catch {
-        // ignore quota errors
-      }
       persistTimerRef.current = null;
+      if (pendingStoreRef.current !== null) {
+        persistStore(pendingStoreRef.current);
+        pendingStoreRef.current = null;
+      }
     }, 0);
     return () => {
+      // Deps-change cleanup only disarms the timer — the next effect run
+      // re-arms it with the newer snapshot, so bursts still coalesce.
       if (persistTimerRef.current !== null) {
         window.clearTimeout(persistTimerRef.current);
         persistTimerRef.current = null;
       }
     };
   }, [store]);
+
+  // Unmount flush: if a debounced write is still pending when the reader
+  // unmounts (toggle a highlight, immediately navigate back), write it now
+  // instead of silently dropping the annotation.
+  useEffect(
+    () => () => {
+      if (pendingStoreRef.current !== null) {
+        persistStore(pendingStoreRef.current);
+        pendingStoreRef.current = null;
+      }
+    },
+    []
+  );
 
   // The raw entries as persisted. Always an array of (upgraded) objects.
   const entries = useMemo<HighlightEntry[]>(
@@ -135,6 +170,27 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
   }, [segmentDigests]);
 
   /**
+   * Map a persisted entry to its index in the currently-loaded story.
+   *
+   * Stay-in-place first: if the segment at the stored index still carries
+   * the same digest, keep it. Only when the content moved away do we fall
+   * back to the digest table (which maps to the first occurrence) — this
+   * keeps two highlights on identical paragraphs from collapsing onto one.
+   * Entries whose content vanished keep their stored index as-is.
+   */
+  const resolveEntryIndex = useCallback(
+    (entry: HighlightEntry): number => {
+      if (entry.digest && segmentDigests && segmentDigests.length > 0) {
+        if (segmentDigests[entry.segmentIndex] === entry.digest) return entry.segmentIndex;
+        const shifted = digestIndex?.get(entry.digest);
+        if (typeof shifted === "number") return shifted;
+      }
+      return entry.segmentIndex;
+    },
+    [segmentDigests, digestIndex]
+  );
+
+  /**
    * Effective highlight indices for the current story — remapped via the
    * digest table when available so annotations survive data-version
    * upgrades. Returned as `{ array, set }` so renderers and hot-path
@@ -143,13 +199,7 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
   const { highlightList, highlightSet } = useMemo(() => {
     const resolved = new Set<number>();
     for (const entry of entries) {
-      let effective = entry.segmentIndex;
-      if (digestIndex && entry.digest) {
-        const hit = digestIndex.get(entry.digest);
-        if (typeof hit === "number") {
-          effective = hit;
-        }
-      }
+      const effective = resolveEntryIndex(entry);
       if (segmentDigests && (effective < 0 || effective >= segmentDigests.length)) {
         continue;
       }
@@ -157,11 +207,36 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
     }
     const sorted = Array.from(resolved).sort((a, b) => a - b);
     return { highlightList: sorted, highlightSet: resolved };
-  }, [entries, digestIndex, segmentDigests]);
+  }, [entries, resolveEntryIndex, segmentDigests]);
 
   const isHighlighted = useCallback(
     (segmentIndex: number) => highlightSet.has(segmentIndex),
     [highlightSet]
+  );
+
+  /**
+   * Conservative self-healing applied whenever a story's list gets
+   * rewritten anyway (i.e. on toggle): fold a digest-confirmed shift into
+   * the stored index so a later update that drops this content still falls
+   * back to the last-seen position, and backfill the digest on legacy
+   * index-only entries (fingerprinting exactly the segment currently shown
+   * as highlighted). Entries whose digest matches nothing are left
+   * untouched — rebinding them to whatever now sits at their index would
+   * silently change what the user annotated.
+   */
+  const realignEntry = useCallback(
+    (entry: HighlightEntry): HighlightEntry => {
+      if (!segmentDigests || segmentDigests.length === 0) return entry;
+      if (entry.digest) {
+        if (segmentDigests[entry.segmentIndex] === entry.digest) return entry;
+        const shifted = digestIndex?.get(entry.digest);
+        if (typeof shifted === "number") return { segmentIndex: shifted, digest: entry.digest };
+        return entry;
+      }
+      const digest = segmentDigests[entry.segmentIndex];
+      return digest ? { segmentIndex: entry.segmentIndex, digest } : entry;
+    },
+    [segmentDigests, digestIndex]
   );
 
   /**
@@ -171,41 +246,42 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
    */
   const toggleHighlight = useCallback(
     (segmentIndex: number) => {
-      const digest = segmentDigests?.[segmentIndex];
+      // `segmentDigestMap` uses "" for unrecognised segment types — never
+      // persist that as a fingerprint.
+      const digest = segmentDigests?.[segmentIndex] || undefined;
       setStore((prev) => {
         const rawList = prev[storyPath] ?? [];
         const current: HighlightEntry[] = [];
         for (const item of rawList) {
           const n = normalizeEntry(item);
-          if (n) current.push(n);
+          if (n) current.push(realignEntry(n));
         }
 
         // Determine whether `segmentIndex` is currently highlighted under
         // the _effective_ (digest-remapped) index.
-        const effectiveIndexOf = (entry: HighlightEntry): number => {
-          if (digestIndex && entry.digest) {
-            const idx = digestIndex.get(entry.digest);
-            if (typeof idx === "number") return idx;
-          }
-          return entry.segmentIndex;
-        };
-
         let isPresent = false;
         for (const entry of current) {
-          if (effectiveIndexOf(entry) === segmentIndex) {
+          if (resolveEntryIndex(entry) === segmentIndex) {
             isPresent = true;
             break;
           }
         }
 
         const next = isPresent
-          ? current.filter((entry) => effectiveIndexOf(entry) !== segmentIndex)
+          ? current.filter((entry) => resolveEntryIndex(entry) !== segmentIndex)
           : [...current, { segmentIndex, digest }];
+        // Removing the last highlight drops the key entirely (same as
+        // `clearHighlights`) instead of leaving empty arrays behind.
+        if (next.length === 0) {
+          const copy = { ...prev };
+          delete copy[storyPath];
+          return copy;
+        }
         next.sort((a, b) => a.segmentIndex - b.segmentIndex);
         return { ...prev, [storyPath]: next };
       });
     },
-    [storyPath, segmentDigests, digestIndex]
+    [storyPath, segmentDigests, realignEntry, resolveEntryIndex]
   );
 
   const clearHighlights = useCallback(() => {

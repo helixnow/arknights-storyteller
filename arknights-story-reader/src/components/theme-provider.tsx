@@ -2,7 +2,7 @@ import {
   createContext,
   useCallback,
   useContext,
-  useEffect,
+  useLayoutEffect,
   useMemo,
   useState,
 } from "react"
@@ -99,7 +99,10 @@ export function ThemeProvider({
     return stored && THEME_COLORS.includes(stored) ? stored : "default"
   })
 
-  useEffect(() => {
+  /* 用 useLayoutEffect 而不是 useEffect：类名要和触发本次渲染的组件更新
+     落在同一帧里。否则切主题时读 context 的组件（如 ThemeToggle 图标）先
+     绘制新状态，根元素的 light/dark 下一帧才翻转，会闪一帧新旧混搭。 */
+  useLayoutEffect(() => {
     const root = window.document.documentElement
 
     if (theme !== "system") {
@@ -117,7 +120,7 @@ export function ThemeProvider({
     return () => mediaQuery.removeEventListener("change", handleChange)
   }, [theme])
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const root = window.document.documentElement
     root.dataset.themeColor = themeColor
     writeStorage(`${storageKey}-color`, themeColor)

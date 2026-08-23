@@ -5,6 +5,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import type { StoryEntry } from "@/types/story";
@@ -85,10 +86,15 @@ function sanitizeGroupMap(input: unknown): Record<string, FavoriteGroup> {
 
     if (storyIds.length === 0) continue;
 
+    // 逐字段收敛：id/name 必须是非空字符串，type 必须落在已知枚举内。
+    // localStorage 可能被旧版本或手改写入任意形状，脏值一律回落到安全默认。
     groups[groupId] = {
-      id: raw.id ?? groupId,
-      name: raw.name ?? groupId,
-      type: raw.type ?? "other",
+      id: typeof raw.id === "string" && raw.id ? raw.id : groupId,
+      name: typeof raw.name === "string" && raw.name ? raw.name : groupId,
+      type:
+        raw.type === "chapter" || raw.type === "activity" || raw.type === "memory"
+          ? raw.type
+          : "other",
       storyIds: Array.from(new Set(storyIds)),
       stories,
     };
@@ -158,10 +164,19 @@ export function FavoritesProvider({ children }: { children: ReactNode }) {
     return ids.size;
   }, [favorites.stories, groupedStoryIds]);
 
+  // 首帧的值就是刚从 localStorage 读出来的，回写没有意义；更糟的是：如果
+  // 读取因数据损坏回落到了空状态，这次回写会立刻用 `{}` 覆盖掉原始数据，
+  // 连恢复的机会都不留。跳过首帧，只有用户真正改动收藏后才落盘。
+  const hydratedRef = useRef(false);
   useEffect(() => {
+    if (!hydratedRef.current) {
+      hydratedRef.current = true;
+      return;
+    }
     try {
       window.localStorage.setItem(STORAGE_KEY, JSON.stringify(favorites));
     } catch (error) {
+      // setItem 失败是原子的：旧数据原样保留，本次改动只在会话内生效。
       console.warn("[Favorites] 写入本地收藏失败:", error);
     }
   }, [favorites]);

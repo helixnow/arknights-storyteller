@@ -37,12 +37,17 @@ const DEFAULT_PREFS: Prefs = {
   inlineImages: true,
 };
 
+/** 持久化数据只认真正的布尔值；字符串 / 数字等脏值一律回落到各自默认。 */
+function readBoolean(value: unknown, fallback: boolean): boolean {
+  return typeof value === "boolean" ? value : fallback;
+}
+
 function normalizePrefs(parsed: unknown): Prefs {
   const source = (parsed ?? {}) as Partial<Record<keyof Prefs, unknown>>;
   return {
-    showSummaries: Boolean(source.showSummaries),
-    minimalMode: Boolean(source.minimalMode),
-    inlineImages: source.inlineImages === false ? false : true,
+    showSummaries: readBoolean(source.showSummaries, DEFAULT_PREFS.showSummaries),
+    minimalMode: readBoolean(source.minimalMode, DEFAULT_PREFS.minimalMode),
+    inlineImages: readBoolean(source.inlineImages, DEFAULT_PREFS.inlineImages),
   };
 }
 

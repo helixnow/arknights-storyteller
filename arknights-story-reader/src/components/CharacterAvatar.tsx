@@ -35,11 +35,13 @@ function CharacterAvatarImpl({
   const resolvedName = name ?? (resolvedId ? resolver.resolveName(resolvedId) : null);
 
   const token = resolvedId ?? name ?? null;
+  // 名字里可能出现增补平面字符（生僻汉字等），`String#slice` 按 UTF-16
+  // 单元切会把代理对劈成两半、渲染成 "�"。先清洗掉标点再按码点取前两个。
   const initials =
     label ??
-    (resolvedName ?? "?")
-      .replace(/[^\p{L}\p{N}]/gu, "")
-      .slice(0, 2);
+    Array.from((resolvedName ?? "").replace(/[^\p{L}\p{N}]/gu, ""))
+      .slice(0, 2)
+      .join("");
 
   return (
     <AssetImage
@@ -56,7 +58,9 @@ function CharacterAvatarImpl({
         "character-avatar shrink-0 rounded-full ring-1 ring-[hsl(var(--color-border)/0.8)]",
         className
       )}
-      style={{ width: size, height: size, minWidth: size, ...style }}
+      // min 宽高双向钉死：flex 行里防压扁靠 minWidth，flex 列里防压瘪靠
+      // minHeight——图片加载前后盒子尺寸永远不变，不产生布局位移。
+      style={{ width: size, height: size, minWidth: size, minHeight: size, ...style }}
       fallback={
         <div
           className="character-avatar-monogram flex h-full w-full items-center justify-center rounded-full bg-[hsl(var(--color-secondary))] text-[hsl(var(--color-muted-foreground))] font-semibold tracking-wide select-none"

@@ -6,6 +6,11 @@ import { useEffect } from "react";
  *
  * The "migration ran" bit is a monotonic number, and every step only lists the
  * keys that step introduced, so bumping the version doesn't re-scan history.
+ *
+ * INVARIANT: every key listed in `CLEANUP_STEPS` must be dead — no live code
+ * may read or write it. Grep the codebase before adding a key here. Keys that
+ * a live feature still migrates from (e.g. the prefs hook upgrading its own
+ * v1 key) belong to that feature, not to this list.
  */
 const CLEANUP_SENTINEL_KEY = "arknights-legacy-cleanup-version";
 
@@ -30,7 +35,17 @@ type IdleWindow = Window & {
   cancelIdleCallback?: (handle: number) => void;
 };
 
+/**
+ * Session-level one-shot latch. The sentinel already makes cleanup one-shot
+ * across boots, but when writing it fails (private mode) a hook remount
+ * would otherwise re-scan every time; the latch caps it at once per session
+ * while the next boot still retries.
+ */
+let ranThisSession = false;
+
 function runCleanup(): void {
+  if (ranThisSession) return;
+  ranThisSession = true;
   try {
     const stored = Number.parseInt(window.localStorage.getItem(CLEANUP_SENTINEL_KEY) ?? "", 10);
     const ranVersion = Number.isFinite(stored) ? stored : 0;
@@ -39,6 +54,9 @@ function runCleanup(): void {
     for (const step of CLEANUP_STEPS) {
       if (step.version <= ranVersion) continue;
       for (const key of step.keys) {
+        // Belt-and-braces: a step must never be able to delete the sentinel
+        // itself, or cleanup would re-run on every boot.
+        if (key === CLEANUP_SENTINEL_KEY) continue;
         try {
           window.localStorage.removeItem(key);
         } catch {

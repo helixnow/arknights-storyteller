@@ -81,19 +81,26 @@ pub fn run() {
 
     builder
         .setup(|app| {
-            let app_data_dir = app
-                .path()
-                .app_data_dir()
-                .expect("Failed to get app data directory");
-
-            std::fs::create_dir_all(&app_data_dir).expect("Failed to create app data directory");
+            // 解析不出数据目录属于致命配置错误，交给 Tauri 的 setup 错误
+            // 通道上报；建目录失败则降级运行——后续每个命令都会把 IO
+            // 错误以字符串抛回前端，用户能看到具体原因而不是闪退。
+            let app_data_dir = app.path().app_data_dir()?;
+            if let Err(err) = std::fs::create_dir_all(&app_data_dir) {
+                eprintln!("[SETUP] 创建应用数据目录失败: {}", err);
+            }
 
             let data_service = DataService::new(app_data_dir);
 
             // 目录解析要读一份数兆的 story_review_table.json；趁 WebView 还在
             // 启动，先在后台把它嚼完，前端第一次拉列表就是缓存命中。
+            // 预热纯属优化：线程起不来或预热失败只记日志，绝不阻塞 UI。
             let warmup = data_service.clone();
-            std::thread::spawn(move || warmup.prewarm_catalog());
+            if let Err(err) = std::thread::Builder::new()
+                .name("catalog-prewarm".into())
+                .spawn(move || warmup.prewarm_catalog())
+            {
+                eprintln!("[SETUP] 目录预热线程启动失败: {}", err);
+            }
 
             app.manage(AppState {
                 data_service: Arc::new(Mutex::new(data_service)),
