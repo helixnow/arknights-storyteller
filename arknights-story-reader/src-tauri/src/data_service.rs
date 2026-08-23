@@ -1849,53 +1849,64 @@ impl DataService {
         // 每条都要过一遍 JSON + IPC，事件本身比下载还贵。整数百分比（总长
         // 未知时按整 MB）变化才发一条，整场下载至多一两百条。
         let mut last_tick = usize::MAX;
-        loop {
-            let bytes_read = response
-                .read(&mut buffer)
-                .map_err(|e| format!("Failed to read download stream: {}", e))?;
-            if bytes_read == 0 {
-                break;
+        let streamed = (|| -> Result<(), String> {
+            loop {
+                let bytes_read = response
+                    .read(&mut buffer)
+                    .map_err(|e| format!("Failed to read download stream: {}", e))?;
+                if bytes_read == 0 {
+                    break;
+                }
+                zip_file
+                    .write_all(&buffer[..bytes_read])
+                    .map_err(|e| format!("Failed to write zip data: {}", e))?;
+                downloaded += bytes_read;
+
+                let downloaded_mb = downloaded as f64 / 1_048_576.0;
+                if total_bytes > 0 {
+                    let percent = (downloaded as f64 / total_bytes as f64 * 100.0).min(100.0);
+                    let rounded = percent.round() as usize;
+                    if rounded != last_tick {
+                        last_tick = rounded;
+                        let total_mb = total_bytes as f64 / 1_048_576.0;
+                        emit_progress(
+                            app,
+                            "下载",
+                            rounded,
+                            100,
+                            format!("已下载 {:.1}/{:.1} MB", downloaded_mb, total_mb.max(0.1)),
+                        );
+                    }
+                } else {
+                    // 服务端没给 Content-Length，就没有百分比可言。以前这里一直
+                    // 报 0/100，进度条整场下载都钉在 0%；改成不确定态（total = 0），
+                    // 让前端只显示已下载的字节数。
+                    let whole_mb = downloaded >> 20;
+                    if whole_mb != last_tick {
+                        last_tick = whole_mb;
+                        emit_progress(app, "下载", 0, 0, format!("已下载 {:.1} MB", downloaded_mb));
+                    }
+                }
             }
             zip_file
-                .write_all(&buffer[..bytes_read])
-                .map_err(|e| format!("Failed to write zip data: {}", e))?;
-            downloaded += bytes_read;
-
-            let downloaded_mb = downloaded as f64 / 1_048_576.0;
-            if total_bytes > 0 {
-                let percent = (downloaded as f64 / total_bytes as f64 * 100.0).min(100.0);
-                let rounded = percent.round() as usize;
-                if rounded != last_tick {
-                    last_tick = rounded;
-                    let total_mb = total_bytes as f64 / 1_048_576.0;
-                    emit_progress(
-                        app,
-                        "下载",
-                        rounded,
-                        100,
-                        format!("已下载 {:.1}/{:.1} MB", downloaded_mb, total_mb.max(0.1)),
-                    );
-                }
-            } else {
-                // 服务端没给 Content-Length，就没有百分比可言。以前这里一直
-                // 报 0/100，进度条整场下载都钉在 0%；改成不确定态（total = 0），
-                // 让前端只显示已下载的字节数。
-                let whole_mb = downloaded >> 20;
-                if whole_mb != last_tick {
-                    last_tick = whole_mb;
-                    emit_progress(app, "下载", 0, 0, format!("已下载 {:.1} MB", downloaded_mb));
-                }
-            }
+                .flush()
+                .map_err(|e| format!("Failed to flush zip file: {}", e))
+        })();
+        // 半截 ZIP 是纯垃圾：断流/磁盘满时留着只会白占几百 MB（重试本就
+        // 整包重下、原地截断重写），用户放弃重试的话它就永远赖在磁盘上。
+        // 先关句柄再删——Windows 上删不掉还打开着的文件。
+        drop(zip_file);
+        if let Err(err) = streamed {
+            fs::remove_file(&zip_path).ok();
+            return Err(err);
         }
-        zip_file
-            .flush()
-            .map_err(|e| format!("Failed to flush zip file: {}", e))?;
 
         emit_progress(app, "下载", 100, 100, "下载完成");
-        self.extract_zip_at(&zip_path, parent_dir, Some(app))?;
+        let extracted = self.extract_zip_at(&zip_path, parent_dir, Some(app));
+        // 与手动导入的 extract_import_zip 同一取舍：解压无论成败，下载包都
+        // 已用完。失败时它多半是个坏包，留着既占磁盘也不能续用。
         fs::remove_file(&zip_path).ok();
-
-        Ok(())
+        extracted
     }
 
     fn extract_zip_at(
@@ -1913,6 +1924,31 @@ impl DataService {
         fs::create_dir_all(&extract_root)
             .map_err(|e| format!("Failed to create extract dir: {}", e))?;
 
+        let result = self.extract_zip_into(zip_path, &extract_root, app);
+
+        // 解压暂存树无论成败都不能留。失败时（坏包、解压中途 IO 错误、
+        // 换入失败）它是上百 MB 的半截垃圾，本来要等下一次同步开场才被
+        // 清理——用户放弃重试就永远占着磁盘；最常见的失败原因又恰是磁盘
+        // 满，残骸还会反过来堵死腾空间后的恢复余地。成功时数据集本体已
+        // 换进 data_dir，这里剩下的只是 __MACOSX 之类的包装残渣；数据集
+        // 根恰好是解压根且已被改名换走时目录已不存在，删除失败忽略即可。
+        fs::remove_dir_all(&extract_root).ok();
+        result?;
+
+        // 数据目录已经整个换掉，缓存的剧情目录立刻作废。
+        self.invalidate_catalog();
+        Ok(())
+    }
+
+    /// `extract_zip_at` 的主体：解压到已备好的空 `extract_root`，校验、
+    /// 剪枝并换入。拆出来是为了让调用方能在任何失败路径上统一清理
+    /// 暂存树（本方法内部的 `?` 提前返回不再各自负责收拾现场）。
+    fn extract_zip_into(
+        &self,
+        zip_path: &Path,
+        extract_root: &Path,
+        app: Option<&AppHandle>,
+    ) -> Result<(), String> {
         let zip_file = fs::File::open(zip_path)
             .map_err(|e| format!("Failed to open downloaded zip: {}", e))?;
         let mut archive =
@@ -1971,16 +2007,15 @@ impl DataService {
         // 集时换进去应用就是空的，必须保留已有 data_dir 让用户继续用旧
         // 数据。空文件同样算校验失败——半截下载解出来的壳子比旧数据更
         // 没用。
-        let extracted_root = if Self::holds_valid_dataset(&extract_root) {
-            extract_root.clone()
+        let extracted_root = if Self::holds_valid_dataset(extract_root) {
+            extract_root.to_path_buf()
         } else {
-            fs::read_dir(&extract_root)
+            fs::read_dir(extract_root)
                 .map_err(|e| format!("Failed to read extracted directory: {}", e))?
                 .filter_map(|entry| entry.ok())
                 .map(|entry| entry.path())
                 .find(|path| path.is_dir() && Self::holds_valid_dataset(path))
                 .ok_or_else(|| {
-                    fs::remove_dir_all(&extract_root).ok();
                     format!(
                         "ZIP 校验失败：缺少或为空 {}，已保留原有数据",
                         REVIEW_TABLE_REL
@@ -1992,12 +2027,7 @@ impl DataService {
         // 是数据集的大头，移动前先剪掉，省磁盘也省一次拷贝。
         Self::prune_unused_dirs(&extracted_root);
 
-        self.swap_in_extracted(&extracted_root)?;
-
-        fs::remove_dir_all(&extract_root).ok();
-        // 数据目录已经整个换掉，缓存的剧情目录立刻作废。
-        self.invalidate_catalog();
-        Ok(())
+        self.swap_in_extracted(&extracted_root)
     }
 
     /// 旧数据在换入期间的暂存目录（`<data_dir>_old`）。上一次换入若在
@@ -2280,7 +2310,13 @@ impl DataService {
 
         let temp_path = self.import_temp_zip_path()?;
         emit_progress(&app, "导入", 0, 100, "正在复制 ZIP 文件");
-        fs::copy(source_path, &temp_path).map_err(|e| format!("复制 ZIP 文件失败: {}", e))?;
+        if let Err(e) = fs::copy(source_path, &temp_path) {
+            // 复制中途失败（典型是磁盘满）会留下半截临时 ZIP；它和数据集
+            // 一个量级，没人会再用它，必须立刻删掉，别让残骸把本就不够的
+            // 磁盘占得更死。
+            fs::remove_file(&temp_path).ok();
+            return Err(format!("复制 ZIP 文件失败: {}", e));
+        }
 
         emit_progress(&app, "导入", 30, 100, "正在校验 ZIP 文件");
         self.finalize_manual_import(&temp_path, &app)
@@ -5367,6 +5403,51 @@ mod tests {
 
         assert!(fx.service.extract_zip_at(&zip_path, &parent, None).is_err());
         assert!(fx.service.is_installed());
+    }
+
+    /// 压根不是 ZIP 的文件（半截下载）：打开归档就失败。失败路径必须
+    /// 清掉刚建好的解压暂存目录——用户放弃重试时它不该赖在磁盘上。
+    #[test]
+    fn extract_cleans_staging_when_archive_is_unreadable() {
+        let fx = Fixture::new("zip_garbage");
+        let parent = fx.service.data_dir.parent().unwrap().to_path_buf();
+        let zip_path = parent.join("garbage.zip");
+        fs::write(&zip_path, b"this is not a zip archive").unwrap();
+
+        assert!(fx.service.extract_zip_at(&zip_path, &parent, None).is_err());
+        assert!(
+            !parent.join("ArknightsGameData_extract").exists(),
+            "打开归档失败后不得留下解压暂存目录"
+        );
+        assert!(fx.service.is_installed(), "失败不能伤及现有数据");
+    }
+
+    /// 解压中途出错（这里用「同名路径先是文件后当目录」制造确定性的 IO
+    /// 失败，现实中对应磁盘满/坏包）：已经解出来的半截树可达上百 MB，
+    /// 失败后必须整个清掉，不能等下一次同步开场才收尸。
+    #[test]
+    fn extract_cleans_staging_when_extraction_fails_midway() {
+        let fx = Fixture::new("zip_midfail");
+        let parent = fx.service.data_dir.parent().unwrap().to_path_buf();
+        let zip_path = parent.join("midfail.zip");
+        write_zip(
+            &zip_path,
+            &[
+                ("pkg/conflict", "occupies the path as a file"),
+                ("pkg/conflict/child.txt", "needs conflict to be a directory"),
+            ],
+        );
+
+        let err = fx
+            .service
+            .extract_zip_at(&zip_path, &parent, None)
+            .expect_err("路径冲突的包必须解压失败");
+        assert!(!err.is_empty());
+        assert!(
+            !parent.join("ArknightsGameData_extract").exists(),
+            "解压中途失败后不得留下半截暂存树"
+        );
+        assert!(fx.service.is_installed(), "失败不能伤及现有数据");
     }
 
     #[test]

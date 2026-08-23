@@ -33,8 +33,20 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             open_install_permission_settings
         ])
         .setup(|app, api| {
-            let updater = AndroidUpdater::init(app, api)?;
-            app.manage(updater);
+            // 注册失败时不要把错误往上抛：插件 setup 返回 Err 会让整个
+            // Tauri 应用启动失败（lib.rs 的 run().expect 直接 panic 闪退），
+            // 用户连剧情都读不了。这里只是不 manage 状态，后续命令经
+            // try_state 拿不到句柄时返回 STATE_MISSING_ERROR——这正是
+            // 文件头承诺的降级路径（与 image_sharer.rs 的处理一致）。
+            match AndroidUpdater::init(app, api) {
+                Ok(updater) => {
+                    app.manage(updater);
+                }
+                Err(_err) => {
+                    #[cfg(debug_assertions)]
+                    eprintln!("[apk-updater] 注册 Android 插件失败：{_err}");
+                }
+            }
             Ok(())
         })
         .build()

@@ -245,7 +245,10 @@ export const ReaderSettingsPanel = memo(function ReaderSettingsPanel({
                   display={`${settings.fontSize}px`}
                   min={14}
                   max={32}
-                  step={2}
+                  // 默认字号 19 必须落在步进格点上。之前 step 是 2（格点
+                  // 14/16/…/32），range 元素会把 19 就近取整成 20 显示——
+                  // 标签写 19px、滑块停在 20，且拖动后再也回不到默认值。
+                  step={1}
                   value={settings.fontSize}
                   onChange={(v) => onUpdateSettings({ fontSize: v })}
                   minLabel="小"
