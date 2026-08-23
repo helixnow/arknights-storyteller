@@ -124,8 +124,16 @@ fn portrait_candidates(token: &str) -> Vec<String> {
     out
 }
 
+/// 去掉剧情脚本里插画 token 的 `$` 前缀。
+///
+/// 只削一层：assetUrls.ts 用的是 `/^\$/` 单次替换，`trim_start_matches`
+/// 会把 `$$bg_xxx` 一路削光，两边就会去请求不同的 URL。
+fn strip_dollar(token: &str) -> &str {
+    token.strip_prefix('$').unwrap_or(token)
+}
+
 fn avg_candidates(token: &str) -> Vec<String> {
-    let t = token.trim_start_matches('$');
+    let t = strip_dollar(token);
     vec![
         format!("{}/avgs/{}.png", FEXLI, t),
         format!("{}/avgs/bg/{}.png", FEXLI, t),
@@ -134,7 +142,7 @@ fn avg_candidates(token: &str) -> Vec<String> {
 }
 
 fn background_candidates(token: &str) -> Vec<String> {
-    let t = token.trim_start_matches('$');
+    let t = strip_dollar(token);
     // fexli 仓库里大多数背景在 `avgs/bg/<token>.png` 子目录，少部分老的在
     // `avgs/<token>.png` 根目录。按命中率排序。
     vec![
@@ -146,9 +154,12 @@ fn background_candidates(token: &str) -> Vec<String> {
 
 /// 去掉图片扩展名。与 assetUrls.ts 的 `/\.(png|jpg|jpeg|webp)$/i` 对齐：
 /// 只削最后一层、大小写不敏感，不像 `trim_end_matches` 那样反复削。
+///
+/// 长度用 `>=` 判断：token 正好等于 `.png` 时 JS 正则同样会削成空串，
+/// 用 `>` 会留下 `.png` 再拼一次后缀，两边的候选就对不上了。
 fn strip_image_ext(token: &str) -> &str {
     for ext in [".png", ".jpg", ".jpeg", ".webp"] {
-        if token.len() > ext.len() {
+        if token.len() >= ext.len() {
             let (head, tail) = token.split_at(token.len() - ext.len());
             if tail.eq_ignore_ascii_case(ext) {
                 return head;
@@ -274,6 +285,30 @@ mod tests {
         // 扩展名只削一层、大小写不敏感。
         let out = activity_kv_candidates("act17side_entrypic.PNG");
         assert_eq!(out[0], format!("{FEXLI}/kvimg/act17side_entrypic.png"));
+    }
+
+    #[test]
+    fn dollar_prefix_is_stripped_exactly_once() {
+        // 剧情脚本里的 `$bg_xxx`：削掉一个 `$` 就是真正的素材名。
+        let out = avg_candidates("$avg_npc_001");
+        assert_eq!(out[0], format!("{FEXLI}/avgs/avg_npc_001.png"));
+
+        // 多个 `$` 时只削一层——assetUrls.ts 的 `/^\$/` 也只削一层，
+        // 削多了两边就会请求不同的 URL。
+        let out = background_candidates("$$bg_rhodes");
+        assert_eq!(out[0], format!("{FEXLI}/avgs/bg/$bg_rhodes.png"));
+    }
+
+    #[test]
+    fn strip_image_ext_matches_the_js_regex() {
+        assert_eq!(strip_image_ext("act17side_entrypic.png"), "act17side_entrypic");
+        assert_eq!(strip_image_ext("cover.JPEG"), "cover");
+        // 只削最后一层。
+        assert_eq!(strip_image_ext("cover.png.webp"), "cover.png");
+        // 不是图片后缀的不动。
+        assert_eq!(strip_image_ext("kv_main.v2"), "kv_main.v2");
+        // token 本身就是个裸后缀：JS 正则会削成空串，这里必须一致。
+        assert_eq!(strip_image_ext(".png"), "");
     }
 
     #[test]

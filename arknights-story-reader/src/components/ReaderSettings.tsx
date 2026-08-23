@@ -1,4 +1,4 @@
-import { memo, useCallback, useId } from "react";
+import { memo, useCallback, useId, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { Button } from "@/components/ui/button";
 import { CustomScrollArea } from "@/components/ui/custom-scroll-area";
 import {
@@ -78,6 +78,25 @@ export const ReaderSettingsPanel = memo(function ReaderSettingsPanel({
   onReset,
 }: ReaderSettingsProps) {
   const { rendered, state } = useSidePanel({ open, onClose });
+  const fontGroupLabelId = useId();
+
+  /*
+   * `useSidePanel` 的 Esc 监听会主动放过 INPUT，免得抢走输入框里「取消输入」
+   * 的语义。但本面板里的 INPUT 全是滑杆：拖完字号后焦点就停在滑杆上，此时
+   * 按 Esc 关不掉抽屉，键盘用户只能再 Tab 一圈去找关闭键。这里在面板内部
+   * 补一条：焦点落在滑杆上时 Esc 同样关闭。
+   */
+  const handleContentKeyDown = useCallback(
+    (event: ReactKeyboardEvent<HTMLDivElement>) => {
+      if (event.key !== "Escape" || event.defaultPrevented) return;
+      const target = event.target as HTMLElement | null;
+      if (!(target instanceof HTMLInputElement) || target.type !== "range") return;
+      event.preventDefault();
+      onClose();
+    },
+    [onClose]
+  );
+
   if (!rendered) return null;
 
   return (
@@ -112,13 +131,13 @@ export const ReaderSettingsPanel = memo(function ReaderSettingsPanel({
       />
 
       <CustomScrollArea className="flex-1 min-h-0" viewportClassName="reader-scroll">
-        <div className="px-4 pt-3 pb-8 space-y-5">
+        <div className="px-4 pt-3 pb-8 space-y-5" onKeyDown={handleContentKeyDown}>
           {/* 阅读模式 ----------------------------------------- */}
           <section className="space-y-2">
             <SheetSectionLabel>
               阅读模式 · <span className="font-normal opacity-70">选择适合你场景的阅读方式</span>
             </SheetSectionLabel>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            <div role="group" aria-label="阅读模式" className="grid grid-cols-1 sm:grid-cols-2 gap-2">
               {READING_MODES.map((mode) => {
                 const active = settings.readingMode === mode.value;
                 return (
@@ -144,7 +163,7 @@ export const ReaderSettingsPanel = memo(function ReaderSettingsPanel({
             <SheetSectionLabel>
               阅读主题 · <span className="font-normal opacity-70">仅作用于阅读器背景与文字</span>
             </SheetSectionLabel>
-            <div className="grid grid-cols-5 gap-2">
+            <div role="group" aria-label="阅读主题" className="grid grid-cols-5 gap-2">
               {READER_THEMES.map((t) => {
                 const active = settings.theme === t.value;
                 return (
@@ -179,10 +198,19 @@ export const ReaderSettingsPanel = memo(function ReaderSettingsPanel({
             <SheetGroup padded>
               <div className="space-y-5">
                 <div className="space-y-2">
-                  <label className="text-sm font-medium text-[hsl(var(--color-foreground))]">
+                  {/* 这一组是按钮而不是表单控件，用 group + aria-labelledby 关联，
+                      比一个指不到任何 id 的 <label> 更准确。 */}
+                  <div
+                    id={fontGroupLabelId}
+                    className="text-sm font-medium text-[hsl(var(--color-foreground))]"
+                  >
                     字体
-                  </label>
-                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                  </div>
+                  <div
+                    role="group"
+                    aria-labelledby={fontGroupLabelId}
+                    className="grid grid-cols-2 sm:grid-cols-3 gap-2"
+                  >
                     {FONT_FAMILIES.map((font) => {
                       const active = settings.fontFamily === font.value;
                       return (
@@ -261,7 +289,7 @@ export const ReaderSettingsPanel = memo(function ReaderSettingsPanel({
             </SheetSectionLabel>
             <SheetGroup padded>
               <div className="space-y-4">
-                <div className="grid grid-cols-2 gap-2">
+                <div role="group" aria-label="文本对齐方式" className="grid grid-cols-2 gap-2">
                   {ALIGN_OPTIONS.map((option) => {
                     const active = settings.textAlign === option.value;
                     return (

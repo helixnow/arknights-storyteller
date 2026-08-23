@@ -25,12 +25,33 @@ const NPC_AVATAR_OVERRIDES: Record<string, string[]> = {
   "希尔达": ["/avatars/npc/hierda.png"],
 };
 
+/**
+ * 从普通对象里安全取字符串值。剧情脚本里的说话人名字直接当 key 用，
+ * 碰上 `constructor` / `toString` 这类名字时 `obj[key]` 会摸到原型链上的
+ * 函数，下游把它当 URL 拼进 `<img src>`。只认自有属性 + 字符串值。
+ */
+function ownString(
+  table: Record<string, string> | null | undefined,
+  key: string
+): string | null {
+  if (!table) return null;
+  if (!Object.prototype.hasOwnProperty.call(table, key)) return null;
+  const value = table[key];
+  return typeof value === "string" && value ? value : null;
+}
+
+function npcOverride(token: string): string[] | null {
+  if (!Object.prototype.hasOwnProperty.call(NPC_AVATAR_OVERRIDES, token)) return null;
+  const urls = NPC_AVATAR_OVERRIDES[token];
+  return Array.isArray(urls) && urls.length > 0 ? urls : null;
+}
+
 function resolveCharId(token: string, index: CharacterIndex | null): string | null {
   if (token.startsWith("char_")) {
     return token.split("#")[0] ?? token;
   }
   if (!index) return null;
-  const exact = index.nameToCharId[token];
+  const exact = ownString(index.nameToCharId, token);
   if (exact) return exact;
   // alias 兜底：干员密录等场景会传 `char_{num}_{alias}` 的 alias 部分
   // （如 `kroos`、`amgoat`）。按 index 快照动态构造反向表并缓存，
@@ -58,9 +79,8 @@ function getAliasMap(index: CharacterIndex): Map<string, string> {
 
 function avatarCandidates(token: string, index: CharacterIndex | null): string[] {
   // 优先检查 NPC 头像覆盖表（这些角色没有 char_ ID）
-  if (NPC_AVATAR_OVERRIDES[token]) {
-    return NPC_AVATAR_OVERRIDES[token];
-  }
+  const override = npcOverride(token);
+  if (override) return override;
   const cid = resolveCharId(token, index);
   if (!cid) return [];
   return [
@@ -74,9 +94,8 @@ function avatarCandidates(token: string, index: CharacterIndex | null): string[]
 
 function portraitCandidates(token: string, index: CharacterIndex | null): string[] {
   // NPC 没有 char_ ID，也就没有精二/精一立绘，只能复用覆盖表里那张图。
-  if (NPC_AVATAR_OVERRIDES[token]) {
-    return NPC_AVATAR_OVERRIDES[token];
-  }
+  const override = npcOverride(token);
+  if (override) return override;
   const cid = resolveCharId(token, index);
   if (!cid) return [];
   // 精二立绘优先（`_2`），没有时回落到精一（`_1`）。少数干员（3 星及
@@ -188,15 +207,23 @@ function chapterCoverCandidates(token: string): string[] {
 // 404 的封面会在两条渲染路径上各失败一次。
 // ─────────────────────────────────────────────────────────────
 
-/** 本进程内已确认加载失败的具体 URL。 */
+/**
+ * 本进程内已确认加载失败的具体 URL。素材 404 是永久事实（镜像仓库不会
+ * 凭空长出图），所以只记不删；但长会话里翻遍全部剧情也可能攒到上万条，
+ * 到顶后按插入顺序丢掉最老的一批。
+ */
 const deadUrls = new Set<string>();
+const DEAD_URL_LIMIT = 8000;
+const DEAD_URL_EVICT = 2000;
 
 /** 至少成功返回过一张图的 host。这类 host 永不熔断。 */
 const provenHosts = new Set<string>();
 
 interface HostStrike {
-  /** 自上次成功以来的连续失败次数。 */
+  /** 观察窗口内的失败次数。 */
   failures: number;
+  /** 窗口内最后一次失败的时间戳（ms）。 */
+  lastFailureAt: number;
   /** 熔断到期时间戳（ms）；0 表示未熔断。 */
   blockedUntil: number;
   /** 已熔断次数，用于指数退避。 */
@@ -213,6 +240,14 @@ const hostStrikes = new Map<string, HostStrike>();
 const HOST_FAILURE_THRESHOLD = 8;
 const HOST_BLOCK_BASE_MS = 30_000;
 const HOST_BLOCK_MAX_MS = 10 * 60_000;
+/**
+ * 失败计数的观察窗口。断网时几十张卡会在同一秒内集体失败，这正是要熔断的
+ * 场景；而「翻了半小时剧情、零散撞上 8 张缺图」不是——超过窗口就重新计数，
+ * 否则一个健康但素材不全的镜像迟早会被误伤。
+ */
+const HOST_FAILURE_WINDOW_MS = 15_000;
+/** 熔断窗口结束后再安静这么久，就把指数退避的档位清零。 */
+const HOST_STRIKE_DECAY_MS = 5 * 60_000;
 
 /** 取 URL 的 host。相对路径（`/bundled/...`）返回 null —— 本地素材不熔断。 */
 function hostOf(url: string): string | null {
@@ -231,26 +266,59 @@ function hostOf(url: string): string | null {
  */
 export function isAssetUrlDead(url: string): boolean {
   if (deadUrls.has(url)) return true;
+  return hostBlockedUntil(url) > Date.now();
+}
+
+/** host 的熔断到期时间；未熔断（或本地素材 / 已证明可达）返回 0。 */
+function hostBlockedUntil(url: string): number {
   const host = hostOf(url);
-  if (!host || provenHosts.has(host)) return false;
-  const strike = hostStrikes.get(host);
-  return strike !== undefined && strike.blockedUntil > Date.now();
+  if (!host || provenHosts.has(host)) return 0;
+  return hostStrikes.get(host)?.blockedUntil ?? 0;
 }
 
 /** 记一次加载失败，必要时熔断整个 host。 */
 export function markAssetUrlDead(url: string): void {
+  // 同一条 URL 只计一次账。一张封面同时出现在列表缩略图和卡片背景里，
+  // 两条渲染路径会各报一次 error；重复计数会让阈值形同虚设。
+  if (deadUrls.has(url)) return;
+  if (deadUrls.size >= DEAD_URL_LIMIT) evictOldestDeadUrls();
   deadUrls.add(url);
+
   const host = hostOf(url);
   if (!host || provenHosts.has(host)) return;
-  const strike = hostStrikes.get(host) ?? { failures: 0, blockedUntil: 0, strikes: 0 };
+  const now = Date.now();
+  const strike = hostStrikes.get(host) ?? {
+    failures: 0,
+    lastFailureAt: 0,
+    blockedUntil: 0,
+    strikes: 0,
+  };
+  // 窗口外的旧账不参与判定，零散 404 攒不出熔断。
+  if (now - strike.lastFailureAt > HOST_FAILURE_WINDOW_MS) strike.failures = 0;
+  if (strike.blockedUntil && now - strike.blockedUntil > HOST_STRIKE_DECAY_MS) strike.strikes = 0;
   strike.failures += 1;
+  strike.lastFailureAt = now;
+  hostStrikes.set(host, strike);
+
   if (strike.failures >= HOST_FAILURE_THRESHOLD) {
     strike.failures = 0;
     strike.strikes += 1;
     strike.blockedUntil =
-      Date.now() + Math.min(HOST_BLOCK_BASE_MS * 2 ** (strike.strikes - 1), HOST_BLOCK_MAX_MS);
+      now + Math.min(HOST_BLOCK_BASE_MS * 2 ** (strike.strikes - 1), HOST_BLOCK_MAX_MS);
+    // 熔断窗口结束时叫醒还在显示兜底色块的组件，让它们再试一次；
+    // 否则一次断网会把已挂载的卡片永久钉死在渐变上。
+    scheduleHealthNotice(strike.blockedUntil);
   }
-  hostStrikes.set(host, strike);
+}
+
+/** Set 保持插入顺序，直接从头删就是「最早记录的失败」。 */
+function evictOldestDeadUrls() {
+  let removed = 0;
+  for (const url of deadUrls) {
+    deadUrls.delete(url);
+    removed += 1;
+    if (removed >= DEAD_URL_EVICT) break;
+  }
 }
 
 /**
@@ -260,8 +328,11 @@ export function markAssetUrlDead(url: string): void {
 export function markAssetUrlAlive(url: string): void {
   const host = hostOf(url);
   if (!host) return;
+  if (provenHosts.has(host)) return;
   provenHosts.add(host);
   hostStrikes.delete(host);
+  // 这个源刚被证明可达：之前因它熔断而放弃的候选现在值得重试。
+  notifyAssetHealth();
 }
 
 /**
@@ -277,6 +348,68 @@ export function pickLiveCandidate(
     if (!isAssetUrlDead(url)) return { url, index: i };
   }
   return null;
+}
+
+/**
+ * 候选全被跳过时，判断这是「暂时的」还是「已经没救了」：只要还有一条
+ * URL 本身没失败过、仅仅是所属 host 在熔断窗口内，就还有翻盘机会。
+ * 调用方据此决定是订阅健康事件等待重试，还是直接报告 exhausted。
+ */
+export function hasRecoverableCandidate(candidates: string[], from = 0): boolean {
+  const now = Date.now();
+  for (let i = Math.max(0, from); i < candidates.length; i += 1) {
+    const url = candidates[i];
+    if (deadUrls.has(url)) continue;
+    if (hostBlockedUntil(url) > now) return true;
+  }
+  return false;
+}
+
+// ─────────────────────────────────────────────────────────────
+// 健康度变更广播
+//
+// 熔断窗口到期 / 某个源首次被证明可达时，界面上那些已经退化成渐变兜底的
+// 组件需要一次重试机会。用一个共享的订阅表 + 一个共享定时器，而不是每个
+// 组件各自 setTimeout —— 一屏几百张卡时后者会排出几百个定时器。
+// ─────────────────────────────────────────────────────────────
+
+const healthSubscribers = new Set<() => void>();
+let healthVersion = 0;
+let healthTimer: ReturnType<typeof setTimeout> | null = null;
+let healthTimerAt = 0;
+
+function notifyAssetHealth() {
+  healthVersion += 1;
+  healthSubscribers.forEach((notify) => {
+    try {
+      notify();
+    } catch {}
+  });
+}
+
+function scheduleHealthNotice(at: number) {
+  // 已经有一个更早（或同时）的唤醒计划就不必重排。
+  if (healthTimer !== null && healthTimerAt <= at) return;
+  if (healthTimer !== null) clearTimeout(healthTimer);
+  healthTimerAt = at;
+  healthTimer = setTimeout(() => {
+    healthTimer = null;
+    healthTimerAt = 0;
+    notifyAssetHealth();
+  }, Math.max(0, at - Date.now()) + 50);
+}
+
+/** 订阅「候选健康度可能变好了」事件。返回取消订阅函数。 */
+export function subscribeAssetHealth(onChange: () => void): () => void {
+  healthSubscribers.add(onChange);
+  return () => {
+    healthSubscribers.delete(onChange);
+  };
+}
+
+/** 供 `useSyncExternalStore` 用的快照。 */
+export function getAssetHealthVersion(): number {
+  return healthVersion;
 }
 
 /** 素材兜底色块的 hue。同一 seed 在任何组件里都得到同一个颜色。 */

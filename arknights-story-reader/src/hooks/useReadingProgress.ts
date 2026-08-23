@@ -91,6 +91,17 @@ function isWorthPersisting(next: ReadingProgress, last: ReadingProgress | null):
   return Math.abs((next.scrollTop ?? 0) - (last.scrollTop ?? 0)) >= MIN_SCROLL_DELTA_PX;
 }
 
+export interface UseReadingProgressOptions {
+  /**
+   * 是否让 `progress` 跟着每次落盘更新。
+   *
+   * 默认 `true`（列表 / 卡片这类要跟着进度重画的地方需要）。阅读器只在挂载
+   * 时读一次初始值、之后一律走 `getProgress()`，把它关掉就能省掉「滚动中
+   * 每 1.2s 冲刷一次 → 整棵阅读器重渲染一次」的开销。
+   */
+  trackState?: boolean;
+}
+
 /**
  * 每篇剧情的阅读进度。
  *
@@ -100,7 +111,10 @@ function isWorthPersisting(next: ReadingProgress, last: ReadingProgress | null):
  * 冲刷时同步——阅读器只在「换篇 / 换模式」时读它，按帧更新 state 只会让
  * 上千段的正文跟着重渲染。
  */
-export function useReadingProgress(storyPath: string | null) {
+export function useReadingProgress(
+  storyPath: string | null,
+  options?: UseReadingProgressOptions
+) {
   const [progress, setProgress] = useState<ReadingProgress | null>(() => {
     if (!storyPath) return null;
     return readProgressMap()[storyPath] ?? null;
@@ -112,6 +126,9 @@ export function useReadingProgress(storyPath: string | null) {
   const lastPersistedRef = useRef<ReadingProgress | null>(progress);
   const lastWriteRef = useRef(0);
   const writeTimerRef = useRef<number | null>(null);
+  // 用 ref 兜住：调用方可以在渲染中途改主意，但落盘回调不该因此换身份。
+  const trackStateRef = useRef(options?.trackState ?? true);
+  trackStateRef.current = options?.trackState ?? true;
 
   useEffect(() => {
     if (!storyPath) {
@@ -148,7 +165,7 @@ export function useReadingProgress(storyPath: string | null) {
       lastWriteRef.current = Date.now();
       const map = readProgressMap();
       writeProgressMap({ ...map, [pending.storyPath]: pending });
-      setProgress(pending);
+      if (trackStateRef.current) setProgress(pending);
     },
     [clearTimer]
   );

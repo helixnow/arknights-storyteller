@@ -1,0 +1,24 @@
+# 仓库根目录：应用本体在 arknights-story-reader/，那里有自己的 .gitignore。
+# 这份只兜底根级别的产物与任何位置都不该入库的敏感文件。
+
+# 剧情数据 dump：由应用在运行时下载 / 手动导入，体积巨大且随上游变动
+ArknightsGameData/
+ArknightsGameData-*/
+ArknightsGameData*.zip
+
+# 签名材料：只允许由 release.yml 从 secrets 还原，任何目录下都不入库
+*.jks
+*.keystore
+*.p12
+*.pepk
+*.b64
+keystore.properties
+
+# 本地环境变量
+.env
+.env.*
+
+# 编辑器与系统垃圾文件
+.DS_Store
+.idea/
+*.swp

@@ -1,4 +1,4 @@
-import { type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ThemeProvider } from "@/components/theme-provider";
 import { StoryList } from "@/components/StoryList";
 import { StoryReader } from "@/components/StoryReader";
@@ -13,18 +13,33 @@ import { CharacterResolverProvider } from "@/hooks/useCharacterResolver";
 import { KeepAlive } from "@/components/KeepAlive";
 import { CharactersPanel } from "@/components/CharactersPanel";
 import { useAppUpdater } from "@/hooks/useAppUpdater";
-import { useBackHandler } from "@/hooks/useBackHandler";
+import { BACK_PRIORITY, useBackHandler } from "@/hooks/useBackHandler";
 import { useAutoIndex } from "@/hooks/useAutoIndex";
 import { useLegacyStorageCleanup } from "@/hooks/useLegacyStorageCleanup";
 import { ToastProvider } from "@/components/ui/toast";
 
-type Tab = "home" | "stories" | "characters" | "search" | "settings";
+const TABS = ["home", "stories", "characters", "search", "settings"] as const;
+type Tab = (typeof TABS)[number];
 
 interface ReaderFocus {
   storyId: string;
   query: string;
   snippet?: string | null;
   issuedAt: number;
+}
+
+interface ReaderJump {
+  storyId: string;
+  segmentIndex: number;
+  preview?: string;
+  issuedAt: number;
+}
+
+/** 打开阅读器时最多只会带其中一种意图（搜索命中 / 角色 / 段落跳转）。 */
+interface ReaderIntent {
+  focus?: ReaderFocus;
+  character?: string;
+  jump?: ReaderJump;
 }
 
 function App() {
@@ -36,99 +51,139 @@ function App() {
   const [readerStory, setReaderStory] = useState<StoryEntry | null>(null);
   const [readerFocus, setReaderFocus] = useState<ReaderFocus | null>(null);
   const [readerInitialCharacter, setReaderInitialCharacter] = useState<string | null>(null);
-  const [readerInitialJump, setReaderInitialJump] = useState<{
-    storyId: string;
-    segmentIndex: number;
-    preview?: string;
-    issuedAt: number;
-  } | null>(null);
+  const [readerInitialJump, setReaderInitialJump] = useState<ReaderJump | null>(null);
   const readerActive = readerVisible && readerStory !== null;
 
-  const handleSelectStory = useCallback((story: StoryEntry) => {
-    setReaderStory(story);
-    setReaderFocus(null);
-    setReaderInitialCharacter(null);
-    setReaderInitialJump(null);
-    setReaderVisible(true);
-  }, []);
+  // 关闭阅读器时要不要广播 `app:home-refresh`，取决于它当时是不是真的开着。
+  // 用 ref 而不是把 `readerVisible` 写进 useCallback 依赖：那样每次开合阅读器
+  // 都会换掉 `handleGoToTab` 的引用，连带把 memo 过的首页视图重算一遍。
+  const readerVisibleRef = useRef(readerVisible);
+  useEffect(() => {
+    readerVisibleRef.current = readerVisible;
+  }, [readerVisible]);
 
-  const handleBackToList = useCallback(() => {
+  /**
+   * 收起阅读器并（仅在它确实开着时）广播一次进度刷新。首页的「继续阅读」和
+   * 剧情列表的进度条都靠这个事件回读 localStorage —— 不管用户是按返回、点
+   * 返回箭头还是被 `app:go-tab` 带走，都要走这里，否则列表会停在旧进度。
+   */
+  const closeReader = useCallback(() => {
+    if (!readerVisibleRef.current) return;
+    readerVisibleRef.current = false;
     setReaderVisible(false);
     window.dispatchEvent(new Event("app:home-refresh"));
   }, []);
 
+  /** 打开阅读器的唯一入口：意图之间互斥，没带的一律清空。 */
+  const openReader = useCallback((story: StoryEntry, intent: ReaderIntent = {}) => {
+    setReaderStory(story);
+    setReaderFocus(intent.focus ?? null);
+    setReaderInitialCharacter(intent.character ?? null);
+    setReaderInitialJump(intent.jump ?? null);
+    readerVisibleRef.current = true;
+    setReaderVisible(true);
+  }, []);
+
+  const handleSelectStory = useCallback(
+    (story: StoryEntry) => {
+      openReader(story);
+    },
+    [openReader]
+  );
+
+  const handleBackToList = useCallback(() => {
+    closeReader();
+  }, [closeReader]);
+
   const handleSearchResult = useCallback(
     (story: StoryEntry, focus: { query: string; snippet?: string | null }) => {
-      setReaderStory(story);
-      setReaderFocus({
-        storyId: story.storyId,
-        query: focus.query,
-        snippet: focus.snippet,
-        issuedAt: Date.now(),
+      openReader(story, {
+        focus: {
+          storyId: story.storyId,
+          query: focus.query,
+          snippet: focus.snippet,
+          issuedAt: Date.now(),
+        },
       });
-      setReaderInitialCharacter(null);
-      setReaderInitialJump(null);
-      setReaderVisible(true);
     },
-    []
+    [openReader]
   );
 
   const handleOpenStoryWithCharacter = useCallback(
     (story: StoryEntry, character: string) => {
-      setReaderStory(story);
-      setReaderFocus(null);
-      setReaderInitialCharacter(character);
-      setReaderInitialJump(null);
-      setReaderVisible(true);
+      openReader(story, { character });
     },
-    []
+    [openReader]
   );
 
   const handleOpenStoryJump = useCallback(
     (story: StoryEntry, jump: { segmentIndex: number; preview?: string }) => {
-      setReaderStory(story);
-      setReaderFocus(null);
-      setReaderInitialCharacter(null);
-      setReaderInitialJump({
-        storyId: story.storyId,
-        segmentIndex: jump.segmentIndex,
-        preview: jump.preview,
-        issuedAt: Date.now(),
+      openReader(story, {
+        jump: {
+          storyId: story.storyId,
+          segmentIndex: jump.segmentIndex,
+          preview: jump.preview,
+          issuedAt: Date.now(),
+        },
       });
-      setReaderVisible(true);
     },
-    []
+    [openReader]
   );
 
   const handleTabChange = useCallback((tab: Tab) => {
     setActiveTab(tab);
   }, []);
 
-  const handleGoToTab = useCallback((tab: Tab) => {
-    setActiveTab(tab);
-    setReaderVisible(false);
-  }, []);
+  const handleGoToTab = useCallback(
+    (tab: Tab) => {
+      setActiveTab(tab);
+      closeReader();
+    },
+    [closeReader]
+  );
 
   useEffect(() => {
     const onGoTab = (event: Event) => {
       const detail = (event as CustomEvent<Tab>).detail;
-      if (detail) handleGoToTab(detail);
+      if (detail && TABS.includes(detail)) handleGoToTab(detail);
     };
+    // 收藏入口：事件自带「去剧情 tab」的语义，派发方只要喊一声就行，
+    // 具体切到哪个分类由 StoryList 自己听同一个事件处理。
+    const onOpenFavorites = () => handleGoToTab("stories");
     window.addEventListener("app:go-tab", onGoTab as EventListener);
-    return () => window.removeEventListener("app:go-tab", onGoTab as EventListener);
+    window.addEventListener("app:open-favorites", onOpenFavorites);
+    return () => {
+      window.removeEventListener("app:go-tab", onGoTab as EventListener);
+      window.removeEventListener("app:open-favorites", onOpenFavorites);
+    };
   }, [handleGoToTab]);
 
-  useBackHandler(readerActive, () => {
-    handleBackToList();
-    return true;
-  });
+  /*
+   * 返回栈（Android 硬件返回键 / 浏览器手势返回）：抽屉 → 阅读器 → 回首页
+   * → 退出。抽屉那一层由 StoryReader 自己按默认的 overlay 优先级注册，这里
+   * 只声明外层两级，优先级保证「阅读器带着抽屉一起重新显示」时也是先关抽屉。
+   *
+   * 首页这一层刻意不注册任何处理器：注册一个永远返回 false 的处理器会让
+   * useBackHandler 认为「有人可能消费返回」而垫上历史哨兵，结果首页的第一次
+   * 返回被哨兵吃掉，用户得按两次才能退出。没有处理器时返回原样落到系统。
+   */
+  useBackHandler(
+    readerActive,
+    () => {
+      handleBackToList();
+      return true;
+    },
+    BACK_PRIORITY.view
+  );
 
-  useBackHandler(!readerActive && activeTab !== "home", () => {
-    setActiveTab("home");
-    return true;
-  });
-
-  useBackHandler(!readerActive && activeTab === "home", () => false);
+  useBackHandler(
+    !readerActive && activeTab !== "home",
+    () => {
+      setActiveTab("home");
+      return true;
+    },
+    BACK_PRIORITY.tab
+  );
 
   const homeView = useMemo(
     () => (
@@ -190,12 +245,7 @@ function App() {
           : null
       }
       onBack={handleBackToList}
-      onNavigateStory={(next) => {
-        setReaderStory(next);
-        setReaderFocus(null);
-        setReaderInitialCharacter(null);
-        setReaderInitialJump(null);
-      }}
+      onNavigateStory={(next) => openReader(next)}
     />
   ) : null;
 
@@ -212,22 +262,29 @@ function App() {
   const appContent = (
     <div className="h-full flex flex-col overflow-hidden pt-[max(env(safe-area-inset-top,0px),12px)]">
       <div className="relative flex-1 overflow-hidden">
-        {panels.map(({ tab, content }) => (
-          <KeepAlive
-            key={tab}
-            active={!readerActive && activeTab === tab}
-            className="absolute inset-0"
-          >
-            <div
-              id={tabPanelId(tab)}
-              role="tabpanel"
-              aria-labelledby={tabButtonId(tab)}
-              className="h-full"
+        {/*
+         * 阅读器是盖在 tab 层之上的整屏浮层，所以整层 tab 一起从无障碍树和
+         * 焦点序列里摘掉，而不是逐个面板去摘：`display: contents` 不产生盒子，
+         * 里面的绝对定位面板照旧相对外层的 relative 容器排布。
+         */}
+        <div className="contents" aria-hidden={readerActive} inert={readerActive}>
+          {panels.map(({ tab, content }) => (
+            <KeepAlive
+              key={tab}
+              active={!readerActive && activeTab === tab}
+              className="absolute inset-0"
             >
-              {content}
-            </div>
-          </KeepAlive>
-        ))}
+              <div
+                id={tabPanelId(tab)}
+                role="tabpanel"
+                aria-labelledby={tabButtonId(tab)}
+                className="h-full"
+              >
+                {content}
+              </div>
+            </KeepAlive>
+          ))}
+        </div>
         {readerStory && (
           <KeepAlive active={readerActive} className="absolute inset-0">
             {readerView}

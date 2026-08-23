@@ -1,0 +1,90 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - cursor/sota-polish-c3ee
+
+permissions:
+  contents: read
+
+# 同一分支上只跑最新一次：连续 push 时旧任务直接取消，省 runner 也省等待。
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "3"
+  RUSTUP_MAX_RETRIES: "3"
+
+# 应用代码在 arknights-story-reader/ 下，仓库根目录只放工作流与数据目录。
+defaults:
+  run:
+    working-directory: arknights-story-reader
+
+jobs:
+  frontend:
+    name: Frontend (typecheck + build)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: arknights-story-reader/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # 目前没有 test script；加上 --if-present 是为了以后补测试时 CI 自动接上。
+      - name: Unit tests
+        run: npm run test --if-present
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Build
+        run: npm run build
+
+  rust:
+    name: Rust lib tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # `cargo test --lib` 会编译整个 lib target，而 tauri -> wry -> webkit2gtk-sys
+      # 在 Linux 上是普通依赖，它的 build script 需要 pkg-config 找到 webkit2gtk-4.1。
+      # 所以即便测试本身不开窗口，这些 -dev 包也省不掉。
+      - name: Install Linux WebView build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev
+
+      # 1.89.0：Cargo.lock 未入库，CI 会重新解析依赖，其中已有 crate 使用
+      # edition2024（需要 >= 1.85），1.83 这类旧工具链会直接解析失败。
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.89.0
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: arknights-story-reader/src-tauri -> target
+
+      # 只跑 --lib：解析器、搜索、数据整理的单元测试都在 lib 里，
+      # tests/search_recall.rs 需要真实剧情数据，不适合放进 PR 门禁。
+      - name: cargo test --lib
+        run: cargo test --lib
+        working-directory: arknights-story-reader/src-tauri

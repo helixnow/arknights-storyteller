@@ -8,6 +8,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
 } from "react";
 import { api } from "@/services/api";
 import type { ParsedStoryContent, StorySegment } from "@/types/story";
@@ -92,6 +93,76 @@ type SegmentRenderer = (
 
 const BASE_MAX_WIDTH = 768; // px
 const TARGET_CHARS_PER_PAGE = 900; // approximate characters we aim to fit per page
+
+/**
+ * 预取缓存。
+ *
+ * 阅读器在 App 里是以 `storyId` 作 key 挂载的，点「下一话」会把整个阅读器
+ * 重挂一遍，组件内的任何 state 都留不下来——所以缓存必须放模块级。带 TTL
+ * 是为了别让重新同步数据之后的旧正文一直粘着；容量上正文只留最近几篇
+ * （单篇解析结果不小），元数据都是索引里的小对象，可以多留一些。
+ */
+const PREFETCH_TTL_MS = 5 * 60 * 1000;
+
+interface CacheEntry<T> {
+  value: T;
+  storedAt: number;
+}
+
+function createLruCache<T>(limit: number) {
+  const entries = new Map<string, CacheEntry<T>>();
+  return {
+    get(key: string): T | null {
+      const hit = entries.get(key);
+      if (!hit) return null;
+      if (Date.now() - hit.storedAt > PREFETCH_TTL_MS) {
+        entries.delete(key);
+        return null;
+      }
+      // 命中后挪到队尾：淘汰时先丢最久没被读到的那条。
+      entries.delete(key);
+      entries.set(key, hit);
+      return hit.value;
+    },
+    set(key: string, value: T) {
+      entries.delete(key);
+      entries.set(key, { value, storedAt: Date.now() });
+      while (entries.size > limit) {
+        const oldest = entries.keys().next();
+        if (oldest.done) break;
+        entries.delete(oldest.value);
+      }
+    },
+  };
+}
+
+/** 「上一话 / 当前 / 下一话」再多留一格，够覆盖来回翻的场景。 */
+const storyContentCache = createLruCache<ParsedStoryContent>(4);
+const storyNeighborsCache = createLruCache<StoryNeighbors>(16);
+const storyEntryCache = createLruCache<StoryEntry>(16);
+
+type IdleHandle = { kind: "idle"; id: number } | { kind: "timeout"; id: number };
+
+/**
+ * 预取只在浏览器空闲时做：正文首屏、恢复阅读位置这些事优先。移动端 WebView
+ * 未必有 `requestIdleCallback`，退回一个短延时即可。
+ */
+function scheduleIdle(task: () => void): IdleHandle | null {
+  if (typeof window === "undefined") return null;
+  if (typeof window.requestIdleCallback === "function") {
+    return { kind: "idle", id: window.requestIdleCallback(task, { timeout: 2000 }) };
+  }
+  return { kind: "timeout", id: window.setTimeout(task, 500) };
+}
+
+function cancelIdle(handle: IdleHandle | null) {
+  if (!handle || typeof window === "undefined") return;
+  if (handle.kind === "idle") {
+    window.cancelIdleCallback?.(handle.id);
+  } else {
+    window.clearTimeout(handle.id);
+  }
+}
 
 function isSegmentHighlightable(segment: StorySegment): boolean {
   switch (segment.type) {
@@ -211,6 +282,50 @@ function captureTopAnchor(
   return { index, offset: node.getBoundingClientRect().top - rect.top };
 }
 
+interface ProgressStore {
+  subscribe: (listener: () => void) => () => void;
+  getSnapshot: () => number;
+  /** 写入 0~1 的阅读比例；小于 0.05% 的变化直接吞掉。 */
+  set: (ratio: number) => void;
+}
+
+/**
+ * 阅读进度的极小外部 store。
+ *
+ * 连续滚动时百分比每帧都在动。如果它是阅读器的一个 state，顶栏、页脚、
+ * 上一话/下一话栏、三个抽屉就得跟着每帧走一遍 diff——正文靠 memo 拦住了，
+ * 外壳没有。改成 store 之后只有真正显示百分比的那一小块会重渲染。
+ */
+function useProgressStore(): ProgressStore {
+  const valueRef = useRef(0);
+  const listenersRef = useRef<Set<() => void>>(new Set());
+  return useMemo(
+    () => ({
+      subscribe: (listener: () => void) => {
+        listenersRef.current.add(listener);
+        return () => {
+          listenersRef.current.delete(listener);
+        };
+      },
+      getSnapshot: () => valueRef.current,
+      set: (ratio: number) => {
+        const clamped = Number.isFinite(ratio) ? Math.min(1, Math.max(0, ratio)) : 0;
+        // 进度条只精确到 0.1%，比这更细的变化没必要惊动 React。
+        if (Math.abs(clamped - valueRef.current) < 0.0005) return;
+        valueRef.current = clamped;
+        listenersRef.current.forEach((listener) => listener());
+      },
+    }),
+    []
+  );
+}
+
+/** 0~1 的比例转成保留一位小数的百分比。 */
+function toPercentage(ratio: number): number {
+  const clamped = Math.max(0, Math.min(1, ratio));
+  return Math.round(clamped * 1000) / 10;
+}
+
 function approximateSegmentLength(segment: StorySegment): number {
   switch (segment.type) {
     case "dialogue":
@@ -235,28 +350,35 @@ function approximateSegmentLength(segment: StorySegment): number {
 }
 
 export function StoryReader({ storyId, storyPath, storyName, active = true, onBack, initialFocus, initialCharacter, initialJump, onNavigateStory }: StoryReaderProps) {
-  const [content, setContent] = useState<ParsedStoryContent | null>(null);
-  const [loading, setLoading] = useState(true);
+  // 命中预取缓存时直接带着正文挂载：从「下一话」进来时连骨架屏都不闪一下。
+  const [content, setContent] = useState<ParsedStoryContent | null>(() =>
+    storyContentCache.get(storyPath)
+  );
+  const [loading, setLoading] = useState(() => storyContentCache.get(storyPath) === null);
   const [error, setError] = useState<string | null>(null);
   const [currentPage, setCurrentPage] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [insightsOpen, setInsightsOpen] = useState(false);
-  const [progressValue, setProgressValue] = useState(0);
   const [highlightSegmentIndex, setHighlightSegmentIndex] = useState<number | null>(null);
   // Monotonic token used to trigger the one-shot search-highlight pulse
   // animation. Bumped each time the reader jumps to a new hit; cleared
   // after the pulse keyframes finish so the data attribute auto-removes.
   const [searchPulseToken, setSearchPulseToken] = useState(0);
   const [activeCharacter, setActiveCharacter] = useState<string | null>(null);
-  const [storyEntry, setStoryEntry] = useState<StoryEntry | null>(null);
+  const [storyEntry, setStoryEntry] = useState<StoryEntry | null>(() =>
+    storyEntryCache.get(storyId)
+  );
   const [storyInfoText, setStoryInfoText] = useState<string | null>(null);
   // 沉浸阅读：连续滚动模式下向下滚动收起顶栏，向上滚动/回到顶部再展开。
   const [headerHidden, setHeaderHidden] = useState(false);
   const [headerHeight, setHeaderHeight] = useState(56);
 
+  const progressStore = useProgressStore();
+
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const readerRootRef = useRef<HTMLDivElement | null>(null);
   const headerRef = useRef<HTMLElement | null>(null);
+  const loadTokenRef = useRef(0);
   const focusAppliedRef = useRef<number | null>(null);
   const characterAppliedRef = useRef<string | null>(null);
   const pendingScrollIndexRef = useRef<number | null>(null);
@@ -271,9 +393,16 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
 
   const { settings, updateSettings, resetSettings } = useReaderSettings();
   const { showSummaries, minimalMode, inlineImages } = useAppPreferences();
-  const { progress, updateProgress, getProgress } = useReadingProgress(storyPath);
+  // `trackState: false`：阅读器只在挂载时要一次初始值，之后一律走
+  // `getProgress()`。让每 1.2s 一次的落盘去驱动 state，只会白白把整棵
+  // 阅读器重渲染一遍。
+  const { progress, updateProgress, getProgress } = useReadingProgress(storyPath, {
+    trackState: false,
+  });
   const { isFavorite, toggleFavorite } = useFavorites();
-  const [neighbors, setNeighbors] = useState<StoryNeighbors>({ prev: null, next: null });
+  const [neighbors, setNeighbors] = useState<StoryNeighbors>(
+    () => storyNeighborsCache.get(storyId) ?? { prev: null, next: null }
+  );
   const [categoryName, setCategoryName] = useState<string | null>(null);
 
   // Multi-select state for "分享为图片". Keeps indices in insertion order so
@@ -284,6 +413,8 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   const [shareDialogOpen, setShareDialogOpen] = useState(false);
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
   const moreMenuRef = useRef<HTMLDivElement | null>(null);
+  const moreMenuTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const moreMenuPanelRef = useRef<HTMLDivElement | null>(null);
 
   // 抽屉 / 选段工具栏是否占据了界面。滚动监听里用 ref 读取，避免因为这些
   // 状态变化而反复重建 scroll listener。
@@ -327,22 +458,40 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     return true;
   });
 
-  // 点击外部关闭更多菜单
+  // 点击外部 / Esc / Tab 移出都关闭更多菜单，并接管焦点：打开时把焦点送进
+  // 菜单，关闭时还给触发它的按钮——否则键盘和读屏用户点开菜单后焦点还留在
+  // 原按钮上，菜单里的项根本走不到。
   useEffect(() => {
     if (!active || !moreMenuOpen) return;
+    const panel = moreMenuPanelRef.current;
+    const firstItem = panel?.querySelector<HTMLElement>("[role='menuitem']:not([disabled])");
+    (firstItem ?? panel)?.focus({ preventScroll: true });
+
     const handlePointer = (event: PointerEvent) => {
       const target = event.target as Node | null;
       if (target && moreMenuRef.current?.contains(target)) return;
       setMoreMenuOpen(false);
     };
     const handleKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setMoreMenuOpen(false);
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setMoreMenuOpen(false);
+        return;
+      }
+      // 菜单只有寥寥几项，不做环形 Tab；按原生 menu 的惯例，Tab 出去就
+      // 顺势关掉（不拦默认行为，焦点照常往下走）。
+      if (event.key === "Tab") setMoreMenuOpen(false);
     };
     window.addEventListener("pointerdown", handlePointer);
     window.addEventListener("keydown", handleKey);
     return () => {
       window.removeEventListener("pointerdown", handlePointer);
       window.removeEventListener("keydown", handleKey);
+      // 焦点已经被别处接走（例如 Tab 出去了）就别抢回来。
+      const activeElement = document.activeElement;
+      const focusStranded =
+        !activeElement || activeElement === document.body || Boolean(panel?.contains(activeElement));
+      if (focusStranded) moreMenuTriggerRef.current?.focus({ preventScroll: true });
     };
   }, [active, moreMenuOpen]);
 
@@ -480,10 +629,10 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     return Math.max(1, pageBoundaries.length);
   }, [pageBoundaries, processedSegments]);
 
-  const progressPercentage = useMemo(() => {
-    const clamped = Math.max(0, Math.min(1, progressValue));
-    return Math.round(clamped * 1000) / 10; // keep one decimal precision
-  }, [progressValue]);
+  // 分页模式的百分比完全由页码决定，直接算就好——不必再绕一圈进度 state，
+  // 也就顺带修掉了「翻页后百分比慢一帧」的老毛病。
+  const pagedPercentage =
+    totalPages > 0 ? toPercentage(totalPages <= 1 ? 1 : (currentPage + 1) / totalPages) : 0;
 
   const readerContentStyles = useMemo(() => {
     const maxWidthPx = Math.round((settings.pageWidth / 100) * BASE_MAX_WIDTH);
@@ -689,10 +838,28 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   }, [processedSegments]);
 
   const loadStory = useCallback(async () => {
+    // 换篇 / 重试时作废上一次请求：后端解析慢的时候，旧结果曾经会盖掉新的一话。
+    const token = (loadTokenRef.current += 1);
+
+    const cached = storyContentCache.get(storyPath);
+    if (cached) {
+      setContent(cached);
+      setCurrentPage(0);
+      setError(null);
+      setLoading(false);
+      try {
+        bumpReadingStreak();
+      } catch {}
+      return;
+    }
+
     try {
       setLoading(true);
       setError(null);
       const data = await api.getStoryContent(storyPath);
+      if (token !== loadTokenRef.current) return;
+      // 空结果不进缓存，否则「重新加载」永远只会拿回同一份空正文。
+      if (data.segments.length > 0) storyContentCache.set(storyPath, data);
       setContent(data);
       setCurrentPage(0);
       // Bump reading streak when user actually opens a story.
@@ -700,9 +867,10 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
         bumpReadingStreak();
       } catch {}
     } catch (err) {
+      if (token !== loadTokenRef.current) return;
       setError(err instanceof Error ? err.message : "加载失败");
     } finally {
-      setLoading(false);
+      if (token === loadTokenRef.current) setLoading(false);
     }
   }, [storyPath]);
 
@@ -716,7 +884,9 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     (async () => {
       try {
         const entry = await api.getStoryEntry(storyId);
-        if (mounted) setStoryEntry(entry);
+        if (!mounted) return;
+        storyEntryCache.set(storyId, entry);
+        setStoryEntry((prev) => (prev?.storyId === entry.storyId ? prev : entry));
       } catch {
         // ignore
       }
@@ -724,14 +894,20 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     return () => { mounted = false; };
   }, [storyId]);
 
-  // 加载 prev/next
+  // 加载 prev/next（预取过就先用缓存里的，底部导航栏不用先闪一遍「—」）
   useEffect(() => {
     let mounted = true;
-    setNeighbors({ prev: null, next: null });
+    setNeighbors(storyNeighborsCache.get(storyId) ?? { prev: null, next: null });
     (async () => {
       try {
         const n = await api.getStoryNeighbors(storyId);
-        if (mounted) setNeighbors(n);
+        if (!mounted) return;
+        storyNeighborsCache.set(storyId, n);
+        setNeighbors((prev) =>
+          prev.prev?.storyId === n.prev?.storyId && prev.next?.storyId === n.next?.storyId
+            ? prev
+            : n
+        );
       } catch {
         // ignore
       }
@@ -740,6 +916,61 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       mounted = false;
     };
   }, [storyId]);
+
+  /**
+   * 预取上一话 / 下一话的正文与元数据。
+   *
+   * 一话读到底再点「下一话」是最常见的动线，预取之后那一跳基本没有骨架屏。
+   * 只在阅读器处于前台、当前这一话已经就绪、且浏览器空闲时才做；换篇、
+   * 卸载、退到后台都会立刻取消（`cancelled` 拦住已经在飞的请求写缓存之外
+   * 的任何后续动作，剩下的一次 invoke 顶多白跑一趟）。
+   */
+  useEffect(() => {
+    if (!active || loading || error) return;
+    // 顺序有讲究：先下一话——往后读的人远多于往回翻的人。
+    const targets = [neighbors.next, neighbors.prev].filter(
+      (entry): entry is StoryEntry => Boolean(entry?.storyTxt)
+    );
+    if (targets.length === 0) return;
+
+    let cancelled = false;
+    const prefetch = async () => {
+      for (const entry of targets) {
+        if (cancelled) return;
+        // 邻居的 StoryEntry 本身就来自索引，直接落缓存，省掉下一次挂载的那次查询。
+        storyEntryCache.set(entry.storyId, entry);
+
+        if (!storyContentCache.get(entry.storyTxt)) {
+          try {
+            const data = await api.getStoryContent(entry.storyTxt);
+            if (cancelled) return;
+            if (data.segments.length > 0) storyContentCache.set(entry.storyTxt, data);
+          } catch {
+            // 预取失败无所谓，真正点进去时会正常走一次加载。
+          }
+        }
+
+        if (cancelled) return;
+        if (!storyNeighborsCache.get(entry.storyId)) {
+          try {
+            const n = await api.getStoryNeighbors(entry.storyId);
+            if (cancelled) return;
+            storyNeighborsCache.set(entry.storyId, n);
+          } catch {
+            // 同上
+          }
+        }
+      }
+    };
+
+    const handle = scheduleIdle(() => {
+      if (!cancelled) void prefetch();
+    });
+    return () => {
+      cancelled = true;
+      cancelIdle(handle);
+    };
+  }, [active, loading, error, neighbors.prev, neighbors.next]);
 
   // 加载章节/活动名，供分享图与顶栏使用
   useEffect(() => {
@@ -835,8 +1066,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
           ? Math.min(stored.currentPage, lastPage)
           : Math.round(storedPercentage * lastPage);
       setCurrentPage(storedPage);
-      const ratio = totalPages <= 1 ? 1 : (storedPage + 1) / totalPages;
-      setProgressValue(Number.isFinite(ratio) ? ratio : 0);
+      progressStore.set(totalPages <= 1 ? 1 : (storedPage + 1) / totalPages);
     } else {
       const container = scrollContainerRef.current;
       if (!container) return;
@@ -851,7 +1081,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       const ratio = denominator <= 0 ? 1 : storedTop / denominator;
       const clamped = Number.isFinite(ratio) ? Math.max(0, Math.min(1, ratio)) : 0;
       scrollRatioRef.current = clamped;
-      setProgressValue(clamped);
+      progressStore.set(clamped);
     }
 
     restoredKeyRef.current = restoreKey;
@@ -864,10 +1094,13 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     initialJump,
     storyId,
     getProgress,
+    progressStore,
   ]);
 
+  // 阅读器退到后台时连滚动监听一起摘掉：`KeepAlive` 只是把它藏起来，容器
+  // 还在文档里，惯性滚动 / 程序化滚动都还能把这条链子跑起来。
   useEffect(() => {
-    if (!processedSegments.length || settings.readingMode !== "scroll") return;
+    if (!active || !processedSegments.length || settings.readingMode !== "scroll") return;
     const container = scrollContainerRef.current;
     if (!container) return;
 
@@ -876,12 +1109,14 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       if (frame) cancelAnimationFrame(frame);
       frame = requestAnimationFrame(() => {
         const { scrollTop, scrollHeight, clientHeight } = container;
+        // 容器还没量出高度（隐藏 / 尚未布局）时别算：denominator<=0 会被
+        // 当成「读完了」，把进度直接写成 100%。
+        if (clientHeight <= 0) return;
         const denominator = scrollHeight - clientHeight;
         const ratio = denominator <= 0 ? 1 : scrollTop / denominator;
         const clamped = Number.isFinite(ratio) ? Math.max(0, Math.min(1, ratio)) : 0;
         scrollRatioRef.current = clamped;
-        // 进度条只精确到 0.1%，比这更细的变化没必要惊动 React。
-        setProgressValue((prev) => (Math.abs(prev - clamped) < 0.0005 ? prev : clamped));
+        progressStore.set(clamped);
         updateProgress({
           readingMode: "scroll",
           scrollTop,
@@ -917,20 +1152,27 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       container.removeEventListener("scroll", handleScroll);
       if (frame) cancelAnimationFrame(frame);
     };
-  }, [processedSegments, settings.readingMode, updateProgress]);
+  }, [active, processedSegments, settings.readingMode, updateProgress, progressStore]);
 
   useEffect(() => {
     if (!processedSegments.length || settings.readingMode !== "paged" || totalPages === 0) return;
     const ratio = totalPages <= 1 ? 1 : (currentPage + 1) / totalPages;
     const clamped = Number.isFinite(ratio) ? Math.max(0, Math.min(1, ratio)) : 0;
-    setProgressValue((prev) => (Math.abs(prev - clamped) < 0.0005 ? prev : clamped));
+    progressStore.set(clamped);
     updateProgress({
       readingMode: "paged",
       currentPage,
       percentage: clamped,
       updatedAt: Date.now(),
     });
-  }, [processedSegments, currentPage, settings.readingMode, totalPages, updateProgress]);
+  }, [
+    processedSegments,
+    currentPage,
+    settings.readingMode,
+    totalPages,
+    updateProgress,
+    progressStore,
+  ]);
 
   // 把标题 / 关卡号一并写进进度记录，首页的「继续阅读」卡片就不用等索引
   // 加载完才知道自己在显示哪一话。旧记录没有这两个字段，读取方按可选处理。
@@ -1118,8 +1360,16 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
         return;
       }
       if (target?.isContentEditable) return;
-      // 抽屉打开时把按键留给抽屉本身（Esc 关闭等）。
-      if (settingsOpen || insightsOpen || shareDialogOpen) return;
+      // 抽屉 / 浮层菜单打开时把按键留给它们自己（Esc 关闭等）。
+      if (settingsOpen || insightsOpen || shareDialogOpen || moreMenuOpen) return;
+
+      // 选段工具栏同样是一层浮层：Esc 退出选段，和抽屉的 Esc 行为对齐。
+      if (event.key === "Escape" && selectMode) {
+        event.preventDefault();
+        setSelectMode(false);
+        setSelectedSegments([]);
+        return;
+      }
 
       const isSpace = event.key === " " || event.key === "Spacebar";
       // 焦点落在按钮/链接上时空格属于该控件本身，别把"打开设置"变成翻页；
@@ -1172,6 +1422,8 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     settingsOpen,
     insightsOpen,
     shareDialogOpen,
+    moreMenuOpen,
+    selectMode,
     goToPrevPage,
     goToNextPage,
   ]);
@@ -1886,7 +2138,10 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
           opacity: headerHidden ? 0 : 1,
           pointerEvents: headerHidden ? "none" : undefined,
         }}
+        // 光有 aria-hidden 会留下一排「看不见但仍能 Tab 到」的按钮，
+        // 键盘焦点会凭空消失在收起的顶栏里；inert 把它整块摘干净。
         aria-hidden={headerHidden}
+        inert={headerHidden}
       >
         <div className="container flex items-center gap-2 h-14">
           <Button variant="ghost" size="icon" onClick={onBack} aria-label="返回剧情列表">
@@ -1935,6 +2190,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
             </Button>
             <div className="relative" ref={moreMenuRef}>
               <Button
+                ref={moreMenuTriggerRef}
                 variant="ghost"
                 size="icon"
                 onClick={() => setMoreMenuOpen((prev) => !prev)}
@@ -1947,7 +2203,11 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
               </Button>
               {moreMenuOpen && (
                 <div
+                  ref={moreMenuPanelRef}
                   role="menu"
+                  aria-label="更多操作"
+                  aria-orientation="vertical"
+                  tabIndex={-1}
                   className="absolute right-0 top-full mt-1 w-44 rounded-md border border-[hsl(var(--color-border))] bg-[hsl(var(--color-popover,var(--color-background)))] shadow-lg overflow-hidden z-30"
                 >
                   <button
@@ -2037,22 +2297,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       </main>
 
       {settings.readingMode === "scroll" && !selectMode && (
-        <div
-          className="flex-shrink-0 bg-[hsl(var(--color-background)/0.92)] backdrop-blur border-t border-[hsl(var(--color-border))]"
-          style={{ paddingBottom: bottomSafeArea }}
-          aria-hidden="false"
-        >
-          <div className="progress-track">
-            <div
-              className="progress-thumb"
-              style={{ width: `${progressPercentage}%` }}
-              aria-hidden="true"
-            />
-          </div>
-          <div className="container flex items-center justify-end px-4 py-1 text-[11px] uppercase tracking-wider text-[hsl(var(--color-muted-foreground))]">
-            已读 {progressPercentage}%
-          </div>
-        </div>
+        <ReaderScrollProgress store={progressStore} bottomSafeArea={bottomSafeArea} />
       )}
 
       {settings.readingMode === "paged" && !selectMode && (
@@ -2060,25 +2305,40 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
           className="flex-shrink-0 bg-[hsl(var(--color-background)/0.95)] backdrop-blur border-t px-4 pt-4 pb-4"
           style={{ paddingBottom: `calc(${bottomSafeArea} + 1rem)` }}
         >
-          <div className="container flex items-center justify-between gap-3">
+          <div className="container flex items-center justify-between gap-3" role="group" aria-label="翻页">
             <Button
               variant="outline"
               onClick={goToPrevPage}
               disabled={currentPage === 0}
               className="flex-1 min-h-[44px]"
+              aria-label="上一页"
             >
               <ChevronLeft className="mr-2 h-4 w-4" />
               上一页
             </Button>
-            <div className="text-xs tabular-nums text-[hsl(var(--color-muted-foreground))] min-w-[5.5rem] text-center">
-              {currentPage + 1} / {totalPages}
-              <span className="block text-[10px] opacity-75">{progressPercentage}%</span>
+            {/* 「3 / 12」读起来是「三斜杠十二」，另配一句完整的播报文案；
+                翻页后由 live region 播出来，视觉那份则对读屏隐藏。 */}
+            <div
+              className="text-xs tabular-nums text-[hsl(var(--color-muted-foreground))] min-w-[5.5rem] text-center"
+              aria-live="polite"
+              aria-atomic="true"
+            >
+              <span aria-hidden="true">
+                {currentPage + 1} / {totalPages}
+              </span>
+              <span className="sr-only">
+                第 {currentPage + 1} 页，共 {totalPages} 页，已读 {pagedPercentage}%
+              </span>
+              <span className="block text-[10px] opacity-75" aria-hidden="true">
+                {pagedPercentage}%
+              </span>
             </div>
             <Button
               variant="outline"
               onClick={goToNextPage}
               disabled={currentPage >= totalPages - 1}
               className="flex-1 min-h-[44px]"
+              aria-label="下一页"
             >
               下一页
               <ChevronRight className="ml-2 h-4 w-4" />
@@ -2093,13 +2353,13 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
           className="flex-shrink-0 border-t border-[hsl(var(--color-border))] bg-[hsl(var(--color-background)/0.92)] backdrop-blur px-4 py-2"
           style={{ paddingBottom: "calc(env(safe-area-inset-bottom, 0px) + 0.5rem)" }}
         >
-          <div className="container grid grid-cols-2 gap-2">
+          <div className="container grid grid-cols-2 gap-2" role="group" aria-label="话数导航">
             <button
               type="button"
               disabled={!neighbors.prev}
               onClick={() => neighbors.prev && onNavigateStory?.(neighbors.prev)}
               className="flex items-center gap-2 rounded-lg px-3 py-2 text-left text-xs transition-colors hover:bg-[hsl(var(--color-accent))] disabled:opacity-40 disabled:cursor-not-allowed"
-              aria-label="上一话"
+              aria-label={neighbors.prev ? `上一话：${neighbors.prev.storyName}` : "已经是第一话"}
             >
               <ChevronLeft className="h-4 w-4 flex-shrink-0 text-[hsl(var(--color-muted-foreground))]" />
               <div className="min-w-0">
@@ -2114,7 +2374,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
               disabled={!neighbors.next}
               onClick={() => neighbors.next && onNavigateStory?.(neighbors.next)}
               className="flex items-center justify-end gap-2 rounded-lg px-3 py-2 text-right text-xs transition-colors hover:bg-[hsl(var(--color-accent))] disabled:opacity-40 disabled:cursor-not-allowed"
-              aria-label="下一话"
+              aria-label={neighbors.next ? `下一话：${neighbors.next.storyName}` : "已经是最后一话"}
             >
               <div className="min-w-0">
                 <div className="text-[10px] uppercase tracking-widest text-[hsl(var(--color-muted-foreground))]">下一话</div>
@@ -2136,19 +2396,33 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
           {/* Paged mode needs the page controls inside the select footer;
               otherwise the user is stuck on one page while picking segments. */}
           {settings.readingMode === "paged" && (
-            <div className="container flex items-center justify-between gap-2">
+            <div
+              className="container flex items-center justify-between gap-2"
+              role="group"
+              aria-label="翻页"
+            >
               <Button
                 variant="outline"
                 size="sm"
                 onClick={goToPrevPage}
                 disabled={currentPage === 0}
                 className="flex-1 min-h-[44px]"
+                aria-label="上一页"
               >
                 <ChevronLeft className="mr-2 h-4 w-4" />
                 上一页
               </Button>
-              <div className="text-xs tabular-nums text-[hsl(var(--color-muted-foreground))] min-w-[4.5rem] text-center">
-                {currentPage + 1} / {totalPages}
+              <div
+                className="text-xs tabular-nums text-[hsl(var(--color-muted-foreground))] min-w-[4.5rem] text-center"
+                aria-live="polite"
+                aria-atomic="true"
+              >
+                <span aria-hidden="true">
+                  {currentPage + 1} / {totalPages}
+                </span>
+                <span className="sr-only">
+                  第 {currentPage + 1} 页，共 {totalPages} 页
+                </span>
               </div>
               <Button
                 variant="outline"
@@ -2156,6 +2430,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
                 onClick={goToNextPage}
                 disabled={currentPage >= totalPages - 1}
                 className="flex-1 min-h-[44px]"
+                aria-label="下一页"
               >
                 下一页
                 <ChevronRight className="ml-2 h-4 w-4" />
@@ -2249,6 +2524,50 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   );
 }
 
+
+interface ReaderScrollProgressProps {
+  store: ProgressStore;
+  bottomSafeArea: string;
+}
+
+/**
+ * 连续滚动模式的底部进度条。
+ *
+ * 单独拆出来订阅外部 store：百分比是全屏里唯一每帧都在变的东西，留在阅读器
+ * 里就会拖着顶栏、页脚、抽屉一起走 diff。现在滚动时重渲染的只有这一条。
+ */
+const ReaderScrollProgress = memo(function ReaderScrollProgress({
+  store,
+  bottomSafeArea,
+}: ReaderScrollProgressProps) {
+  const ratio = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
+  const percentage = toPercentage(ratio);
+  return (
+    <div
+      className="flex-shrink-0 bg-[hsl(var(--color-background)/0.92)] backdrop-blur border-t border-[hsl(var(--color-border))]"
+      style={{ paddingBottom: bottomSafeArea }}
+    >
+      <div
+        className="progress-track"
+        role="progressbar"
+        aria-label="阅读进度"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={percentage}
+        aria-valuetext={`已读 ${percentage}%`}
+      >
+        <div className="progress-thumb" style={{ width: `${percentage}%` }} aria-hidden="true" />
+      </div>
+      {/* 数字只是进度条的视觉复述，交给上面的 progressbar 播报即可。 */}
+      <div
+        className="container flex items-center justify-end px-4 py-1 text-[11px] uppercase tracking-wider text-[hsl(var(--color-muted-foreground))]"
+        aria-hidden="true"
+      >
+        已读 {percentage}%
+      </div>
+    </div>
+  );
+});
 
 interface ReaderStatusScreenProps {
   theme: string;

@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from "react";
 import { Button } from "@/components/ui/button";
 import { CustomScrollArea } from "@/components/ui/custom-scroll-area";
 import {
@@ -28,6 +35,26 @@ import { Download, Loader2, Share2, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const SHOW_AVATAR_STORAGE_KEY = "arknights-share-image-show-avatar";
+const THEME_AWARE_STORAGE_KEY = "arknights-share-image-theme-aware";
+
+function readBooleanPreference(key: string, fallback: boolean): boolean {
+  if (typeof window === "undefined") return fallback;
+  try {
+    const raw = window.localStorage.getItem(key);
+    return raw === null ? fallback : raw === "true";
+  } catch {
+    return fallback;
+  }
+}
+
+function writeBooleanPreference(key: string, value: boolean): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(key, String(value));
+  } catch {
+    // 忽略配额 / 隐私模式等写入失败
+  }
+}
 
 export interface ShareSegmentInput {
   index: number;
@@ -63,14 +90,121 @@ const CONTENT_FONT_FAMILY =
 const TITLE_FONT_FAMILY =
   "'Arknights Noto Sans SC', 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif";
 
+/** 一张分享图用到的全部颜色。两个模板共用同一份，配色才不会互相打架。 */
+interface SharePalette {
+  bg: string;
+  accent: string;
+  text: string;
+  muted: string;
+  divider: string;
+}
+
 // Measured colors — paper-white background with ink-black body copy so the
 // image stays readable in messaging apps that re-render previews at small
-// sizes.
-const BG_COLOR = "#f6f2ea";
-const ACCENT_COLOR = "#b45309";
-const TEXT_COLOR = "#221c14";
-const MUTED_COLOR = "#7b6d58";
-const DIVIDER_COLOR = "rgba(123, 109, 88, 0.25)";
+// sizes. 这也是所有兜底路径的落点：取不到阅读器配色、或取到的配色对比度
+// 不合格时都退回这里。
+const PAPER_PALETTE: SharePalette = {
+  bg: "#f6f2ea",
+  accent: "#b45309",
+  text: "#221c14",
+  muted: "#7b6d58",
+  divider: "rgba(123, 109, 88, 0.25)",
+};
+
+type Rgb = [number, number, number];
+
+function parseRgb(input: string): Rgb | null {
+  const match = /^rgba?\(([^)]+)\)$/i.exec(input.trim());
+  if (!match) return null;
+  // `rgb(1, 2, 3)`、`rgb(1 2 3 / 50%)` 两种序列化形式都要吃得下。
+  const parts = match[1]
+    .split(/[\s,/]+/)
+    .filter(Boolean)
+    .map((piece) => Number.parseFloat(piece));
+  if (parts.length < 3 || parts.slice(0, 3).some((n) => !Number.isFinite(n))) return null;
+  // 完全透明说明这个元素压根没画背景，不能当成有效取色。
+  if (parts.length >= 4 && parts[3] === 0) return null;
+  return [parts[0], parts[1], parts[2]];
+}
+
+function cssRgb([r, g, b]: Rgb): string {
+  return `rgb(${Math.round(r)}, ${Math.round(g)}, ${Math.round(b)})`;
+}
+
+function cssRgba([r, g, b]: Rgb, alpha: number): string {
+  return `rgba(${Math.round(r)}, ${Math.round(g)}, ${Math.round(b)}, ${alpha})`;
+}
+
+/** `t = 0` 取 `a`，`t = 1` 取 `b`。 */
+function mixRgb(a: Rgb, b: Rgb, t: number): Rgb {
+  return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+}
+
+function relativeLuminance([r, g, b]: Rgb): number {
+  const channel = (value: number) => {
+    const c = Math.min(255, Math.max(0, value)) / 255;
+    return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+  };
+  return 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b);
+}
+
+function contrastRatio(a: Rgb, b: Rgb): number {
+  const la = relativeLuminance(a);
+  const lb = relativeLuminance(b);
+  return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
+}
+
+/**
+ * 从阅读器所在的 `.reader-surface` 上取当前真正生效的配色。
+ *
+ * 分享图之前永远是暖纸色，夜里读 `dark` 主题的用户点一下分享，导出的却是
+ * 一张刺眼的米白长图——它跟屏幕上刚读完的那一页毫无关系。这里改成跟随
+ * **阅读器纸张**（`--reader-*`），而不是应用外壳（sheet / 导航栏那层玻璃）：
+ * 用户要分享的是正文，不是 app 的 UI。
+ *
+ * 取色走 `getComputedStyle` 的**已用值**而不是自定义属性的字面量：
+ * `--reader-bg` 在 `default` 主题下是 `hsl(var(--color-background))`，
+ * 只有读元素真实的 `background-color` / `color` 才能拿到解析后的 rgb。
+ * accent 没有对应的 CSS 属性可读，挂一个隐藏探针让浏览器替我们解析。
+ */
+function resolveSharePalette(anchor: HTMLElement | null): SharePalette {
+  if (typeof window === "undefined" || !anchor) return PAPER_PALETTE;
+  const surface = anchor.closest<HTMLElement>(".reader-surface");
+  if (!surface) return PAPER_PALETTE;
+
+  let probe: HTMLElement | null = null;
+  try {
+    const surfaceStyle = window.getComputedStyle(surface);
+    const bg = parseRgb(surfaceStyle.backgroundColor);
+    const text = parseRgb(surfaceStyle.color);
+    if (!bg || !text) return PAPER_PALETTE;
+    // 正文和背景对比度不够，说明取到的是半透明玻璃层之类的中间态。这种
+    // 图在聊天软件的小尺寸预览里根本读不清，宁可退回暖纸。
+    if (contrastRatio(bg, text) < 4.5) return PAPER_PALETTE;
+
+    probe = document.createElement("span");
+    probe.style.cssText =
+      "position:absolute;width:0;height:0;overflow:hidden;visibility:hidden;color:var(--reader-accent)";
+    surface.appendChild(probe);
+    const probed = parseRgb(window.getComputedStyle(probe).color);
+    // accent 跟背景糊在一起（比如主题没定义 accent 时继承了正文色）就退回
+    // 正文色，至少不会出现"看不见的标题"。
+    const accent = probed && contrastRatio(bg, probed) >= 3 ? probed : text;
+
+    const muted = mixRgb(text, bg, 0.42);
+    return {
+      bg: cssRgb(bg),
+      accent: cssRgb(accent),
+      text: cssRgb(text),
+      muted: cssRgb(muted),
+      divider: cssRgba(muted, 0.35),
+    };
+  } catch {
+    return PAPER_PALETTE;
+  } finally {
+    probe?.remove();
+  }
+}
 
 /**
  * Font specs used by {@link buildLayout}. We must `document.fonts.load()`
@@ -377,7 +511,8 @@ function buildLayout(
   subtitle: string | null,
   prepared: PreparedSegment[],
   contentWidth: number,
-  avatarImages: Map<number, HTMLImageElement | null>
+  avatarImages: Map<number, HTMLImageElement | null>,
+  palette: SharePalette
 ): LayoutBlock[] {
   const blocks: LayoutBlock[] = [];
   const AVATAR_SIZE = 56; // diameter of speaker avatar in classic template
@@ -390,7 +525,7 @@ function buildLayout(
     marginTop: 0,
     height: titleLines.length * 48,
     draw: (c, x, top, _w) => {
-      c.fillStyle = TEXT_COLOR;
+      c.fillStyle = palette.text;
       c.font = `600 38px ${TITLE_FONT_FAMILY}`;
       c.textBaseline = "top";
       titleLines.forEach((line, i) => c.fillText(line, x, top + i * 48));
@@ -406,7 +541,7 @@ function buildLayout(
       marginTop: 14,
       height: subLines.length * 32,
       draw: (c, x, top, _w) => {
-        c.fillStyle = ACCENT_COLOR;
+        c.fillStyle = palette.accent;
         c.font = `500 24px ${TITLE_FONT_FAMILY}`;
         c.textBaseline = "top";
         subLines.forEach((line, i) => c.fillText(line, x, top + i * 32));
@@ -420,7 +555,7 @@ function buildLayout(
     marginTop: 12,
     height: 28,
     draw: (c, x, top, _w) => {
-      c.fillStyle = MUTED_COLOR;
+      c.fillStyle = palette.muted;
       c.font = `500 20px ${TITLE_FONT_FAMILY}`;
       c.textBaseline = "top";
       c.fillText("明日方舟剧情阅读器", x, top);
@@ -431,7 +566,7 @@ function buildLayout(
     marginTop: 22,
     height: 2,
     draw: (c, x, top, w) => {
-      c.fillStyle = DIVIDER_COLOR;
+      c.fillStyle = palette.divider;
       c.fillRect(x, top, w, 2);
     },
   });
@@ -448,7 +583,7 @@ function buildLayout(
         marginTop: firstSegmentMargin,
         height: lines.length * 44,
         draw: (c, x, top, w) => {
-          c.fillStyle = ACCENT_COLOR;
+          c.fillStyle = palette.accent;
           c.font = `600 34px ${TITLE_FONT_FAMILY}`;
           c.textBaseline = "top";
           lines.forEach((line, i) => {
@@ -467,7 +602,7 @@ function buildLayout(
         marginTop: firstSegmentMargin,
         height: 32,
         draw: (c, x, top, _w) => {
-          c.fillStyle = ACCENT_COLOR;
+          c.fillStyle = palette.accent;
           c.font = `600 24px ${TITLE_FONT_FAMILY}`;
           c.textBaseline = "top";
           c.fillText(label, x, top);
@@ -482,7 +617,7 @@ function buildLayout(
           marginTop: 14,
           height: wrapped.length * CONTENT_LINE_HEIGHT,
           draw: (c, x, top, _w) => {
-            c.fillStyle = TEXT_COLOR;
+            c.fillStyle = palette.text;
             c.font = `400 ${CONTENT_FONT_SIZE}px ${CONTENT_FONT_FAMILY}`;
             c.textBaseline = "top";
             wrapped.forEach((line, i) => c.fillText(line, x, top + i * CONTENT_LINE_HEIGHT));
@@ -506,10 +641,10 @@ function buildLayout(
           draw: (c, x, top, _w) => {
             let textX = x;
             if (hasAvatar && avatarImg) {
-              drawCircleAvatar(c, avatarImg, x, top, AVATAR_SIZE, DIVIDER_COLOR);
+              drawCircleAvatar(c, avatarImg, x, top, AVATAR_SIZE, palette.divider);
               textX = x + AVATAR_SIZE + AVATAR_GAP;
             }
-            c.fillStyle = ACCENT_COLOR;
+            c.fillStyle = palette.accent;
             c.font = `600 24px ${TITLE_FONT_FAMILY}`;
             // 头像行垂直居中对齐文字；无头像时保持旧的 top 对齐视觉。
             c.textBaseline = hasAvatar ? "middle" : "top";
@@ -526,7 +661,7 @@ function buildLayout(
           marginTop: rawIdx === 0 && item.speaker ? 12 : rawIdx === 0 ? firstSegmentMargin : 6,
           height: wrapped.length * CONTENT_LINE_HEIGHT,
           draw: (c, x, top, _w) => {
-            c.fillStyle = TEXT_COLOR;
+            c.fillStyle = palette.text;
             c.font = `400 ${CONTENT_FONT_SIZE}px ${CONTENT_FONT_FAMILY}`;
             c.textBaseline = "top";
             wrapped.forEach((line, i) => c.fillText(line, x, top + i * CONTENT_LINE_HEIGHT));
@@ -545,7 +680,7 @@ function buildLayout(
         marginTop: rawIdx === 0 ? firstSegmentMargin : 6,
         height: wrapped.length * CONTENT_LINE_HEIGHT,
         draw: (c, x, top, _w) => {
-          c.fillStyle = item.role === "narration" ? TEXT_COLOR : MUTED_COLOR;
+          c.fillStyle = item.role === "narration" ? palette.text : palette.muted;
           c.font = `${italic ? "italic " : ""}400 ${CONTENT_FONT_SIZE}px ${CONTENT_FONT_FAMILY}`;
           c.textBaseline = "top";
           wrapped.forEach((line, i) => c.fillText(line, x, top + i * CONTENT_LINE_HEIGHT));
@@ -557,12 +692,49 @@ function buildLayout(
   return blocks;
 }
 
+/** 一次成功光栅化的产物。`width`/`height` 是 CSS 像素（未乘 dpr）。 */
+interface RenderedImage {
+  dataUrl: string;
+  width: number;
+  height: number;
+  blob: Promise<Blob | null>;
+}
+
+/**
+ * 把画好的 canvas 导出成 data URL + Blob，并挡住两类"静默失败"：
+ * 跨域素材污染画布（`toDataURL` 抛 SecurityError）和尺寸过大导致部分
+ * WebView 直接返回一个空的 `data:,`。两种情况以前都会让用户拿到一张
+ * 打不开的图，而界面上一切正常。
+ */
+function exportCanvas(canvas: HTMLCanvasElement, width: number, height: number): RenderedImage {
+  let dataUrl: string;
+  try {
+    dataUrl = canvas.toDataURL("image/png");
+  } catch {
+    throw new Error("图片导出被浏览器安全策略拦截（头像素材跨域），可关闭头像后重试");
+  }
+  if (!dataUrl.startsWith("data:image/png") || dataUrl.length < 512) {
+    throw new Error("图片导出失败（画布内容可能过大），请减少选段后重试");
+  }
+  // Kick off a parallel Blob export so the save / share buttons can use
+  // the native byte form directly (smaller than re-parsing the data URL).
+  const blob = new Promise<Blob | null>((resolve) => {
+    try {
+      canvas.toBlob((b) => resolve(b), "image/png");
+    } catch {
+      resolve(null);
+    }
+  });
+  return { dataUrl, width, height, blob };
+}
+
 function renderImage(
   storyName: string,
   subtitle: string | null,
   segments: ShareSegmentInput[],
-  avatarImages: Map<number, HTMLImageElement | null>
-): { canvas: HTMLCanvasElement; dataUrl: string; blob: Promise<Blob | null> } | null {
+  avatarImages: Map<number, HTMLImageElement | null>,
+  palette: SharePalette
+): RenderedImage | null {
   if (!segments.length) return null;
 
   // Prepared segments are sorted by position in the story so the exported
@@ -583,7 +755,15 @@ function renderImage(
   const probeCtx = probe.getContext("2d");
   if (!probeCtx) return null;
 
-  const blocks = buildLayout(probeCtx, storyName, subtitle, prepared, contentWidth, avatarImages);
+  const blocks = buildLayout(
+    probeCtx,
+    storyName,
+    subtitle,
+    prepared,
+    contentWidth,
+    avatarImages,
+    palette
+  );
   const totalHeight = blocks.reduce((acc, block) => acc + block.marginTop + block.height, 0);
   const canvasHeight = CANVAS_TOP_PADDING + totalHeight + CANVAS_BOTTOM_PADDING;
 
@@ -611,10 +791,10 @@ function renderImage(
   ctx.scale(dpr, dpr);
 
   // Background
-  ctx.fillStyle = BG_COLOR;
+  ctx.fillStyle = palette.bg;
   ctx.fillRect(0, 0, width, canvasHeight);
   // Subtle top accent bar as a visual anchor
-  ctx.fillStyle = ACCENT_COLOR;
+  ctx.fillStyle = palette.accent;
   ctx.fillRect(CANVAS_HORIZONTAL_PADDING, 56, 72, 6);
 
   let cursor = CANVAS_TOP_PADDING;
@@ -625,24 +805,14 @@ function renderImage(
   });
 
   // Footer attribution
-  ctx.fillStyle = MUTED_COLOR;
+  ctx.fillStyle = palette.muted;
   ctx.font = `400 18px ${TITLE_FONT_FAMILY}`;
   ctx.textBaseline = "bottom";
   const footer = "来自 · 明日方舟剧情阅读器";
   const measure = ctx.measureText(footer).width;
   ctx.fillText(footer, width - CANVAS_HORIZONTAL_PADDING - measure, canvasHeight - 36);
 
-  const dataUrl = canvas.toDataURL("image/png");
-  // Kick off a parallel Blob export so the save / share buttons can use
-  // the native byte form directly (smaller than re-parsing the data URL).
-  const blob = new Promise<Blob | null>((resolve) => {
-    try {
-      canvas.toBlob((b) => resolve(b), "image/png");
-    } catch {
-      resolve(null);
-    }
-  });
-  return { canvas, dataUrl, blob };
+  return exportCanvas(canvas, width, canvasHeight);
 }
 
 function sanitizeFileStem(storyName: string): string {
@@ -677,8 +847,9 @@ const QUOTE_MARK_GLYPHS = "\u201C\u201D";
 function renderQuoteImage(
   storyName: string,
   subtitle: string | null,
-  dialogue: DialogueSegment
-): { canvas: HTMLCanvasElement; dataUrl: string; blob: Promise<Blob | null> } | null {
+  dialogue: DialogueSegment,
+  palette: SharePalette
+): RenderedImage | null {
   const width = QUOTE_CANVAS_WIDTH;
   const height = QUOTE_CANVAS_HEIGHT;
   const contentWidth = width - QUOTE_HORIZONTAL_PADDING * 2;
@@ -694,14 +865,14 @@ function renderQuoteImage(
   ctx.scale(dpr, dpr);
 
   // Background matches the classic template so the two feel like a set.
-  ctx.fillStyle = BG_COLOR;
+  ctx.fillStyle = palette.bg;
   ctx.fillRect(0, 0, width, height);
 
   // Oversized quotation marks — rendered at 50% alpha so they read as a
   // decorative anchor rather than competing with the body copy.
   ctx.save();
   ctx.globalAlpha = 0.5;
-  ctx.fillStyle = ACCENT_COLOR;
+  ctx.fillStyle = palette.accent;
   ctx.font = `400 ${QUOTE_MARK_FONT_SIZE}px ${CONTENT_FONT_FAMILY}`;
   ctx.textBaseline = "top";
   ctx.fillText(QUOTE_MARK_GLYPHS, QUOTE_HORIZONTAL_PADDING, QUOTE_VERTICAL_PADDING);
@@ -738,7 +909,7 @@ function renderQuoteImage(
     bodyTopLimit,
     bodyTopLimit + (bodyBottomLimit - bodyTopLimit - bodyBlockHeight) / 2
   );
-  ctx.fillStyle = TEXT_COLOR;
+  ctx.fillStyle = palette.text;
   ctx.font = `400 ${QUOTE_BODY_FONT_SIZE}px ${CONTENT_FONT_FAMILY}`;
   ctx.textBaseline = "top";
   lines.forEach((line, i) =>
@@ -749,7 +920,7 @@ function renderQuoteImage(
   // piece without dominating the quote body.
   const storyLabel = [subtitle?.trim(), storyName].filter(Boolean).join(" · ");
   const attribution = `—— ${dialogue.characterName} · ${storyLabel}`;
-  ctx.fillStyle = TEXT_COLOR;
+  ctx.fillStyle = palette.text;
   ctx.font = `700 ${QUOTE_ATTR_FONT_SIZE}px ${CONTENT_FONT_FAMILY}`;
   ctx.textBaseline = "bottom";
   const attrWidth = ctx.measureText(attribution).width;
@@ -761,7 +932,7 @@ function renderQuoteImage(
 
   // Tiny bottom-left watermark so a reposted image still carries the
   // source without visual weight.
-  ctx.fillStyle = MUTED_COLOR;
+  ctx.fillStyle = palette.muted;
   ctx.font = `400 ${QUOTE_WATERMARK_FONT_SIZE}px ${TITLE_FONT_FAMILY}`;
   ctx.textBaseline = "bottom";
   ctx.fillText(
@@ -770,15 +941,7 @@ function renderQuoteImage(
     height - QUOTE_VERTICAL_PADDING
   );
 
-  const dataUrl = canvas.toDataURL("image/png");
-  const blob = new Promise<Blob | null>((resolve) => {
-    try {
-      canvas.toBlob((b) => resolve(b), "image/png");
-    } catch {
-      resolve(null);
-    }
-  });
-  return { canvas, dataUrl, blob };
+  return exportCanvas(canvas, width, height);
 }
 
 /**
@@ -798,6 +961,62 @@ function decodeDataUrlBytes(dataUrl: string): Uint8Array<ArrayBuffer> {
   return bytes;
 }
 
+/**
+ * 抽出一条能给用户看的错误文本。
+ *
+ * Tauri 的 `invoke` 是用**字符串**而不是 `Error` reject 的，所以
+ * `err instanceof Error ? err.message : "失败"` 会把原生层辛苦拼出来的
+ * 中文原因整条丢掉，只剩一句没有信息量的"失败"。
+ */
+function errorText(err: unknown): string | null {
+  if (typeof err === "string") return err.trim() || null;
+  if (err instanceof Error) return err.message.trim() || null;
+  if (err && typeof err === "object" && "message" in err) {
+    const message = (err as { message?: unknown }).message;
+    if (typeof message === "string" && message.trim()) return message.trim();
+  }
+  return null;
+}
+
+/** 用户在系统分享面板里点了取消——这是正常操作，不该弹错误提示。 */
+function isShareAbort(err: unknown): boolean {
+  return err instanceof Error && err.name === "AbortError";
+}
+
+function describeShareError(err: unknown): string {
+  if (err instanceof Error && err.name === "NotAllowedError") {
+    return "系统拒绝了分享请求：请确认已授予应用相关权限，或改用「下载图片」后手动分享";
+  }
+  if (err instanceof Error && (err.name === "DataError" || err.name === "TypeError")) {
+    return "当前系统不支持直接分享图片，请改用「下载图片」后手动分享";
+  }
+  return errorText(err) ?? "分享失败，请稍后重试";
+}
+
+/** 权限类失败的兜底文案：一定要说清楚"去哪儿开"，而不是只说一句失败。 */
+const STORAGE_PERMISSION_HINT =
+  "请到 系统设置 → 应用 → 明日方舟剧情阅读器 → 权限 中开启「存储 / 照片」后重试";
+
+function describeSaveError(err: unknown): string {
+  const text = errorText(err);
+  if (text && /permission|denied|EACCES|权限/i.test(text)) {
+    return `系统拒绝了写入相册：${STORAGE_PERMISSION_HINT}`;
+  }
+  return text ?? "保存失败，请稍后重试";
+}
+
+function formatByteSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${Math.round(kb)} KB`;
+  return `${(kb / 1024).toFixed(1)} MB`;
+}
+
+const TEMPLATE_OPTIONS = [
+  { value: "classic", label: "经典", hint: "长图 · 完整段落" },
+  { value: "quote", label: "对话金句", hint: "竖版 · 单条对话" },
+] as const satisfies ReadonlyArray<{ value: TemplateKind; label: string; hint: string }>;
+
 export function ShareImageDialog({
   open,
   onClose,
@@ -816,60 +1035,104 @@ export function ShareImageDialog({
   // preview <img> doesn't carry a several-hundred-kilobyte `data:` string
   // around in React's prop tree.
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  // 导出规格（CSS 像素 + 字节数），显示在预览下方。`bytes` 要等
+  // `canvas.toBlob` 落地才有。
+  const [imageMeta, setImageMeta] = useState<{
+    width: number;
+    height: number;
+    bytes: number | null;
+  } | null>(null);
   const [renderError, setRenderError] = useState<string | null>(null);
   const [rendering, setRendering] = useState(false);
   const [busyAction, setBusyAction] = useState<"share" | "save" | null>(null);
+  // 渲染失败后手动重试的计数器：光靠现有依赖项无法重跑同一份输入。
+  const [retryToken, setRetryToken] = useState(0);
   // Template selection. `classic` is the unchanged long-form composition;
   // `quote` opts into the single-dialogue 1080×1350 poster. Switching
   // templates re-runs the render pipeline via the effect's dep array.
   const [template, setTemplate] = useState<TemplateKind>("classic");
-  // Tracks whether we actually rendered the quote template or fell back
-  // to classic (e.g. because the selection had no dialogue segment). Used
-  // to pick the right filename suffix and to surface the fallback notice.
-  const [effectiveTemplate, setEffectiveTemplate] = useState<TemplateKind>("classic");
   // 分享图里是否在 speaker 行前渲染头像。开关状态会写入 localStorage，
   // 这样切换剧情或重开弹窗时保持用户上一次的选择。
-  const [showAvatar, setShowAvatar] = useState<boolean>(() => {
-    if (typeof window === "undefined") return true;
-    try {
-      const raw = window.localStorage.getItem(SHOW_AVATAR_STORAGE_KEY);
-      // 默认开启：首次使用时直接展示更有"朋友圈风格"的排版。
-      return raw === null ? true : raw === "true";
-    } catch {
-      return true;
-    }
-  });
+  // 默认开启：首次使用时直接展示更有"朋友圈风格"的排版。
+  const [showAvatar, setShowAvatar] = useState<boolean>(() =>
+    readBooleanPreference(SHOW_AVATAR_STORAGE_KEY, true)
+  );
   useEffect(() => {
-    if (typeof window === "undefined") return;
-    try {
-      window.localStorage.setItem(SHOW_AVATAR_STORAGE_KEY, String(showAvatar));
-    } catch {
-      // 忽略配额 / 隐私模式等写入失败
-    }
+    writeBooleanPreference(SHOW_AVATAR_STORAGE_KEY, showAvatar);
   }, [showAvatar]);
+  // 导出配色是否跟随阅读器主题。默认开启：用户分享的是刚读完的那一页，
+  // 图片就该长得跟屏幕上一样。关掉则永远用经典暖纸配色。
+  const [themeAware, setThemeAware] = useState<boolean>(() =>
+    readBooleanPreference(THEME_AWARE_STORAGE_KEY, true)
+  );
+  useEffect(() => {
+    writeBooleanPreference(THEME_AWARE_STORAGE_KEY, themeAware);
+  }, [themeAware]);
   const platform = useMemo<RuntimePlatform>(() => detectRuntimePlatform(), []);
+
+  /**
+   * 预览区容器。既是取色锚点（`closest(".reader-surface")` 需要一个真实
+   * 挂载在阅读器子树里的节点），也是 `aria-busy` 的载体。
+   */
+  const previewBoxRef = useRef<HTMLDivElement | null>(null);
+
+  /*
+   * 当前 object URL 的镜像。React 18 里对已卸载组件调用 setState 是空操作，
+   * updater 函数根本不会执行——原来靠 `setPreviewUrl(prev => ...)` 在卸载
+   * 时释放 URL 的写法，实际上一次都没释放过，每开一次弹窗就漏一张位图。
+   */
+  const previewUrlRef = useRef<string | null>(null);
+  const setPreview = useCallback((next: string | null) => {
+    const prev = previewUrlRef.current;
+    if (prev === next) return;
+    if (prev && prev.startsWith("blob:")) URL.revokeObjectURL(prev);
+    previewUrlRef.current = next;
+    setPreviewUrl(next);
+  }, []);
+  useEffect(
+    () => () => {
+      const url = previewUrlRef.current;
+      if (url && url.startsWith("blob:")) URL.revokeObjectURL(url);
+      previewUrlRef.current = null;
+    },
+    []
+  );
+
+  /** 丢掉上一张图的所有痕迹，让"能不能分享"和"屏幕上有没有图"保持一致。 */
+  const clearRendered = useCallback(() => {
+    setDataUrl(null);
+    setPngBlob(null);
+    setImageMeta(null);
+    setPreview(null);
+  }, [setPreview]);
+
+  // 金句模板取选段里最靠前的一条对话。没有对话就只能回落到经典模板，
+  // 这个判断在文件名、开关可见性、渲染分支三处都要用到，统一算一次。
+  const firstDialogue = useMemo(
+    () =>
+      segments
+        .slice()
+        .sort((a, b) => a.index - b.index)
+        .find(
+          (s): s is ShareSegmentInput & { segment: DialogueSegment } =>
+            s.segment.type === "dialogue"
+        ) ?? null,
+    [segments]
+  );
+  // 实际生效的模板。以前它是一份在渲染完成后才写回的 state，导致选段一变
+  // 就有一帧"头像开关/回落提示"跟画面对不上；改成纯派生值后不会再抖。
+  const resolvedTemplate: TemplateKind =
+    template === "quote" && firstDialogue ? "quote" : "classic";
 
   // Re-render the image whenever the selection (or the visible story) changes
   // while the dialog is open. Use a microtask so the heavy canvas work
   // happens after the slide-in animation starts.
   useEffect(() => {
-    if (!open) {
-      setDataUrl(null);
-      setPngBlob(null);
-      setPreviewUrl((prev) => {
-        if (prev && prev.startsWith("blob:")) URL.revokeObjectURL(prev);
-        return null;
-      });
-      setRenderError(null);
-      return;
-    }
+    // 关闭时刻意不清空：抽屉还要滑出 220ms，这段时间里把预览抹掉会看到
+    // 一块空白。真正的释放交给下面那个跟着 `rendered` 走的 effect。
+    if (!open) return;
     if (!segments.length) {
-      setDataUrl(null);
-      setPngBlob(null);
-      setPreviewUrl((prev) => {
-        if (prev && prev.startsWith("blob:")) URL.revokeObjectURL(prev);
-        return null;
-      });
+      clearRendered();
       setRenderError("未选择任何段落");
       // Safety: if a previous render was in flight when `segments` emptied
       // we'd be stuck in the loading state.
@@ -911,6 +1174,12 @@ export function ShareImageDialog({
 
     (async () => {
       try {
+        // 取色必须在 await 之前做：此刻 DOM 一定是挂着的，等到异步回来
+        // 组件可能已经在卸载途中，`closest` 会拿到一个脱离文档的节点。
+        const palette = themeAware
+          ? resolveSharePalette(previewBoxRef.current)
+          : PAPER_PALETTE;
+
         await ensureFontsLoaded(sample);
         if (cancelled) return;
 
@@ -941,63 +1210,37 @@ export function ShareImageDialog({
           .filter((x): x is string => Boolean(x))
           .join(" · ") || null;
 
-        // Resolve which template to actually render. `template` is the
-        // user's choice; `effective` is what we ship — they diverge when
-        // the user picks "quote" but the selection has no dialogue.
-        let effective: TemplateKind = template;
-        let result: ReturnType<typeof renderImage> = null;
-        if (template === "quote") {
-          const firstDialogue = segments
-            .slice()
-            .sort((a, b) => a.index - b.index)
-            .find((s): s is ShareSegmentInput & { segment: DialogueSegment } =>
-              s.segment.type === "dialogue"
-            );
-          if (!firstDialogue) {
-            toast.warn("金句模板需至少选中一条对话，已回落到经典模板");
-            effective = "classic";
-            result = renderImage(storyName, subtitle, segments, avatarImages);
-          } else {
-            result = renderQuoteImage(storyName, subtitle, firstDialogue.segment);
-          }
-        } else {
-          result = renderImage(storyName, subtitle, segments, avatarImages);
-        }
+        const result =
+          resolvedTemplate === "quote" && firstDialogue
+            ? renderQuoteImage(storyName, subtitle, firstDialogue.segment, palette)
+            : renderImage(storyName, subtitle, segments, avatarImages, palette);
 
         if (cancelled) return;
         if (!result) {
-          setRenderError("无法生成图片，请稍后重试");
-        } else {
-          setEffectiveTemplate(effective);
-          setDataUrl(result.dataUrl);
-          // Kick off Blob export + preview URL in parallel. `toBlob` on a
-          // big canvas can easily take 100ms+, so resolve the data URL
-          // preview first and upgrade to the Blob URL when it lands.
-          result.blob.then((blob) => {
-            if (cancelled) return;
-            setPngBlob(blob);
-            if (!blob) {
-              setPreviewUrl(result.dataUrl);
-              return;
-            }
-            const next = URL.createObjectURL(blob);
-            setPreviewUrl((prev) => {
-              if (prev && prev.startsWith("blob:")) URL.revokeObjectURL(prev);
-              return next;
-            });
-          });
-          // Optimistic fallback — show the data URL instantly while the
-          // Blob is encoding, so the user doesn't see an empty preview
-          // for the ~100ms it takes canvas.toBlob to resolve.
-          setPreviewUrl((prev) => {
-            if (prev && prev.startsWith("blob:")) URL.revokeObjectURL(prev);
-            return result.dataUrl;
-          });
+          throw new Error("当前环境不支持 Canvas 绘图，无法生成分享图");
         }
+        setDataUrl(result.dataUrl);
+        setImageMeta({ width: result.width, height: result.height, bytes: null });
+        // Optimistic fallback — show the data URL instantly while the
+        // Blob is encoding, so the user doesn't see an empty preview
+        // for the ~100ms it takes canvas.toBlob to resolve.
+        setPreview(result.dataUrl);
+        // Kick off Blob export + preview URL in parallel. `toBlob` on a
+        // big canvas can easily take 100ms+, so resolve the data URL
+        // preview first and upgrade to the Blob URL when it lands.
+        void result.blob.then((blob) => {
+          if (cancelled || !blob) return;
+          setPngBlob(blob);
+          setImageMeta((prev) => (prev ? { ...prev, bytes: blob.size } : prev));
+          setPreview(URL.createObjectURL(blob));
+        });
       } catch (err) {
         if (cancelled) return;
         console.error("[ShareImageDialog] render failed", err);
-        setRenderError(err instanceof Error ? err.message : "生成图片失败");
+        // 失败时必须把上一张成功的图一起丢掉：否则错误提示下面的「分享 /
+        // 保存」仍然可点，用户会把一张跟当前选段对不上的旧图发出去。
+        clearRendered();
+        setRenderError(errorText(err) ?? "生成图片失败，请重试");
       } finally {
         if (!cancelled) setRendering(false);
       }
@@ -1006,18 +1249,28 @@ export function ShareImageDialog({
     return () => {
       cancelled = true;
     };
-  }, [open, segments, storyName, categoryName, storyCode, template, showAvatar, toast]);
+  }, [
+    open,
+    segments,
+    storyName,
+    categoryName,
+    storyCode,
+    resolvedTemplate,
+    firstDialogue,
+    showAvatar,
+    themeAware,
+    retryToken,
+    clearRendered,
+    setPreview,
+  ]);
 
-  // Revoke the preview URL on unmount so we don't leak across story
-  // switches when the dialog is kept mounted by a parent KeepAlive.
+  // 抽屉整体卸载（退场动画放完）后再释放位图与错误态，下次打开是干净的。
   useEffect(() => {
-    return () => {
-      setPreviewUrl((prev) => {
-        if (prev && prev.startsWith("blob:")) URL.revokeObjectURL(prev);
-        return null;
-      });
-    };
-  }, []);
+    if (rendered) return;
+    clearRendered();
+    setRenderError(null);
+    setRendering(false);
+  }, [rendered, clearRendered]);
 
   const fileName = useMemo(() => {
     const stem = sanitizeFileStem(storyName);
@@ -1025,93 +1278,176 @@ export function ShareImageDialog({
     // folder full of quote posters self-describes. When the quote
     // template falls back to classic (no dialogue in selection) we use
     // the classic naming instead.
-    if (effectiveTemplate === "quote") {
-      const firstDialogue = segments
-        .slice()
-        .sort((a, b) => a.index - b.index)
-        .find((s): s is ShareSegmentInput & { segment: DialogueSegment } =>
-          s.segment.type === "dialogue"
-        );
-      const character = firstDialogue
-        ? sanitizeFileStem(firstDialogue.segment.characterName || "character")
-        : "character";
+    if (resolvedTemplate === "quote" && firstDialogue) {
+      const character = sanitizeFileStem(
+        firstDialogue.segment.characterName || "character"
+      );
       return `${character}-${stem}-quote.png`;
     }
     return `${stem}.png`;
-  }, [effectiveTemplate, segments, storyName]);
+  }, [resolvedTemplate, firstDialogue, storyName]);
 
   const payload = useMemo<ShareImagePayload | null>(() => {
     if (!dataUrl) return null;
     return { dataUrl, fileName, title: storyName };
   }, [dataUrl, fileName, storyName]);
 
+  /*
+   * 按钮的 `disabled` 要等一次渲染才生效，而两次极快的点击（触摸屏上的
+   * 双击、或者回车与鼠标同时触发）会落在同一帧里——那就会真的弹出两次
+   * 系统分享面板、往相册里塞两张一模一样的图。用 ref 做真正的互斥闸。
+   */
+  const actionLockRef = useRef(false);
+  const runExclusive = useCallback(
+    async (action: "share" | "save", task: () => Promise<void>) => {
+      if (actionLockRef.current) return;
+      actionLockRef.current = true;
+      setBusyAction(action);
+      try {
+        await task();
+      } finally {
+        actionLockRef.current = false;
+        setBusyAction(null);
+      }
+    },
+    []
+  );
+
   const handleShare = useCallback(async () => {
     if (!payload) return;
-    setBusyAction("share");
-    try {
-      if (platform === "android") {
-        await shareImageViaSystem(payload);
-        toast.show("已打开系统分享面板");
-      } else if (typeof navigator !== "undefined" && "share" in navigator) {
-        // Web Share API path (mostly mobile browsers / PWAs). Use the
-        // already-rasterised Blob when we have it — decoding the data
-        // URL again just to build a File would pointlessly walk the
-        // several-hundred-kilobyte string twice.
-        const blob =
-          pngBlob ?? new Blob([decodeDataUrlBytes(payload.dataUrl)], { type: "image/png" });
-        const file = new File([blob], payload.fileName ?? "story.png", { type: "image/png" });
-        // TS lib.dom doesn't always have `canShare` typed.
-        const nav = navigator as Navigator & {
-          canShare?: (data: { files: File[] }) => boolean;
-          share?: (data: { files: File[]; title?: string }) => Promise<void>;
-        };
-        if (nav.canShare?.({ files: [file] }) && nav.share) {
-          await nav.share({ files: [file], title: payload.title });
-        } else {
-          saveImageToDesktopFile({ ...payload, blob: pngBlob });
-          toast.show("已下载图片，请手动分享");
+    await runExclusive("share", async () => {
+      try {
+        if (platform === "android") {
+          await shareImageViaSystem(payload);
+          toast.show("已打开系统分享面板");
+          return;
         }
-      } else {
+        if (typeof navigator !== "undefined" && "share" in navigator) {
+          // Web Share API path (mostly mobile browsers / PWAs). Use the
+          // already-rasterised Blob when we have it — decoding the data
+          // URL again just to build a File would pointlessly walk the
+          // several-hundred-kilobyte string twice.
+          const blob =
+            pngBlob ?? new Blob([decodeDataUrlBytes(payload.dataUrl)], { type: "image/png" });
+          const file = new File([blob], payload.fileName ?? "story.png", {
+            type: "image/png",
+          });
+          // TS lib.dom doesn't always have `canShare` typed.
+          const nav = navigator as Navigator & {
+            canShare?: (data: { files: File[] }) => boolean;
+            share?: (data: { files: File[]; title?: string }) => Promise<void>;
+          };
+          if (nav.canShare?.({ files: [file] }) && nav.share) {
+            await nav.share({ files: [file], title: payload.title });
+            return;
+          }
+        }
         saveImageToDesktopFile({ ...payload, blob: pngBlob });
         toast.show("已下载图片，请手动分享");
+      } catch (err) {
+        // 用户自己在分享面板上点了取消，不是错误，不该弹红条。
+        if (isShareAbort(err)) return;
+        console.error("[ShareImageDialog] share failed", err);
+        toast.error(describeShareError(err));
       }
-    } catch (err) {
-      console.error("[ShareImageDialog] share failed", err);
-      toast.error(err instanceof Error ? err.message : "分享失败");
-    } finally {
-      setBusyAction(null);
-    }
-  }, [payload, platform, pngBlob, toast]);
+    });
+  }, [payload, platform, pngBlob, runExclusive, toast]);
 
   const handleSave = useCallback(async () => {
     if (!payload) return;
-    setBusyAction("save");
-    try {
-      if (platform === "android") {
+    await runExclusive("save", async () => {
+      try {
+        if (platform !== "android") {
+          saveImageToDesktopFile({ ...payload, blob: pngBlob });
+          toast.success("已下载图片到浏览器");
+          return;
+        }
         const response = await saveImageToGallery(payload);
         if (response.needsPermission) {
-          toast.warn("需要存储权限才能保存，正在跳转系统设置");
+          let jumped = true;
           try {
             await openStoragePermissionSettings();
           } catch (openErr) {
+            jumped = false;
             console.warn("[ShareImageDialog] open settings failed", openErr);
           }
+          // 权限被拒时最忌讳只说一句"失败"。无论有没有跳转成功，都要留下
+          // 一条照着做就能解决的路径——跳过去了就说在哪一屏点什么，没跳成
+          // 就把完整的设置路径写出来。
+          toast.warn(
+            jumped
+              ? "需要存储权限才能保存到相册：请在刚打开的系统设置里开启「存储 / 照片」权限，再回到应用重试"
+              : `需要存储权限才能保存到相册：${STORAGE_PERMISSION_HINT}`,
+            8000
+          );
           return;
         }
         if (response.saved) {
           toast.success("已保存到相册 · Pictures/ArknightsStoryReader");
+          return;
         }
-      } else {
-        saveImageToDesktopFile({ ...payload, blob: pngBlob });
-        toast.success("已下载图片到浏览器");
+        // saved=false 又不缺权限：多半是 MediaStore 插入失败。给一条还能
+        // 走通的退路，别让用户对着一个没有任何反馈的按钮反复点。
+        toast.error("保存到相册失败，可改用「分享」把图片发给自己，或稍后重试");
+      } catch (err) {
+        console.error("[ShareImageDialog] save failed", err);
+        toast.error(describeSaveError(err));
       }
-    } catch (err) {
-      console.error("[ShareImageDialog] save failed", err);
-      toast.error(err instanceof Error ? err.message : "保存失败");
-    } finally {
-      setBusyAction(null);
-    }
-  }, [payload, platform, pngBlob, toast]);
+    });
+  }, [payload, platform, pngBlob, runExclusive, toast]);
+
+  const handleRetry = useCallback(() => {
+    setRenderError(null);
+    setRetryToken((token) => token + 1);
+  }, []);
+
+  /**
+   * 模板选择。金句模板缺对话时的提示放在这里而不是渲染 effect 里——
+   * 后者每次选段变化都会重跑，同一句提示会被反复弹出来。
+   */
+  const selectTemplate = useCallback(
+    (next: TemplateKind) => {
+      setTemplate(next);
+      if (next === "quote" && !firstDialogue) {
+        toast.warn("金句模板需至少选中一条对话，已回落到经典模板");
+      }
+    },
+    [firstDialogue, toast]
+  );
+
+  /** radiogroup 的方向键导航：只有选中项可 Tab 进入，左右/上下切换选项。 */
+  const handleTemplateKeyDown = useCallback(
+    (event: ReactKeyboardEvent<HTMLDivElement>) => {
+      const { key } = event;
+      if (
+        key !== "ArrowRight" &&
+        key !== "ArrowDown" &&
+        key !== "ArrowLeft" &&
+        key !== "ArrowUp" &&
+        key !== "Home" &&
+        key !== "End"
+      ) {
+        return;
+      }
+      event.preventDefault();
+      const count = TEMPLATE_OPTIONS.length;
+      const current = TEMPLATE_OPTIONS.findIndex((opt) => opt.value === template);
+      const nextIndex =
+        key === "Home"
+          ? 0
+          : key === "End"
+            ? count - 1
+            : key === "ArrowRight" || key === "ArrowDown"
+              ? (current + 1) % count
+              : (current - 1 + count) % count;
+      selectTemplate(TEMPLATE_OPTIONS[nextIndex].value);
+      // 焦点跟着选中项走，读屏才会把新值念出来。
+      event.currentTarget
+        .querySelectorAll<HTMLButtonElement>('[role="radio"]')
+        [nextIndex]?.focus();
+    },
+    [selectTemplate, template]
+  );
 
   if (!rendered) return null;
 

@@ -29,9 +29,21 @@ src-tauri/Cargo.lock
 
 # Data
 ArknightsGameData/
+ArknightsGameData-*/
+ArknightsGameData*.zip
+story_index.db
 gradle-8.14.3/
 .gradle/
 .gradle-cache/
+
+# 签名材料：只允许由 release.yml 从 secrets 还原到
+# src-tauri/gen/android/，任何情况下都不入库
+*.jks
+*.keystore
+*.p12
+*.pepk
+*.b64
+keystore.properties
 
 # Environment overrides
 .env

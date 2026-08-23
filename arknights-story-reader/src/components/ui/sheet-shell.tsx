@@ -15,10 +15,13 @@ import { cn } from "@/lib/utils";
  *   - `.glass-thick` material so the page content behind blurs out of focus
  *   - Soft shadow beneath for lift; inner highlight on the top edge
  *
- * Animation and lifecycle (esc/scroll-lock/two-phase unmount) are left to
- * the caller via `state`, which must be spread onto the outer element's
- * `data-state` attribute. The existing `useSidePanel` hook returns that
- * value already — see `ShareImageDialog` for the usage.
+ * The enter/exit animation and the two-phase unmount are still driven by the
+ * caller via `state`, which must be spread onto the outer element's
+ * `data-state` attribute — the existing `useSidePanel` hook returns that
+ * value already (see `ShareImageDialog` for the usage). Everything a modal
+ * owes the user regardless of how it is animated — focus trap, focus
+ * restore, Escape, background scroll lock — lives here so a sheet is never
+ * half-modal just because a caller wired it up by hand.
  */
 
 export type SheetState = "open" | "closed";
@@ -36,6 +39,77 @@ interface SheetShellProps {
 const FOCUSABLE =
   'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
+/** Esc 要放过正在输入的控件：那里 Esc 的语义是「撤销这次输入」。 */
+function isTextEntry(node: EventTarget | null): boolean {
+  const el = node as HTMLElement | null;
+  if (!el) return false;
+  return (
+    el.tagName === "INPUT" ||
+    el.tagName === "TEXTAREA" ||
+    el.isContentEditable === true
+  );
+}
+
+/**
+ * sheet 挂在阅读器子树里，而阅读器退到后台时整棵子树会被 KeepAlive 置为
+ * inert（抽屉状态还留着）。这种时候面板并没有真的呈现在用户面前，键盘和
+ * 焦点看守必须一起失效 —— 否则用户在剧情列表里按 Tab，焦点会被拽进一个
+ * inert 的面板，等于整个应用的 Tab 键失灵。
+ */
+function isPresented(panel: HTMLElement | null): panel is HTMLElement {
+  return Boolean(panel && !panel.closest("[inert]"));
+}
+
+function focusableWithin(panel: HTMLElement): HTMLElement[] {
+  return Array.from(panel.querySelectorAll<HTMLElement>(FOCUSABLE)).filter((el) => {
+    if (el.closest("[inert]") || el.closest('[aria-hidden="true"]')) return false;
+    // getClientRects() 对 position: fixed 的元素也成立，offsetParent 不行。
+    return el.getClientRects().length > 0 || el === document.activeElement;
+  });
+}
+
+/*
+ * 背景滚动锁。计数是模块级的：同时开两个 sheet 时后关的那个才真正解锁。
+ *
+ * `useSidePanel` 里还有一份同样的锁（它比 sheet 早一步存在，不能直接拆），
+ * 两边的清理在同一次提交里同步执行且先后顺序没有保证 —— 谁最后落笔谁说了
+ * 算，先解锁再被对方按原值写回 `hidden` 就永久锁死了。所以这里把解锁推到
+ * 微任务：提交跑完才轮到我们，最后写进 body 的一定是开锁前记下的原值。
+ */
+let scrollLockCount = 0;
+let scrollLockRestore: { overflow: string; paddingRight: string } | null = null;
+let scrollLockReleaseScheduled = false;
+
+function lockBodyScroll() {
+  scrollLockCount += 1;
+  if (scrollLockCount > 1) return;
+  const body = document.body;
+  if (!scrollLockRestore) {
+    scrollLockRestore = {
+      overflow: body.style.overflow,
+      paddingRight: body.style.paddingRight,
+    };
+  }
+  // 桌面端补上消失的滚动条宽度，避免整页横向抖一下。
+  const scrollbarWidth = window.innerWidth - document.documentElement.clientWidth;
+  body.style.overflow = "hidden";
+  if (scrollbarWidth > 0) body.style.paddingRight = `${scrollbarWidth}px`;
+}
+
+function unlockBodyScroll() {
+  scrollLockCount = Math.max(0, scrollLockCount - 1);
+  if (scrollLockCount > 0 || scrollLockReleaseScheduled) return;
+  scrollLockReleaseScheduled = true;
+  queueMicrotask(() => {
+    scrollLockReleaseScheduled = false;
+    // 微任务排队期间又开了一个 sheet（严格模式的重挂载也算），锁继续留着。
+    if (scrollLockCount > 0 || !scrollLockRestore) return;
+    document.body.style.overflow = scrollLockRestore.overflow;
+    document.body.style.paddingRight = scrollLockRestore.paddingRight;
+    scrollLockRestore = null;
+  });
+}
+
 export function SheetShell({
   state,
   onClose,
@@ -45,33 +119,34 @@ export function SheetShell({
 }: SheetShellProps) {
   const panelRef = React.useRef<HTMLDivElement | null>(null);
   const restoreRef = React.useRef<HTMLElement | null>(null);
+  // 键盘监听里读最新的 onClose，省得每次父组件重渲染都重绑一遍。
+  const onCloseRef = React.useRef(onClose);
+  React.useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
 
   /*
-   * `aria-modal` 只是给辅助技术的声明，真正的模态行为要自己实现：
-   * 打开时把焦点移进面板（面板本身可聚焦，避免直接跳到输入框弹起软键盘），
-   * 关闭时还给触发它的按钮，否则键盘/读屏用户会被扔回文档开头。
+   * 下面三个 effect 的声明顺序有意义：清理函数按声明顺序执行，焦点归还必须
+   * 排在焦点看守卸载之后 —— 否则归还焦点的那一下会被看守当成「焦点跑到面板
+   * 外面了」再抓回来，触发它的按钮就永远拿不回焦点。
    */
-  React.useEffect(() => {
-    if (state !== "open") return;
-    restoreRef.current = document.activeElement as HTMLElement | null;
-    panelRef.current?.focus({ preventScroll: true });
-    return () => {
-      const previous = restoreRef.current;
-      if (previous && document.contains(previous)) {
-        previous.focus({ preventScroll: true });
-      }
-    };
-  }, [state]);
 
+  // 键盘：Tab 循环锁在面板内，Esc 关闭。
   React.useEffect(() => {
     if (state !== "open") return;
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Tab") return;
       const panel = panelRef.current;
-      if (!panel) return;
-      const items = Array.from(panel.querySelectorAll<HTMLElement>(FOCUSABLE)).filter(
-        (el) => el.offsetParent !== null || el === document.activeElement
-      );
+      if (!isPresented(panel)) return;
+
+      if (event.key === "Escape") {
+        if (event.defaultPrevented || isTextEntry(event.target)) return;
+        event.preventDefault();
+        onCloseRef.current();
+        return;
+      }
+
+      if (event.key !== "Tab") return;
+      const items = focusableWithin(panel);
       const active = document.activeElement;
       if (items.length === 0) {
         event.preventDefault();
@@ -94,6 +169,50 @@ export function SheetShell({
     document.addEventListener("keydown", handleKeyDown, true);
     return () => document.removeEventListener("keydown", handleKeyDown, true);
   }, [state]);
+
+  /*
+   * Tab 只是最常见的一条逃逸路径。读屏手势、软键盘的「下一项」、外部代码
+   * 主动 focus 都能把焦点送出面板，这里兜底把它请回来。上面还压着另一个
+   * dialog 时不抢，免得两个模态互相拉扯。
+   */
+  React.useEffect(() => {
+    if (state !== "open") return;
+    const handleFocusIn = (event: FocusEvent) => {
+      const panel = panelRef.current;
+      const target = event.target as HTMLElement | null;
+      if (!isPresented(panel) || !target || panel.contains(target)) return;
+      if (target.closest?.('[role="dialog"]')) return;
+      panel.focus({ preventScroll: true });
+    };
+    document.addEventListener("focusin", handleFocusIn);
+    return () => document.removeEventListener("focusin", handleFocusIn);
+  }, [state]);
+
+  /*
+   * `aria-modal` 只是给辅助技术的声明，真正的模态行为要自己实现：
+   * 打开时把焦点移进面板（面板本身可聚焦，避免直接跳到输入框弹起软键盘），
+   * 关闭时还给触发它的按钮，否则键盘/读屏用户会被扔回文档开头。
+   */
+  React.useEffect(() => {
+    if (state !== "open") return;
+    restoreRef.current = document.activeElement as HTMLElement | null;
+    if (isPresented(panelRef.current)) {
+      panelRef.current.focus({ preventScroll: true });
+    }
+    return () => {
+      const previous = restoreRef.current;
+      if (previous && document.contains(previous)) {
+        previous.focus({ preventScroll: true });
+      }
+    };
+  }, [state]);
+
+  // 背景滚动锁跟着挂载周期走（含退场动画），而不是跟着 `state`：动画播到
+  // 一半时页面在底下滚起来同样出戏。
+  React.useEffect(() => {
+    lockBodyScroll();
+    return unlockBodyScroll;
+  }, []);
 
   return (
     <div className="fixed inset-0 z-50 flex">

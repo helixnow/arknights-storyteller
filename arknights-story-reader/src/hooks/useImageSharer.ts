@@ -27,6 +27,30 @@ function assertAndroid() {
 }
 
 /**
+ * 文件名主干的最大字节数（UTF-8）。ext4 / MediaStore 的上限是 255 **字节**，
+ * 中文标题一个字就占 3 字节——「泰拉大陆漫游指南·第二十三卷·（下）」这种
+ * 长标题按字符数算完全没超，按字节数早就爆了，落盘会直接失败。留出后缀和
+ * 少量余量，主干截到 180 字节。
+ */
+const MAX_STEM_BYTES = 180;
+
+/** 按 UTF-8 字节数截断，不切断代理对/组合字。 */
+function truncateToBytes(input: string, maxBytes: number): string {
+  const encoder = new TextEncoder();
+  if (encoder.encode(input).length <= maxBytes) return input;
+  let bytes = 0;
+  let out = "";
+  // `for...of` 按码点迭代，emoji 这类代理对不会被从中间劈开。
+  for (const ch of input) {
+    const size = encoder.encode(ch).length;
+    if (bytes + size > maxBytes) break;
+    bytes += size;
+    out += ch;
+  }
+  return out;
+}
+
+/**
  * 归一化导出文件名：去掉路径分隔符与控制字符、补上 `.png` 后缀（后缀
  * 比较大小写不敏感，`封面.PNG` 不该再被拼成 `封面.PNG.png`）。三条落盘
  * 路径——相册、系统分享、浏览器下载——共用同一份规则，避免 Android
@@ -35,10 +59,17 @@ function assertAndroid() {
 function normalizePngFileName(fileName: string | null | undefined): string {
   const cleaned = (fileName ?? "")
     .replace(/[\\/:*?"<>|\u0000-\u001f]+/g, "_")
+    // 换行/制表符已在上一步变成 `_`，这里把连续空白压成一个空格，
+    // 免得分享出去的文件名里带一长串空格。
+    .replace(/\s+/g, " ")
     .trim()
     .replace(/^\.+/, "");
   if (!cleaned) return "story.png";
-  return /\.png$/i.test(cleaned) ? cleaned : `${cleaned}.png`;
+  const stem = /\.png$/i.test(cleaned) ? cleaned.slice(0, -4) : cleaned;
+  // 截断后可能又露出末尾的空格或点：Windows 不允许以它们结尾，Android
+  // 上也只是难看。
+  const trimmed = truncateToBytes(stem, MAX_STEM_BYTES).replace(/[ .]+$/, "");
+  return trimmed ? `${trimmed}.png` : "story.png";
 }
 
 /**

@@ -1,12 +1,13 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
 import { useStoryPreview } from "@/hooks/useStoryPreview";
+import { peekAssetCandidates, useAssetHealthNonce } from "@/hooks/useAsset";
 import {
   gradientFallbackBackground,
+  hasRecoverableCandidate,
   markAssetUrlAlive,
   markAssetUrlDead,
   pickLiveCandidate,
-  resolveAssetCandidatesLocal,
 } from "@/lib/assetUrls";
 import type { StoryEntry } from "@/types/story";
 
@@ -31,13 +32,14 @@ export function StoryThumbnail({
 }: StoryThumbnailProps) {
   const { token: previewToken } = useStoryPreview(story.storyTxt);
 
+  // 候选表统一走 `peekAssetCandidates` 的按-token 缓存：同一张封面在列表
+  // 缩略图和卡片模糊背景里各渲染一次，两处拿到的是同一个数组引用，字符串
+  // 拼接也只做一次。
   const candidates = useMemo(() => {
     const urls: string[] = [];
 
     if (previewToken) {
-      urls.push(
-        ...resolveAssetCandidatesLocal(previewToken.kind, previewToken.token, null)
-      );
+      urls.push(...peekAssetCandidates(previewToken.kind, previewToken.token));
     }
 
     const storyTxt = story.storyTxt ?? "";
@@ -45,9 +47,9 @@ export function StoryThumbnail({
     if (!group) {
       // 没 group，没法兜底
     } else if (storyTxt.startsWith("obt/main/")) {
-      urls.push(...resolveAssetCandidatesLocal("chapter_cover", group, null));
+      urls.push(...peekAssetCandidates("chapter_cover", group));
     } else if (storyTxt.startsWith("activities/")) {
-      urls.push(...resolveAssetCandidatesLocal("activity_kv", group, null));
+      urls.push(...peekAssetCandidates("activity_kv", group));
     }
 
     return Array.from(new Set(urls));
@@ -81,7 +83,22 @@ export function StoryThumbnail({
   // 与 `<AssetImage>` 共用同一份失败缓存 / host 熔断：同一张 404 的封面
   // 不会因为走了两条渲染路径就被请求两遍。
   const live = pickLiveCandidate(candidates, cursor);
-  const currentUrl = live?.url ?? null;
+  // 候选被熔断跳光时，订阅一次健康度事件：窗口结束后自动再试，而不是把
+  // 卡片永久钉在渐变兜底上。图片正常显示时不订阅，零开销。
+  useAssetHealthNonce(live === null && hasRecoverableCandidate(candidates, cursor));
+
+  // 解码放到主线程之外：滚动时一张 1920px 的活动 KV 同步解码足以掉帧。
+  // 解码完成前保持兜底色块，完成后再淡入，避免"半张图"闪现。
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+  const currentUrlRef = useRef<string | null>(null);
+  currentUrlRef.current = live?.url ?? null;
+
   const tintClass = tint === "soft" ? "filter saturate-[0.85]" : "";
 
   return (
@@ -91,6 +108,12 @@ export function StoryThumbnail({
         className
       )}
     >
+      {/* 兜底色块常驻：卡片的宽高由调用方的容器决定，这里只做淡入淡出，
+          既不会在图片到位的瞬间产生一次 DOM 增删，也不会有任何布局位移。 */}
+      <GradientFallback
+        seed={story.storyGroup || story.storyId}
+        hidden={Boolean(live) && loaded}
+      />
       {live ? (
         <img
           key={live.url}
@@ -98,27 +121,35 @@ export function StoryThumbnail({
           alt={alt ?? story.storyName}
           loading={lazy ? "lazy" : "eager"}
           decoding="async"
+          fetchPriority={lazy ? "low" : "high"}
           referrerPolicy="no-referrer"
           draggable={false}
-          onLoad={() => {
-            markAssetUrlAlive(live.url);
-            loadedUrlRef.current = live.url;
-            setLoaded(true);
+          onLoad={(event) => {
+            const img = event.currentTarget;
+            const url = live.url;
+            markAssetUrlAlive(url);
+            const show = () => {
+              if (!mountedRef.current || currentUrlRef.current !== url) return;
+              loadedUrlRef.current = url;
+              setLoaded(true);
+            };
+            if (typeof img.decode === "function") {
+              img.decode().then(show, show);
+            } else {
+              show();
+            }
           }}
           onError={() => {
             markAssetUrlDead(live.url);
             setCursor(Math.min(live.index + 1, candidates.length));
           }}
           className={cn(
-            "absolute inset-0 h-full w-full object-cover",
+            "absolute inset-0 h-full w-full object-cover motion-safe:transition-opacity motion-safe:duration-300",
             tintClass,
             loaded ? "opacity-100" : "opacity-0"
           )}
         />
       ) : null}
-      {(!currentUrl || !loaded) && (
-        <GradientFallback seed={story.storyGroup || story.storyId} />
-      )}
     </div>
   );
 }
@@ -128,11 +159,14 @@ export function StoryThumbnail({
  * `.story-card-memory-bg` 靠它把这块装饰色块藏掉，否则封面加载失败时卡片
  * 背后会冒出一块跟卡片底色打架的渐变。
  */
-function GradientFallback({ seed }: { seed: string }) {
+function GradientFallback({ seed, hidden }: { seed: string; hidden: boolean }) {
   return (
     <div
       aria-hidden="true"
-      className="story-thumbnail-fallback absolute inset-0"
+      className={cn(
+        "story-thumbnail-fallback absolute inset-0 motion-safe:transition-opacity motion-safe:duration-300",
+        hidden ? "opacity-0" : "opacity-100"
+      )}
       style={{ background: gradientFallbackBackground(seed) }}
     />
   );

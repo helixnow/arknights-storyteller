@@ -3,9 +3,26 @@ import type { StoryEntry } from "@/types/story";
 import { Button } from "@/components/ui/button";
 import { CustomScrollArea } from "@/components/ui/custom-scroll-area";
 import { StoryThumbnail } from "@/components/StoryThumbnail";
-import { storyCatalog } from "@/components/StoryList";
+import {
+  READ_FINISHED_PCT,
+  getReadingProgress,
+  storyCatalog,
+  toReadPercent,
+  useOnlineStatus,
+  type ReadingProgressEntry,
+} from "@/components/StoryList";
 import { useFavorites } from "@/hooks/useFavorites";
-import { BookOpen, Flame, Sparkles } from "lucide-react";
+import {
+  ArrowDownToLine,
+  BookOpen,
+  Flame,
+  RotateCcw,
+  Settings2,
+  Sparkles,
+  TriangleAlert,
+  WifiOff,
+  type LucideIcon,
+} from "lucide-react";
 
 type Tab = "home" | "stories" | "characters" | "search" | "settings";
 
@@ -16,22 +33,21 @@ interface HomePanelProps {
   onGoToFavorites?: () => void;
 }
 
-interface RecentItem {
-  storyPath: string;
-  percentage: number;
-  updatedAt: number;
+/** 首页用到的最近阅读记录，形状与剧情列表共享的进度快照一致。 */
+type RecentItem = ReadingProgressEntry;
+
+interface RecentStory {
+  entry: StoryEntry;
+  meta: RecentItem;
 }
 
 const STREAK_KEY = "arknights-reading-streak-v1";
-const PROGRESS_KEY = "reading-progress";
 /** 扫描最近进度的上限：够算「最近阅读 N 章」，又不会把整个 map 都解析成卡片。 */
 const RECENT_SCAN_LIMIT = 60;
 /** 首页最多渲染几张最近阅读卡片（含「继续阅读」大卡）。 */
 const RECENT_RENDER_LIMIT = 5;
 /** 刷新超过这个时长才提示「正在刷新」，命中缓存时不闪。 */
 const REFRESH_HINT_DELAY_MS = 400;
-/** 进度到这个比例就当作读完，和列表里「已读完」的口径一致。 */
-const FINISHED_THRESHOLD = 0.99;
 
 interface StreakInfo {
   currentStreak: number;
@@ -52,39 +68,41 @@ function readStreak(): StreakInfo {
   return { currentStreak: 0, lastReadOn: "", totalDays: 0 };
 }
 
-/** 阅读进度：percentage 是 0~1，脏数据（NaN / 越界）直接夹回区间。 */
-function readRecentProgress(): RecentItem[] {
-  try {
-    const raw = window.localStorage.getItem(PROGRESS_KEY);
-    if (!raw) return [];
-    const map = JSON.parse(raw) as Record<string, { percentage?: number; updatedAt?: number }>;
-    const entries: RecentItem[] = [];
-    for (const [path, v] of Object.entries(map)) {
-      if (!v || typeof v !== "object") continue;
-      const percentage = Number(v.percentage ?? 0);
-      const updatedAt = Number(v.updatedAt ?? 0);
-      entries.push({
-        storyPath: path,
-        percentage: Number.isFinite(percentage) ? Math.min(1, Math.max(0, percentage)) : 0,
-        updatedAt: Number.isFinite(updatedAt) ? updatedAt : 0,
-      });
-    }
-    entries.sort((a, b) => b.updatedAt - a.updatedAt);
-    return entries;
-  } catch {
-    return [];
+function sameStreak(a: StreakInfo, b: StreakInfo): boolean {
+  return (
+    a.currentStreak === b.currentStreak &&
+    a.lastReadOn === b.lastReadOn &&
+    a.totalDays === b.totalDays
+  );
+}
+
+/**
+ * 首页每次获得焦点都会重跑一遍 `loadHome`，绝大多数时候结果和上一次一模
+ * 一样。这里逐条比一遍，内容没变就沿用旧数组——否则每次切窗口都会把所有
+ * 卡片连同封面重新渲染一次。
+ */
+function sameRecentStories(a: RecentStory[], b: RecentStory[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i].entry.storyId !== b[i].entry.storyId) return false;
+    if (a[i].meta.percentage !== b[i].meta.percentage) return false;
+    if (a[i].meta.updatedAt !== b[i].meta.updatedAt) return false;
   }
+  return true;
 }
 
 export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePanelProps) {
   // 与剧情页「收藏」分类同口径：单章收藏 + 收藏分组展开后的去重总数。
   const { favoriteCount } = useFavorites();
-  const [recentStories, setRecentStories] = useState<Array<{ entry: StoryEntry; meta: RecentItem }>>([]);
+  const [recentStories, setRecentStories] = useState<RecentStory[]>([]);
   const [highlight, setHighlight] = useState<StoryEntry | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   // null = 还没问过后端。先渲染骨架，避免闪一下「已安装」再跳回未同步。
   const [installed, setInstalled] = useState<boolean | null>(null);
+  /** 读目录本身失败了（IPC 异常 / 数据损坏），和「没装数据」是两码事。 */
+  const [loadFailed, setLoadFailed] = useState(false);
   const [streak, setStreak] = useState<StreakInfo>(() => readStreak());
+  const online = useOnlineStatus();
   // 聚焦、返回列表、数据同步都会触发刷新，可能叠在一起。用递增序号
   // 保证只有最后一次的结果能写进 state。
   const loadSeqRef = useRef(0);
@@ -100,8 +118,9 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
       const ok = await storyCatalog.isInstalled();
       if (stale()) return;
       setInstalled(ok);
+      setLoadFailed(false);
       if (!ok) {
-        setRecentStories([]);
+        setRecentStories((prev) => (prev.length === 0 ? prev : []));
         setHighlight(null);
         return;
       }
@@ -115,10 +134,12 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
       const t = todayKey();
       let hash = 0;
       for (let i = 0; i < t.length; i += 1) hash = (hash * 31 + t.charCodeAt(i)) >>> 0;
-      setHighlight(allMain[hash % Math.max(allMain.length, 1)] ?? null);
+      const pick = allMain[hash % Math.max(allMain.length, 1)] ?? null;
+      setHighlight((prev) => (prev?.storyId === pick?.storyId ? prev : pick));
 
       // 2) 最近阅读：progress 的 key 就是 storyTxt，反查成 StoryEntry。
-      const entries = readRecentProgress().slice(0, RECENT_SCAN_LIMIT);
+      // 快照和剧情列表的进度徽标同源，两边不可能显示成不一样的百分比。
+      const entries = getReadingProgress().recent.slice(0, RECENT_SCAN_LIMIT);
       const byPath = new Map<string, StoryEntry>();
       allMain.forEach((story) => byPath.set(story.storyTxt, story));
 
@@ -146,12 +167,14 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
           const entry = byPath.get(item.storyPath);
           return entry ? { entry, meta: item } : null;
         })
-        .filter((x): x is { entry: StoryEntry; meta: RecentItem } => x !== null);
-      setRecentStories(matched);
+        .filter((x): x is RecentStory => x !== null);
+      setRecentStories((prev) => (sameRecentStories(prev, matched) ? prev : matched));
     } catch (err) {
       if (stale()) return;
       console.warn("[Home] load failed", err);
-      setInstalled((prev) => prev ?? false);
+      // 读取失败 ≠ 没装数据。把两者混为一谈会让用户去做一次根本没必要的
+      // 同步，所以这里只标记失败，由界面给出「重试 / 去设置」。
+      setLoadFailed(true);
     } finally {
       window.clearTimeout(hintTimer);
       if (!stale()) setRefreshing(false);
@@ -167,7 +190,11 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
     // 剧情数据刚同步完（app:data-updated）、窗口重新获得焦点。
     const handler = () => {
       void loadHome();
-      setStreak(readStreak());
+      // 同上：连续阅读天数没变时保持同一个对象，避免整页跟着重渲染。
+      setStreak((prev) => {
+        const next = readStreak();
+        return sameStreak(prev, next) ? prev : next;
+      });
     };
     window.addEventListener("focus", handler);
     window.addEventListener("app:home-refresh", handler);
@@ -183,7 +210,7 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
   // 再把这章推回来没有意义。全都读完了才退回最近一条。
   const continueItem = useMemo(
     () =>
-      recentStories.find(({ meta }) => meta.percentage < FINISHED_THRESHOLD) ??
+      recentStories.find(({ meta }) => toReadPercent(meta.percentage) < READ_FINISHED_PCT) ??
       recentStories[0] ??
       null,
     [recentStories]
@@ -198,7 +225,12 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
     [continueItem, recentStories]
   );
 
-  const showSkeleton = installed === null;
+  const showSkeleton = installed === null && !loadFailed;
+  const goToSettings = useCallback(() => onGoToTab("settings"), [onGoToTab]);
+  const retryLoad = useCallback(() => {
+    setLoadFailed(false);
+    void loadHome();
+  }, [loadHome]);
 
   const handleGoToFavorites = useCallback(() => {
     if (onGoToFavorites) {
@@ -215,7 +247,18 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
         <div className="text-[11px] uppercase tracking-[0.18em] text-[hsl(var(--color-muted-foreground))]">
           Welcome, Doctor
         </div>
-        <h1 className="mt-1 text-2xl font-semibold">欢迎回来，博士</h1>
+        <div className="mt-1 flex flex-wrap items-center gap-2">
+          <h1 className="text-2xl font-semibold">欢迎回来，博士</h1>
+          {!online && (
+            <span
+              title="设备当前离线，已同步的剧情仍可正常阅读"
+              className="inline-flex items-center gap-1 rounded-full border border-[hsl(var(--color-border))] px-2 py-0.5 text-[11px] text-[hsl(var(--color-muted-foreground))]"
+            >
+              <WifiOff className="h-3 w-3" aria-hidden="true" />
+              离线
+            </span>
+          )}
+        </div>
       </header>
 
       <main className="flex-1 overflow-hidden">
@@ -227,16 +270,43 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
           <div className="pl-[max(1.25rem,env(safe-area-inset-left,0px))] pr-[max(1.25rem,env(safe-area-inset-right,0px))] pb-32 space-y-6">
             {showSkeleton && <HomeSkeleton />}
 
-            {installed === false && (
-              <div className="rounded-2xl border border-dashed border-[hsl(var(--color-border))] p-5 text-sm text-[hsl(var(--color-muted-foreground))]">
-                <div>剧情数据尚未同步，先去设置里同步一次再回来。</div>
-                <Button
-                  className="mt-3 min-h-[44px]"
-                  onClick={() => onGoToTab("settings")}
-                >
-                  去设置同步
-                </Button>
-              </div>
+            {/* 读取失败：明确说是「读不出来」而不是「没同步」，并且第一动作
+                是重试——绝大多数是刚同步完索引还没建好的短暂状态。 */}
+            {loadFailed && (
+              <HomeNotice
+                tone="error"
+                icon={TriangleAlert}
+                title="读不出本机的剧情目录"
+                description={
+                  installed === true
+                    ? "本地数据在，但这次没读出来。刚同步完、正在重建索引时最常见，重试一次通常就好。"
+                    : "可能是数据目录被移动或损坏了。先重试，仍然失败就去设置里重新同步或导入 ZIP。"
+                }
+                actions={[
+                  { label: "重试", onClick: retryLoad, icon: RotateCcw, variant: "default" },
+                  { label: "打开设置", onClick: goToSettings, icon: Settings2 },
+                ]}
+              />
+            )}
+
+            {installed === false && !loadFailed && (
+              <HomeNotice
+                icon={ArrowDownToLine}
+                title="还没有同步剧情数据"
+                description={
+                  online
+                    ? "去设置里同步一次（约几十 MB），之后首页会记住你读到哪里，也可以完全离线阅读。"
+                    : "设备当前离线，无法从远端下载。可以在设置里导入一份离线 ZIP 数据包。"
+                }
+                actions={[
+                  {
+                    label: online ? "去设置同步" : "去设置导入 ZIP",
+                    onClick: goToSettings,
+                    icon: online ? Settings2 : ArrowDownToLine,
+                    variant: "default",
+                  },
+                ]}
+              />
             )}
 
             {installed === true && continueItem ? (
@@ -324,6 +394,82 @@ function HomeSkeleton() {
   );
 }
 
+interface HomeNoticeAction {
+  label: string;
+  onClick: () => void;
+  icon?: LucideIcon;
+  variant?: "default" | "outline";
+}
+
+/**
+ * 首页的状态卡。和剧情列表一样的原则：说清现状、说清原因、给出下一步，
+ * 而不是丢一句「数据未同步」让用户自己猜该点哪里。
+ */
+function HomeNotice({
+  icon: Icon,
+  title,
+  description,
+  actions,
+  tone = "muted",
+}: {
+  icon: LucideIcon;
+  title: string;
+  description: string;
+  actions: HomeNoticeAction[];
+  tone?: "muted" | "error";
+}) {
+  const isError = tone === "error";
+  return (
+    <div
+      role={isError ? "alert" : undefined}
+      className={`space-y-4 rounded-2xl border p-5 ${
+        isError
+          ? "border-[hsl(var(--color-destructive)/0.4)] bg-[hsl(var(--color-destructive)/0.06)]"
+          : "border-dashed border-[hsl(var(--color-border))]"
+      }`}
+    >
+      <div className="flex items-start gap-3">
+        <Icon
+          className={`mt-0.5 h-5 w-5 flex-shrink-0 ${
+            isError
+              ? "text-[hsl(var(--color-destructive))]"
+              : "text-[hsl(var(--color-muted-foreground))]"
+          }`}
+          aria-hidden="true"
+        />
+        <div className="min-w-0 space-y-1">
+          <div
+            className={`text-sm font-medium ${
+              isError
+                ? "text-[hsl(var(--color-destructive))]"
+                : "text-[hsl(var(--color-foreground))]"
+            }`}
+          >
+            {title}
+          </div>
+          <p className="text-sm text-[hsl(var(--color-muted-foreground))]">{description}</p>
+        </div>
+      </div>
+      <div className="flex flex-wrap gap-2">
+        {actions.map((action) => {
+          const ActionIcon = action.icon;
+          return (
+            <Button
+              key={action.label}
+              variant={action.variant ?? "outline"}
+              className="min-h-[44px]"
+              onClick={action.onClick}
+            >
+              {ActionIcon && <ActionIcon className="mr-2 h-4 w-4" />}
+              {action.label}
+            </Button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function SectionTitle({ icon: Icon, title }: { icon: typeof BookOpen; title: string }) {
   return (
     <div className="flex items-center gap-2 px-1 text-sm font-semibold text-[hsl(var(--color-foreground))]">
@@ -342,12 +488,13 @@ function ContinueReadingCard({
   percentage: number;
   onOpen: () => void;
 }) {
-  const pct = Math.max(0, Math.min(100, Math.round(percentage * 100)));
+  // 与列表徽标同一个换算，两处不会出现 0% 和 1% 的差异。
+  const pct = toReadPercent(percentage);
   return (
     <button
       onClick={onOpen}
       className="story-card group relative block w-full overflow-hidden text-left transition-transform active:scale-[0.995]"
-      aria-label={`继续阅读 ${entry.storyName}`}
+      aria-label={`继续阅读 ${entry.storyName}，已读 ${pct}%`}
     >
       <div className="story-card-cover aspect-[16/9]">
         <StoryThumbnail story={entry} alt={entry.storyName} lazy={false} tint="soft" />
@@ -482,11 +629,13 @@ function RecentCard({
   onOpen: () => void;
   tag?: string;
 }) {
-  const pct = Math.max(0, Math.min(100, Math.round((percentage || 0) * 100)));
-  const progressText = pct >= 99 ? "已读完" : pct > 0 ? `已读 ${pct}%` : "未开始";
+  const pct = toReadPercent(percentage);
+  const progressText =
+    pct >= READ_FINISHED_PCT ? "已读完" : pct > 0 ? `已读 ${pct}%` : "未开始";
   return (
     <button
       onClick={onOpen}
+      aria-label={`${entry.storyName}，${tag ?? progressText}`}
       className="story-card flex w-full items-stretch gap-3 p-3 text-left transition-transform active:scale-[0.99]"
     >
       <div className="relative h-16 w-24 flex-shrink-0 overflow-hidden rounded-lg">

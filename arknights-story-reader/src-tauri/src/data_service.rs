@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -42,6 +43,12 @@ const SEARCH_RESULT_LIMIT: usize = 500;
 ///      join the index; both shift stored segment indices.
 const INDEX_VERSION: i32 = 7;
 
+const META_TOTAL_COUNT: &str = "total_count";
+const META_SEGMENT_TOTAL: &str = "segment_total";
+/// 建这份索引时数据集的身份（commit + 三张表的大小/mtime + 篇数 + 索引版本）。
+/// 对得上就说明索引已经是最新的，重建可以整个跳过。
+const META_DATASET_FINGERPRINT: &str = "dataset_fingerprint";
+
 #[derive(Clone, serde::Serialize)]
 struct SyncProgress {
     phase: String,
@@ -72,10 +79,14 @@ struct VersionInfo {
     fetched_at: i64,
 }
 
+/// 目录里的一篇剧情。同一章节 / 活动下的上百个条目共享同一份分类名与
+/// 分类标签，所以这三个字段用 `Arc<str>` 而不是各自持有一份 `String`。
 #[derive(Clone)]
 struct IndexedStory {
-    category_name: String,
-    entry_type: String,
+    category_name: Arc<str>,
+    /// `<类型> | <分组名>`，建目录时算一次。索引重建和线性扫描都是每篇剧情
+    /// 都要用的热路径，之前每次都重新 format 一遍。
+    category_label: Arc<str>,
     story: StoryEntry,
 }
 
@@ -108,8 +119,6 @@ struct StoryCatalog {
     by_id: HashMap<String, usize>,
     /// `story_group` → positions in `stories`, ordered by `story_sort`.
     by_group: HashMap<String, Vec<usize>>,
-    /// `story_id` → (display name, `<类型> | <分组名>` label).
-    labels: HashMap<String, (String, String)>,
     main_groups: Vec<(String, Vec<StoryEntry>)>,
     activity_groups: Vec<(String, Vec<StoryEntry>)>,
     sidestory_groups: Vec<(String, Vec<StoryEntry>)>,
@@ -119,7 +128,18 @@ struct StoryCatalog {
     /// surfaces the failure.
     roguelike_error: Option<String>,
     memory_stories: Vec<StoryEntry>,
-    mainline_categories: Vec<StoryCategory>,
+}
+
+impl StoryCatalog {
+    /// `(剧情名, `<类型> | <分组名>`)`，给搜索结果贴显示标签用。之前这份
+    /// 映射是单独一张 `HashMap<String, (String, String)>`，等于把每篇剧情的
+    /// 名字和标签又存了一遍；现在直接落到 `stories` 上查。
+    fn label_for(&self, story_id: &str) -> Option<(&str, &str)> {
+        self.by_id.get(story_id).map(|idx| {
+            let item = &self.stories[*idx];
+            (item.story.story_name.as_str(), &*item.category_label)
+        })
+    }
 }
 
 struct CatalogSlot {
@@ -134,6 +154,23 @@ static CATALOG_CACHE: Mutex<Option<HashMap<PathBuf, CatalogSlot>>> = Mutex::new(
 /// A single app only ever needs one entry; the cap just stops long test runs
 /// from holding every temp dataset they ever created.
 const CATALOG_CACHE_CAPACITY: usize = 16;
+
+/// 每个索引库一把重建锁，见 `rebuild_story_index_inner`。
+static INDEX_BUILD_LOCKS: Mutex<Option<HashMap<PathBuf, Arc<Mutex<()>>>>> = Mutex::new(None);
+
+/// 真正从头重建过多少次（跳过的不算）。测试靠它证明「已是最新就不干活」。
+#[cfg(test)]
+static INDEX_BUILD_LOG: Mutex<Option<HashMap<PathBuf, usize>>> = Mutex::new(None);
+
+#[cfg(test)]
+fn index_build_count(index_db_path: &Path) -> usize {
+    INDEX_BUILD_LOG
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|map| map.get(index_db_path).copied())
+        .unwrap_or(0)
+}
 
 /// How many times each data directory has been parsed from scratch. Tests use
 /// it to prove the memoization actually holds (and actually gives way when the
@@ -293,6 +330,82 @@ fn normalize_for_fuzzy(text: &str) -> String {
         .collect()
 }
 
+/// 把一个查询词切成「索引里真的会成词」的原子：ASCII 字母数字连成一段，
+/// CJK 逐字，其余字符（标点、假名、符号）在 `tokenize_for_fts` 里根本不会
+/// 进索引，这里也一并丢掉。
+///
+/// 必须和 `DataService::term_to_clause` 的切分保持一致——那边生成 FTS 子句，
+/// 这边生成线性扫描的判定条件，两者一旦分叉，同一个查询在「索引可用」和
+/// 「索引没建好」两种状态下就会给出不同的结果集。
+fn split_match_atoms(text: &str) -> Vec<String> {
+    let mut atoms: Vec<String> = Vec::new();
+    let mut ascii = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() {
+            ascii.push(ch.to_ascii_lowercase());
+        } else {
+            if !ascii.is_empty() {
+                atoms.push(std::mem::take(&mut ascii));
+            }
+            if is_cjk(ch) {
+                atoms.push(ch.to_string());
+            }
+        }
+    }
+    if !ascii.is_empty() {
+        atoms.push(ascii);
+    }
+    atoms
+}
+
+/// 一个查询词。`atoms` 里的每一项都必须出现，命中方式与 FTS 侧一一对应：
+///
+/// * 普通词 `凯尔希` → FTS `("凯" AND "尔" AND "希")`，原子 = 逐字，
+///   出现在文中任意位置即可（不要求相邻）。
+/// * 引号短语 `"凯尔希"` → FTS `"凯 尔 希"`，原子只有一个 = 整串，
+///   因为 `normalize_for_fuzzy` 已经把空白和标点去掉了，`contains` 恰好
+///   等价于 FTS 短语要求的「token 连续」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Term {
+    /// 归一化后的完整词，用来给预览片段定位。
+    text: String,
+    atoms: Vec<String>,
+}
+
+impl Term {
+    /// `text` 必须已经过 `normalize_for_fuzzy`。返回 `None` 表示这个词在
+    /// 索引侧同样产生不了任何子句，两边一起当它不存在。
+    fn word(text: String) -> Option<Self> {
+        let atoms = split_match_atoms(&text);
+        (!atoms.is_empty()).then(|| Self { text, atoms })
+    }
+
+    fn phrase(text: String) -> Option<Self> {
+        let atoms = split_match_atoms(&text);
+        if atoms.is_empty() {
+            return None;
+        }
+        let joined = atoms.concat();
+        Some(Self {
+            text,
+            atoms: vec![joined],
+        })
+    }
+
+    /// FTS 的 `MATCH` 判定是行级的：`A AND B` 允许 A 命中一列、B 命中另一列。
+    /// 这里同样允许不同原子落在不同的 haystack 上。
+    fn matches(&self, haystacks: &[&str]) -> bool {
+        self.atoms
+            .iter()
+            .all(|atom| haystacks.iter().any(|hay| hay.contains(atom.as_str())))
+    }
+
+    /// 取上下文片段时依次尝试的探针：先整词，再退回单个原子。
+    fn snippet_probes(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.text.as_str()).chain(self.atoms.iter().map(String::as_str))
+    }
+}
+
 /// A user query broken down for the linear-scan fallback, mirroring the
 /// boolean semantics of `build_fts_query_advanced`: AND between groups, OR
 /// inside a group, and `-term` excludes.
@@ -300,19 +413,16 @@ fn normalize_for_fuzzy(text: &str) -> String {
 struct QueryTerms {
     /// Positive terms. Every group must be satisfied (AND); within a group
     /// any single alternative suffices (OR).
-    positive: Vec<Vec<String>>,
+    positive: Vec<Vec<Term>>,
     /// Terms introduced with a leading `-`; a document matching any of them
     /// is rejected.
-    negative: Vec<String>,
+    negative: Vec<Term>,
 }
 
 impl QueryTerms {
     /// The first positive term, used to centre the preview snippet.
-    fn primary(&self) -> Option<&str> {
-        self.positive
-            .first()
-            .and_then(|group| group.first())
-            .map(String::as_str)
+    fn primary(&self) -> Option<&Term> {
+        self.positive.first().and_then(|group| group.first())
     }
 
     /// Are all positive groups satisfied by at least one of `haystacks`?
@@ -322,17 +432,13 @@ impl QueryTerms {
         if self.positive.is_empty() {
             return false;
         }
-        self.positive.iter().all(|group| {
-            group
-                .iter()
-                .any(|term| haystacks.iter().any(|hay| hay.contains(term.as_str())))
-        })
+        self.positive
+            .iter()
+            .all(|group| group.iter().any(|term| term.matches(haystacks)))
     }
 
     fn excluded_by(&self, haystacks: &[&str]) -> bool {
-        self.negative
-            .iter()
-            .any(|term| haystacks.iter().any(|hay| hay.contains(term.as_str())))
+        self.negative.iter().any(|term| term.matches(haystacks))
     }
 }
 
@@ -341,56 +447,92 @@ impl QueryTerms {
 /// into one OR group, and a leading `-` marks an exclusion. Returns already
 /// fuzzy-normalized terms.
 fn split_query_terms(query: &str) -> QueryTerms {
-    let mut raw_terms: Vec<String> = Vec::new();
-    let mut buf = String::new();
-    let mut in_quotes = false;
+    struct Raw {
+        text: String,
+        is_not: bool,
+        is_quoted: bool,
+    }
 
-    // Quoted segments are pushed pre-normalized; the `-` of a NOT term is
-    // preserved here and interpreted below.
-    let flush = |buf: &mut String, terms: &mut Vec<String>| {
+    fn flush_bare(buf: &mut String, terms: &mut Vec<Raw>) {
         if buf.is_empty() {
             return;
         }
         let raw = std::mem::take(buf);
-        let negated = raw.starts_with('-');
+        let is_not = raw.starts_with('-');
         let normalized = normalize_for_fuzzy(&raw);
         if normalized.is_empty() {
             return;
         }
-        if negated {
-            terms.push(format!("-{}", normalized));
-        } else {
-            terms.push(normalized);
+        terms.push(Raw {
+            text: normalized,
+            is_not,
+            is_quoted: false,
+        });
+    }
+
+    fn flush_quoted(buf: &mut String, terms: &mut Vec<Raw>, is_not: bool) {
+        let phrase = std::mem::take(buf);
+        let normalized = normalize_for_fuzzy(&phrase);
+        if normalized.is_empty() {
+            return;
         }
-    };
+        terms.push(Raw {
+            text: normalized,
+            is_not,
+            is_quoted: true,
+        });
+    }
+
+    let mut raw_terms: Vec<Raw> = Vec::new();
+    let mut buf = String::new();
+    let mut in_quotes = false;
+    // `-"凯尔希"`：减号落在引号之前，`normalize_for_fuzzy` 会把孤零零的 `-`
+    // 抹成空串。先记下来，否则否定短语会被当成肯定短语，语义正好反过来。
+    let mut quote_is_not = false;
 
     for ch in query.chars() {
         match ch {
             '"' => {
-                flush(&mut buf, &mut raw_terms);
-                in_quotes = !in_quotes;
+                if in_quotes {
+                    in_quotes = false;
+                    flush_quoted(&mut buf, &mut raw_terms, quote_is_not);
+                    quote_is_not = false;
+                } else {
+                    quote_is_not = buf == "-";
+                    flush_bare(&mut buf, &mut raw_terms);
+                    in_quotes = true;
+                }
             }
             c if c.is_whitespace() && !in_quotes => {
-                flush(&mut buf, &mut raw_terms);
+                flush_bare(&mut buf, &mut raw_terms);
             }
             _ => buf.push(ch),
         }
     }
-    flush(&mut buf, &mut raw_terms);
+    // 引号没闭合时按普通词收尾，和 `build_fts_query_advanced` 一致。
+    if in_quotes && quote_is_not {
+        buf.insert(0, '-');
+    }
+    flush_bare(&mut buf, &mut raw_terms);
 
     let mut out = QueryTerms::default();
     let mut pending_or = false;
-    for term in raw_terms {
-        if term == "or" {
+    for raw in raw_terms {
+        // 引号里的 `or` 是要搜的字面量，不是连接词。
+        if !raw.is_quoted && raw.text == "or" {
             // `or` only connects when there is something on the left to
             // connect to; a leading `or` is just noise.
             pending_or = !out.positive.is_empty();
             continue;
         }
-        if let Some(rest) = term.strip_prefix('-') {
-            if !rest.is_empty() {
-                out.negative.push(rest.to_string());
-            }
+        let term = if raw.is_quoted {
+            Term::phrase(raw.text)
+        } else {
+            Term::word(raw.text)
+        };
+        let Some(term) = term else { continue };
+        if raw.is_not {
+            out.negative.push(term);
             continue;
         }
         if pending_or {
@@ -712,6 +854,10 @@ impl DataService {
                 .unwrap_or("UNKNOWN");
 
             let category_name = Self::resolve_category_name(entry_type, entry_id, value);
+            // 一个分组算一次，组内所有条目共享同一份字符串。
+            let category_label: Arc<str> =
+                Self::format_category_label(entry_type, &category_name).into();
+            let category_name: Arc<str> = category_name.into();
 
             for story in Self::parse_group_entries(value) {
                 if story.story_txt.trim().is_empty() {
@@ -719,8 +865,8 @@ impl DataService {
                 }
                 if seen_ids.insert(story.story_id.clone()) {
                     stories.push(IndexedStory {
-                        category_name: category_name.clone(),
-                        entry_type: entry_type.to_string(),
+                        category_name: Arc::clone(&category_name),
+                        category_label: Arc::clone(&category_label),
                         story,
                     });
                 }
@@ -731,14 +877,17 @@ impl DataService {
         // table. Without them 肉鸽 is unsearchable and `get_story_entry` /
         // `get_story_neighbors` fail for every roguelike reader session.
         for (group_key, group_stories) in roguelike_groups {
+            let category_name: Arc<str> = group_key.as_str().into();
+            let category_label: Arc<str> =
+                Self::format_category_label("ROGUELIKE", group_key).into();
             for story in group_stories {
                 if story.story_txt.trim().is_empty() {
                     continue;
                 }
                 if seen_ids.insert(story.story_id.clone()) {
                     stories.push(IndexedStory {
-                        category_name: group_key.clone(),
-                        entry_type: "ROGUELIKE".to_string(),
+                        category_name: Arc::clone(&category_name),
+                        category_label: Arc::clone(&category_label),
                         story: story.clone(),
                     });
                 }
@@ -868,20 +1017,12 @@ impl DataService {
 
         let mut by_id = HashMap::with_capacity(stories.len());
         let mut by_group: HashMap<String, Vec<usize>> = HashMap::new();
-        let mut labels = HashMap::with_capacity(stories.len());
         for (idx, item) in stories.iter().enumerate() {
             by_id.insert(item.story.story_id.clone(), idx);
             by_group
                 .entry(item.story.story_group.clone())
                 .or_default()
                 .push(idx);
-            labels.insert(
-                item.story.story_id.clone(),
-                (
-                    item.story.story_name.clone(),
-                    Self::format_category_label(&item.entry_type, &item.category_name),
-                ),
-            );
         }
         for positions in by_group.values_mut() {
             // `stories` is story_id-ordered, so a stable sort on storySort
@@ -889,35 +1030,23 @@ impl DataService {
             positions.sort_by_key(|idx| stories[*idx].story.story_sort);
         }
 
-        let mainline_stories = Self::parse_stories_by_entry_type(&data, "MAINLINE");
-        let mainline_categories = if mainline_stories.is_empty() {
-            Vec::new()
-        } else {
-            vec![StoryCategory {
-                id: "mainline".to_string(),
-                name: "主线剧情".to_string(),
-                category_type: "chapter".to_string(),
-                stories: mainline_stories,
-            }]
-        };
-
         Ok(StoryCatalog {
             stories,
             by_id,
             by_group,
-            labels,
             main_groups: Self::build_main_groups(&data),
             activity_groups: Self::build_activity_groups(&data),
             sidestory_groups: Self::build_sidestory_groups(&data),
             roguelike_groups,
             roguelike_error,
             memory_stories: Self::build_memory_stories(&data),
-            mainline_categories,
         })
     }
 
-    fn flatten_segments(segments: &[StorySegment]) -> String {
-        let mut parts = Vec::with_capacity(segments.len());
+    /// 把段落摊平成一段可索引的纯文本，追加到 `out`（每段前置一个换行）。
+    /// 直接往一个缓冲区里写，避免先攒 `Vec<String>` 再 `join` ——那等于把
+    /// 整篇剧情在内存里复制两遍。
+    fn flatten_segments_into(out: &mut String, segments: &[StorySegment]) {
         for segment in segments {
             match segment {
                 StorySegment::Dialogue {
@@ -925,27 +1054,36 @@ impl DataService {
                     text,
                     ..
                 } => {
-                    parts.push(format!("{}：{}", character_name, text));
+                    out.push('\n');
+                    out.push_str(character_name);
+                    out.push('：');
+                    out.push_str(text);
                 }
                 StorySegment::Narration { text }
                 | StorySegment::System { text, .. }
                 | StorySegment::Subtitle { text, .. }
                 | StorySegment::Sticker { text, .. } => {
-                    parts.push(text.clone());
+                    out.push('\n');
+                    out.push_str(text);
                 }
                 StorySegment::Decision { options, .. } => {
                     // Use newline separator so each option is tokenized/indexed
                     // independently — users searching an option verbatim should
                     // still be able to hit the story. (bug A9)
-                    parts.push(options.join("\n"));
+                    for option in options {
+                        out.push('\n');
+                        out.push_str(option);
+                    }
                 }
                 StorySegment::Header { title } => {
-                    parts.push(title.clone());
+                    out.push('\n');
+                    out.push_str(title);
                 }
                 StorySegment::Image { caption, .. } => {
                     if let Some(cap) = caption {
                         if !cap.trim().is_empty() {
-                            parts.push(cap.clone());
+                            out.push('\n');
+                            out.push_str(cap);
                         }
                     }
                 }
@@ -954,7 +1092,26 @@ impl DataService {
                 }
             }
         }
-        parts.join("\n")
+    }
+
+    /// 一篇剧情的可搜索全文：标题 + 摊平后的正文。索引里的 `raw_content`
+    /// 就是它，线性扫描扫的也是它，两条路径必须同源。
+    fn searchable_text(story_name: &str, segments: &[StorySegment]) -> String {
+        let mut out = String::with_capacity(story_name.len() + segments.len() * 32);
+        out.push_str(story_name);
+        Self::flatten_segments_into(&mut out, segments);
+        out
+    }
+
+    /// 读盘 + 解析 + 后处理，得到与索引完全一致的可搜索全文。
+    /// 读不到（脚本缺失）时返回 `None`，调用方跳过这篇。
+    fn story_searchable_text(&self, story_name: &str, story_txt: &str) -> Option<String> {
+        let raw = self.read_story_text(story_txt).ok()?;
+        let parsed = parse_story_text(&raw);
+        drop(raw);
+        let processed = Self::post_process_segments_for_index(&parsed.segments);
+        drop(parsed);
+        Some(Self::searchable_text(story_name, &processed))
     }
 
     /// Mirror the frontend's in-reader segment post-processing so the indices
@@ -1166,6 +1323,9 @@ impl DataService {
             }
         };
 
+        // `-"凯尔希"`：减号在引号之前，`flush_bare` 会把孤零零的 `-` 丢掉。
+        // 不记住它的话否定短语会变成肯定短语，语义正好反过来。
+        let mut quote_is_not = false;
         for ch in q.chars() {
             match ch {
                 '"' => {
@@ -1175,13 +1335,15 @@ impl DataService {
                             let phrase = std::mem::take(&mut buf);
                             terms.push(UserTerm {
                                 text: phrase,
-                                is_not: false,
+                                is_not: quote_is_not,
                                 is_or_before: prev_was_or,
                                 is_quoted: true,
                             });
                             prev_was_or = false;
                         }
+                        quote_is_not = false;
                     } else {
+                        quote_is_not = buf == "-";
                         flush_bare(&mut buf, &mut terms, &mut prev_was_or);
                         in_quotes = true;
                     }
@@ -1191,6 +1353,10 @@ impl DataService {
                 }
                 _ => buf.push(ch),
             }
+        }
+        // 引号没闭合：剩下的部分退化成普通词，但否定语义要保住。
+        if in_quotes && quote_is_not {
+            buf.insert(0, '-');
         }
         flush_bare(&mut buf, &mut terms, &mut prev_was_or);
         if terms.is_empty() {
@@ -1318,13 +1484,29 @@ impl DataService {
         }
 
         // Assemble positives with their AND/OR connectives.
-        let mut assembled = String::new();
-        for (i, (clause, or_flag)) in positives.iter().enumerate() {
-            if i > 0 {
-                assembled.push_str(if *or_flag { " OR " } else { " AND " });
+        //
+        // 相邻的 OR 项先合成一组，组间再 AND，多选项的组显式加括号。
+        // FTS5 里 AND 比 OR 结合得紧，`A OR B AND C` 会被解析成
+        // `A OR (B AND C)`，而线性扫描按 `(A OR B) AND C` 判定——不括起来
+        // 两条路径对同一个查询的答案就不一样了。
+        let mut groups: Vec<Vec<String>> = Vec::new();
+        for (clause, or_flag) in positives {
+            match groups.last_mut() {
+                Some(group) if or_flag => group.push(clause),
+                _ => groups.push(vec![clause]),
             }
-            assembled.push_str(clause);
         }
+        let mut assembled = groups
+            .into_iter()
+            .map(|group| {
+                if group.len() == 1 {
+                    group.into_iter().next().unwrap()
+                } else {
+                    format!("({})", group.join(" OR "))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ");
 
         // Append any NOT clauses — one per negation, left-to-right.
         for neg in negatives {
@@ -1344,6 +1526,57 @@ impl DataService {
         )
         .optional()
         .map_err(|e| format!("Failed to read story index meta {}: {}", key, e))
+    }
+
+    fn index_build_lock(&self) -> Arc<Mutex<()>> {
+        let mut guard = INDEX_BUILD_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        let map = guard.get_or_insert_with(HashMap::new);
+        Arc::clone(
+            map.entry(self.index_db_path.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
+    }
+
+    /// 把数据集身份压成一行文本存进索引元数据。带上 `INDEX_VERSION` 和篇数，
+    /// 任何一项对不上都必须重建。
+    fn index_dataset_fingerprint(&self, story_count: usize) -> String {
+        let fp = self.catalog_fingerprint();
+        let files = fp
+            .files
+            .iter()
+            .map(|(len, modified)| format!("{}:{}", len, modified))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "v{}|{}|{}|{}|{}",
+            INDEX_VERSION, fp.commit, fp.fetched_at, files, story_count
+        )
+    }
+
+    /// 索引是否已经对应当前数据集。除了比指纹，还要求两张表里实际的行数与
+    /// 记录的总数一致——被截断或写坏的库不能被认成「最新」。
+    fn index_current_totals(conn: &Connection, fingerprint: &str) -> Option<(usize, usize)> {
+        let stored = Self::extract_meta_value(conn, META_DATASET_FINGERPRINT).ok()??;
+        if stored != fingerprint {
+            return None;
+        }
+        let recorded = |key: &str| -> Option<i64> {
+            Self::extract_meta_value(conn, key)
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<i64>().ok())
+        };
+        let count = |sql: &str| -> Option<i64> { conn.query_row(sql, [], |row| row.get(0)).ok() };
+
+        let stories = recorded(META_TOTAL_COUNT)?;
+        let segments = recorded(META_SEGMENT_TOTAL)?;
+        if stories <= 0
+            || count("SELECT COUNT(*) FROM story_index")? != stories
+            || count("SELECT COUNT(*) FROM story_segment_index")? != segments
+        {
+            return None;
+        }
+        Some((stories as usize, segments as usize))
     }
 
     /// 下载并解压最新数据包
@@ -1404,7 +1637,9 @@ impl DataService {
 
         // Auto-rebuild the FTS index so the next search is immediately fast
         // instead of silently falling back to linear scan (bug A5).
-        emit_progress(&app, "索引", 0, 1, "正在重建全文索引");
+        // 真实刻度走 `index-progress`，这里只是宣布阶段切换：报 0/1 会让
+        // 同步对话框先画一条 0% 的进度条，那个 0% 是编的。
+        emit_progress(&app, "索引", 0, 0, "正在重建全文索引");
         let index_service = self.clone();
         let index_app = app.clone();
         std::thread::spawn(move || {
@@ -1556,19 +1791,23 @@ impl DataService {
                 .map_err(|e| format!("Failed to write zip data: {}", e))?;
             downloaded += bytes_read;
 
-            let percent = if total_bytes > 0 {
-                (downloaded as f64 / total_bytes as f64 * 100.0).min(100.0)
-            } else {
-                0.0
-            };
             let downloaded_mb = downloaded as f64 / 1_048_576.0;
-            let total_mb = total_bytes as f64 / 1_048_576.0;
-            let message = if total_bytes > 0 {
-                format!("已下载 {:.1}/{:.1} MB", downloaded_mb, total_mb.max(0.1))
+            if total_bytes > 0 {
+                let percent = (downloaded as f64 / total_bytes as f64 * 100.0).min(100.0);
+                let total_mb = total_bytes as f64 / 1_048_576.0;
+                emit_progress(
+                    app,
+                    "下载",
+                    percent.round() as usize,
+                    100,
+                    format!("已下载 {:.1}/{:.1} MB", downloaded_mb, total_mb.max(0.1)),
+                );
             } else {
-                format!("已下载 {:.1} MB", downloaded_mb)
-            };
-            emit_progress(app, "下载", percent.round() as usize, 100, message);
+                // 服务端没给 Content-Length，就没有百分比可言。以前这里一直
+                // 报 0/100，进度条整场下载都钉在 0%；改成不确定态（total = 0），
+                // 让前端只显示已下载的字节数。
+                emit_progress(app, "下载", 0, 0, format!("已下载 {:.1} MB", downloaded_mb));
+            }
         }
         zip_file
             .flush()
@@ -1735,7 +1974,7 @@ impl DataService {
         self.invalidate_catalog();
 
         // Auto-rebuild the FTS index (bug A5, same as sync_data).
-        emit_progress(app, "索引", 0, 1, "正在重建全文索引");
+        emit_progress(app, "索引", 0, 0, "正在重建全文索引");
         let index_service = self.clone();
         let index_app = app.clone();
         std::thread::spawn(move || {
@@ -1896,8 +2135,26 @@ impl DataService {
     }
 
     /// 获取分类的剧情列表（仅返回分类，不含故事列表）
+    ///
+    /// 由 `main_groups` 现拼，不再在目录里单独存一份主线副本。顺带把顺序修
+    /// 正成「按章节、章节内按 storySort」——原来是把所有主线摊平后全局按
+    /// storySort 排，而 storySort 是组内序号，结果是各章节的第 1 篇挤在一起。
     pub fn get_story_categories(&self) -> Result<Vec<StoryCategory>, String> {
-        Ok(self.catalog()?.mainline_categories.clone())
+        let catalog = self.catalog()?;
+        let stories: Vec<StoryEntry> = catalog
+            .main_groups
+            .iter()
+            .flat_map(|(_, group)| group.iter().cloned())
+            .collect();
+        if stories.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(vec![StoryCategory {
+            id: "mainline".to_string(),
+            name: "主线剧情".to_string(),
+            category_type: "chapter".to_string(),
+            stories,
+        }])
     }
 
     /// 根据 entryType 解析剧情
@@ -1999,8 +2256,37 @@ impl DataService {
             }
         };
 
+        // 同一份索引同时只允许一次重建。同步/导入完成后后台线程会自动重建，
+        // 而前端的 `useAutoIndex`（以及设置页的手动按钮）可能同时也发起一次；
+        // 两个事务同时写同一张 FTS 表只会互相 SQLITE_BUSY。串行化之后，
+        // 后来的那次会发现指纹已经对上，直接返回。
+        let build_lock = self.index_build_lock();
+        let _build_guard = build_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+        let catalog = self.catalog()?;
+        let fingerprint = self.index_dataset_fingerprint(catalog.stories.len());
+
         let mut conn = self.open_index_connection()?;
         Self::init_index_tables(&conn)?;
+
+        if let Some((stories, segments)) = Self::index_current_totals(&conn, &fingerprint) {
+            emit(
+                "完成",
+                stories,
+                stories,
+                &format!("索引已是最新（{} 篇 / {} 段）", stories, segments),
+            );
+            return Ok(());
+        }
+
+        #[cfg(test)]
+        {
+            let mut guard = INDEX_BUILD_LOG.lock().unwrap_or_else(|e| e.into_inner());
+            *guard
+                .get_or_insert_with(HashMap::new)
+                .entry(self.index_db_path.clone())
+                .or_insert(0) += 1;
+        }
 
         let tx = conn
             .transaction()
@@ -2011,7 +2297,6 @@ impl DataService {
         tx.execute("DELETE FROM story_segment_index", [])
             .map_err(|e| format!("Failed to clear story segment index: {}", e))?;
 
-        let catalog = self.catalog()?;
         let indexed_stories = &catalog.stories;
         let mut story_insert_stmt = tx
             .prepare(
@@ -2064,32 +2349,27 @@ impl DataService {
             };
 
             let parsed = parse_story_text(&raw_text);
+            // 原文已经解析完了，`combined_raw` / `tokenized` 都不小；
+            // 提前放掉，别让同一篇剧情在内存里同时躺四五份。
+            drop(raw_text);
             // Post-process segments the same way the frontend reader does so
             // that the segment indices we store match what the UI will scroll
             // to. Specifically: drop empty segments and merge consecutive
             // same-speaker dialogue.
             let processed = Self::post_process_segments_for_index(&parsed.segments);
-            let flattened = Self::flatten_segments(&processed);
-
-            let combined_raw = if flattened.trim().is_empty() {
-                story_name.clone()
-            } else {
-                format!("{}\n{}", story_name, flattened)
-            };
+            drop(parsed);
+            let combined_raw = Self::searchable_text(story_name, &processed);
 
             let tokenized = Self::build_tokenized_content(&combined_raw);
             if tokenized.trim().is_empty() {
                 continue;
             }
 
-            let category_label =
-                Self::format_category_label(&indexed.entry_type, &indexed.category_name);
-
             story_insert_stmt
                 .execute(params![
                     story_id,
                     story_name,
-                    &category_label,
+                    &*indexed.category_label,
                     tokenized,
                     indexed
                         .story
@@ -2106,27 +2386,39 @@ impl DataService {
             // indexed. Header/Decision are useful for navigation so we still
             // index their text where applicable.
             for (seg_idx, segment) in processed.iter().enumerate() {
-                let (seg_type, character_name, raw_text): (&str, Option<&str>, String) = match segment {
-                    StorySegment::Dialogue { character_name, text, .. } => {
-                        ("dialogue", Some(character_name.as_str()), text.clone())
-                    }
-                    StorySegment::Narration { text } => ("narration", None, text.clone()),
-                    StorySegment::System { speaker, text } => {
-                        ("system", speaker.as_deref(), text.clone())
-                    }
-                    StorySegment::Subtitle { text, .. } => ("subtitle", None, text.clone()),
-                    StorySegment::Sticker { text, .. } => ("sticker", None, text.clone()),
-                    StorySegment::Header { title } => ("header", None, title.clone()),
-                    StorySegment::Decision { options, .. } => {
-                        ("decision", None, options.join("\n"))
-                    }
-                    StorySegment::Image { caption, .. } => {
-                        // 插画段 caption 如有文字可索引；否则跳过。
-                        let cap = caption.clone().unwrap_or_default();
-                        ("image", None, cap)
-                    }
-                    StorySegment::Music { .. } => ("music", None, String::new()),
-                };
+                // 段落文本一律借用；只有 Decision 需要现拼一份。之前这里每段
+                // 都 `clone()`，相当于把整部语料在重建过程中又复制了一遍。
+                let (seg_type, character_name, raw_text): (&str, Option<&str>, Cow<'_, str>) =
+                    match segment {
+                        StorySegment::Dialogue { character_name, text, .. } => (
+                            "dialogue",
+                            Some(character_name.as_str()),
+                            Cow::Borrowed(text.as_str()),
+                        ),
+                        StorySegment::Narration { text } => {
+                            ("narration", None, Cow::Borrowed(text.as_str()))
+                        }
+                        StorySegment::System { speaker, text } => {
+                            ("system", speaker.as_deref(), Cow::Borrowed(text.as_str()))
+                        }
+                        StorySegment::Subtitle { text, .. } => {
+                            ("subtitle", None, Cow::Borrowed(text.as_str()))
+                        }
+                        StorySegment::Sticker { text, .. } => {
+                            ("sticker", None, Cow::Borrowed(text.as_str()))
+                        }
+                        StorySegment::Header { title } => {
+                            ("header", None, Cow::Borrowed(title.as_str()))
+                        }
+                        StorySegment::Decision { options, .. } => {
+                            ("decision", None, Cow::Owned(options.join("\n")))
+                        }
+                        StorySegment::Image { caption, .. } => {
+                            // 插画段 caption 如有文字可索引；否则跳过。
+                            ("image", None, Cow::Borrowed(caption.as_deref().unwrap_or("")))
+                        }
+                        StorySegment::Music { .. } => ("music", None, Cow::Borrowed("")),
+                    };
                 if raw_text.trim().is_empty() {
                     continue;
                 }
@@ -2144,7 +2436,7 @@ impl DataService {
                         seg_type,
                         character_norm,
                         seg_tokenized,
-                        raw_text,
+                        raw_text.as_ref(),
                     ])
                     .map_err(|e| format!("Failed to insert segment into index: {}", e))?;
                 segment_total += 1;
@@ -2169,35 +2461,23 @@ impl DataService {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
-        tx.execute(
-            "
+        for (key, value) in [
+            ("last_built_at", timestamp.to_string()),
+            (META_TOTAL_COUNT, total.to_string()),
+            (META_SEGMENT_TOTAL, segment_total.to_string()),
+            // 最后写指纹：中途失败时事务回滚，下一次照样会完整重建。
+            (META_DATASET_FINGERPRINT, fingerprint),
+        ] {
+            tx.execute(
+                "
             INSERT INTO story_index_meta (key, value)
-            VALUES ('last_built_at', ?1)
+            VALUES (?1, ?2)
             ON CONFLICT(key) DO UPDATE SET value = excluded.value
         ",
-            params![timestamp.to_string()],
-        )
-        .map_err(|e| format!("Failed to update index metadata: {}", e))?;
-
-        tx.execute(
-            "
-            INSERT INTO story_index_meta (key, value)
-            VALUES ('total_count', ?1)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value
-        ",
-            params![total.to_string()],
-        )
-        .map_err(|e| format!("Failed to update index total: {}", e))?;
-
-        tx.execute(
-            "
-            INSERT INTO story_index_meta (key, value)
-            VALUES ('segment_total', ?1)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value
-        ",
-            params![segment_total.to_string()],
-        )
-        .map_err(|e| format!("Failed to update segment index total: {}", e))?;
+                params![key, value],
+            )
+            .map_err(|e| format!("Failed to update index metadata {}: {}", key, e))?;
+        }
 
         tx.commit()
             .map_err(|e| format!("Failed to commit story index rebuild: {}", e))?;
@@ -2332,23 +2612,31 @@ impl DataService {
         Ok(Some(results))
     }
 
-    fn search_stories_fallback(&self, query: &str) -> Result<Vec<SearchResult>, String> {
-        let mut results = Vec::new();
+    /// 线性扫描：索引不可用时的兜底。`on_progress(done, total)` 在开扫之前
+    /// 会先被调用一次 `(0, total)`，之后每处理完一篇调用一次。
+    ///
+    /// 这是唯一一份扫描实现——`search_stories_fallback` 与
+    /// `search_stories_with_progress` 曾经各抄了一份，两边的判定条件很容易
+    /// 慢慢长歪。
+    fn scan_stories(
+        &self,
+        query: &str,
+        mut on_progress: impl FnMut(usize, usize),
+    ) -> Result<Vec<SearchResult>, String> {
+        let catalog = self.catalog()?;
+        let stories = &catalog.stories;
+        let total = stories.len();
+        on_progress(0, total);
+
         let terms = split_query_terms(query);
         if terms.positive.is_empty() {
             // Purely-negative (or empty) queries have no meaningful answer.
-            return Ok(results);
+            return Ok(Vec::new());
         }
-        // Primary term for context extraction + raw query for display fallback.
-        let primary_term = terms.primary().unwrap_or_default().to_string();
 
-        let catalog = self.catalog()?;
-
-        for indexed in &catalog.stories {
+        let mut results = Vec::new();
+        for (idx, indexed) in stories.iter().enumerate() {
             let story = &indexed.story;
-            let category_label =
-                Self::format_category_label(&indexed.entry_type, &indexed.category_name);
-
             let story_name_norm = normalize_for_fuzzy(&story.story_name);
             let code_norm = story
                 .story_code
@@ -2361,50 +2649,66 @@ impl DataService {
             // Fast path: title/code hit and nothing to exclude. With NOT terms
             // in play we still have to read the body, since an exclusion may
             // only appear there.
-            if title_hits && terms.negative.is_empty() {
+            let hit = if title_hits && terms.negative.is_empty() {
+                Some(story.story_name.clone())
+            } else {
+                // 扫的是「标题 + 解析后的正文」，也就是索引里 `raw_content`
+                // 的同一份文本。直接扫原始脚本的话，`[name=...]`、素材 token
+                // 之类的指令文字只在这条路径上能被搜到，索引建好之后同一个
+                // 查询就突然搜不到了。
+                self.story_searchable_text(&story.story_name, &story.story_txt)
+                    .and_then(|content| {
+                        let content_norm = normalize_for_fuzzy(&content);
+                        let haystacks = [content_norm.as_str(), code_norm.as_str()];
+                        if terms.excluded_by(&haystacks) {
+                            return None;
+                        }
+                        if !title_hits && !terms.positives_match(&haystacks) {
+                            return None;
+                        }
+                        Some(if title_hits {
+                            story.story_name.clone()
+                        } else {
+                            self.preview_for(&content, terms.primary())
+                        })
+                    })
+            };
+
+            if let Some(matched_text) = hit {
                 results.push(SearchResult {
                     story_id: story.story_id.clone(),
                     story_name: story.story_name.clone(),
-                    matched_text: story.story_name.clone(),
-                    category: category_label,
+                    matched_text,
+                    // 只有真的命中才付这次 `String` 分配的钱。
+                    category: indexed.category_label.to_string(),
                 });
-                if results.len() >= SEARCH_RESULT_LIMIT {
-                    return Ok(results);
-                }
-                continue;
             }
 
-            if let Ok(content) = self.read_story_text(&story.story_txt) {
-                // Normalize the content with the same rules used for terms so that
-                // `{@nickname}` → `博士`, whitespace and punctuation differences are neutralized.
-                let content_norm = normalize_for_fuzzy(&content);
-                if terms.excluded_by(&[
-                    content_norm.as_str(),
-                    story_name_norm.as_str(),
-                    code_norm.as_str(),
-                ]) {
-                    continue;
-                }
-                if title_hits || terms.positives_match(&[content_norm.as_str()]) {
-                    let matched_text = if title_hits {
-                        story.story_name.clone()
-                    } else {
-                        self.extract_context(&content, &primary_term)
-                    };
-                    results.push(SearchResult {
-                        story_id: story.story_id.clone(),
-                        story_name: story.story_name.clone(),
-                        matched_text,
-                        category: category_label,
-                    });
-                    if results.len() >= SEARCH_RESULT_LIMIT {
-                        return Ok(results);
-                    }
-                }
+            on_progress(idx + 1, total);
+            if results.len() >= SEARCH_RESULT_LIMIT {
+                break;
             }
         }
 
         Ok(results)
+    }
+
+    /// 命中片段：先按整词定位，不行再退回单个原子，最后给一段开头预览。
+    /// 空字符串对用户毫无意义，任何情况下都要给点上下文。
+    fn preview_for(&self, content: &str, term: Option<&Term>) -> String {
+        if let Some(term) = term {
+            for probe in term.snippet_probes() {
+                let snippet = self.extract_context(content, probe);
+                if !snippet.trim().is_empty() {
+                    return snippet;
+                }
+            }
+        }
+        Self::clip_preview(content, 120)
+    }
+
+    fn search_stories_fallback(&self, query: &str) -> Result<Vec<SearchResult>, String> {
+        self.scan_stories(query, |_, _| {})
     }
 
     /// 搜索剧情（混合：索引优先 + 线性扫描补全，防止遗漏）
@@ -2484,20 +2788,19 @@ impl DataService {
             });
         }
 
-        progress("检索", 0, 3, format!("搜索「{}」", trimmed));
-        let results = match app {
-            Some(app) => self.search_stories_with_progress(app, trimmed)?,
-            None => self.search_stories(trimmed)?,
-        };
-        progress("检索", 1, 3, format!("命中 {} 篇", results.len()));
+        // `total = 0` 是与前端约定的「不确定态」：还不知道要走索引还是扫全库，
+        // 报一个 0/3 只是编出来的百分比。真实分母由线性扫描那一步给出。
+        progress("检索", 0, 0, format!("搜索「{}」", trimmed));
+        let results = self.search_stories_emitting(app, trimmed)?;
 
         // Compute total via FTS (best effort — if the index is unavailable we
         // fall back to `results.len()` which is at least a lower bound).
+        progress("统计", 0, 0, format!("命中 {} 篇，正在统计", results.len()));
         let total_matched = self
             .count_fts_matches(trimmed)
             .unwrap_or_else(|_| results.len());
         let total_matched = total_matched.max(results.len());
-        progress("统计", 2, 3, format!("共 {} 条匹配", total_matched));
+        progress("完成", 1, 1, format!("共 {} 条匹配", total_matched));
 
         // Build facets from the returned subset. Categories are formatted as
         // `<Type> | <Specific Name>` (see `format_category_label`); aggregating
@@ -2582,7 +2885,9 @@ impl DataService {
             });
         }
 
-        progress("段落检索", 0, 2, format!("搜索「{}」", trimmed));
+        // 段落检索只有一步（一次 FTS 查询），中途没有可报的真实刻度。
+        // `total = 0` 让前端转 spinner，而不是画一条永远停在 0% 的进度条。
+        progress("段落检索", 0, 0, format!("搜索「{}」", trimmed));
 
         let Some(conn) = self.try_open_index_connection()? else {
             progress("完成", 1, 1, "段落索引尚未建立".to_string());
@@ -2611,6 +2916,7 @@ impl DataService {
         }
 
         let Some(fts_query) = Self::build_fts_query_advanced(trimmed) else {
+            progress("完成", 1, 1, "查询没有可用的正向词".to_string());
             return Ok(SegmentSearchPage {
                 hits: Vec::new(),
                 total_matched: 0,
@@ -2642,6 +2948,7 @@ impl DataService {
             Ok(s) => s,
             Err(err) => {
                 eprintln!("[SEG-INDEX] prepare failed: {}", err);
+                progress("完成", 1, 1, "段落索引不可用".to_string());
                 return Ok(SegmentSearchPage {
                     hits: Vec::new(),
                     total_matched: 0,
@@ -2650,10 +2957,9 @@ impl DataService {
             }
         };
 
-        // Pre-fetch story_id → (story_name, category) for labels.
+        // 显示标签走目录（`story_id` → 剧情名 / 分类），本身就是缓存好的。
         let catalog = self.collect_story_labels();
-        let no_labels: HashMap<String, (String, String)> = HashMap::new();
-        let label_map = catalog.as_ref().map(|c| &c.labels).unwrap_or(&no_labels);
+        let labels = catalog.as_deref();
 
         let rows = match stmt.query_map(params![fts_query], |row| {
             let story_id: String = row.get(0)?;
@@ -2667,6 +2973,7 @@ impl DataService {
             Ok(r) => r,
             Err(err) => {
                 eprintln!("[SEG-INDEX] query failed for '{}': {}", fts_query, err);
+                progress("完成", 1, 1, "段落检索失败".to_string());
                 return Ok(SegmentSearchPage {
                     hits: Vec::new(),
                     total_matched: 0,
@@ -2715,9 +3022,9 @@ impl DataService {
             } else {
                 Self::clip_preview(&raw_text, 240)
             };
-            let (story_name, category) = label_map
-                .get(&story_id)
-                .cloned()
+            let (story_name, category) = labels
+                .and_then(|c| c.label_for(&story_id))
+                .map(|(name, label)| (name.to_string(), label.to_string()))
                 .unwrap_or_else(|| (story_id.clone(), String::new()));
             let character_name = if character_norm.trim().is_empty() {
                 None
@@ -2745,7 +3052,7 @@ impl DataService {
         // result even though the title itself isn't stored as a segment.
         // Each such hit is presented as a pseudo-"header" segment at index 0
         // so the reader lands on the beginning of the story when clicked.
-        if let Ok(story_rows) = self.story_level_title_hits(&fts_query, trimmed, label_map) {
+        if let Ok(story_rows) = self.story_level_title_hits(&fts_query, trimmed, labels) {
             let remaining = SEARCH_RESULT_LIMIT.saturating_sub(hits.len());
             for hit in story_rows.into_iter().take(remaining) {
                 let key = (hit.story_id.clone(), hit.segment_index);
@@ -2815,7 +3122,7 @@ impl DataService {
         &self,
         fts_query: &str,
         query_raw: &str,
-        label_map: &HashMap<String, (String, String)>,
+        labels: Option<&StoryCatalog>,
     ) -> Result<Vec<SegmentHit>, String> {
         let Some(conn) = self.try_open_index_connection()? else {
             return Ok(Vec::new());
@@ -2858,9 +3165,9 @@ impl DataService {
             if !name_norm.contains(&probe) && !code_norm.contains(&probe) {
                 continue;
             }
-            let (story_name, category) = label_map
-                .get(&story_id)
-                .cloned()
+            let (story_name, category) = labels
+                .and_then(|c| c.label_for(&story_id))
+                .map(|(name, label)| (name.to_string(), label.to_string()))
                 .unwrap_or((story_name, category));
             hits.push(SegmentHit {
                 story_id,
@@ -2988,89 +3295,57 @@ impl DataService {
             return Ok(Vec::new());
         }
 
-        // 尝试索引
+        let results = self.search_stories_emitting(Some(app), trimmed)?;
+        emit_search_progress(app, "完成", 1, 1, format!("命中 {} 篇", results.len()));
+        Ok(results)
+    }
+
+    /// `search_stories` 的发进度版本，但**不**发终态事件——外层
+    /// (`search_stories_with_progress` / `search_stories_ex_inner`)
+    /// 各自还有收尾工作，终态由它们来发，免得进度条先跳「完成」再往回退。
+    ///
+    /// 每篇都 emit 一次会给事件总线灌进两千条消息（还都要过一次 JSON），
+    /// 光是发事件就比扫描本身还贵，所以按批发。
+    fn search_stories_emitting(
+        &self,
+        app: Option<&AppHandle>,
+        trimmed: &str,
+    ) -> Result<Vec<SearchResult>, String> {
+        const SCAN_PROGRESS_STRIDE: usize = 32;
+
+        let Some(app) = app else {
+            return self.search_stories(trimmed);
+        };
+
+        emit_search_progress(app, "检索", 0, 0, "尝试全文索引");
         match self.search_stories_with_index(trimmed) {
             Ok(Some(results)) => {
                 emit_search_progress(app, "索引检索", 1, 1, "使用全文索引完成");
                 return Ok(results);
             }
-            Ok(None) => {
-                // fallthrough
-            }
-            Err(_err) => {
-                // fallthrough to fallback scan
-            }
-        }
-
-        // 线性扫描，实时进度
-        let catalog = self.catalog()?;
-        let stories = &catalog.stories;
-        let total = stories.len();
-        emit_search_progress(app, "线性扫描", 0, total.max(1), "开始遍历");
-
-        let mut results = Vec::new();
-        let terms = split_query_terms(trimmed);
-        if terms.positive.is_empty() {
-            emit_search_progress(app, "完成", 1, 1, "查询没有可用的正向词");
-            return Ok(Vec::new());
-        }
-        let primary_term = terms.primary().unwrap_or_default().to_string();
-        for (idx, indexed) in stories.iter().enumerate() {
-            let story = &indexed.story;
-            let category_label =
-                Self::format_category_label(&indexed.entry_type, &indexed.category_name);
-
-            let story_name_norm = normalize_for_fuzzy(&story.story_name);
-            let code_norm = story
-                .story_code
-                .as_ref()
-                .map(|s| normalize_for_fuzzy(s))
-                .unwrap_or_default();
-            let title_hits =
-                terms.positives_match(&[story_name_norm.as_str(), code_norm.as_str()]);
-            if title_hits && terms.negative.is_empty() {
-                results.push(SearchResult {
-                    story_id: story.story_id.clone(),
-                    story_name: story.story_name.clone(),
-                    matched_text: story.story_name.clone(),
-                    category: category_label.clone(),
-                });
-            } else if let Ok(content) = self.read_story_text(&story.story_txt) {
-                let content_norm = normalize_for_fuzzy(&content);
-                let excluded = terms.excluded_by(&[
-                    content_norm.as_str(),
-                    story_name_norm.as_str(),
-                    code_norm.as_str(),
-                ]);
-                if !excluded && (title_hits || terms.positives_match(&[content_norm.as_str()])) {
-                    let matched_text = if title_hits {
-                        story.story_name.clone()
-                    } else {
-                        self.extract_context(&content, &primary_term)
-                    };
-                    results.push(SearchResult {
-                        story_id: story.story_id.clone(),
-                        story_name: story.story_name.clone(),
-                        matched_text,
-                        category: category_label.clone(),
-                    });
-                }
-            }
-
-            emit_search_progress(
-                app,
-                "线性扫描",
-                (idx + 1).min(total),
-                total.max(1),
-                format!("已扫描 {} / {}", idx + 1, total),
-            );
-
-            if results.len() >= SEARCH_RESULT_LIMIT {
-                break;
+            // 索引没建好 / 查询失败：往下走线性扫描。
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!(
+                    "[INDEX] Failed to search using index ({}), fallback to linear scan",
+                    err
+                );
             }
         }
 
-        Ok(results)
+        self.scan_stories(trimmed, |done, total| {
+            if done == 0 {
+                emit_search_progress(app, "线性扫描", 0, total.max(1), "开始遍历");
+            } else if done % SCAN_PROGRESS_STRIDE == 0 || done == total {
+                emit_search_progress(
+                    app,
+                    "线性扫描",
+                    done,
+                    total.max(1),
+                    format!("已扫描 {} / {}", done, total),
+                );
+            }
+        })
     }
 
     pub fn get_story_entry(&self, story_id: &str) -> Result<StoryEntry, String> {
@@ -3697,10 +3972,23 @@ mod tests {
         );
     }
 
+    /// `QueryTerms` 里存的是切好原子的 `Term`；断言时只看归一化后的原文。
+    fn positive_texts(terms: &QueryTerms) -> Vec<Vec<&str>> {
+        terms
+            .positive
+            .iter()
+            .map(|group| group.iter().map(|t| t.text.as_str()).collect())
+            .collect()
+    }
+
+    fn negative_texts(terms: &QueryTerms) -> Vec<&str> {
+        terms.negative.iter().map(|t| t.text.as_str()).collect()
+    }
+
     #[test]
     fn split_query_terms_basic() {
         let terms = split_query_terms("凯尔希 阿米娅");
-        assert_eq!(terms.positive, vec![vec!["凯尔希"], vec!["阿米娅"]]);
+        assert_eq!(positive_texts(&terms), vec![vec!["凯尔希"], vec!["阿米娅"]]);
         assert!(terms.negative.is_empty());
     }
 
@@ -3708,7 +3996,30 @@ mod tests {
     fn split_query_terms_quoted_phrase() {
         let terms = split_query_terms("\"凯尔希 阿米娅\"");
         // Quoted phrase collapses internal whitespace because of fuzzy normalization.
-        assert_eq!(terms.positive, vec![vec!["凯尔希阿米娅"]]);
+        assert_eq!(positive_texts(&terms), vec![vec!["凯尔希阿米娅"]]);
+        // 短语只有一个原子：整串必须连续出现，对应 FTS 的 `"凯 尔 希 阿 米 娅"`。
+        assert_eq!(terms.positive[0][0].atoms, vec!["凯尔希阿米娅"]);
+        assert!(terms.positives_match(&["和凯尔希阿米娅一起"]));
+        assert!(!terms.positives_match(&["凯尔希在，阿米娅不在"]));
+    }
+
+    #[test]
+    fn split_query_terms_bare_cjk_is_char_level_like_the_index() {
+        // 普通词对应 FTS 的 `("凯" AND "尔" AND "希")`：逐字命中即可，不要求
+        // 连续。线性扫描必须用同样的判定，否则索引建好前后结果集会变。
+        let terms = split_query_terms("凯尔希");
+        assert_eq!(terms.positive[0][0].atoms, vec!["凯", "尔", "希"]);
+        assert!(terms.positives_match(&["凯尔希"]));
+        assert!(terms.positives_match(&["凯瑟琳、尔后、希望"]));
+        assert!(!terms.positives_match(&["凯尔"]));
+    }
+
+    #[test]
+    fn split_query_terms_ascii_run_is_one_atom() {
+        let terms = split_query_terms("prts2");
+        assert_eq!(terms.positive[0][0].atoms, vec!["prts2"]);
+        // 索引里落不成 token 的字符（假名等）两边都当它不存在。
+        assert!(split_query_terms("アイ").positive.is_empty());
     }
 
     #[test]
@@ -3716,18 +4027,39 @@ mod tests {
         let terms = split_query_terms("凯尔希 or 阿米娅 -博士");
         // `or` merges the two names into one alternative group; `-博士` is an
         // exclusion, never a positive term.
-        assert_eq!(terms.positive, vec![vec!["凯尔希", "阿米娅"]]);
-        assert_eq!(terms.negative, vec!["博士"]);
+        assert_eq!(positive_texts(&terms), vec![vec!["凯尔希", "阿米娅"]]);
+        assert_eq!(negative_texts(&terms), vec!["博士"]);
     }
 
     #[test]
     fn split_query_terms_not_is_not_inverted() {
         let terms = split_query_terms("-凯尔希 博士");
-        assert_eq!(terms.positive, vec![vec!["博士"]]);
-        assert_eq!(terms.negative, vec!["凯尔希"]);
+        assert_eq!(positive_texts(&terms), vec![vec!["博士"]]);
+        assert_eq!(negative_texts(&terms), vec!["凯尔希"]);
         assert!(terms.positives_match(&["博士说过的话"]));
         assert!(terms.excluded_by(&["凯尔希说过的话"]));
         assert!(!terms.excluded_by(&["博士说过的话"]));
+    }
+
+    #[test]
+    fn split_query_terms_negated_phrase_stays_negative() {
+        // `-"..."` 的减号在引号外，归一化会把它抹掉；不特判的话否定短语会
+        // 变成肯定短语，语义正好反过来。
+        let terms = split_query_terms("博士 -\"凯尔希\"");
+        assert_eq!(positive_texts(&terms), vec![vec!["博士"]]);
+        assert_eq!(negative_texts(&terms), vec!["凯尔希"]);
+        assert!(terms.excluded_by(&["凯尔希来了"]));
+
+        // 引号没闭合时同样保住否定语义。
+        let terms = split_query_terms("博士 -\"凯尔希");
+        assert_eq!(negative_texts(&terms), vec!["凯尔希"]);
+    }
+
+    #[test]
+    fn split_query_terms_quoted_or_is_a_literal() {
+        // 引号里的 `or` 是要搜的词，不是连接词。
+        let terms = split_query_terms("\"or\" 博士");
+        assert_eq!(positive_texts(&terms), vec![vec!["or"], vec!["博士"]]);
     }
 
     #[test]
@@ -4107,7 +4439,7 @@ mod tests {
         let rogue: Vec<&IndexedStory> = catalog
             .stories
             .iter()
-            .filter(|s| s.entry_type == "ROGUELIKE")
+            .filter(|s| s.category_label.starts_with("肉鸽"))
             .collect();
         assert_eq!(rogue.len(), 2, "both roguelike scripts must be indexable");
         assert!(catalog.by_id.contains_key("Obt/Roguelike/ro2/ro2_1"));
