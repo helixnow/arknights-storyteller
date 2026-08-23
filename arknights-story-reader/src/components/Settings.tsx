@@ -110,6 +110,8 @@ export function Settings() {
   const [statusNotice, setStatusNotice] = useState<StatusNotice | null>(null);
   const statusSeqRef = useRef(0);
   const [appVersion, setAppVersion] = useState<string>("");
+  /** 版本号读取失败的终态；没有它，更新卡片会永远停在「读取中...」。 */
+  const [appVersionUnavailable, setAppVersionUnavailable] = useState(false);
   const [updateStatus, setUpdateStatus] = useState<
     | "idle"
     | "checking"
@@ -170,8 +172,10 @@ export function Settings() {
   // 文件对话框弹出期间按钮必须先锁上：确认框与系统选择器都是异步的，
   // 此时 hook 的 importing 还没置起来，连点两下会开出两个选择器。
   const [preparingImport, setPreparingImport] = useState(false);
+  /** 同步确认框弹出期间的忙态；此时 "sync" 任务锁已被 handleSyncClick 预占。 */
+  const [preparingSync, setPreparingSync] = useState(false);
   const importBusy = importing || preparingImport;
-  const dataBusy = busy || preparingImport;
+  const dataBusy = busy || preparingImport || preparingSync;
   /**
    * 任务锁被本页之外的东西占着（同步对话框、自动索引、更新安装）。这时候所有
    * 会改数据的入口都要禁用，并把占用者报出来——只把按钮灰掉，用户只会以为坏了。
@@ -190,12 +194,31 @@ export function Settings() {
     if (dataActionsDisabled) return;
     showStatus(null);
     setError(null);
-    const confirmed = await safeConfirm(
-      status === "not-installed"
-        ? "将从 GitHub 下载完整剧情数据包并占用较多存储，确定开始？"
-        : "同步会覆盖本机已有的剧情数据并重建索引，确定继续？",
-      { title: "同步剧情数据", kind: "warning" }
-    );
+    // 与导入同一纪律：确认框是异步的，弹着的这段时间锁必须先占住。空着的话，
+    // 自动索引的重试定时器（索引未就绪时每 10s 一次）随时会抢锁开工，用户点完
+    // 「确定」只会收到「正在重建全文索引」的报错，刚给出的确认就被吞掉了。
+    const releaseJob = acquireDataJob("sync");
+    if (!releaseJob) {
+      setError(dataJobConflictMessage("同步"));
+      return;
+    }
+    setPreparingSync(true);
+    let confirmed = false;
+    try {
+      confirmed = await safeConfirm(
+        status === "not-installed"
+          ? "将从 GitHub 下载完整剧情数据包并占用较多存储，确定开始？"
+          : "同步会覆盖本机已有的剧情数据并重建索引，确定继续？",
+        { title: "同步剧情数据", kind: "warning" }
+      );
+    } finally {
+      // handleSync 自己抢锁，这里必须先放。放锁与它开头的同步抢锁在同一个
+      // 宏任务里，自动索引的定时器插不进来；能截走锁的只有
+      // acquireDataJobWhenIdle 的同步等待者（用户已点头的自动更新安装），
+      // 那种情况下 handleSync 会给出明确的冲突提示，而不是静默吞确认。
+      releaseJob();
+      setPreparingSync(false);
+    }
     if (!confirmed) return;
     void handleSync();
   };
@@ -519,10 +542,12 @@ export function Settings() {
     let cancelled = false;
     getAppVersion()
       .then((version) => {
-        if (!cancelled) setAppVersion(version);
+        if (cancelled) return;
+        setAppVersion(version);
+        setAppVersionUnavailable(false);
       })
       .catch(() => {
-        if (!cancelled) setAppVersion("");
+        if (!cancelled) setAppVersionUnavailable(true);
       });
     return () => {
       cancelled = true;
@@ -749,7 +774,11 @@ export function Settings() {
                   </div>
                   <div>
                     <div className="text-xs text-[hsl(var(--color-muted-foreground))]">最新版本</div>
-                    <div className="font-mono text-sm">{remoteVersion || "未知"}</div>
+                    {/* 与「当前版本」同一纪律：还在向 GitHub 查询就说读取中，
+                        别把没拿到的瞬间先写成「未知」再跳变。 */}
+                    <div className="font-mono text-sm">
+                      {remoteVersion || (loadingInfo ? "读取中..." : "未知")}
+                    </div>
                   </div>
                   {renderStatusBadge()}
                   <Button
@@ -813,7 +842,13 @@ export function Settings() {
                       <>
                         <div className="flex justify-between text-sm">
                           <span className="text-[hsl(var(--color-muted-foreground))]">
-                            {syncing ? "连接中" : preparingImport && !importing ? "等待选择文件" : "正在导入"}
+                            {syncing
+                              ? "连接中"
+                              : preparingSync
+                              ? "等待确认"
+                              : preparingImport && !importing
+                              ? "等待选择文件"
+                              : "正在导入"}
                           </span>
                           <span className="font-mono" aria-hidden="true">
                             …
@@ -823,7 +858,13 @@ export function Settings() {
                           role="progressbar"
                           aria-label="剧情数据处理进度"
                           aria-valuetext={
-                            syncing ? "正在开始同步" : preparingImport && !importing ? "等待选择文件" : "正在导入"
+                            syncing
+                              ? "正在开始同步"
+                              : preparingSync
+                              ? "等待确认是否开始同步"
+                              : preparingImport && !importing
+                              ? "等待选择文件"
+                              : "正在导入"
                           }
                           className="w-full bg-[hsl(var(--color-secondary))] rounded-full h-2 overflow-hidden"
                         >
@@ -832,6 +873,8 @@ export function Settings() {
                         <p className="text-xs text-[hsl(var(--color-muted-foreground))]">
                           {syncing
                             ? "正在开始同步…"
+                            : preparingSync
+                            ? "请在弹出的对话框中确认是否开始同步"
                             : preparingImport && !importing
                             ? "请在系统对话框中选择 ZIP 压缩包"
                             : "请稍候"}
@@ -917,7 +960,12 @@ export function Settings() {
                   <div>
                     <div className="text-xs text-[hsl(var(--color-muted-foreground))]">当前版本</div>
                     <div className="font-mono text-sm">
-                      {appVersion || (runtimePlatform === "unknown" ? "非 Tauri 环境" : "读取中...")}
+                      {appVersion ||
+                        (runtimePlatform === "unknown"
+                          ? "非 Tauri 环境"
+                          : appVersionUnavailable
+                          ? "未知"
+                          : "读取中...")}
                     </div>
                   </div>
                   <div>

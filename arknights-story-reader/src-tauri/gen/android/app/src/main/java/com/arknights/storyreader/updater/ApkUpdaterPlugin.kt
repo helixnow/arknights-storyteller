@@ -138,6 +138,7 @@ class ApkUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
     withContext(Dispatchers.IO) {
       val name = sanitizeApkFileName(fileName)
         ?: "update-${System.currentTimeMillis()}.apk"
+      purgeStaleApks(keep = name)
       val outputFile = File(activity.cacheDir, name)
       val call = httpClient.newCall(Request.Builder().url(url).build())
       activeCall = call
@@ -180,6 +181,26 @@ class ApkUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
         activeCall = null
       }
     }
+
+  /**
+   * 装完（或放弃安装）的 APK 没有任何后续引用，却会一直躺在 cacheDir 里：
+   * 回退命名带毫秒时间戳永不复用，manifest 命名通常也随版本变化，几个版本
+   * 下来就是几百 MB 死文件。开新下载时顺手清掉旧的；只删超过 24 小时的，
+   * 避免误删「系统安装界面还开着、用户马上要点安装」的那一份。
+   */
+  private fun purgeStaleApks(keep: String) {
+    val cutoff = System.currentTimeMillis() - TimeUnit.HOURS.toMillis(24)
+    activity.cacheDir.listFiles()?.forEach { file ->
+      if (
+        file.isFile &&
+        file.name != keep &&
+        file.name.endsWith(".apk", ignoreCase = true) &&
+        file.lastModified() < cutoff
+      ) {
+        file.delete()
+      }
+    }
+  }
 
   /**
    * The caller-supplied name is used verbatim as a file name inside

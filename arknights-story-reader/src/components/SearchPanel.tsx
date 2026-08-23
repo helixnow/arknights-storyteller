@@ -30,6 +30,7 @@ import {
   describeDataJob,
   useActiveDataJob,
 } from "@/hooks/useDataSyncManager";
+import { useBackHandler } from "@/hooks/useBackHandler";
 
 type SearchMode = "story" | "segment";
 
@@ -1328,6 +1329,19 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     window.addEventListener("app:rebuild-story-index", handler);
     return () => window.removeEventListener("app:rebuild-story-index", handler);
   }, [runBuildIndex]);
+
+  // 「⋯」菜单要占一层返回栈：Android 硬返回 / 浏览器手势返回本该先关掉
+  // 这个浮层，但它是 role="menu" 而非 aria-modal 对话框，useBackHandler
+  // 里的 DOM 兜底接不住——不注册的话返回会越过开着的菜单直接落到 App 的
+  // tab 兜底，整个 tab 跳回首页；返回键又不产生 mousedown/Escape，
+  // moreOpen 还留在 true，切回搜索页时菜单仍挂着。本面板没有 active
+  // prop，菜单开着时面板可能被 KeepAlive 藏起来（祖先带 inert），这时
+  // 绝不消费返回，否则首页的退出会被一个看不见的菜单吞掉。
+  useBackHandler(moreOpen, () => {
+    if (moreMenuRef.current?.closest("[inert]")) return false;
+    setMoreOpen(false);
+    return true;
+  });
 
   // Close the ⋯ popover on outside click or Escape.
   useEffect(() => {

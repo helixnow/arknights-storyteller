@@ -777,6 +777,9 @@ body {
   gap: 1rem;
 }
 
+/* 分隔线跟标题文字一样基于阅读主题变量：全局 --color-border 在「浅色 App +
+   深色阅读主题」组合下是压在近黑纸面上的亮白细线（反之则是脏色块）。
+   20% 前景色在四个原生组合下和旧的 border 色几乎逐像素一致。 */
 .reader-header::before,
 .reader-header::after {
   content: "";
@@ -785,8 +788,8 @@ body {
   background: linear-gradient(
     90deg,
     transparent,
-    hsl(var(--color-border)) 40%,
-    hsl(var(--color-border)) 60%,
+    color-mix(in srgb, var(--reader-fg) 20%, transparent) 40%,
+    color-mix(in srgb, var(--reader-fg) 20%, transparent) 60%,
     transparent
   );
 }
@@ -833,7 +836,12 @@ body {
   position: absolute;
   top: calc(clamp(0.75rem, 2vw, 1rem) + var(--scroll-area-track-offset-top));
   bottom: calc(clamp(0.75rem, 2vw, 1rem) + var(--scroll-area-track-offset-bottom));
-  right: calc(clamp(0.2rem, 1vw, 0.6rem) + var(--scroll-area-track-offset-right));
+  /* 滚动区贴满面板整宽，横屏刘海机上轨道会缩进屏幕圆角里：把右侧安全区
+     算进偏移。竖屏/桌面 env 为 0，位置不变。 */
+  right: calc(
+    clamp(0.2rem, 1vw, 0.6rem) + var(--scroll-area-track-offset-right) +
+      env(safe-area-inset-right, 0px)
+  );
   width: 0.45rem;
   border-radius: 9999px;
   background: hsl(var(--color-secondary) / 0.12);
@@ -863,6 +871,10 @@ body {
 
 .reader-scroll--paged .reader-content {
   min-height: calc(100vh - 12rem);
+  /* 移动端浏览器工具栏展开时 100vh 比可视视口高约一条工具栏，分页模式
+     每一页都会多出一截滚动、页尾沉到折叠线下。dvh 跟随实际视口；
+     旧内核不认识这行会自动回落到上面的 vh。 */
+  min-height: calc(100dvh - 12rem);
 }
 
 .progress-track {
@@ -1108,7 +1120,10 @@ input[type="range"]::-moz-range-thumb {
   margin-top: 0.5rem;
   margin-bottom: 0.5rem;
   font-size: 0.85rem;
-  color: hsl(var(--color-muted-foreground));
+  /* 必须基于阅读主题变量：全局 muted-foreground 在「深色 App + 白纸阅读
+     主题」下是浅灰字压近白底（≈1.9:1，不可读），反向组合同样崩。
+     72% 与 .reader-narration 同一档，在原生组合下和旧色几乎一致。 */
+  color: color-mix(in srgb, var(--reader-fg) 72%, transparent);
   text-align: center;
 }
 
