@@ -96,6 +96,14 @@ const INDEX_JOB_WATCHDOG_MS = 30_000;
  */
 const FILE_PICKER_CANCEL_GRACE_MS = 1500;
 
+/**
+ * 兜底超时：个别平台打开 <input type="file"> 不会让窗口失焦，「先见失焦、
+ * 再等回焦」的取消侦测永远布防不了，寄存的锁会一直占着。等这么久仍没有
+ * change 就按取消放锁，保证不死锁。取 5 分钟而不是几秒：它只该在侦测完全
+ * 失灵时兜底，绝不能反过来误伤慢慢挑文件的用户。
+ */
+const FILE_PICKER_STUCK_RELEASE_MS = 5 * 60_000;
+
 export function Settings() {
   const { themeColor, setThemeColor } = useTheme();
   const { minimalMode, setMinimalMode, inlineImages, setInlineImages } = useAppPreferences();
@@ -202,7 +210,7 @@ export function Settings() {
    * importFromFile；确认取消后在这里释放。
    */
   const pendingImportJobRef = useRef<(() => void) | null>(null);
-  /** 撤掉取消侦听（焦点监听 + 宽限计时器）；寄存的锁本身由调用方另行处置。 */
+  /** 撤掉取消侦测（blur / focus / visibility 监听 + 各计时器）；寄存的锁本身由调用方另行处置。 */
   const pendingImportWatchCleanupRef = useRef<(() => void) | null>(null);
 
   /** 取走寄存的锁并撤掉侦听；之后交棒还是释放由取走的人决定。 */
@@ -214,34 +222,89 @@ export function Settings() {
   }, []);
 
   /**
-   * 寄存锁并布防取消侦听。检测手法沿用本仓库刷新数据用的窗口焦点事件
-   * （HomePanel / StoryList 同款）：选择器（Android 上是独立 activity）关掉后
-   * 窗口必然重新获得焦点，此时先等一个宽限期让可能在路上的 change 事件先到；
-   * 等不到就视为用户取消，放锁并清 preparing 态。万一误判（change 姗姗来迟），
-   * importFromFile 会退回自己抢锁，行为和修复前一致，不会更糟。
+   * 寄存锁并布防取消侦测。检测手法沿用本仓库刷新数据用的窗口焦点事件
+   * （HomePanel / StoryList 同款），但必须分两步布防，不能一挂上就听 focus：
+   * handleImportClick 里确认框刚收场，它归还焦点的那次 focus 可能在监听挂上
+   * 之后才派发，若直接当「选择器收场」处理，宽限期一到就会在用户还在系统
+   * 选择器里挑文件时把锁放掉——等待者（自动索引 / 更新安装）被唤醒截锁，
+   * 空窗就回来了。所以：
+   *   1. 先等窗口 blur 或页面被隐藏（Android 选择器是独立 activity）——这才是
+   *      「选择器真的打开了」的信号，在此之前到达的 focus（确认框的余焦）
+   *      一律忽略；
+   *   2. 见过失焦后才认回焦（focus / 页面重新可见）：选择器收场时窗口必然
+   *      回焦，先等一个宽限期让可能在路上的 change 先到，等不到才按
+   *      「用户取消」放锁。用户在选择器里泡多久都安全——期间窗口始终失焦，
+   *      回焦事件根本不会来，倒计时无从开始。
+   * 个别平台打开选择器不夺焦点，第 1 步永远等不到，由 5 分钟兜底超时保证
+   * 最终放锁、不死锁。万一误判（change 姗姗来迟），importFromFile 会退回
+   * 自己抢锁，行为和修复前一致，不会更糟。
    */
   const armPendingImportWatch = useCallback((releaseJob: () => void) => {
     pendingImportJobRef.current = releaseJob;
+    /** 已确认选择器真正打开过（窗口失焦 / 页面隐藏），回焦事件才可信。 */
+    let pickerSeen = false;
     let graceTimer: number | null = null;
-    const onFocus = () => {
-      window.removeEventListener("focus", onFocus);
+    let stuckTimer: number | null = null;
+
+    // 按「用户取消」收场：撤掉全部侦听与计时器、放锁、清 preparing 态。
+    const settleAsCancelled = () => {
+      pendingImportWatchCleanupRef.current?.();
+      const job = pendingImportJobRef.current;
+      pendingImportJobRef.current = null;
+      if (job) {
+        job();
+        setPreparingImport(false);
+      }
+    };
+
+    const startGrace = () => {
+      if (graceTimer !== null) return;
       graceTimer = window.setTimeout(() => {
         graceTimer = null;
-        pendingImportWatchCleanupRef.current = null;
-        const job = pendingImportJobRef.current;
-        pendingImportJobRef.current = null;
-        if (job) {
-          job();
-          setPreparingImport(false);
-        }
+        settleAsCancelled();
       }, FILE_PICKER_CANCEL_GRACE_MS);
     };
+
+    const stopGrace = () => {
+      if (graceTimer !== null) {
+        window.clearTimeout(graceTimer);
+        graceTimer = null;
+      }
+    };
+
+    const onLostFocus = () => {
+      pickerSeen = true;
+      // 又失焦了（还在选择器里，或过渡动画抖出的假回焦）：撤掉可能误开的
+      // 倒计时，等真正回焦再重新计时，绝不在用户看不见页面时放锁。
+      stopGrace();
+    };
+    const onGotFocus = () => {
+      if (!pickerSeen) return; // 确认框收尾的余焦，选择器还没开，不理。
+      startGrace();
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "hidden") onLostFocus();
+      else onGotFocus();
+    };
+
     pendingImportWatchCleanupRef.current = () => {
-      window.removeEventListener("focus", onFocus);
-      if (graceTimer !== null) window.clearTimeout(graceTimer);
+      window.removeEventListener("blur", onLostFocus);
+      window.removeEventListener("focus", onGotFocus);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      stopGrace();
+      if (stuckTimer !== null) {
+        window.clearTimeout(stuckTimer);
+        stuckTimer = null;
+      }
       pendingImportWatchCleanupRef.current = null;
     };
-    window.addEventListener("focus", onFocus);
+    window.addEventListener("blur", onLostFocus);
+    window.addEventListener("focus", onGotFocus);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    stuckTimer = window.setTimeout(() => {
+      stuckTimer = null;
+      settleAsCancelled();
+    }, FILE_PICKER_STUCK_RELEASE_MS);
   }, []);
 
   // 设置页卸载时选择器可能还开着：侦听要拆，寄存的锁必须放掉，不能跟着组件蒸发。

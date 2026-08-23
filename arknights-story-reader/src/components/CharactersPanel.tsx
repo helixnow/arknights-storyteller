@@ -19,6 +19,7 @@ import { cn } from "@/lib/utils";
 import { CharacterAvatar } from "@/components/CharacterAvatar";
 import { useCharacterResolver } from "@/hooks/useCharacterResolver";
 import { postProcessSegments } from "@/components/StoryReader";
+import { BACK_PRIORITY, useBackHandler } from "@/hooks/useBackHandler";
 
 interface CharactersPanelProps {
   active?: boolean;
@@ -385,7 +386,10 @@ export function CharactersPanel({
             setCacheBuiltAt(parsed.builtAt);
           }
         } catch {
-          // 缓存损坏就丢掉重建，不用打扰用户。
+          // 缓存损坏就丢掉重建，不用打扰用户。回填可能在半路抛错，此时
+          // aggMap 已混入部分缓存条目，必须清空：否则下面的全量重扫会在
+          // 残留计数上继续累加，统计翻倍后还会被原样写回缓存。
+          aggMap.clear();
           try {
             localStorage.removeItem(getCacheKey(ver));
           } catch {}
@@ -552,6 +556,19 @@ export function CharactersPanel({
   }, [allCharacters, searchNeedles, deferredSearch]);
 
   const handleSelectCharacter = useCallback((name: string) => setSelected(name), []);
+
+  // 人物详情是盖在网格上的全屏二级视图，必须占一层返回栈：否则 Android
+  // 硬返回 / 手势返回会越过它落到 App 的 tab 兜底，整个 tab 直接跳回首页，
+  // 而详情还留在原地（切回人物页时它仍开着）。与 `active` 相与：阅读器盖
+  // 在上面或面板隐藏时，这一层不许继续占着返回栈。
+  useBackHandler(
+    active && selected !== null,
+    () => {
+      setSelected(null);
+      return true;
+    },
+    BACK_PRIORITY.view
+  );
 
   const selectedAgg = useMemo(() => (selected ? aggregates.get(selected) ?? null : null), [aggregates, selected]);
 
