@@ -632,7 +632,32 @@ impl DataService {
         // setup 里跑一次，任何命令（包括同步换入）都还没机会启动，此时
         // 动这些目录没有并发之忧。
         service.restore_data_dir_from_aside();
+        // 分块导入半途而废（WebView 重载 / 直接杀进程）留下的 `.part`
+        // 暂存和数据集一个量级，重启后没人会再续上——协议规定重传从
+        // offset 0 原地重开。开机顺手删掉，免得几百 MB 白占到用户手动
+        // 清数据。同上，此刻不可能有传输在途。
+        service.discard_stale_import_staging();
         service
+    }
+
+    /// 删除上一次运行遗留的分块导入暂存文件。删不掉只记日志：顶多多占
+    /// 一阵磁盘，下一轮传输的首块仍会原地截断重写，不影响功能。
+    fn discard_stale_import_staging(&self) {
+        let Ok(staging) = self.import_staging_path() else {
+            return;
+        };
+        match fs::remove_file(&staging) {
+            Ok(()) => {
+                eprintln!("[IMPORT] 已清理上次中断的导入暂存文件 {:?}", staging);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                eprintln!(
+                    "[IMPORT] 清理导入暂存文件 {:?} 失败（忽略）: {}",
+                    staging, err
+                );
+            }
+        }
     }
 
     fn open_index_connection(&self) -> Result<Connection, String> {
@@ -2214,7 +2239,8 @@ impl DataService {
 
     /// 分块导入的暂存文件路径。放在导入临时 ZIP 同一个目录里，收尾改名
     /// 时保证不跨文件系统；`.part` 后缀表明它随时可能是半截文件。半途
-    /// 而废的暂存不必专门清理：下一轮传输的首块会原地截断重写。
+    /// 而废的暂存运行期不必专门清理——下一轮传输的首块会原地截断重
+    /// 写；跨次启动的残留由 `discard_stale_import_staging` 在开机时删掉。
     pub fn import_staging_path(&self) -> Result<PathBuf, String> {
         let parent_dir = self
             .data_dir
@@ -5383,6 +5409,26 @@ mod tests {
             "现有数据目录不该被残骸覆盖"
         );
         assert!(leftover.exists());
+    }
+
+    /// 分块导入半途而废（WebView 重载 / 杀进程）留下的 `.part` 暂存和
+    /// 数据集一个量级，重启后没人会再续上。启动时必须删掉，且只删
+    /// `.part`——同目录的导入临时 ZIP 有自己的清理时机，不许扩大化。
+    #[test]
+    fn new_discards_leftover_import_staging_part() {
+        let fx = Fixture::new("staging_cleanup");
+        let staging = fx
+            .service
+            .import_staging_path()
+            .expect("必须能推导暂存路径");
+        fs::write(&staging, b"abandoned half transfer").unwrap();
+        let temp_zip = staging.with_file_name("ArknightsGameData_import.zip");
+        fs::write(&temp_zip, b"not touched by startup cleanup").unwrap();
+
+        let relaunched = DataService::new(fx.root.clone());
+        assert!(!staging.exists(), "启动必须清理中断传输留下的暂存文件");
+        assert!(temp_zip.exists(), "启动清理只针对 .part 暂存文件");
+        assert!(relaunched.is_installed(), "清理暂存不得伤及数据目录");
     }
 
     /// 手动导入的临时 ZIP 在解压失败后也必须删掉——它和数据集一个量级，

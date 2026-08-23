@@ -6,6 +6,7 @@ use crate::models::{
 };
 use crate::parser::parse_story_text;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, State};
 
 pub struct AppState {
@@ -62,6 +63,9 @@ impl Drop for InstallLockGuard {
 /// 而不是排队等待——前端等一个不知何时结束的解压毫无意义，
 /// 明确报错让用户稍后重试才是正确的交互。
 fn acquire_install_lock(task: &'static str) -> Result<InstallLockGuard, String> {
+    // 先把分块传输的弃单持有收走（见 IMPORT_TRANSFER_HOLD），否则一次
+    // 页面重载留下的半截传输会把安装锁攥到进程退出。
+    reap_stale_transfer_hold_at(Instant::now());
     let mut holder = INSTALL_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -72,6 +76,69 @@ fn acquire_install_lock(task: &'static str) -> Result<InstallLockGuard, String> 
     }
     *holder = Some(task);
     Ok(InstallLockGuard)
+}
+
+/// 分块传输在途时寄存的安装互斥持有。首块拿到 INSTALL_LOCK 后不再立刻
+/// 放掉，而是寄存在这里、由后续块取走接力、收尾块带进导入流程：整个
+/// 传输期间 sync_data / 其他导入会立刻得到明确报错，而不是等用户传完
+/// 几百 MB 后才在收尾撞锁。读类命令从不碰 INSTALL_LOCK，寄存不影响
+/// 任何读取。
+///
+/// WebView 重载 / 前端崩溃会让传输无声中止，没有任何回调能来放锁，
+/// 所以持有里记着最后一块的落盘时间：静默超过 IMPORT_TRANSFER_STALE
+/// 后，下一个抢锁者（见 acquire_install_lock）会把它当弃单收走。
+///
+/// 锁序约定：持这把 Mutex 期间可以 Drop 里面的 InstallLockGuard（它会
+/// 去锁 INSTALL_LOCK），反向嵌套不存在——INSTALL_LOCK 的临界区从不碰
+/// 这里。
+struct ImportTransferHold {
+    guard: InstallLockGuard,
+    last_chunk_at: Instant,
+}
+
+static IMPORT_TRANSFER_HOLD: Mutex<Option<ImportTransferHold>> = Mutex::new(None);
+
+/// 前端逐块 await 上传，正常块间隔是毫秒级；整整一分钟没有新块只可能
+/// 是传输已死。取宽不取严：误杀活传输会让导入莫名失败，晚一分钟解锁
+/// 只是让 sync 多等一会。
+const IMPORT_TRANSFER_STALE: Duration = Duration::from_secs(60);
+
+fn lock_transfer_hold() -> std::sync::MutexGuard<'static, Option<ImportTransferHold>> {
+    IMPORT_TRANSFER_HOLD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 取走寄存的持有（若有）。offset 0 的新一轮传输用它作废上一轮，
+/// 续传块用它接手继续持锁。
+fn take_transfer_hold() -> Option<InstallLockGuard> {
+    lock_transfer_hold().take().map(|hold| hold.guard)
+}
+
+/// 一块落盘成功后把持有放回寄存处并刷新活跃时间，等下一块来取。
+fn stow_transfer_hold(guard: InstallLockGuard) {
+    *lock_transfer_hold() = Some(ImportTransferHold {
+        guard,
+        last_chunk_at: Instant::now(),
+    });
+}
+
+/// 判定寄存持有是否已是弃单。单独抽成纯函数是为了让单测不必真等一
+/// 分钟；saturating 语义顺带把「now 早于 last_chunk_at」按不过期处理。
+fn transfer_hold_is_stale(last_chunk_at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last_chunk_at) >= IMPORT_TRANSFER_STALE
+}
+
+/// 把过期的寄存持有收走（Drop 即释放 INSTALL_LOCK）。任何抢安装锁的
+/// 任务都先来收一次尸，保证弃单不会把同步永久锁死。
+fn reap_stale_transfer_hold_at(now: Instant) {
+    let mut slot = lock_transfer_hold();
+    if slot
+        .as_ref()
+        .is_some_and(|hold| transfer_hold_is_stale(hold.last_chunk_at, now))
+    {
+        *slot = None;
+    }
 }
 
 /// 所有走阻塞线程池的命令共用的外壳：`task` 用命令名做 slug 方便从
@@ -336,11 +403,24 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// append_import_chunk 的专用互斥：它的「查暂存长度 → 追加写入」是两
+/// 步，若上一轮传输滞留在阻塞线程池里的迟到块恰好在新一轮某块查完长度
+/// 之后落盘，偏移校验就形同虚设，最终悄悄拼出一个损坏的 ZIP。所有追加
+/// 统一串行在这把小锁下（临界区一次 stat 加一次顺序写，与安装互斥无
+/// 嵌套），迟到块要么排在前面被偏移校验拒掉，要么排在后面看到已变化的
+/// 长度同样被拒。
+static IMPORT_CHUNK_LOCK: Mutex<()> = Mutex::new(());
+
 /// 把解码后的一块字节追加到暂存文件。`offset == 0` 开新文件（顺带截断
 /// 上一轮半途而废的暂存）；其余块要求偏移与暂存文件当前长度严格相等，
 /// 乱序 / 串台宁可报错让用户重传，也不能悄悄拼出一个损坏的 ZIP。
+/// 「查长度 → 写入」全程握着 IMPORT_CHUNK_LOCK，保证校验与落盘原子。
 fn append_import_chunk(staging: &std::path::Path, offset: u64, chunk: &[u8]) -> Result<(), String> {
     use std::io::Write;
+
+    let _serialized = IMPORT_CHUNK_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     if let Some(parent) = staging.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("无法创建数据目录: {}", e))?;
@@ -384,7 +464,12 @@ fn append_import_chunk(staging: &std::path::Path, offset: u64, chunk: &[u8]) -> 
 /// 协议：`offset` 是该块在文件中的字节偏移，0 表示开启新一轮传输
 /// （创建 / 截断暂存文件）；后端校验 offset 必须等于暂存文件当前长度，
 /// 防止 WebView 重载后旧传输的尾巴混进新传输。`last` 为 true 时收尾：
-/// 拿安装互斥，把暂存文件改名为导入临时 ZIP，走统一导入流程。
+/// 把暂存文件改名为导入临时 ZIP，走统一导入流程。
+///
+/// 安装互斥从首块一路持到收尾，块与块之间寄存在 IMPORT_TRANSFER_HOLD：
+/// sync_data 在传输中途插进来会立刻失败，而不是等用户传完几百 MB 后
+/// 收尾块才撞锁、整轮上传白费。传输半途而废（WebView 重载）时寄存的
+/// 持有会在静默超时后被下一个抢锁者收走，不会把同步永久锁死。
 #[tauri::command]
 pub async fn import_from_zip_bytes(
     app: AppHandle,
@@ -393,26 +478,33 @@ pub async fn import_from_zip_bytes(
     offset: u64,
     last: bool,
 ) -> Result<(), String> {
-    // 只有收尾块真正改写数据目录，需要全程握着安装互斥；首块只探测
-    // 一下立刻放掉——纯粹为了快速失败，免得用户传完几百 MB 才被告知
-    // 「后台正在同步」。中间的追加只写自己的暂存文件，跟谁都不冲突。
-    if offset == 0 && !last {
-        drop(acquire_install_lock("import_from_zip_bytes")?);
-    }
-    let guard = if last {
-        Some(acquire_install_lock("import_from_zip_bytes")?)
+    let guard = if offset == 0 {
+        // 新一轮传输：上一轮的寄存持有（若有）直接作废——offset 0 本就
+        // 会截断重写暂存文件。随后重新抢锁，抢不到说明真有同步/导入
+        // 在跑，第一块就快速失败。
+        drop(take_transfer_hold());
+        acquire_install_lock("import_from_zip_bytes")?
     } else {
-        None
+        // 续传块：取回寄存的持有接着扛。寄存已空说明持有被当弃单收走
+        // 了（传输停顿超时）或进程重启过，重新抢锁接续；抢不到说明
+        // 空档期里同步已经插进来，这轮传输注定失败，立即报错。
+        match take_transfer_hold() {
+            Some(guard) => guard,
+            None => acquire_install_lock("import_from_zip_bytes")?,
+        }
     };
     let service = clone_service(&state);
     run_blocking("import_from_zip_bytes", move || {
-        let _guard = guard;
         let chunk = decode_base64(&chunk_base64)?;
         let staging = service.import_staging_path()?;
+        // 解码或落盘失败会把 guard 一起带走（Drop 放锁）：废掉的传输
+        // 不该继续占着安装互斥。
         append_import_chunk(&staging, offset, &chunk)?;
         if last {
+            let _guard = guard;
             service.import_zip_from_staging(app)
         } else {
+            stow_transfer_hold(guard);
             Ok(())
         }
     })
@@ -720,11 +812,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 安装互斥的完整生命周期。INSTALL_LOCK 是进程级单例，而 cargo test
-    /// 默认并行跑测试，拆成多个 #[test] 会互相抢锁产生偶发失败，
-    /// 所以按顺序写在同一个测试里。
+    /// 追加的「查长度 → 写入」必须整体串行：持有 IMPORT_CHUNK_LOCK 期间
+    /// 另一个线程的追加既不能落盘也不能通过校验——这正是挡住上一轮
+    /// 传输迟到块插队的机制。断言方向是单边安全的：只有追加根本不抢锁
+    /// 时才会失败。
+    #[test]
+    fn append_import_chunk_is_serialized_by_dedicated_mutex() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("askr_import_serial_{nanos}"));
+        let staging = dir.join("staging.part");
+        append_import_chunk(&staging, 0, b"head").expect("首块必须成功");
+
+        let outer = IMPORT_CHUNK_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let worker_staging = staging.clone();
+        let worker = std::thread::spawn(move || append_import_chunk(&worker_staging, 4, b"tail"));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!worker.is_finished(), "持锁期间追加不得完成");
+        assert_eq!(
+            std::fs::read(&staging).unwrap(),
+            b"head",
+            "持锁期间暂存文件不得被写入"
+        );
+        drop(outer);
+        worker
+            .join()
+            .expect("追加线程不该 panic")
+            .expect("放锁后排队的追加必须成功");
+        assert_eq!(std::fs::read(&staging).unwrap(), b"headtail");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// INSTALL_LOCK / IMPORT_TRANSFER_HOLD 都是进程级单例，而 cargo test
+    /// 默认并行跑测试；所有触碰它们的测试先拿这把测试专用锁互相串行，
+    /// 否则会互相抢锁产生偶发失败。
+    static GLOBAL_LOCK_TEST_SERIAL: Mutex<()> = Mutex::new(());
+
+    fn serialize_global_lock_tests() -> std::sync::MutexGuard<'static, ()> {
+        GLOBAL_LOCK_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// 安装互斥的完整生命周期，按顺序写在同一个测试里。
     #[test]
     fn install_lock_serializes_and_always_releases() {
+        let _serial = serialize_global_lock_tests();
+
         // 空闲时首次获取必须成功。
         let guard = acquire_install_lock("sync_data").expect("空闲时获取必须成功");
 
@@ -756,8 +895,69 @@ mod tests {
         drop(acquire_install_lock("sync_data").expect("panic 后锁必须自动释放"));
     }
 
-    /// DataService::new 除记路径外还会尝试接回 `_old` 暂存目录，但对这个
-    /// 不存在的路径它扫不到任何候选、不会动磁盘，所以这里不需要 GameData。
+    /// 弃单判定是纯函数，边界在这里钉死：静默刚满时限即过期，差一秒
+    /// 不过期，时钟倒挂按不过期处理（saturating）。
+    #[test]
+    fn transfer_hold_staleness_boundary() {
+        let base = Instant::now();
+        assert!(!transfer_hold_is_stale(base, base), "刚落盘的持有不过期");
+        assert!(
+            !transfer_hold_is_stale(base, base + IMPORT_TRANSFER_STALE - Duration::from_secs(1)),
+            "差一秒不过期"
+        );
+        assert!(
+            transfer_hold_is_stale(base, base + IMPORT_TRANSFER_STALE),
+            "静默满时限即过期"
+        );
+        assert!(
+            !transfer_hold_is_stale(base + IMPORT_TRANSFER_STALE, base),
+            "now 早于 last_chunk_at 时按不过期处理"
+        );
+    }
+
+    /// 分块传输期间安装互斥的寄存/接力/弃单收尸全流程。
+    #[test]
+    fn import_transfer_hold_keeps_lock_and_reaps_stale() {
+        let _serial = serialize_global_lock_tests();
+        // 防御：清掉可能的残留寄存，保证从空闲态开始。
+        drop(take_transfer_hold());
+
+        // 首块拿锁后寄存，传输在途时 sync 必须立刻被拒。
+        let guard = acquire_install_lock("import_from_zip_bytes").expect("空闲时首块必须拿到锁");
+        stow_transfer_hold(guard);
+        let err = acquire_install_lock("sync_data").expect_err("传输在途时 sync 必须快速失败");
+        assert!(
+            err.contains("import_from_zip_bytes"),
+            "错误应指明占用者是分块导入: {err}"
+        );
+
+        // 续传块取回持有接力；收尾（或失败）放掉后锁恢复空闲。
+        let guard = take_transfer_hold().expect("续传块必须能取回寄存的持有");
+        assert!(
+            take_transfer_hold().is_none(),
+            "持有只有一份，取走后寄存处必须为空"
+        );
+        drop(guard);
+        drop(acquire_install_lock("sync_data").expect("持有放掉后锁必须空闲"));
+
+        // 弃单：寄存后长时间无新块，抢锁者必须能把它收走并拿到锁。
+        let guard = acquire_install_lock("import_from_zip_bytes").expect("上一段结束后锁应空闲");
+        stow_transfer_hold(guard);
+        reap_stale_transfer_hold_at(Instant::now() + IMPORT_TRANSFER_STALE);
+        assert!(take_transfer_hold().is_none(), "弃单必须已被收走");
+        drop(acquire_install_lock("sync_data").expect("弃单收走后 sync 必须能拿到锁"));
+
+        // 新鲜持有绝不能被误杀。
+        let guard = acquire_install_lock("import_from_zip_bytes").expect("锁应空闲");
+        stow_transfer_hold(guard);
+        reap_stale_transfer_hold_at(Instant::now());
+        acquire_install_lock("sync_data").expect_err("新鲜持有不该被当弃单收走");
+        drop(take_transfer_hold());
+    }
+
+    /// DataService::new 除记路径外还会尝试接回 `_old` 暂存目录、清理导入
+    /// 暂存文件，但对这个不存在的路径它扫不到候选也删不到文件、不会动
+    /// 磁盘，所以这里不需要 GameData。
     #[test]
     fn lock_service_recovers_from_poisoned_mutex() {
         let mutex = Arc::new(Mutex::new(DataService::new(PathBuf::from(
