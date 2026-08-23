@@ -399,7 +399,9 @@ export function Settings() {
         if (response?.needsPermission) {
           await openAndroidInstallPermissionSettings();
           setUpdateStatus("needs-permission");
-          setUpdateMessage("请在系统设置中允许安装未知来源应用，然后返回应用重新点击“立即更新”。");
+          // 指引统一由 needs-permission 状态的固定段落给出，这里必须清掉
+          // 下载中提示，否则同一件事会在卡片里连着念两遍。
+          setUpdateMessage(null);
           return;
         }
         setUpdateStatus("installed");
@@ -504,7 +506,9 @@ export function Settings() {
                           aria-pressed={active}
                           onClick={() => setThemeColor(option.value)}
                           className={cn(
-                            "w-full rounded-lg border p-3 text-left transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2",
+                            // ring/offset 颜色必须写死主题变量：默认 offset 是 #fff，
+                            // 深色主题下键盘焦点会围出一圈刺眼的白边。
+                            "w-full rounded-lg border p-3 text-left transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--color-ring))] focus-visible:ring-offset-2 focus-visible:ring-offset-[hsl(var(--color-card))]",
                             active
                               ? "border-[hsl(var(--color-primary))] bg-[hsl(var(--color-accent))]"
                               : "border-[hsl(var(--color-border))] hover:bg-[hsl(var(--color-accent)/0.7)]"
@@ -769,7 +773,7 @@ export function Settings() {
 
                 {updateStatus === "needs-permission" ? (
                   <p className="text-sm text-[hsl(var(--color-warning))]">
-                    已打开系统授权界面，请允许安装未知来源应用后返回继续。
+                    已打开系统授权界面，请允许安装未知来源应用，然后返回并重新点击“立即更新”。
                   </p>
                 ) : null}
 
@@ -853,7 +857,8 @@ export function Settings() {
                     ) : (
                       <RefreshCw className="mr-2 h-4 w-4" />
                     )}
-                    {isCheckingUpdate ? "检查中..." : updateIssue ? "重试检查" : "检查更新"}
+                    {/* 「重试检查」只在检查本身失败时出现；安装失败的重试入口是旁边的「立即更新」。 */}
+                    {isCheckingUpdate ? "检查中..." : updateIssue && !availableUpdate ? "重试检查" : "检查更新"}
                   </Button>
                   {availableUpdate ? (
                     <Button
