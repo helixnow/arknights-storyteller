@@ -264,11 +264,12 @@ pub struct ShareImageResponse {
     pub shared: bool,
 }
 
+// 不要给这个类型手写 `unsafe impl Send/Sync`：`PluginHandle<R>` 本身就是
+// `Send + Sync`（`app.manage` 的约束即为证明，见 apk_updater.rs 的同款
+// 结构），让编译器自动推导才能在内部类型变化时暴露问题，而不是把
+// 潜在的线程不安全静默掩盖成未定义行为。
 #[derive(Clone)]
 pub struct AndroidImageSharer<R: Runtime>(PluginHandle<R>);
-
-unsafe impl<R: Runtime> Send for AndroidImageSharer<R> {}
-unsafe impl<R: Runtime> Sync for AndroidImageSharer<R> {}
 
 impl<R: Runtime> AndroidImageSharer<R> {
     fn init<C: serde::de::DeserializeOwned>(

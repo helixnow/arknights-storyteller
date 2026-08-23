@@ -227,6 +227,14 @@ function facetKeyOf(category: string): string {
   return category.split(" | ")[0]?.trim() ?? category;
 }
 
+/**
+ * get_current_version 返回 `abc1234 (3天前)` 这种带相对时间的串，隔天整串就变了。
+ * 缓存版本只取 commit 部分（与 CharactersPanel 的做法一致），数据没变缓存就一直有效。
+ */
+function stableVersionOf(v: string): string {
+  return v.split(" ")[0] || v;
+}
+
 function prune<T extends { updatedAt: number }>(map: Record<string, T>): Record<string, T> {
   const entries = Object.entries(map);
   if (entries.length <= CACHE_LIMIT) return map;
@@ -250,7 +258,9 @@ function loadCacheMap<T extends { page: unknown; updatedAt: number; version: str
       const entry = value as Partial<T>;
       if (typeof entry.updatedAt !== "number" || typeof entry.version !== "string") continue;
       if (!hasPayload(entry.page)) continue;
-      out[cacheKey] = entry as T;
+      // 旧条目存的是带相对时间的完整版本串，这里归一化成 commit 部分，
+      // 让升级前落盘的缓存也能继续命中。
+      out[cacheKey] = { ...entry, version: stableVersionOf(entry.version) } as T;
     }
     return out;
   } catch {
@@ -554,7 +564,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
   useEffect(() => {
     void api
       .getCurrentVersion()
-      .then((v) => setVersion(v))
+      .then((v) => setVersion(stableVersionOf(v)))
       .catch(() => setVersion(""));
   }, []);
 
@@ -567,7 +577,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
       setSegmentCache({});
       void api
         .getCurrentVersion()
-        .then((v) => setVersion(v))
+        .then((v) => setVersion(stableVersionOf(v)))
         .catch(() => undefined);
     };
     window.addEventListener("app:data-updated", onUpdated);

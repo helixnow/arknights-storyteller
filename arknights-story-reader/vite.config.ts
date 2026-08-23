@@ -27,7 +27,10 @@ export default defineConfig(async () => ({
       ? {
           protocol: "ws",
           host,
-          port: 1451,
+          // 和主服务共用 1450：devCsp 的 connect-src 只放行了 1450 端口的
+          // WebSocket（独立的 1451 会被 CSP 拦掉，真机调试时 HMR 会失效）。
+          // 端口与 server.port 相同时 Vite 会把 ws 挂在主 HTTP 服务上。
+          port: 1450,
         }
       : undefined,
     watch: {

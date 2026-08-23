@@ -331,9 +331,13 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
   }, [cancelAutoClear, loadVersionInfo, scheduleAutoClear]);
 
   const runImport = useCallback(
-    async (label: string, run: () => Promise<void>) => {
+    async (label: string, run: () => Promise<void>, transferredJob?: () => void) => {
       if (busyRef.current) return;
-      const releaseJob = acquireDataJob("import");
+      // 调用方可能在弹文件选择器前就抢到了 "import" 锁（见 Settings 的导入入口）。
+      // 必须整把交接过来，不能先放再抢：释放会同步唤醒 acquireDataJobWhenIdle
+      // 的等待者（比如自动更新安装），它们在同一个 tick 里就能把锁抢走。
+      // 接手后释放责任归这里；释放函数幂等，调用方兜底再释放一次也无害。
+      const releaseJob = transferredJob ?? acquireDataJob("import");
       if (!releaseJob) {
         setError(dataJobConflictMessage("导入"));
         return;
@@ -384,12 +388,20 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
     [runImport]
   );
 
-  /** 桌面端按路径导入：整包不经过 JS 堆，但 UI 状态要和字节流导入完全一致。 */
+  /**
+   * 桌面端按路径导入：整包不经过 JS 堆，但 UI 状态要和字节流导入完全一致。
+   * `transferredJob` 用于交接调用方已持有的 "import" 任务锁（弹文件选择器前
+   * 抢到的那把），避免中途释放被其他等待者插队。
+   */
   const importFromPath = useCallback(
-    async (path: string) => {
-      await runImport("正在读取所选压缩包…", async () => {
-        await api.importFromZip(path);
-      });
+    async (path: string, options: { transferredJob?: () => void } = {}) => {
+      await runImport(
+        "正在读取所选压缩包…",
+        async () => {
+          await api.importFromZip(path);
+        },
+        options.transferredJob
+      );
     },
     [runImport]
   );

@@ -239,10 +239,11 @@ export function Settings() {
       // 用户取消选择。
       if (!path) return;
 
-      // 交棒给 importFromPath：它会在同一个同步执行段里重新抢锁，中间没有
-      // 别人插队的窗口；释放函数是幂等的，finally 里再调一次也不会误伤新锁。
-      releaseJob();
-      await importFromPath(path);
+      // 把手里这把锁整体交棒给 importFromPath，绝不能先放再让它重抢：
+      // 释放会同步唤醒 acquireDataJobWhenIdle 的等待者（自动更新安装），
+      // 它们在同一个 tick 里就会把锁截走。交棒后由导入流程负责释放；
+      // 释放函数幂等，finally 里的兜底调用不会误伤。
+      await importFromPath(path, { transferredJob: releaseJob });
     } finally {
       releaseJob();
       setPreparingImport(false);

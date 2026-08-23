@@ -1912,26 +1912,31 @@ impl DataService {
 
         emit_progress_opt(app, "解压", 100, 100, "解压完成");
 
-        let extracted_root = fs::read_dir(&extract_root)
-            .map_err(|e| format!("Failed to read extracted directory: {}", e))?
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.path())
-            .find(|path| path.is_dir())
-            .ok_or_else(|| {
-                fs::remove_dir_all(&extract_root).ok();
-                "解压后的文件结构不正确".to_string()
-            })?;
-
-        // 先验收再动旧数据：如果这个包里没有 story_review_table.json，整个
-        // 应用就是空的。此时必须保留已有 data_dir，让用户继续用旧数据。
-        // 空文件同样算校验失败——半截下载解出来的壳子比旧数据更没用。
-        if !Self::holds_valid_dataset(&extracted_root) {
-            fs::remove_dir_all(&extract_root).ok();
-            return Err(format!(
-                "ZIP 校验失败：缺少或为空 {}，已保留原有数据",
-                REVIEW_TABLE_REL
-            ));
-        }
+        // 定位数据集根不能盲选第一个子目录：macOS 打出来的包常带
+        // __MACOSX 伴生目录，有的包则把 zh_CN 直接放在压缩包根部（此时
+        // 根本没有「顶层目录」可选）。以 holds_valid_dataset 为准——解压
+        // 根本身或某个子目录，谁装着非空 story_review_table.json 谁就是根。
+        //
+        // 选根同时就是验收，先验收再动旧数据：整个包里都找不到有效数据
+        // 集时换进去应用就是空的，必须保留已有 data_dir 让用户继续用旧
+        // 数据。空文件同样算校验失败——半截下载解出来的壳子比旧数据更
+        // 没用。
+        let extracted_root = if Self::holds_valid_dataset(&extract_root) {
+            extract_root.clone()
+        } else {
+            fs::read_dir(&extract_root)
+                .map_err(|e| format!("Failed to read extracted directory: {}", e))?
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path())
+                .find(|path| path.is_dir() && Self::holds_valid_dataset(path))
+                .ok_or_else(|| {
+                    fs::remove_dir_all(&extract_root).ok();
+                    format!(
+                        "ZIP 校验失败：缺少或为空 {}，已保留原有数据",
+                        REVIEW_TABLE_REL
+                    )
+                })?
+        };
 
         // 阅读器只需要 story / excel 数据；关卡、战斗、美术等目录加起来
         // 是数据集的大头，移动前先剪掉，省磁盘也省一次拷贝。
@@ -1968,7 +1973,7 @@ impl DataService {
     }
 
     /// `extract_zip_at` 的验收标准：非空 `story_review_table.json` 才算一份
-    /// 撑得起应用的数据集。换入验收和崩溃恢复用同一把尺子。
+    /// 撑得起应用的数据集。解压后选根、换入验收和崩溃恢复用同一把尺子。
     fn holds_valid_dataset(dir: &Path) -> bool {
         fs::metadata(dir.join(REVIEW_TABLE_REL))
             .map(|meta| meta.is_file() && meta.len() > 0)
@@ -5083,6 +5088,99 @@ mod tests {
             .data_dir
             .join("zh_CN/gamedata/story/obt/main/level_main_00-01.txt")
             .exists());
+        assert!(!parent.join("ArknightsGameData_extract").exists());
+    }
+
+    /// macOS 的压缩工具会给包塞一个 __MACOSX 伴生目录。选数据根不能盲选
+    /// read_dir 返回的第一个目录——必须认准装着有效数据集的那一个。
+    #[test]
+    fn extract_skips_macosx_sibling_dir() {
+        let fx = Fixture::new("zip_macosx");
+        let parent = fx.service.data_dir.parent().unwrap().to_path_buf();
+        let zip_path = parent.join("macosx.zip");
+        write_zip(
+            &zip_path,
+            &[
+                // 伴生目录写在前面：无论 read_dir 先读到谁都不能选错。
+                ("__MACOSX/pkg/._story_review_table.json", "AppleDouble junk"),
+                (
+                    "pkg/zh_CN/gamedata/excel/story_review_table.json",
+                    REVIEW_TABLE_JSON,
+                ),
+            ],
+        );
+
+        fx.service
+            .extract_zip_at(&zip_path, &parent, None)
+            .expect("__MACOSX 伴生目录不该挡住有效数据集");
+
+        assert!(fx.service.is_installed());
+        assert_eq!(
+            fx.service.get_story_entry("main_00-01").unwrap().story_name,
+            "序章"
+        );
+        assert!(
+            !fx.service.data_dir.join("__MACOSX").exists(),
+            "伴生目录不该跟着数据集一起换进来"
+        );
+        assert!(!parent.join("ArknightsGameData_extract").exists());
+    }
+
+    /// 有的包不带顶层目录，zh_CN 直接躺在压缩包根部。此时解压根本身就是
+    /// 数据集根，不能再钻进子目录里找。
+    #[test]
+    fn extract_accepts_dataset_at_archive_root() {
+        let fx = Fixture::new("zip_rootset");
+        let parent = fx.service.data_dir.parent().unwrap().to_path_buf();
+        let zip_path = parent.join("rootset.zip");
+        write_zip(
+            &zip_path,
+            &[
+                (
+                    "zh_CN/gamedata/excel/story_review_table.json",
+                    REVIEW_TABLE_JSON,
+                ),
+                ("zh_CN/gamedata/story/obt/main/level_main_00-01.txt", "文本"),
+            ],
+        );
+
+        fx.service
+            .extract_zip_at(&zip_path, &parent, None)
+            .expect("zh_CN 在压缩包根部的包也必须能装");
+
+        assert!(fx.service.is_installed());
+        assert!(fx
+            .service
+            .data_dir
+            .join("zh_CN/gamedata/story/obt/main/level_main_00-01.txt")
+            .exists());
+        assert!(!parent.join("ArknightsGameData_extract").exists());
+    }
+
+    /// 常规布局：数据集在唯一的顶层子目录里。换入的应是子目录的内容，
+    /// 而不是外层解压目录（否则会多嵌套一层）。
+    #[test]
+    fn extract_finds_dataset_in_single_child_dir() {
+        let fx = Fixture::new("zip_child");
+        let parent = fx.service.data_dir.parent().unwrap().to_path_buf();
+        let zip_path = parent.join("child.zip");
+        write_zip(
+            &zip_path,
+            &[(
+                "ArknightsGameData-master/zh_CN/gamedata/excel/story_review_table.json",
+                REVIEW_TABLE_JSON,
+            )],
+        );
+
+        fx.service
+            .extract_zip_at(&zip_path, &parent, None)
+            .expect("数据集在唯一子目录里的常规包必须能装");
+
+        assert!(fx.service.is_installed());
+        assert!(
+            !fx.service.data_dir.join("ArknightsGameData-master").exists(),
+            "换入的是子目录内容，不该嵌套一层"
+        );
         assert!(!parent.join("ArknightsGameData_extract").exists());
     }
 

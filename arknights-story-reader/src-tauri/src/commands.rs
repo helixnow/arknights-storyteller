@@ -35,6 +35,45 @@ fn join_error(task: &str, err: &dyn std::fmt::Display) -> String {
     format!("后台任务 {task} 异常中止: {err}")
 }
 
+/// 进程级安装互斥。sync_data / import_from_zip / import_from_zip_bytes
+/// 都会改写同一组固定路径（ArknightsGameData*.zip、*_extract、*_old），
+/// 前端虽有模块级锁，但 location.reload / ErrorBoundary 重载会把 JS 状态
+/// 清零，而 Rust 侧的解压线程还在跑——第二次同步就会跟它抢路径。
+/// 所以互斥必须落在 Rust 进程里。存的是当前持有者的任务 slug，
+/// `None` 表示空闲；这把锁只护着这个 Option，临界区是纳秒级的，
+/// 真正的磁盘工作由 RAII guard 的生命周期覆盖。
+static INSTALL_LOCK: Mutex<Option<&'static str>> = Mutex::new(None);
+
+/// 安装互斥的 RAII guard：随任务 move 进阻塞闭包，闭包正常返回或
+/// panic（unwind）时 Drop 都会把锁放掉，绝不会把锁带进坟墓。
+#[derive(Debug)]
+struct InstallLockGuard;
+
+impl Drop for InstallLockGuard {
+    fn drop(&mut self) {
+        let mut holder = INSTALL_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *holder = None;
+    }
+}
+
+/// 尝试拿安装互斥。拿不到时立即返回中文错误（指明当前占用者），
+/// 而不是排队等待——前端等一个不知何时结束的解压毫无意义，
+/// 明确报错让用户稍后重试才是正确的交互。
+fn acquire_install_lock(task: &'static str) -> Result<InstallLockGuard, String> {
+    let mut holder = INSTALL_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(current) = *holder {
+        return Err(format!(
+            "任务 {task} 无法启动: 后台任务 {current} 正在同步/导入数据（页面重载不会中止它），请等待其完成后再试"
+        ));
+    }
+    *holder = Some(task);
+    Ok(InstallLockGuard)
+}
+
 /// 所有走阻塞线程池的命令共用的外壳：`task` 用命令名做 slug 方便从
 /// 日志反查；任务 panic 时把 JoinError 转成统一格式的 Err 字符串抛回
 /// 前端，绝不让 panic 穿透命令边界。
@@ -50,8 +89,15 @@ where
 
 #[tauri::command]
 pub async fn sync_data(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    // guard 必须 move 进阻塞闭包：命令的 async 外壳在 WebView 重载后
+    // 可能先行消亡，锁的寿命要跟真正的下载/解压线程对齐。
+    let guard = acquire_install_lock("sync_data")?;
     let service = clone_service(&state);
-    run_blocking("sync_data", move || service.sync_data(app)).await
+    run_blocking("sync_data", move || {
+        let _guard = guard;
+        service.sync_data(app)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -236,8 +282,10 @@ pub async fn import_from_zip(
     state: State<'_, AppState>,
     path: String,
 ) -> Result<(), String> {
+    let guard = acquire_install_lock("import_from_zip")?;
     let service = clone_service(&state);
     run_blocking("import_from_zip", move || {
+        let _guard = guard;
         service.import_zip_from_path(path, app)
     })
     .await
@@ -249,8 +297,10 @@ pub async fn import_from_zip_bytes(
     state: State<'_, AppState>,
     bytes: Vec<u8>,
 ) -> Result<(), String> {
+    let guard = acquire_install_lock("import_from_zip_bytes")?;
     let service = clone_service(&state);
     run_blocking("import_from_zip_bytes", move || {
+        let _guard = guard;
         service.import_zip_from_bytes(&bytes, app)
     })
     .await
@@ -445,6 +495,42 @@ mod tests {
     fn parse_asset_kind_rejects_unknown_kind() {
         let err = parse_asset_kind("sprite").expect_err("未知 kind 必须报错");
         assert!(err.contains("sprite"), "错误信息应包含原始 kind: {err}");
+    }
+
+    /// 安装互斥的完整生命周期。INSTALL_LOCK 是进程级单例，而 cargo test
+    /// 默认并行跑测试，拆成多个 #[test] 会互相抢锁产生偶发失败，
+    /// 所以按顺序写在同一个测试里。
+    #[test]
+    fn install_lock_serializes_and_always_releases() {
+        // 空闲时首次获取必须成功。
+        let guard = acquire_install_lock("sync_data").expect("空闲时获取必须成功");
+
+        // 持锁期间的第二个调用者必须立即得到中文错误（含双方任务名），
+        // 而不是排队阻塞。
+        let err = acquire_install_lock("import_from_zip").expect_err("持锁期间必须拒绝");
+        assert!(
+            err.contains("import_from_zip") && err.contains("sync_data"),
+            "错误信息应同时指明被拒任务与占用者: {err}"
+        );
+        assert!(
+            err.contains("请等待其完成后再试"),
+            "错误信息应给出中文指引: {err}"
+        );
+
+        // guard Drop 后锁必须回到空闲态，可被任意任务再次获取。
+        drop(guard);
+        drop(acquire_install_lock("import_from_zip_bytes").expect("释放后必须可再次获取"));
+
+        // 与真实命令相同的用法：guard move 进阻塞闭包。任务 panic 时
+        // unwind 会触发 Drop，锁必须自动释放，不能死锁后续同步。
+        let guard = acquire_install_lock("sync_data").expect("上一段结束后锁应空闲");
+        let result: Result<(), String> =
+            tauri::async_runtime::block_on(run_blocking("sync_data", move || {
+                let _guard = guard;
+                panic!("模拟解压线程崩溃")
+            }));
+        assert!(result.is_err(), "panic 应以 Err 浮出");
+        drop(acquire_install_lock("sync_data").expect("panic 后锁必须自动释放"));
     }
 
     /// DataService::new 只记两条路径、不碰磁盘，所以这里不需要 GameData。
