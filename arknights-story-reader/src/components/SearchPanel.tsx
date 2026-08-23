@@ -621,7 +621,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
               aria-pressed={mode === "story"}
               onClick={() => setMode("story")}
               className={cn(
-                "flex items-center gap-1 rounded-full px-3 py-1 text-xs transition-colors",
+                "flex min-h-[44px] items-center gap-1 rounded-full px-4 text-xs transition-colors",
                 mode === "story"
                   ? "bg-[hsl(var(--color-primary))] text-[hsl(var(--color-primary-foreground))]"
                   : "text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-foreground))]"
@@ -635,7 +635,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
               aria-pressed={mode === "segment"}
               onClick={() => setMode("segment")}
               className={cn(
-                "flex items-center gap-1 rounded-full px-3 py-1 text-xs transition-colors",
+                "flex min-h-[44px] items-center gap-1 rounded-full px-4 text-xs transition-colors",
                 mode === "segment"
                   ? "bg-[hsl(var(--color-primary))] text-[hsl(var(--color-primary-foreground))]"
                   : "text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-foreground))]"
@@ -653,10 +653,10 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
                 {history.slice(0, 10).map((h) => (
                   <div
                     key={h}
-                    className="flex items-center gap-1 border rounded-full pl-3 pr-1 py-0.5"
+                    className="flex items-center border rounded-full pl-3 pr-0.5"
                   >
                     <button
-                      className="text-xs text-[hsl(var(--color-foreground))]"
+                      className="min-h-[44px] text-xs text-[hsl(var(--color-foreground))]"
                       onClick={() => {
                         setQuery(h);
                         setTimeout(() => handleSearch({ queryOverride: h }), 0);
@@ -664,8 +664,9 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
                     >
                       {h}
                     </button>
+                    {/* 删除的命中区撑到 44×44，图标仍是 12px 的小 ×。 */}
                     <button
-                      className="inline-flex h-5 w-5 items-center justify-center rounded-full text-[hsl(var(--color-muted-foreground))] hover:bg-[hsl(var(--color-accent))]"
+                      className="inline-flex h-11 w-11 items-center justify-center rounded-full text-[hsl(var(--color-muted-foreground))] hover:bg-[hsl(var(--color-accent))]"
                       onClick={() => removeHistory(h)}
                       aria-label={`删除历史记录：${h}`}
                     >

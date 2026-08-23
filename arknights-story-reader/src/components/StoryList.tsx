@@ -1327,17 +1327,24 @@ function StoryItem({
             }}
             aria-pressed={isFavorite}
             aria-label={isFavorite ? "取消收藏" : "收藏"}
-            className={`flex-shrink-0 p-1 rounded-full transition-colors border ${
-              isFavorite
-                ? "text-[hsl(var(--color-primary))] border-[hsl(var(--color-primary)/0.4)] bg-[hsl(var(--color-primary)/0.08)]"
-                : "text-[hsl(var(--color-muted-foreground))] border-transparent hover:text-[hsl(var(--color-foreground))]"
-            }`}
+            /* 命中区固定 44×44（-my-2 抵消额外高度，避免撑开卡片行高），
+               视觉上仍是那颗小星星——外层只负责触控，内层负责外观。 */
+            className="-my-2 -mr-1 flex h-11 w-11 flex-shrink-0 items-center justify-center rounded-full"
           >
-            <Star
-              className="h-4 w-4"
-              fill={isFavorite ? "currentColor" : "transparent"}
-              strokeWidth={isFavorite ? 0 : 2}
-            />
+            <span
+              aria-hidden="true"
+              className={`inline-flex h-6 w-6 items-center justify-center rounded-full border transition-colors ${
+                isFavorite
+                  ? "text-[hsl(var(--color-primary))] border-[hsl(var(--color-primary)/0.4)] bg-[hsl(var(--color-primary)/0.08)]"
+                  : "text-[hsl(var(--color-muted-foreground))] border-transparent hover:text-[hsl(var(--color-foreground))]"
+              }`}
+            >
+              <Star
+                className="h-4 w-4"
+                fill={isFavorite ? "currentColor" : "transparent"}
+                strokeWidth={isFavorite ? 0 : 2}
+              />
+            </span>
           </button>
         </div>
         {story.avgTag && (

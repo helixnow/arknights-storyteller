@@ -54,6 +54,13 @@ interface StoryReaderProps {
   storyId: string;
   storyPath: string;
   storyName: string;
+  /**
+   * 阅读器是否正处于前台。阅读器在返回列表后仍以 `KeepAlive` 挂载着（为了
+   * 保留滚动位置），所以所有会外溢到全局的能力——键盘快捷键、返回栈、
+   * 左缘返回手势——都必须按这个开关关掉，否则列表页按空格会翻不可见的页、
+   * 系统返回键会被隐藏阅读器的选段/抽屉 handler 吃掉。
+   */
+  active?: boolean;
   onBack: () => void;
   initialFocus?: ReaderSearchFocus | null;
   initialCharacter?: string;
@@ -175,7 +182,7 @@ function approximateSegmentLength(segment: StorySegment): number {
   }
 }
 
-export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocus, initialCharacter, initialJump, onNavigateStory }: StoryReaderProps) {
+export function StoryReader({ storyId, storyPath, storyName, active = true, onBack, initialFocus, initialCharacter, initialJump, onNavigateStory }: StoryReaderProps) {
   const [content, setContent] = useState<ParsedStoryContent | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -239,31 +246,34 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
   // doesn't determine priority; each hook simply adds to the stack when
   // its guard flips to `true`. The fallthrough case (no handler consumes
   // the event) lets the outer App handler close the reader.
-  useBackHandler(shareDialogOpen, () => {
+  //
+  // 每个 guard 都要与 `active` 相与：阅读器隐藏后仍然挂载，残留的选段 /
+  // 抽屉状态不应该继续占着返回栈。
+  useBackHandler(active && shareDialogOpen, () => {
     setShareDialogOpen(false);
     return true;
   });
-  useBackHandler(insightsOpen, () => {
+  useBackHandler(active && insightsOpen, () => {
     setInsightsOpen(false);
     return true;
   });
-  useBackHandler(settingsOpen, () => {
+  useBackHandler(active && settingsOpen, () => {
     setSettingsOpen(false);
     return true;
   });
-  useBackHandler(selectMode, () => {
+  useBackHandler(active && selectMode, () => {
     setSelectMode(false);
     setSelectedSegments([]);
     return true;
   });
-  useBackHandler(moreMenuOpen, () => {
+  useBackHandler(active && moreMenuOpen, () => {
     setMoreMenuOpen(false);
     return true;
   });
 
   // 点击外部关闭更多菜单
   useEffect(() => {
-    if (!moreMenuOpen) return;
+    if (!active || !moreMenuOpen) return;
     const handlePointer = (event: PointerEvent) => {
       const target = event.target as Node | null;
       if (target && moreMenuRef.current?.contains(target)) return;
@@ -278,7 +288,7 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
       window.removeEventListener("pointerdown", handlePointer);
       window.removeEventListener("keydown", handleKey);
     };
-  }, [moreMenuOpen]);
+  }, [active, moreMenuOpen]);
 
   // iOS-style edge swipe back — close the reader when the user swipes from
   // the left edge. Only active when none of the inner modals are open so the
@@ -287,7 +297,7 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
     // Disable edge-swipe while any drawer or the multi-select toolbar is
     // open — otherwise a stray swipe could tear down a half-captured
     // selection / share preview.
-    enabled: !settingsOpen && !insightsOpen && !shareDialogOpen && !selectMode,
+    enabled: active && !settingsOpen && !insightsOpen && !shareDialogOpen && !selectMode,
     onBack,
   });
 
@@ -910,6 +920,16 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
     !shareDialogOpen &&
     !moreMenuOpen;
 
+  // 「上一话 / 下一话」栏在底部时是最下面的一层，安全区内边距只由它来吃；
+  // 否则进度条 / 分页页脚会再叠一份，底部凭空多出一条空白。
+  const showNeighborBar =
+    !selectMode &&
+    !settingsOpen &&
+    !insightsOpen &&
+    !shareDialogOpen &&
+    Boolean(neighbors.prev || neighbors.next);
+  const bottomSafeArea = showNeighborBar ? "0px" : "env(safe-area-inset-bottom, 0px)";
+
   const handleReaderTap = useCallback(
     (event: ReactMouseEvent<HTMLElement>) => {
       if (!pageTapEnabled) return;
@@ -941,6 +961,9 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
   );
 
   useEffect(() => {
+    // 阅读器不在前台时完全不注册，避免列表页按空格翻到看不见的页面。
+    if (!active) return;
+
     const handleKey = (event: KeyboardEvent) => {
       // 段落自己已经消费掉的按键（选段模式的空格/回车）不再重复处理。
       if (event.defaultPrevented) return;
@@ -997,6 +1020,7 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
   }, [
+    active,
     settings.readingMode,
     totalPages,
     settingsOpen,
@@ -1314,7 +1338,7 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
       const selectionClass = selectable
         ? cn(
             "reader-segment-selectable cursor-pointer rounded-md transition-shadow",
-            isSelected && "ring-2 ring-[hsl(var(--color-primary))] ring-offset-2 ring-offset-transparent"
+            isSelected && "ring-2 ring-[var(--reader-accent)] ring-offset-2 ring-offset-transparent"
           )
         : "";
 
@@ -1358,15 +1382,17 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
                 width: "1.75rem",
                 height: "1.75rem",
                 borderRadius: "9999px",
-                border: `1px solid hsl(var(--color-${
-                  annotationHighlight ? "primary" : "border"
-                }) / ${annotationHighlight ? "0.45" : "1"})`,
+                border: `1px solid ${
+                  annotationHighlight
+                    ? "color-mix(in srgb, var(--reader-accent) 45%, transparent)"
+                    : "color-mix(in srgb, var(--reader-fg) 22%, transparent)"
+                }`,
                 background: annotationHighlight
-                  ? "hsl(var(--color-primary) / 0.18)"
-                  : "hsl(var(--color-card) / 0.92)",
+                  ? "color-mix(in srgb, var(--reader-accent) 18%, var(--reader-bg))"
+                  : "color-mix(in srgb, var(--reader-fg) 6%, var(--reader-bg))",
                 color: annotationHighlight
-                  ? "hsl(var(--color-primary))"
-                  : "hsl(var(--color-muted-foreground))",
+                  ? "var(--reader-accent)"
+                  : "color-mix(in srgb, var(--reader-fg) 62%, transparent)",
               }}
             >
               {annotationHighlight ? (
@@ -1849,7 +1875,7 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
       {settings.readingMode === "scroll" && !selectMode && (
         <div
           className="flex-shrink-0 bg-[hsl(var(--color-background)/0.92)] backdrop-blur border-t border-[hsl(var(--color-border))]"
-          style={{ paddingBottom: "env(safe-area-inset-bottom, 0px)" }}
+          style={{ paddingBottom: bottomSafeArea }}
           aria-hidden="false"
         >
           <div className="progress-track">
@@ -1868,7 +1894,7 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
       {settings.readingMode === "paged" && !selectMode && (
         <footer
           className="flex-shrink-0 bg-[hsl(var(--color-background)/0.95)] backdrop-blur border-t px-4 pt-4 pb-4"
-          style={{ paddingBottom: "calc(env(safe-area-inset-bottom, 0px) + 1rem)" }}
+          style={{ paddingBottom: `calc(${bottomSafeArea} + 1rem)` }}
         >
           <div className="container flex items-center justify-between gap-3">
             <Button
@@ -1898,7 +1924,7 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
       )}
 
       {/* 上/下一话导航 —— 基于 storyGroup + storySort 推导（仅在阅读且无选段/无抽屉时展示）。 */}
-      {!selectMode && !settingsOpen && !insightsOpen && !shareDialogOpen && (neighbors.prev || neighbors.next) && (
+      {showNeighborBar && (
         <div
           className="flex-shrink-0 border-t border-[hsl(var(--color-border))] bg-[hsl(var(--color-background)/0.92)] backdrop-blur px-4 py-2"
           style={{ paddingBottom: "calc(env(safe-area-inset-bottom, 0px) + 0.5rem)" }}
@@ -1982,17 +2008,19 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
             <Button
               variant="ghost"
               size="sm"
+              className="min-h-[44px]"
               onClick={clearSelection}
               disabled={selectedSegments.length === 0}
             >
               清空
             </Button>
-            <Button variant="outline" size="sm" onClick={exitSelectMode}>
+            <Button variant="outline" size="sm" className="min-h-[44px]" onClick={exitSelectMode}>
               取消
             </Button>
             <Button
               variant="outline"
               size="sm"
+              className="min-h-[44px]"
               onClick={handleBookmarkSelection}
               disabled={selectionBookmarkState.mode === "none"}
               title={
@@ -2010,6 +2038,7 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
             </Button>
             <Button
               size="sm"
+              className="min-h-[44px]"
               onClick={() => setShareDialogOpen(true)}
               disabled={selectedSegments.length === 0}
             >
@@ -2020,8 +2049,11 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
         </footer>
       )}
 
+      {/* 抽屉的 open 同样与 `active` 相与：它们各自会挂一个全局 Esc 监听并
+          锁 body 滚动，阅读器退到后台时这些副作用不该继续生效。状态本身
+          保留，回到阅读器时抽屉会照原样恢复。 */}
       <StoryInsightsPanel
-        open={insightsOpen}
+        open={active && insightsOpen}
         insights={insights}
         highlightEntries={highlightEntries}
         activeCharacter={activeCharacter}
@@ -2034,7 +2066,7 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
       />
 
       <ReaderSettingsPanel
-        open={settingsOpen}
+        open={active && settingsOpen}
         settings={settings}
         onClose={() => setSettingsOpen(false)}
         onUpdateSettings={updateSettings}
@@ -2042,7 +2074,7 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
       />
 
       <ShareImageDialog
-        open={shareDialogOpen}
+        open={active && shareDialogOpen}
         onClose={() => setShareDialogOpen(false)}
         storyName={storyName}
         categoryName={categoryName}

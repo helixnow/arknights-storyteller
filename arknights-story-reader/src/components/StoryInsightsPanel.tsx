@@ -7,6 +7,7 @@ import {
   SheetSectionLabel,
 } from "@/components/ui/sheet-shell";
 import { useSidePanel } from "@/hooks/useSidePanel";
+import { safeConfirm } from "@/hooks/useAppUpdater";
 import { cn } from "@/lib/utils";
 import { Trash2, X } from "lucide-react";
 
@@ -116,8 +117,16 @@ export function StoryInsightsPanel({
                 {highlightEntries.length > 0 && (
                   <button
                     type="button"
-                    className="text-[11px] font-medium text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-destructive))] transition-colors"
-                    onClick={onClearHighlights}
+                    className="-my-2 inline-flex min-h-[44px] items-center px-2 text-[11px] font-medium text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-destructive))] transition-colors"
+                    onClick={() => {
+                      void (async () => {
+                        const ok = await safeConfirm(
+                          `确定要清空这篇剧情的 ${highlightEntries.length} 条划线吗？此操作无法撤销。`,
+                          { title: "清空划线", kind: "warning" }
+                        );
+                        if (ok) onClearHighlights();
+                      })();
+                    }}
                   >
                     清空
                   </button>
@@ -178,7 +187,7 @@ export function StoryInsightsPanel({
                 {activeCharacter && (
                   <button
                     type="button"
-                    className="text-[11px] font-medium text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-destructive))] transition-colors"
+                    className="-my-2 inline-flex min-h-[44px] items-center px-2 text-[11px] font-medium text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-destructive))] transition-colors"
                     onClick={onClearCharacter}
                   >
                     清除高亮

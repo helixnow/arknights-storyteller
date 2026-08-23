@@ -167,6 +167,7 @@ function App() {
       storyPath={readerStory.storyTxt}
       storyName={readerStory.storyName}
       storyId={readerStory.storyId}
+      active={readerActive}
       initialCharacter={readerInitialCharacter ?? undefined}
       initialFocus={
         readerFocus && readerFocus.storyId === readerStory.storyId ? readerFocus : null
