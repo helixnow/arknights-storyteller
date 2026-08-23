@@ -1,5 +1,18 @@
-import { useEffect, useRef } from "react";
+import { useEffect } from "react";
 import { api } from "@/services/api";
+import { acquireDataJob, describeDataJob, getActiveDataJob } from "@/hooks/useDataSyncManager";
+import type { StoryIndexStatus } from "@/types/story";
+
+/** 首屏渲染先跑完，再去碰磁盘。 */
+const INITIAL_DELAY_MS = 500;
+/** 数据刚换过：给后端自带的重建留出启动时间，再决定要不要兜底。 */
+const AFTER_DATA_UPDATE_DELAY_MS = 3000;
+/** 超过这么久没有新的 index-progress，就认为那次重建已经结束/死掉了。 */
+const INDEX_PROGRESS_STALE_MS = 60_000;
+/** 让路之后过多久再回来看一眼。 */
+const RETRY_DELAY_MS = 10_000;
+/** 一直有人占着就别死等：留给用户手动重建，省得后台无限轮询。 */
+const MAX_DEFERRALS = 6;
 
 /**
  * 在应用启动时悄悄把全文索引准备好。
@@ -17,20 +30,55 @@ import { api } from "@/services/api";
  *   - 未就绪就触发 `build_story_index`，交给后端线程跑；
  *   - 全过程不占主线程，也不弹 toast；日志只在开发构建里打，线上保持安静。
  *
- * 同时派发 `app:story-index-updated` 事件，让 SearchPanel 等 UI 订阅
- * 刷新状态条。
+ * 关键是「不跟人抢」：同步/导入在跑、用户自己点了重建、后端正在发索引进度，
+ * 这三种情况都直接让路——多跑一次重建不会更快，只会让两个写库任务互相拖慢，
+ * 还会让搜索页的进度条来回跳。
+ *
+ * 每次检查完都派发 `app:story-index-updated`（带上 detail 里的状态快照），
+ * 让 SearchPanel 等 UI 立刻把「索引尚未就绪」的提示刷出来，而不是等用户
+ * 切到搜索页才发现搜索退化成了逐篇扫描。
  */
 export function useAutoIndex() {
-  // 单例 flag：React StrictMode / Tab 重挂载都不要重复触发
-  const triggeredRef = useRef(false);
-
   useEffect(() => {
-    if (triggeredRef.current) return;
-    triggeredRef.current = true;
-
     let cancelled = false;
+    /** 本 hook 自己发起的重建在途；和全局任务锁一起用，避免重复触发。 */
+    let running = false;
+    let lastIndexProgressAt = 0;
+    let backendBuilding = false;
+    let deferrals = 0;
+    /** 上一次广播出去的状态，用来去重，避免退让期间反复惊动监听方。 */
+    let lastBroadcast: string | null = null;
+    const timers = new Set<number>();
 
-    const run = async () => {
+    const later = (fn: () => void, delay: number) => {
+      const timer = window.setTimeout(() => {
+        timers.delete(timer);
+        if (!cancelled) fn();
+      }, delay);
+      timers.add(timer);
+    };
+
+    /** 后端正在重建（不管是谁点的）：有新鲜进度事件就算。 */
+    const isBackendBuilding = () =>
+      backendBuilding && Date.now() - lastIndexProgressAt < INDEX_PROGRESS_STALE_MS;
+
+    /** 别人占着的时候只是让路，不是放弃：过一会儿回来补一次兜底。 */
+    const deferRetry = (reason: string) => {
+      if (deferrals >= MAX_DEFERRALS) return;
+      deferrals += 1;
+      later(() => void ensureIndex(reason), RETRY_DELAY_MS);
+    };
+
+    const broadcast = (status: StoryIndexStatus | null, reason: string) => {
+      const signature = `${status?.ready ?? false}:${status?.total ?? 0}`;
+      if (signature === lastBroadcast) return;
+      lastBroadcast = signature;
+      dispatchIndexUpdated(status, reason);
+    };
+
+    const ensureIndex = async (reason: string) => {
+      if (cancelled || running) return;
+      running = true;
       try {
         const installed = await api.isInstalled();
         if (cancelled || !installed) return;
@@ -38,33 +86,88 @@ export function useAutoIndex() {
         const status = await api.getStoryIndexStatus();
         if (cancelled) return;
 
+        // 无论就绪与否都广播：UI 得知道现在到底能不能走索引搜索，
+        // 「数据换过之后索引还没跟上」这件事必须当场看得见。
+        broadcast(status, reason);
         if (status.ready) {
-          // 已经就绪，告知 UI 可以直接走索引路径。
-          dispatchIndexUpdated();
+          deferrals = 0;
           return;
         }
 
-        // 后端的 rebuild 是同步阻塞调用，但 Rust 侧用 spawn_blocking 跑在
-        // 线程池，不会卡住 UI。前端这里直接 await；成功后再派发事件。
-        devLog("检测到索引未就绪，自动后台重建…");
-        await api.buildStoryIndex();
+        if (isBackendBuilding()) {
+          devLog(`索引未就绪，但后端已在重建，让路（${reason}）`);
+          deferRetry(reason);
+          return;
+        }
+
+        // 同步/导入结束后后端会自己重建；用户点的重建也占着这把锁。
+        const release = acquireDataJob("index");
+        if (!release) {
+          const owner = getActiveDataJob();
+          devLog(`索引未就绪，但「${owner ? describeDataJob(owner) : "其他任务"}」占用中，稍后再看（${reason}）`);
+          deferRetry(reason);
+          return;
+        }
+        try {
+          devLog(`检测到索引未就绪，自动后台重建…（${reason}）`);
+          await api.buildStoryIndex();
+        } finally {
+          release();
+        }
         if (cancelled) return;
+
         devLog("索引重建完成");
-        dispatchIndexUpdated();
+        deferrals = 0;
+        const rebuilt = await api.getStoryIndexStatus().catch(() => null);
+        if (cancelled) return;
+        broadcast(rebuilt, "rebuilt");
       } catch (err) {
         // 失败不影响可用性：后端搜索会退回线性扫描，UI 也有"刷新索引"入口。
         devLog("自动索引任务失败，搜索将回退到线性扫描", err);
+      } finally {
+        running = false;
       }
     };
 
-    // 不阻塞主线程，也不抢首屏 CPU——稍微延后一丢丢让首屏渲染先跑完。
-    const timer = window.setTimeout(() => {
-      void run();
-    }, 500);
+    // 后端重建进度是「有人在写索引」的唯一可靠信号，和发起方无关。
+    let disposeProgress: (() => void) | null = null;
+    void api
+      .onIndexProgress((p) => {
+        lastIndexProgressAt = Date.now();
+        backendBuilding = !(p.total > 0 && p.current >= p.total);
+      })
+      .then((unlisten) => {
+        if (cancelled) {
+          unlisten();
+          return;
+        }
+        disposeProgress = unlisten;
+      })
+      .catch((err) => devLog("监听索引进度失败", err));
+
+    // 用户在搜索页/设置页点了重建：把自动流程整个让出去。
+    const onUserRebuild = () => {
+      lastIndexProgressAt = Date.now();
+      backendBuilding = true;
+    };
+    // 数据换过之后索引必然过期。后端通常会自己重建，这里只做兜底与状态广播。
+    const onDataUpdated = () => {
+      deferrals = 0;
+      lastBroadcast = null;
+      later(() => void ensureIndex("data-updated"), AFTER_DATA_UPDATE_DELAY_MS);
+    };
+
+    window.addEventListener("app:rebuild-story-index", onUserRebuild);
+    window.addEventListener("app:data-updated", onDataUpdated);
+    later(() => void ensureIndex("startup"), INITIAL_DELAY_MS);
 
     return () => {
       cancelled = true;
-      window.clearTimeout(timer);
+      for (const timer of timers) window.clearTimeout(timer);
+      timers.clear();
+      window.removeEventListener("app:rebuild-story-index", onUserRebuild);
+      window.removeEventListener("app:data-updated", onDataUpdated);
+      disposeProgress?.();
     };
   }, []);
 }
@@ -78,9 +181,17 @@ function devLog(message: string, err?: unknown) {
   }
 }
 
-function dispatchIndexUpdated() {
+/**
+ * 事件名保持不变（SearchPanel 等已在监听），只额外带上状态快照：
+ * 老监听者忽略 detail 即可，新监听者可以直接拿到「是否过期」的判断依据。
+ */
+function dispatchIndexUpdated(status: StoryIndexStatus | null, reason: string) {
   try {
-    window.dispatchEvent(new Event("app:story-index-updated"));
+    window.dispatchEvent(
+      new CustomEvent("app:story-index-updated", {
+        detail: { ready: status?.ready ?? false, total: status?.total ?? 0, reason },
+      })
+    );
   } catch {
     /* ignore */
   }

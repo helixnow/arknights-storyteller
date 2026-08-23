@@ -6,7 +6,15 @@ import { useTheme } from "@/components/theme-provider";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { AlertCircle, CheckCircle, Download, Eye, EyeOff, ImageOff, Loader2, RefreshCw, Upload } from "lucide-react";
-import { localizeBackendError, useDataSyncManager } from "@/hooks/useDataSyncManager";
+import {
+  acquireDataJob,
+  dataJobConflictMessage,
+  describeDataJob,
+  getActiveDataJob,
+  localizeBackendError,
+  useDataSyncManager,
+} from "@/hooks/useDataSyncManager";
+import { api } from "@/services/api";
 import { useAppPreferences } from "@/hooks/useAppPreferences";
 import { getVersion as getAppVersion } from "@tauri-apps/api/app";
 import {
@@ -74,6 +82,9 @@ interface StatusNotice {
 
 const STATUS_NOTICE_TTL_MS = 4000;
 
+/** 这么久收不到任何索引进度，就认为那次重建已经结束（或压根没起来），放锁。 */
+const INDEX_JOB_WATCHDOG_MS = 30_000;
+
 export function Settings() {
   const { themeColor, setThemeColor } = useTheme();
   const { minimalMode, setMinimalMode, inlineImages, setInlineImages } = useAppPreferences();
@@ -119,6 +130,7 @@ export function Settings() {
     syncing,
     importing,
     busy,
+    activeJob,
     loadingInfo,
     progress,
     error,
@@ -141,6 +153,12 @@ export function Settings() {
   const [preparingImport, setPreparingImport] = useState(false);
   const importBusy = importing || preparingImport;
   const dataBusy = busy || preparingImport;
+  /**
+   * 任务锁被本页之外的东西占着（同步对话框、自动索引、更新安装）。这时候所有
+   * 会改数据的入口都要禁用，并把占用者报出来——只把按钮灰掉，用户只会以为坏了。
+   */
+  const blockedBy = activeJob && !dataBusy ? activeJob : null;
+  const dataActionsDisabled = dataBusy || blockedBy !== null;
 
   const handleRefreshInfo = () => {
     showStatus(null);
@@ -150,7 +168,7 @@ export function Settings() {
   };
 
   const handleSyncClick = async () => {
-    if (dataBusy) return;
+    if (dataActionsDisabled) return;
     showStatus(null);
     setError(null);
     const confirmed = await safeConfirm(
@@ -166,9 +184,16 @@ export function Settings() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const handleImportClick = async () => {
-    if (dataBusy) return;
+    if (dataActionsDisabled) return;
     showStatus(null);
     setError(null);
+    // 系统文件对话框可能开很久，这段时间同样要占住任务锁，否则别处（同步对话框、
+    // 自动索引）会以为没人干活，跑起一个会和随后的导入互相覆盖的任务。
+    const releaseJob = acquireDataJob("import");
+    if (!releaseJob) {
+      setError(dataJobConflictMessage("导入"));
+      return;
+    }
     setPreparingImport(true);
     try {
       const confirmed = await safeConfirm(
@@ -210,8 +235,12 @@ export function Settings() {
       // 用户取消选择。
       if (!path) return;
 
+      // 交棒给 importFromPath：它会在同一个同步执行段里重新抢锁，中间没有
+      // 别人插队的窗口；释放函数是幂等的，finally 里再调一次也不会误伤新锁。
+      releaseJob();
       await importFromPath(path);
     } finally {
+      releaseJob();
       setPreparingImport(false);
     }
   };
@@ -225,19 +254,76 @@ export function Settings() {
 
   const toast = useToast();
 
+  /**
+   * 索引重建实际跑在搜索面板里（它常驻挂载，监听 `app:rebuild-story-index`），
+   * 这边只是发起方，所以只能靠后端的 index-progress 判断它是否还在跑：
+   * 收到终态就放锁，长时间没有任何进度就认定那次重建已经结束，兜底放锁。
+   */
+  const indexJobReleaseRef = useRef<(() => void) | null>(null);
+  const indexWatchdogRef = useRef<number | null>(null);
+
+  const releaseIndexJob = useCallback(() => {
+    if (indexWatchdogRef.current !== null) {
+      window.clearTimeout(indexWatchdogRef.current);
+      indexWatchdogRef.current = null;
+    }
+    indexJobReleaseRef.current?.();
+    indexJobReleaseRef.current = null;
+  }, []);
+
+  const armIndexWatchdog = useCallback(() => {
+    if (indexWatchdogRef.current !== null) window.clearTimeout(indexWatchdogRef.current);
+    indexWatchdogRef.current = window.setTimeout(releaseIndexJob, INDEX_JOB_WATCHDOG_MS);
+  }, [releaseIndexJob]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let dispose: (() => void) | null = null;
+    void api
+      .onIndexProgress((p) => {
+        if (cancelled || !indexJobReleaseRef.current) return;
+        if (p.total > 0 && p.current >= p.total) releaseIndexJob();
+        else armIndexWatchdog();
+      })
+      .then((unlisten) => {
+        if (cancelled) {
+          unlisten();
+          return;
+        }
+        dispose = unlisten;
+      })
+      .catch((err) => devLog("[Settings] 监听索引进度失败", err));
+    return () => {
+      cancelled = true;
+      dispose?.();
+      releaseIndexJob();
+    };
+  }, [armIndexWatchdog, releaseIndexJob]);
+
   const handleRebuildIndex = useCallback(() => {
-    showStatus("已请求重新建立全文索引");
     setError(null);
-    toast.show("已请求重新建立全文索引");
+    const release = acquireDataJob("index");
+    if (!release) {
+      toast.warn(dataJobConflictMessage("重建索引"));
+      return;
+    }
+    indexJobReleaseRef.current = release;
+    armIndexWatchdog();
     window.dispatchEvent(new Event("app:rebuild-story-index"));
-  }, [setError, showStatus, toast]);
+    // 完成提示由搜索面板给（它才知道结果），这里只确认「已经开跑」，
+    // 避免同一件事在同一屏上提示两遍。
+    toast.show("已开始重新建立全文索引，可在搜索页查看进度");
+  }, [armIndexWatchdog, setError, toast]);
 
   const handleRefreshCharacters = useCallback(() => {
-    showStatus("已请求刷新人物统计");
     setError(null);
-    toast.show("已请求刷新人物统计");
+    if (getActiveDataJob() !== null) {
+      toast.warn(dataJobConflictMessage("刷新人物统计"));
+      return;
+    }
     window.dispatchEvent(new Event("app:refresh-character-stats"));
-  }, [setError, showStatus, toast]);
+    toast.show("已请求刷新人物统计");
+  }, [setError, toast]);
 
   useEffect(() => {
     if (runtimePlatform === "unknown") return;
@@ -288,6 +374,12 @@ export function Settings() {
 
   const handleInstallAppUpdate = useCallback(async () => {
     if (!availableUpdate) return;
+    // 桌面端装完立刻重启进程，安卓端会拉起系统安装器：这期间数据目录不能有人写。
+    const releaseJob = acquireDataJob("update");
+    if (!releaseJob) {
+      setUpdateIssue({ tone: "warning", kind: "unknown", message: dataJobConflictMessage("安装更新") });
+      return;
+    }
     setUpdateStatus("installing");
     setUpdateIssue(null);
     setDownloadProgress(null);
@@ -316,16 +408,26 @@ export function Settings() {
       }
     } catch (error) {
       devLog("[Settings] 安装更新失败", error);
-      setUpdateStatus("error");
+      const issue = describeUpdateError(error, "更新安装未完成，可稍后重试。");
       setUpdateMessage(null);
-      setUpdateIssue(describeUpdateError(error, "更新安装未完成，可稍后重试。"));
+      // 用户自己点了取消（含 Windows UAC 拒绝）不是故障：退回「可更新」状态，
+      // 「立即更新」按钮留着，也不摆出红色报错。
+      setUpdateStatus(issue.kind === "cancelled" ? "available" : "error");
+      setUpdateIssue(issue);
     } finally {
+      releaseJob();
       setDownloadProgress(null);
     }
   }, [availableUpdate]);
 
   const isCheckingUpdate = updateStatus === "checking";
   const isInstallingUpdate = updateStatus === "installing";
+  /** 更新安装要等数据任务收工，否则重启/覆盖会打断正在写盘的同步。 */
+  const installBlocked = activeJob !== null && activeJob !== "update";
+  const dataProgressPercent =
+    progress && progress.total > 0
+      ? Math.min(Math.round((progress.current / progress.total) * 100), 100)
+      : null;
   const updateIssueClass =
     updateIssue?.tone === "error"
       ? "text-[hsl(var(--color-destructive))]"
@@ -457,7 +559,7 @@ export function Settings() {
                     variant="ghost"
                     size="sm"
                     onClick={handleRefreshInfo}
-                    disabled={loadingInfo || dataBusy}
+                    disabled={loadingInfo || dataActionsDisabled}
                     className="sm:ml-auto"
                   >
                     {loadingInfo ? (
@@ -474,6 +576,16 @@ export function Settings() {
                   </Button>
                 </div>
 
+                {blockedBy && (
+                  <div
+                    role="status"
+                    className="flex items-center gap-2 text-xs text-[hsl(var(--color-muted-foreground))]"
+                  >
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+                    <span>正在{describeDataJob(blockedBy)}，完成后即可继续其他数据操作。</span>
+                  </div>
+                )}
+
                 {(progress || dataBusy) && (
                   <div className="space-y-2" aria-live="polite">
                     {progress ? (
@@ -484,12 +596,18 @@ export function Settings() {
                             {progress.current}/{progress.total}
                           </span>
                         </div>
-                        <div className="w-full bg-[hsl(var(--color-secondary))] rounded-full h-2 overflow-hidden">
+                        <div
+                          role="progressbar"
+                          aria-label="剧情数据处理进度"
+                          aria-valuemin={0}
+                          aria-valuemax={100}
+                          aria-valuenow={dataProgressPercent ?? undefined}
+                          aria-valuetext={`${progress.phase}：${progress.message || `${progress.current}/${progress.total}`}`}
+                          className="w-full bg-[hsl(var(--color-secondary))] rounded-full h-2 overflow-hidden"
+                        >
                           <div
                             className="bg-[hsl(var(--color-primary))] h-full transition-all duration-300"
-                            style={{
-                              width: `${progress.total > 0 ? Math.min((progress.current / progress.total) * 100, 100) : 0}%`,
-                            }}
+                            style={{ width: `${dataProgressPercent ?? 0}%` }}
                           />
                         </div>
                         <p className="text-xs text-[hsl(var(--color-muted-foreground))]">{progress.message}</p>
@@ -500,9 +618,18 @@ export function Settings() {
                           <span className="text-[hsl(var(--color-muted-foreground))]">
                             {syncing ? "连接中" : preparingImport && !importing ? "等待选择文件" : "正在导入"}
                           </span>
-                          <span className="font-mono">…</span>
+                          <span className="font-mono" aria-hidden="true">
+                            …
+                          </span>
                         </div>
-                        <div className="w-full bg-[hsl(var(--color-secondary))] rounded-full h-2 overflow-hidden">
+                        <div
+                          role="progressbar"
+                          aria-label="剧情数据处理进度"
+                          aria-valuetext={
+                            syncing ? "正在开始同步" : preparingImport && !importing ? "等待选择文件" : "正在导入"
+                          }
+                          className="w-full bg-[hsl(var(--color-secondary))] rounded-full h-2 overflow-hidden"
+                        >
                           <div className="bg-[hsl(var(--color-primary))] h-full animate-pulse" style={{ width: "30%" }} />
                         </div>
                         <p className="text-xs text-[hsl(var(--color-muted-foreground))]">
@@ -539,7 +666,7 @@ export function Settings() {
                 )}
 
                 <div className="flex flex-wrap gap-3">
-                  <Button onClick={handleSyncClick} disabled={dataBusy}>
+                  <Button onClick={handleSyncClick} disabled={dataActionsDisabled}>
                     {syncing ? (
                       <span className="inline-flex items-center gap-2">
                         <Loader2 className="h-4 w-4 animate-spin" />
@@ -555,7 +682,7 @@ export function Settings() {
                   <Button
                     variant="outline"
                     onClick={handleImportClick}
-                    disabled={dataBusy}
+                    disabled={dataActionsDisabled}
                   >
                     {importBusy ? (
                       <span className="inline-flex items-center gap-2">
@@ -662,7 +789,21 @@ export function Settings() {
                           : "…"}
                       </span>
                     </div>
-                    <div className="w-full bg-[hsl(var(--color-secondary))] rounded-full h-2 overflow-hidden">
+                    <div
+                      role="progressbar"
+                      aria-label="更新包下载进度"
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                      aria-valuenow={downloadProgress?.percent ?? undefined}
+                      aria-valuetext={
+                        downloadProgress?.percent != null
+                          ? `已下载 ${downloadProgress.percent}%`
+                          : downloadProgress
+                          ? `已下载 ${formatMegabytes(downloadProgress.downloadedBytes)}`
+                          : "正在准备下载"
+                      }
+                      className="w-full bg-[hsl(var(--color-secondary))] rounded-full h-2 overflow-hidden"
+                    >
                       {downloadProgress?.percent != null ? (
                         <div
                           className="bg-[hsl(var(--color-primary))] h-full transition-all duration-300"
@@ -708,7 +849,12 @@ export function Settings() {
                     {isCheckingUpdate ? "检查中..." : updateIssue ? "重试检查" : "检查更新"}
                   </Button>
                   {availableUpdate ? (
-                    <Button type="button" onClick={handleInstallAppUpdate} disabled={isInstallingUpdate}>
+                    <Button
+                      type="button"
+                      onClick={handleInstallAppUpdate}
+                      disabled={isInstallingUpdate || installBlocked}
+                      title={installBlocked && activeJob ? `正在${describeDataJob(activeJob)}，暂不能安装更新` : undefined}
+                    >
                       {isInstallingUpdate ? (
                         <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                       ) : (
@@ -787,19 +933,26 @@ export function Settings() {
                 <p>
                   若搜索结果或人物统计与最新数据不符，可在此重新构建相关索引。
                 </p>
+                {blockedBy && (
+                  <p role="status" className="text-xs">
+                    正在{describeDataJob(blockedBy)}，完成后即可继续。
+                  </p>
+                )}
               </div>
               <div className="grid gap-3 sm:grid-cols-2">
                 <Button
                   variant="outline"
                   onClick={handleRebuildIndex}
+                  disabled={dataActionsDisabled}
                 >
-                  <RefreshCw className="h-4 w-4 mr-2" /> 重新建立全文索引
+                  <RefreshCw className="h-4 w-4 mr-2" aria-hidden="true" /> 重新建立全文索引
                 </Button>
                 <Button
                   variant="outline"
                   onClick={handleRefreshCharacters}
+                  disabled={dataActionsDisabled}
                 >
-                  <RefreshCw className="h-4 w-4 mr-2" /> 刷新人物统计
+                  <RefreshCw className="h-4 w-4 mr-2" aria-hidden="true" /> 刷新人物统计
                 </Button>
               </div>
             </CardContent>

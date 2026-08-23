@@ -1,10 +1,83 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { api, type SyncProgress } from "@/services/api";
 import { devLog, devWarn } from "@/hooks/useAppUpdater";
 
 interface UseDataSyncManagerOptions {
   active: boolean;
   onSuccess?: () => void;
+}
+
+/**
+ * 会互相踩踏的重任务：同步/导入都在改数据目录，索引重建在读同一批文件，
+ * 安装应用更新最后还会重启进程。它们同时跑轻则进度条打架，重则把数据写坏，
+ * 所以共用一把进程内的任务锁。
+ *
+ * 锁必须放在模块作用域：设置页和 StoryList 里的同步对话框各持有一份
+ * `useDataSyncManager`，组件内的 ref 拦不住「一边开着对话框同步、一边在设置页
+ * 点同步」这种情况。
+ */
+export type DataJobKind = "sync" | "import" | "index" | "update";
+
+const DATA_JOB_LABELS: Record<DataJobKind, string> = {
+  sync: "同步剧情数据",
+  import: "导入 ZIP",
+  index: "重建全文索引",
+  update: "安装应用更新",
+};
+
+let activeDataJob: DataJobKind | null = null;
+const dataJobListeners = new Set<() => void>();
+
+export function getActiveDataJob(): DataJobKind | null {
+  return activeDataJob;
+}
+
+/** 任务名，用来在按钮旁边说明「现在是谁占着」。 */
+export function describeDataJob(kind: DataJobKind): string {
+  return DATA_JOB_LABELS[kind];
+}
+
+/** 抢锁失败时的统一话术：说清是哪个任务占着，而不是只把按钮灰掉。 */
+export function dataJobConflictMessage(intent: string): string {
+  const owner = getActiveDataJob();
+  return owner
+    ? `正在${DATA_JOB_LABELS[owner]}，请等待完成后再${intent}。`
+    : `另一项数据任务正在进行，请稍后再${intent}。`;
+}
+
+function notifyDataJobListeners(): void {
+  for (const listener of [...dataJobListeners]) listener();
+}
+
+/**
+ * 抢占任务锁。被别的任务占着时返回 null，调用方负责给提示；
+ * 拿到的释放函数可重复调用（finally 里调一次、卸载时再兜底调一次都安全）。
+ */
+export function acquireDataJob(kind: DataJobKind): (() => void) | null {
+  if (activeDataJob !== null) return null;
+  activeDataJob = kind;
+  notifyDataJobListeners();
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    if (activeDataJob === kind) {
+      activeDataJob = null;
+      notifyDataJobListeners();
+    }
+  };
+}
+
+function subscribeDataJob(listener: () => void): () => void {
+  dataJobListeners.add(listener);
+  return () => {
+    dataJobListeners.delete(listener);
+  };
+}
+
+/** 订阅任务锁，用于禁用冲突入口并显示占用者。 */
+export function useActiveDataJob(): DataJobKind | null {
+  return useSyncExternalStore(subscribeDataJob, getActiveDataJob, getActiveDataJob);
 }
 
 /** 终态进度多留一会儿让用户看清「完成」，之后自动收起。 */
@@ -188,6 +261,11 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
 
   const handleSync = useCallback(async () => {
     if (busyRef.current) return;
+    const releaseJob = acquireDataJob("sync");
+    if (!releaseJob) {
+      setError(dataJobConflictMessage("同步"));
+      return;
+    }
     busyRef.current = true;
     cancelAutoClear();
     setSyncing(true);
@@ -209,6 +287,7 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
         setError(localizeBackendError(err, "同步失败"));
       }
     } finally {
+      releaseJob();
       busyRef.current = false;
       if (mountedRef.current) {
         setSyncing(false);
@@ -220,6 +299,11 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
   const runImport = useCallback(
     async (label: string, run: () => Promise<void>) => {
       if (busyRef.current) return;
+      const releaseJob = acquireDataJob("import");
+      if (!releaseJob) {
+        setError(dataJobConflictMessage("导入"));
+        return;
+      }
       busyRef.current = true;
       cancelAutoClear();
       setImporting(true);
@@ -240,6 +324,7 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
           setError(localizeBackendError(err, "导入失败"));
         }
       } finally {
+        releaseJob();
         busyRef.current = false;
         if (mountedRef.current) {
           setImporting(false);
@@ -291,11 +376,16 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
   }, [currentVersion, hasUpdate]);
 
   const busy = syncing || importing;
+  const activeJob = useActiveDataJob();
+  /** 锁被本组件之外的任务占着：按钮要禁用，并且得说明在等谁。 */
+  const blockedBy = activeJob && !busy ? activeJob : null;
 
   return {
     syncing,
     importing,
     busy,
+    activeJob,
+    blockedBy,
     loadingInfo,
     progress,
     error,

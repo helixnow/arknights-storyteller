@@ -1,8 +1,19 @@
-import { useEffect, useRef } from "react";
+import { useEffect } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
+import { acquireDataJob } from "@/hooks/useDataSyncManager";
 
 const IS_DEV = import.meta.env.DEV;
+
+/**
+ * 更新源地址、下载直链、签名参数都不该出现在正式包的控制台里（用户随手截个图
+ * 就把私有分发地址带出去了），界面文案里同样不该出现。
+ */
+export function redactSensitive(text: string): string {
+  return text
+    .replace(/\b[a-z][a-z0-9+.-]*:\/\/\S+/gi, "<链接>")
+    .replace(/\b(token|key|signature|sig|secret|password)=[^\s&"']+/gi, "$1=<已隐藏>");
+}
 
 /**
  * 诊断日志只在开发构建输出。更新 / 同步流程打点很密，正式包里既刷屏又会把
@@ -97,8 +108,22 @@ export function compareVersions(a: string, b: string): CompareResult {
 
 export type UpdateIssueTone = "info" | "warning" | "error";
 
+/**
+ * 失败原因分类。调用方要靠它区分「用户自己取消」「网络不通」「签名不对」——
+ * 前者根本不算错误，后者必须当成安全事件对待，不能混成同一条红字。
+ */
+export type UpdateIssueKind =
+  | "unsupported"
+  | "not-configured"
+  | "cancelled"
+  | "signature"
+  | "feed"
+  | "network"
+  | "unknown";
+
 export interface UpdateIssue {
   tone: UpdateIssueTone;
+  kind: UpdateIssueKind;
   message: string;
 }
 
@@ -106,40 +131,53 @@ export interface UpdateIssue {
  * 更新检查失败在绝大多数情况下都不是用户能修的问题（没打更新签名、没配更新源、
  * 网络不通），所以只有签名校验这类真正危险的分支才用 error 语气。
  */
-const UPDATE_ERROR_RULES: Array<{ test: RegExp; tone: UpdateIssueTone; message: string }> = [
+const UPDATE_ERROR_RULES: Array<{ test: RegExp; tone: UpdateIssueTone; kind: UpdateIssueKind; message: string }> = [
   {
     test: /并非\s*Tauri|not a tauri/i,
     tone: "info",
+    kind: "unsupported",
     message: "当前环境不是桌面/移动客户端，无法检查更新。",
   },
   {
     test: /VITE_ANDROID_UPDATE_FEED|未配置安卓更新源/i,
     tone: "info",
+    kind: "not-configured",
     message: "当前构建未配置更新源，请前往项目发布页手动下载新版本。",
   },
   {
     test: /not allowed|unknown plugin|plugin .*not (?:found|registered)|updater.*disabled/i,
     tone: "info",
+    kind: "not-configured",
     message: "当前安装包未启用自动更新，请前往项目发布页手动下载新版本。",
+  },
+  {
+    // 用户自己点了「取消」/UAC 拒绝（Windows 1223），不是故障。
+    test: /user cancell?ed|cancell?ed by (?:the )?user|操作已取消|用户已?取消|os error 1223/i,
+    tone: "info",
+    kind: "cancelled",
+    message: "更新已取消，可稍后在设置里重新检查。",
   },
   {
     test: /signature|pubkey|public key|verif/i,
     tone: "error",
+    kind: "signature",
     message: "更新包签名校验失败，出于安全考虑已中止安装。",
   },
   {
     test: /could not fetch a valid release|releases?\.json|manifest|缺少 version|HTTP 4\d\d|HTTP 5\d\d/i,
     tone: "warning",
+    kind: "feed",
     message: "更新源暂时不可用，请稍后再试。",
   },
   {
     test: /network|failed to fetch|error sending request|timed? ?out|超时|dns|connect|ECONN|ENOTFOUND|offline|网络/i,
     tone: "warning",
+    kind: "network",
     message: "无法连接更新服务器，请检查网络后重试。",
   },
 ];
 
-/** 把更新流程里的异常翻译成一句不吓人的中文，同时保留原文便于排查。 */
+/** 把更新流程里的异常翻译成一句不吓人的中文；兜底透出的原文先脱敏。 */
 export function describeUpdateError(
   error: unknown,
   fallback = "本次更新检查没有完成，可稍后再试。"
@@ -148,11 +186,26 @@ export function describeUpdateError(
   const text = raw.trim();
   for (const rule of UPDATE_ERROR_RULES) {
     if (rule.test.test(text)) {
-      return { tone: rule.tone, message: rule.message };
+      return { tone: rule.tone, kind: rule.kind, message: rule.message };
     }
   }
-  if (!text) return { tone: "warning", message: fallback };
-  return { tone: "warning", message: `${fallback}（${text}）` };
+  if (!text) return { tone: "warning", kind: "unknown", message: fallback };
+  return { tone: "warning", kind: "unknown", message: `${fallback}（${redactSensitive(text)}）` };
+}
+
+/**
+ * 更新流程里唯一允许在正式包落日志的出口：只打脱敏后的一行文本。
+ * 原始 error 对象（可能带更新源地址、请求头）只在开发构建里展开。
+ */
+function logUpdateIssue(scope: string, issue: UpdateIssue, error: unknown): void {
+  if (IS_DEV) {
+    if (issue.tone === "error") console.error(`${scope} ${issue.message}`, error);
+    else console.info(`${scope} ${issue.message}`, error);
+    return;
+  }
+  if (issue.tone === "error") {
+    console.error(`${scope} ${redactSensitive(issue.message)}`);
+  }
 }
 
 type ManifestOptions = {
@@ -329,12 +382,17 @@ export async function openAndroidInstallPermissionSettings(): Promise<void> {
   await invoke("plugin:apk-updater|open_install_permission_settings");
 }
 
-export function useAppUpdater() {
-  const startedRef = useRef(false);
+/**
+ * 启动期自动更新整个会话只跑一次。用模块级 flag 而不是组件内的 ref：
+ * StrictMode 的双挂载、路由重建、乃至第二处误调 `useAppUpdater()`，
+ * 都不该再弹一次「发现更新」或再冒一条同样的提示。
+ */
+let autoUpdateFlowStarted = false;
 
+export function useAppUpdater() {
   useEffect(() => {
-    if (startedRef.current || !isTauriEnvironment()) return;
-    startedRef.current = true;
+    if (autoUpdateFlowStarted || !isTauriEnvironment()) return;
+    autoUpdateFlowStarted = true;
 
     let cancelled = false;
     const isCancelled = () => cancelled;
@@ -353,21 +411,26 @@ export function useAppUpdater() {
           return;
         }
 
-        devLog("[Updater] 开始下载更新", updateInfo.availableVersion);
-        await installDesktopUpdate(updateInfo, (progress) => {
-          if (isCancelled() || !progress.done) return;
-          devLog("[Updater] 更新包下载完成", progress.downloadedBytes);
-        });
+        // 安装完会立刻重启进程：这时候若正在同步/导入，数据目录会写到一半被砍。
+        const releaseJob = acquireDataJob("update");
+        if (!releaseJob) {
+          devLog("[Updater] 有数据任务在跑，跳过本次自动安装");
+          return;
+        }
+        try {
+          devLog("[Updater] 开始下载更新", updateInfo.availableVersion);
+          await installDesktopUpdate(updateInfo, (progress) => {
+            if (isCancelled() || !progress.done) return;
+            devLog("[Updater] 更新包下载完成", progress.downloadedBytes);
+          });
+        } finally {
+          releaseJob();
+        }
       } catch (error) {
         if (isCancelled()) return;
         // 缺少 `updater:allow-check` 权限、未配置更新源之类都是打包配置问题，
         // 启动期没必要在控制台刷红。
-        const issue = describeUpdateError(error);
-        if (issue.tone === "error") {
-          console.error("[Updater] 桌面更新失败", error);
-        } else {
-          devLog("[Updater] 桌面更新不可用：", issue.message);
-        }
+        logUpdateIssue("[Updater] 桌面更新未完成：", describeUpdateError(error), error);
       }
     };
 
@@ -394,11 +457,21 @@ export function useAppUpdater() {
           return;
         }
 
-        const response = await installAndroidUpdate({
-          platform: "android",
-          currentVersion,
-          manifest,
-        });
+        const releaseJob = acquireDataJob("update");
+        if (!releaseJob) {
+          devLog("[Updater] 有数据任务在跑，跳过本次自动安装");
+          return;
+        }
+        let response: AndroidInstallResponse;
+        try {
+          response = await installAndroidUpdate({
+            platform: "android",
+            currentVersion,
+            manifest,
+          });
+        } finally {
+          releaseJob();
+        }
 
         if (isCancelled()) return;
 
@@ -410,12 +483,7 @@ export function useAppUpdater() {
         }
       } catch (error) {
         if (isCancelled()) return;
-        const issue = describeUpdateError(error);
-        if (issue.tone === "error") {
-          console.error("[Updater] 安卓更新失败", error);
-        } else {
-          devLog("[Updater] 安卓更新不可用：", issue.message);
-        }
+        logUpdateIssue("[Updater] 安卓更新未完成：", describeUpdateError(error), error);
       }
     };
 
