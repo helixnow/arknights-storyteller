@@ -23,16 +23,17 @@ lazy_static! {
 
 /// 立绘变体后缀：`#4`（表情）、`$1`（差分）、`_1`/`_2`（皮肤）、`_ex`（异格）。
 /// 这些都不影响「是谁」，剥掉之后才能对上头像仓库里的文件名。
-fn strip_art_variants<'a>(token: &'a str, keep_at_least: usize) -> Vec<&'a str> {
+fn strip_art_variants(token: &str, keep_at_least: usize) -> Vec<&str> {
     let base = token
         .split(|c| c == '#' || c == '$')
         .next()
         .unwrap_or(token);
     let mut parts: Vec<&str> = base.split('_').filter(|p| !p.is_empty()).collect();
     while parts.len() > keep_at_least {
-        let last = *parts.last().expect("non-empty by loop condition");
-        let is_variant =
-            last.eq_ignore_ascii_case("ex") || last.chars().all(|c| c.is_ascii_digit());
+        let is_variant = parts
+            .last()
+            .map(|last| last.eq_ignore_ascii_case("ex") || last.chars().all(|c| c.is_ascii_digit()))
+            .unwrap_or(false);
         if !is_variant {
             break;
         }
@@ -90,7 +91,7 @@ pub fn parse_story_text(content: &str) -> ParsedStoryContent {
             continue;
         }
 
-        // 只有真正闭合的方括号才是指令。`[`  开头但没有 `]` 的行是正文
+        // 只有真正闭合的方括号才是指令。`[` 开头但没有 `]` 的行是正文
         // （台词里出现半个括号并不稀奇），当指令处理会整行消失。
         if line.starts_with('[') && line.contains(']') {
             if let Some(segment) = parse_command_line(line, current_char_id.as_deref()) {
