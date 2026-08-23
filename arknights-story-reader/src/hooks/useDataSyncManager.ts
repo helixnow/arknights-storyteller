@@ -411,8 +411,14 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
           do {
             const end = Math.min(offset + IMPORT_CHUNK_BYTES, total);
             const chunk = await blobToBase64(file.slice(offset, end));
-            if (mountedRef.current) {
-              // 传输映射到 0–30%，与后端导入进度（校验 30 → 解压 40 → 完成 100）衔接。
+            const isLast = end >= total;
+            await api.importZipChunk(chunk, offset, isLast);
+            offset = end;
+            // 进度要等块成功送达后再上报，并按已完成字节（即新的 offset）计算，
+            // 否则显示会恒定落后一块（第一块传完还停在 0%）。传输映射到 0–30%，
+            // 与后端导入进度（校验 30 → 解压 40 → 完成 100）衔接；最后一块返回时
+            // 后端已接管发进度，这里不再上报，免得把后端推进的进度拉回 30%。
+            if (!isLast && mountedRef.current) {
               const ratio = total > 0 ? offset / total : 0;
               setProgress({
                 phase: "导入",
@@ -421,8 +427,6 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
                 message: `正在传输 ZIP 数据…（${Math.round(ratio * 100)}%）`,
               });
             }
-            await api.importZipChunk(chunk, offset, end >= total);
-            offset = end;
           } while (offset < total);
         } catch (err) {
           // 传输半途而废（FileReader 读块失败 / 某块 IPC 没送达）时，

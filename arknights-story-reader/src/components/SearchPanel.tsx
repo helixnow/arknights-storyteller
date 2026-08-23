@@ -653,11 +653,26 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     setProgress({ phase: "搜索中", current: 0, total: 0, message: "" });
 
     try {
+      // 挂载时的 getCurrentVersion 可能失败过一次，version 会停在空串，
+      // 缓存就整个会话都不可用。真正开搜这一刻补取一次（同样只留稳定的
+      // commit 前缀）：成功就把 version 落回 state，本次搜索立刻能用缓存；
+      // 仍失败则照旧按无版本处理（不读不写缓存），不阻塞搜索本身。
+      let activeVersion = version;
+      if (!activeVersion) {
+        try {
+          activeVersion = stableVersionOf(await api.getCurrentVersion());
+          if (activeVersion) setVersion(activeVersion);
+        } catch (err) {
+          devLog("补取数据版本失败", err);
+        }
+        if (isStale()) return;
+      }
+
       if (activeMode === "segment") {
         // version 还没就绪（getCurrentVersion 未返回或失败）时缓存整体停用：
         // 空串没法证明缓存对应的是当前这份数据。
-        const cached = opts?.forceRefresh || !version ? undefined : segmentCache[raw];
-        if (cached && cached.version === version) {
+        const cached = opts?.forceRefresh || !activeVersion ? undefined : segmentCache[raw];
+        if (cached && cached.version === activeVersion) {
           setSegmentPage(cached.page);
           setPage(null);
           setSearched(true);
@@ -685,10 +700,10 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
 
         // version 没就绪前一律不写缓存：记在空版本下的条目在真实版本落地后
         // 永远不再命中，落盘后还会污染下个会话的空版本窗口期。
-        if (version) {
+        if (activeVersion) {
           const nextCache = prune({
             ...segmentCache,
-            [raw]: { page: data, updatedAt: Date.now(), version },
+            [raw]: { page: data, updatedAt: Date.now(), version: activeVersion },
           });
           setSegmentCache(nextCache);
           // 边打边搜的中间结果只进内存：跨会话留着「凯」「凯尔」这种半截查询
@@ -704,9 +719,9 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
       }
 
       // 同段落模式：version 为空时缓存既不可读也不可写。
-      if (!opts?.forceRefresh && !debugMode && version) {
+      if (!opts?.forceRefresh && !debugMode && activeVersion) {
         const cached = cache[raw];
-        if (cached && cached.version === version) {
+        if (cached && cached.version === activeVersion) {
           setPage(cached.page);
           setSegmentPage(null);
           setSearched(true);
@@ -738,10 +753,10 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
         setSegmentPage(null);
         setDebugLogs([]);
         setDebugExpanded(false);
-        if (version) {
+        if (activeVersion) {
           const nextCache = prune({
             ...cache,
-            [raw]: { page: data, updatedAt: Date.now(), version },
+            [raw]: { page: data, updatedAt: Date.now(), version: activeVersion },
           });
           setCache(nextCache);
           if (!auto) writeJson(CACHE_KEY, nextCache);
