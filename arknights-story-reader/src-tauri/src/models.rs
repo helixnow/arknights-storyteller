@@ -18,6 +18,10 @@ pub struct StoryEntry {
     pub story_txt: String,
     #[serde(rename = "storyInfo")]
     pub story_info: Option<String>,
+    /// 条目自带的封面图 token。原始数据里经常是 null，此时后端会用所在组的
+    /// `storyPic` / `storyEntryPicId` 回填，供前端拼活动 KV。
+    #[serde(rename = "storyPic", default)]
+    pub story_pic: Option<String>,
     #[serde(rename = "storyReviewType")]
     pub story_review_type: String,
     #[serde(rename = "unLockType")]
@@ -230,6 +234,14 @@ pub struct StoryIndexStatus {
     pub total: usize,
     #[serde(rename = "lastBuiltAt")]
     pub last_built_at: Option<i64>,
+}
+
+/// 剧情缩略图 token：取自剧情脚本里的第一张插画（`kind = "image"`），
+/// 没有插画时退化为第一条场景背景（`kind = "background"`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoryPreviewToken {
+    pub kind: String,
+    pub token: String,
 }
 
 /// prev/next 邻接关系；前端阅读器底部导航使用。

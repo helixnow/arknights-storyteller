@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@plugin "tailwindcss-animate";
 
 @variant dark (.dark &);
 
@@ -430,31 +431,27 @@ body {
 }
 
 .reader-text {
-  color: hsl(var(--color-foreground) / 0.92);
+  color: var(--reader-fg);
   white-space: normal;
 }
 
 .reader-paragraph {
   margin-bottom: 0;
-  color: hsl(var(--color-foreground) / 0.92);
-  text-align: justify;
-  text-indent: 0;
+  color: var(--reader-fg);
 }
 
 .reader-character-name {
   font-weight: 700;
-  color: hsl(var(--color-primary));
+  color: var(--reader-accent);
   margin-bottom: 0.35rem;
   display: block;
   font-size: 1.05em;
-  letter-spacing: 0.01em;
 }
 
 .reader-narration {
-  color: hsl(var(--color-muted-foreground) / 0.9);
+  color: color-mix(in srgb, var(--reader-fg) 72%, transparent);
   padding-left: 1rem;
-  border-left: 3px solid hsl(var(--color-muted) / 0.45);
-  letter-spacing: 0.02em;
+  border-left: 3px solid color-mix(in srgb, var(--reader-fg) 22%, transparent);
 }
 
 .reader-summary {
@@ -462,29 +459,25 @@ body {
   margin-bottom: 2rem;
   padding: 1.25rem 1.5rem;
   border-radius: 1rem;
-  border: 1px solid hsl(var(--color-border));
-  background: linear-gradient(
-    145deg,
-    hsl(var(--color-secondary) / 0.32),
-    hsl(var(--color-card) / 0.94)
-  );
-  box-shadow: 0 18px 36px hsl(var(--color-border) / 0.28);
-  color: hsl(var(--color-muted-foreground));
+  border: 1px solid color-mix(in srgb, var(--reader-fg) 14%, transparent);
+  background: color-mix(in srgb, var(--reader-fg) 6%, var(--reader-bg));
+  box-shadow: 0 18px 36px color-mix(in srgb, var(--reader-fg) 8%, transparent);
+  color: color-mix(in srgb, var(--reader-fg) 82%, transparent);
   line-height: 1.75;
 }
 
 .reader-summary-label {
-  font-size: 0.75rem;
+  font-size: 0.75em;
   text-transform: uppercase;
   letter-spacing: 0.14em;
   font-weight: 600;
-  color: hsl(var(--color-muted-foreground) / 0.8);
+  color: color-mix(in srgb, var(--reader-fg) 62%, transparent);
 }
 
 .reader-summary-body {
   margin-top: 0.65rem;
-  font-size: 0.95rem;
-  color: hsl(var(--color-foreground) / 0.86);
+  font-size: 0.95em;
+  color: var(--reader-fg);
 }
 
 .story-item-summary {
@@ -507,17 +500,17 @@ body {
 
 .reader-decision {
   padding: 1rem 1.25rem;
-  border: 1px solid hsl(var(--color-border));
+  border: 1px solid color-mix(in srgb, var(--reader-fg) 16%, transparent);
   border-radius: 0.75rem;
-  background: hsl(var(--color-secondary) / 0.3);
+  background: color-mix(in srgb, var(--reader-fg) 6%, var(--reader-bg));
 }
 
 .reader-decision-title {
-  font-size: 0.85rem;
+  font-size: 0.85em;
   font-weight: 600;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: hsl(var(--color-muted-foreground));
+  color: color-mix(in srgb, var(--reader-fg) 62%, transparent);
   margin-bottom: 0.75rem;
 }
 
@@ -526,7 +519,7 @@ body {
   align-items: flex-start;
   gap: 0.5rem;
   margin-bottom: 0.35rem;
-  color: hsl(var(--color-foreground) / 0.9);
+  color: var(--reader-fg);
 }
 
 .reader-decision-option > span:nth-child(2) {
@@ -544,8 +537,8 @@ body {
   width: 1.3rem;
   height: 1.3rem;
   border-radius: 9999px;
-  background: hsl(var(--color-primary) / 0.1);
-  color: hsl(var(--color-primary));
+  background: color-mix(in srgb, var(--reader-accent) 14%, var(--reader-bg));
+  color: var(--reader-accent);
   font-size: 0.75rem;
   font-weight: 600;
 }
@@ -554,17 +547,17 @@ body {
   margin-bottom: 1.5rem;
   padding: 1rem 1.25rem;
   border-radius: 0.75rem;
-  background: hsl(var(--color-secondary) / 0.18);
-  border: 1px dashed hsl(var(--color-border));
-  color: hsl(var(--color-foreground) / 0.92);
+  background: color-mix(in srgb, var(--reader-fg) 5%, var(--reader-bg));
+  border: 1px dashed color-mix(in srgb, var(--reader-fg) 22%, transparent);
+  color: var(--reader-fg);
 }
 
 .reader-system-speaker {
-  font-size: 0.8rem;
+  font-size: 0.8em;
   text-transform: uppercase;
   letter-spacing: 0.08em;
   font-weight: 600;
-  color: hsl(var(--color-muted-foreground));
+  color: color-mix(in srgb, var(--reader-fg) 62%, transparent);
   margin-bottom: 0.5rem;
 }
 
@@ -583,10 +576,10 @@ body {
   width: 1.75rem;
   height: 1.75rem;
   border-radius: 9999px;
-  border: 1px solid hsl(var(--color-border));
-  background: hsl(var(--color-card) / 0.92);
-  color: hsl(var(--color-muted-foreground));
-  box-shadow: 0 6px 18px hsl(var(--color-border) / 0.28);
+  border: 1px solid color-mix(in srgb, var(--reader-fg) 22%, transparent);
+  background: color-mix(in srgb, var(--reader-fg) 6%, var(--reader-bg));
+  color: color-mix(in srgb, var(--reader-fg) 62%, transparent);
+  box-shadow: 0 6px 18px color-mix(in srgb, var(--reader-fg) 10%, transparent);
   opacity: 0.35;
   transition: opacity 0.2s ease, transform 0.2s ease, background-color 0.2s ease, color 0.2s ease;
 }
@@ -602,26 +595,32 @@ body {
 }
 
 .reader-highlight-toggle.is-active {
-  background: hsl(var(--color-primary) / 0.18);
-  color: hsl(var(--color-primary));
-  border-color: hsl(var(--color-primary) / 0.45);
-  box-shadow: 0 6px 20px hsl(var(--color-primary) / 0.25);
+  background: color-mix(in srgb, var(--reader-accent) 18%, var(--reader-bg));
+  color: var(--reader-accent);
+  border-color: color-mix(in srgb, var(--reader-accent) 45%, transparent);
+  box-shadow: 0 6px 20px color-mix(in srgb, var(--reader-accent) 25%, transparent);
 }
 
+/* 高亮层一律基于阅读主题变量，而不是全局主题 token——否则「深色 App +
+   白纸主题」这类组合会把浅色底的正文盖上深色高亮，反之亦然。 */
 .reader-highlighted {
-  background: linear-gradient(135deg, hsl(var(--color-accent) / 0.55), hsl(var(--color-card) / 0.95));
-  box-shadow: 0 12px 30px hsl(var(--color-accent) / 0.3);
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--reader-accent) 20%, var(--reader-bg)),
+    color-mix(in srgb, var(--reader-fg) 5%, var(--reader-bg))
+  );
+  box-shadow: 0 12px 30px color-mix(in srgb, var(--reader-fg) 12%, transparent);
   border-radius: 0.9rem;
 }
 
 .reader-search-highlight {
   position: relative;
-  /* Double-ring emphasis — primary color glow with a soft fill so the hit
+  /* Double-ring emphasis — accent color glow with a soft fill so the hit
    * reads instantly even on dense pages. */
-  background: hsl(var(--color-primary) / 0.1);
+  background: color-mix(in srgb, var(--reader-accent) 12%, transparent);
   box-shadow:
-    0 0 0 2px hsl(var(--color-primary) / 0.55),
-    0 0 0 6px hsl(var(--color-primary) / 0.18);
+    0 0 0 2px color-mix(in srgb, var(--reader-accent) 55%, transparent),
+    0 0 0 6px color-mix(in srgb, var(--reader-accent) 18%, transparent);
   border-radius: 0.5rem;
   transition: background 0.4s ease, box-shadow 0.4s ease;
 }
@@ -636,10 +635,22 @@ body {
 }
 
 @keyframes reader-search-pulse {
-  0%   { box-shadow: 0 0 0 0 hsl(var(--color-primary) / 0.0),   0 0 0 0 hsl(var(--color-primary) / 0.0); }
-  20%  { box-shadow: 0 0 0 3px hsl(var(--color-primary) / 0.75), 0 0 0 10px hsl(var(--color-primary) / 0.25); }
-  60%  { box-shadow: 0 0 0 3px hsl(var(--color-primary) / 0.55), 0 0 0 14px hsl(var(--color-primary) / 0.0); }
-  100% { box-shadow: 0 0 0 2px hsl(var(--color-primary) / 0.55), 0 0 0 6px  hsl(var(--color-primary) / 0.18); }
+  0%   { box-shadow: 0 0 0 0 transparent, 0 0 0 0 transparent; }
+  20%  {
+    box-shadow:
+      0 0 0 3px color-mix(in srgb, var(--reader-accent) 75%, transparent),
+      0 0 0 10px color-mix(in srgb, var(--reader-accent) 25%, transparent);
+  }
+  60%  {
+    box-shadow:
+      0 0 0 3px color-mix(in srgb, var(--reader-accent) 55%, transparent),
+      0 0 0 14px transparent;
+  }
+  100% {
+    box-shadow:
+      0 0 0 2px color-mix(in srgb, var(--reader-accent) 55%, transparent),
+      0 0 0 6px color-mix(in srgb, var(--reader-accent) 18%, transparent);
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -656,15 +667,18 @@ body {
 }
 
 .reader-character-highlight {
-  border-left: 4px solid hsl(var(--color-primary));
-  background: linear-gradient(135deg, hsl(var(--color-primary) / 0.18), transparent 65%);
+  border-left: 4px solid var(--reader-accent);
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--reader-accent) 18%, transparent),
+    transparent 65%
+  );
 }
 
 .reader-subtitle {
   margin-bottom: 1.5rem;
-  color: hsl(var(--color-foreground) / 0.9);
+  color: var(--reader-fg);
   text-align: center;
-  letter-spacing: 0.12em;
   font-weight: 500;
 }
 
@@ -680,21 +694,20 @@ body {
   margin-bottom: 1.5rem;
   padding: 0.75rem 1rem;
   border-radius: 0.5rem;
-  background: hsl(var(--color-accent) / 0.15);
-  color: hsl(var(--color-foreground) / 0.95);
+  background: color-mix(in srgb, var(--reader-accent) 12%, var(--reader-bg));
+  color: var(--reader-fg);
   white-space: pre-line;
   font-family: "JetBrains Mono", "Sarasa Mono SC", ui-monospace, monospace;
-  letter-spacing: 0.04em;
-  border: 1px solid hsl(var(--color-primary) / 0.18);
+  border: 1px solid color-mix(in srgb, var(--reader-accent) 22%, transparent);
 }
 
 .reader-header {
   margin-bottom: 1.5rem;
-  font-size: 1.35rem;
+  font-size: 1.35em;
   font-weight: 700;
   letter-spacing: 0.04em;
   text-align: center;
-  color: hsl(var(--color-primary));
+  color: var(--reader-accent);
   display: grid;
   grid-template-columns: 1fr auto 1fr;
   align-items: center;
@@ -844,9 +857,9 @@ input[type="range"]::-moz-range-thumb {
   border: none;
 }
 
-/* 触摸优化 */
+/* 触摸优化：保留纵向滚动与左缘返回手势的同时允许双指缩放正文。 */
 .touch-action-pan-y {
-  touch-action: pan-y;
+  touch-action: pan-y pinch-zoom;
 }
 
 .dark .scroll-area__track {
@@ -890,11 +903,15 @@ input[type="range"]::-moz-range-thumb {
 .reader-search-highlight.reader-highlighted {
   /* When the user also has this segment highlighted, trust the outer ring
      — suppress the highlight background fill to avoid double-layering. */
-  background: hsl(var(--color-primary) / 0.08);
+  background: color-mix(in srgb, var(--reader-accent) 8%, transparent);
 }
 .reader-character-highlight.reader-highlighted:not(.reader-search-highlight) {
   /* 角色高亮优先于划线收藏背景 */
-  background: linear-gradient(135deg, hsl(var(--color-primary) / 0.18), transparent 65%);
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--reader-accent) 18%, transparent),
+    transparent 65%
+  );
 }
 
 /* ===== 尊重 prefers-reduced-motion ===== */

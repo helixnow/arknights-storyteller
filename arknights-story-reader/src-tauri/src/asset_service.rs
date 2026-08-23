@@ -69,6 +69,8 @@ fn resolve_char_id(token: &str) -> Option<String> {
 fn avatar_candidates(token: &str) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(cid) = resolve_char_id(token) {
+        // 打包进 public/bundled/avatar/ 的内置头像，零网络开销，优先命中。
+        out.push(format!("/bundled/avatar/{}.png", cid));
         // yuanyan3060 的 avatar 是 char_xxx.png
         out.push(format!("{}/avatar/{}.png", YUANYAN, cid));
         // fexli 也有 charpor（半身），同路径也可用作备胎
@@ -82,7 +84,10 @@ fn avatar_candidates(token: &str) -> Vec<String> {
 fn portrait_candidates(token: &str) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(cid) = resolve_char_id(token) {
-        // yuanyan3060 portrait 命名为 char_xxx_1.png（默认 e0 立绘）
+        // 精二立绘（`_2`）优先，缺素材时才回落到精一（`_1`）。
+        out.push(format!("{}/portrait/{}_2.png", YUANYAN, cid));
+        out.push(format!("{}/charpack/{}_2.png", FEXLI, cid));
+        out.push(format!("{}/characters/{}_2.png", PUPPIIZ, cid));
         out.push(format!("{}/portrait/{}_1.png", YUANYAN, cid));
         out.push(format!("{}/portrait/{}_1b.png", YUANYAN, cid));
         out.push(format!("{}/charpack/{}_1.png", FEXLI, cid));
@@ -111,9 +116,9 @@ fn background_candidates(token: &str) -> Vec<String> {
     ]
 }
 
-fn activity_kv_candidates(token: &str) -> Vec<String> {
-    // 活动 id 形如 `act17side`、`act20side`，相关 KV 命名多种；
-    // 剥掉 `act` 前缀后大多数情况下对应 fexli/kvimg 的 token。
+/// 从活动 id 里猜 KV 素材名的核心部分：`act17side` → `side` 之类。
+/// 猜错（削成空串）时返回 None，调用方只用原始 token。
+fn strip_act_prefix(token: &str) -> Option<String> {
     let core = token
         .strip_prefix("act_")
         .or_else(|| token.strip_prefix("act"))
@@ -121,33 +126,65 @@ fn activity_kv_candidates(token: &str) -> Vec<String> {
     let core = core.trim_start_matches(|c: char| c.is_ascii_digit());
     let core = core.trim_end_matches("side");
     let core = core.trim_end_matches("mini");
-    vec![
-        format!("{}/kvimg/default_kv_{}.png", FEXLI, core),
-        format!("{}/kvimg/kv_{}1.png", FEXLI, core),
-        format!("{}/kvimg/kv_{}.png", FEXLI, core),
-    ]
+    if core.is_empty() || core == token {
+        None
+    } else {
+        Some(core.to_string())
+    }
+}
+
+fn activity_kv_candidates(token: &str) -> Vec<String> {
+    // token 可能已经是 story_review_table 给的图片名（`storyPic` /
+    // `storyEntryPicId`，形如 `act17side_entrypic`），这种情况下再去剥
+    // `act` 前缀只会把它削坏，所以原始 token 永远排在候选表最前面。
+    let base = token.trim_end_matches(".png").trim_end_matches(".jpg");
+    let mut out = vec![
+        format!("{}/kvimg/{}.png", FEXLI, base),
+        format!("{}/kvimg/default_kv_{}.png", FEXLI, base),
+        format!("{}/kvimg/kv_{}.png", FEXLI, base),
+    ];
+    // 旧的启发式猜测保留作兜底。
+    if let Some(core) = strip_act_prefix(base) {
+        out.push(format!("{}/kvimg/default_kv_{}.png", FEXLI, core));
+        out.push(format!("{}/kvimg/kv_{}1.png", FEXLI, core));
+        out.push(format!("{}/kvimg/kv_{}.png", FEXLI, core));
+    }
+    dedup(out)
 }
 
 fn activity_logo_candidates(token: &str) -> Vec<String> {
-    let core = token
-        .strip_prefix("act_")
-        .or_else(|| token.strip_prefix("act"))
-        .unwrap_or(token);
-    let core = core.trim_start_matches(|c: char| c.is_ascii_digit());
-    let core = core.trim_end_matches("side");
-    let core = core.trim_end_matches("mini");
-    vec![
-        format!("{}/kvimg/brand_{}.png", FEXLI, core),
-        format!("{}/camplogo/logo_{}.png", FEXLI, core),
-    ]
+    let base = token.trim_end_matches(".png").trim_end_matches(".jpg");
+    let mut out = vec![
+        format!("{}/kvimg/brand_{}.png", FEXLI, base),
+        format!("{}/camplogo/logo_{}.png", FEXLI, base),
+    ];
+    if let Some(core) = strip_act_prefix(base) {
+        out.push(format!("{}/kvimg/brand_{}.png", FEXLI, core));
+        out.push(format!("{}/camplogo/logo_{}.png", FEXLI, core));
+    }
+    dedup(out)
 }
 
 fn chapter_cover_candidates(token: &str) -> Vec<String> {
-    // 主线章节 token 多为 `main_08`，对应背景 `bg_main_08` 或剧情插画 `avg_8_xx`
-    let t = token.trim_start_matches("main_");
-    vec![
-        format!("{}/avgs/bg_main_{}.png", FEXLI, t),
-        format!("{}/avgs/{}_i01.png", FEXLI, t),
-        format!("{}/avgs/{}_I01.png", FEXLI, t),
-    ]
+    // 主线章节 token 多为 `main_8`，对应封面 `main_08-01`、背景 `bg_main_8`
+    // 或剧情插画 `8_i01`。
+    let raw = token.trim_start_matches("main_").trim();
+    let padded = if raw.chars().all(|c| c.is_ascii_digit()) && !raw.is_empty() {
+        format!("{:0>2}", raw)
+    } else {
+        raw.to_string()
+    };
+    dedup(vec![
+        // 打包进 public/bundled/mapreview/ 的内置章节封面。
+        format!("/bundled/mapreview/main_{}-01.png", padded),
+        format!("{}/mapreview/main_{}-01.png", FEXLI, padded),
+        format!("{}/avgs/bg_main_{}.png", FEXLI, raw),
+        format!("{}/avgs/{}_i01.png", FEXLI, raw),
+        format!("{}/avgs/{}_I01.png", FEXLI, raw),
+    ])
+}
+
+fn dedup(urls: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    urls.into_iter().filter(|u| seen.insert(u.clone())).collect()
 }

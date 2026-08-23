@@ -8,6 +8,8 @@ export interface StoryEntry {
   avgTag?: string; // 行动前/行动后
   storyTxt: string; // 剧情文本文件路径
   storyInfo?: string; // 剧情简介文件路径
+  /** 封面图 token；条目自身缺失时后端会用所在活动/章节组的 storyPic 回填。 */
+  storyPic?: string | null;
   storyReviewType: string;
   unLockType: string;
   // 元数据（存在则返回）

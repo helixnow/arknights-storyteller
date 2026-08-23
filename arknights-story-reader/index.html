@@ -1,13 +1,30 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/icon-rounded.svg" />
     <meta
       name="viewport"
-      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover"
     />
-    <title>Story Teller</title>
+    <title>明日方舟剧情阅读器</title>
+    <script>
+      (function () {
+        try {
+          var key = "story-teller-theme";
+          var theme = localStorage.getItem(key) || "system";
+          var color = localStorage.getItem(key + "-color") || "default";
+          var resolved = theme;
+          if (theme === "system") {
+            resolved = window.matchMedia("(prefers-color-scheme: dark)").matches
+              ? "dark"
+              : "light";
+          }
+          document.documentElement.classList.add(resolved);
+          document.documentElement.dataset.themeColor = color;
+        } catch (e) {}
+      })();
+    </script>
   </head>
 
   <body>

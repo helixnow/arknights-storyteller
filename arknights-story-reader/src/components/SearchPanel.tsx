@@ -139,6 +139,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     used: false,
   });
   const [version, setVersion] = useState<string>("");
+  const [lastQuery, setLastQuery] = useState("");
   const [moreOpen, setMoreOpen] = useState(false);
   const moreMenuRef = useRef<HTMLDivElement | null>(null);
   const toast = useToast();
@@ -149,6 +150,19 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
       .getCurrentVersion()
       .then((v) => setVersion(v))
       .catch(() => setVersion(""));
+  }, []);
+
+  useEffect(() => {
+    const onUpdated = () => {
+      setCache({});
+      setSegmentCache({});
+      void api
+        .getCurrentVersion()
+        .then((v) => setVersion(v))
+        .catch(() => undefined);
+    };
+    window.addEventListener("app:data-updated", onUpdated);
+    return () => window.removeEventListener("app:data-updated", onUpdated);
   }, []);
 
   const saveHistory = useCallback((q: string) => {
@@ -165,9 +179,14 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     localStorage.setItem(HISTORY_KEY, JSON.stringify(next));
   }, [history]);
 
-  const handleSearch = async (opts?: { forceRefresh?: boolean; queryOverride?: string }) => {
+  const handleSearch = async (opts?: {
+    forceRefresh?: boolean;
+    queryOverride?: string;
+    modeOverride?: SearchMode;
+  }) => {
     const raw = (opts?.queryOverride ?? query).trim();
     if (!raw) return;
+    const activeMode = opts?.modeOverride ?? mode;
 
     try {
       setSearching(true);
@@ -179,7 +198,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
         };
       }
 
-      if (mode === "segment") {
+      if (activeMode === "segment") {
         if (!opts?.forceRefresh) {
           const cached = segmentCache[raw];
           if (cached && cached.version === version) {
@@ -206,10 +225,17 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
         }
         setFromCache({ used: false });
         setSearched(true);
+        setLastQuery(raw);
         saveHistory(raw);
         if (data.hits.length === 0 && indexStatus?.ready) {
-          toast.warn("段级索引暂无命中，已自动落回整篇搜索", 2500);
+          toast.warn("段级索引暂无命中，已自动改搜整篇", 2500);
           setMode("story");
+          await handleSearch({
+            queryOverride: raw,
+            forceRefresh: true,
+            modeOverride: "story",
+          });
+          return;
         }
         return;
       }
@@ -256,6 +282,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
         setFromCache({ used: false });
       }
       setSearched(true);
+      setLastQuery(raw);
       saveHistory(raw);
     } catch (err) {
       console.error("Search failed:", err);
@@ -270,7 +297,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     try {
       setOpeningStoryId(result.storyId);
       const story = await api.getStoryEntry(result.storyId);
-      onSelectResult(story, { query, snippet: result.matchedText });
+      onSelectResult(story, { query: lastQuery || query, snippet: result.matchedText });
     } catch (err) {
       console.error("Open story failed:", err);
       toast.error("打开剧情失败");
@@ -296,7 +323,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
         onSelectSegment(story, {
           segmentIndex: hit.segmentIndex,
           preview: hit.matchedText,
-          query,
+          query: lastQuery || query,
         });
       }
     } catch (err) {
@@ -307,9 +334,10 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     }
   };
 
-  const handleKeyPress = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter") {
-      handleSearch();
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "Enter" && !e.nativeEvent.isComposing) {
+      e.preventDefault();
+      void handleSearch();
     }
   };
 
@@ -512,16 +540,16 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
               <Input
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                onKeyPress={handleKeyPress}
+                onKeyDown={handleKeyDown}
                 placeholder="搜索剧情名称或内容..."
-                className="pr-8"
+                className="pr-10 min-h-[44px]"
                 aria-label="搜索剧情"
               />
               {query && (
                 <button
                   onClick={clearSearch}
                   aria-label="清空搜索"
-                  className="absolute right-2 top-1/2 -translate-y-1/2 text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-foreground))]"
+                  className="absolute right-1 top-1/2 -translate-y-1/2 h-11 w-11 inline-flex items-center justify-center text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-foreground))]"
                 >
                   <X className="h-4 w-4" />
                 </button>
@@ -593,7 +621,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
               aria-pressed={mode === "story"}
               onClick={() => setMode("story")}
               className={cn(
-                "flex items-center gap-1 rounded-full px-3 py-1 text-xs transition-colors",
+                "flex min-h-[44px] items-center gap-1 rounded-full px-4 text-xs transition-colors",
                 mode === "story"
                   ? "bg-[hsl(var(--color-primary))] text-[hsl(var(--color-primary-foreground))]"
                   : "text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-foreground))]"
@@ -607,7 +635,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
               aria-pressed={mode === "segment"}
               onClick={() => setMode("segment")}
               className={cn(
-                "flex items-center gap-1 rounded-full px-3 py-1 text-xs transition-colors",
+                "flex min-h-[44px] items-center gap-1 rounded-full px-4 text-xs transition-colors",
                 mode === "segment"
                   ? "bg-[hsl(var(--color-primary))] text-[hsl(var(--color-primary-foreground))]"
                   : "text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-foreground))]"
@@ -618,17 +646,17 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
             </button>
           </div>
 
-          {history.length > 0 && !searched && (
+          {history.length > 0 && (
             <div className="mt-3 space-y-2">
               <div className="text-xs text-[hsl(var(--color-muted-foreground))]">历史搜索</div>
               <div className="flex flex-wrap items-center gap-2">
                 {history.slice(0, 10).map((h) => (
                   <div
                     key={h}
-                    className="flex items-center gap-1 border rounded-full pl-3 pr-1 py-0.5"
+                    className="flex items-center border rounded-full pl-3 pr-0.5"
                   >
                     <button
-                      className="text-xs text-[hsl(var(--color-foreground))]"
+                      className="min-h-[44px] text-xs text-[hsl(var(--color-foreground))]"
                       onClick={() => {
                         setQuery(h);
                         setTimeout(() => handleSearch({ queryOverride: h }), 0);
@@ -636,8 +664,9 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
                     >
                       {h}
                     </button>
+                    {/* 删除的命中区撑到 44×44，图标仍是 12px 的小 ×。 */}
                     <button
-                      className="inline-flex h-5 w-5 items-center justify-center rounded-full text-[hsl(var(--color-muted-foreground))] hover:bg-[hsl(var(--color-accent))]"
+                      className="inline-flex h-11 w-11 items-center justify-center rounded-full text-[hsl(var(--color-muted-foreground))] hover:bg-[hsl(var(--color-accent))]"
                       onClick={() => removeHistory(h)}
                       aria-label={`删除历史记录：${h}`}
                     >
@@ -832,6 +861,18 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
 
             {!searching && mode === "story" && page && page.results.length > 0 && (
               <div className="space-y-3">
+                {page.facets && Object.keys(page.facets).length > 0 && (
+                  <div className="flex flex-wrap gap-2">
+                    {Object.entries(page.facets).map(([name, count]) => (
+                      <span
+                        key={name}
+                        className="inline-flex min-h-8 items-center rounded-full border border-[hsl(var(--color-border))] px-2.5 text-xs text-[hsl(var(--color-muted-foreground))]"
+                      >
+                        {name} {count}
+                      </span>
+                    ))}
+                  </div>
+                )}
                 <div className="flex items-center justify-between text-sm text-[hsl(var(--color-muted-foreground))]">
                   <span>共 {page.totalMatched} 条匹配</span>
                   {page.truncated && (
@@ -893,7 +934,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
                     </div>
                     <div>
                       <span className="font-mono text-[hsl(var(--color-foreground))]">"短语"</span>
-                      <span className="ml-2">用英文引号匹配精确短语</span>
+                      <span className="ml-2">用英文引号匹配精确短语。中文默认按单字 AND，搜「凯尔希」请写成 <code>"凯尔希"</code></span>
                     </div>
                   </div>
                 </details>

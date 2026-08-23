@@ -15,12 +15,26 @@ lazy_static! {
         Regex::new(r"(?i)<p[^>]*>").expect("invalid paragraph tag regex");
 }
 
-/// Normalize a `char_XXX_name#N` token to `char_XXX_name`. Strips `#` skin
-/// variant suffixes so the frontend can directly map to the avatar repo.
+/// Normalize a `char_XXX_name#N` / `char_XXX_name_1` token to `char_XXX_name`.
+/// Strips `#` expression suffixes and trailing `_1` / `_2` / `_ex` art
+/// variants so the frontend can map to the avatar repo (`char_345_folnic.png`).
 fn normalize_char_id(raw: &str) -> String {
     let trimmed = raw.trim().trim_matches('"').trim_start_matches('$');
-    let without_skin = trimmed.split('#').next().unwrap_or(trimmed);
-    without_skin.to_string()
+    let without_hash = trimmed.split('#').next().unwrap_or(trimmed);
+    let mut parts: Vec<&str> = without_hash.split('_').filter(|p| !p.is_empty()).collect();
+    if parts.len() >= 3 && parts[0] == "char" {
+        if let Some(last) = parts.last() {
+            let is_art_suffix = *last == "ex"
+                || last
+                    .chars()
+                    .all(|c| c.is_ascii_digit());
+            if is_art_suffix {
+                parts.pop();
+            }
+        }
+        return parts.join("_");
+    }
+    without_hash.to_string()
 }
 
 pub fn parse_story_text(content: &str) -> ParsedStoryContent {
@@ -41,12 +55,16 @@ pub fn parse_story_text(content: &str) -> ParsedStoryContent {
                 let inside = &line[1..cmd_end];
                 let (cmd, _) = split_command_and_attrs(inside);
                 let cmd_lower = cmd.to_ascii_lowercase();
-                if cmd_lower == "character" {
+                if cmd_lower == "character" || cmd_lower == "charslot" {
                     // Update the current speaker's charId without emitting a
-                    // segment. Empty or missing `name` clears the state.
+                    // segment. Newer scripts use `[charslot(name="char_xxx")]`
+                    // instead of `[Character]`. Empty or missing `name` clears
+                    // the state.
                     let attrs = parse_attributes(inside);
                     current_char_id = attrs
                         .get("name")
+                        .or_else(|| attrs.get("a"))
+                        .or_else(|| attrs.get("b"))
                         .map(|s| normalize_char_id(s))
                         .filter(|s| s.starts_with("char_"));
                     continue;
@@ -179,8 +197,8 @@ fn parse_command_line(line: &str, current_char_id: Option<&str>) -> Option<Story
         // 非文本指令一律忽略（但 Image/PlayMusic 已在上方单独处理）。
         // Background 被有意忽略：它是 AVG 的场景切换信号，一章会出现几十条，
         // 当成 16:9 大图渲染会把正文切得稀碎；真正值得渲染的是 `[Image]`。
-        "background" | "imagetween" | "character" | "stopmusic" | "playsound" | "delay"
-        | "camerashake" | "blocker" => None,
+        "background" | "imagetween" | "character" | "charslot" | "stopmusic" | "playsound"
+        | "delay" | "camerashake" | "blocker" => None,
         "image" => {
             // 原始形如：[Image(image="avg_8_34",screenadapt="coverall",fadetime=2)]
             let token = attrs
@@ -689,6 +707,33 @@ mod tests {
                 assert_eq!(text, "这一段是旁白。");
             }
             _ => panic!("Expected narration segment"),
+        }
+    }
+
+    #[test]
+    fn test_normalize_char_id_strips_art_suffixes() {
+        assert_eq!(normalize_char_id("char_345_folnic_1"), "char_345_folnic");
+        assert_eq!(normalize_char_id("char_002_amiya_1#5"), "char_002_amiya");
+        assert_eq!(normalize_char_id("char_130_doberm_ex"), "char_130_doberm");
+        assert_eq!(normalize_char_id("char_003_kalts"), "char_003_kalts");
+    }
+
+    #[test]
+    fn test_charslot_updates_current_speaker() {
+        let content = r#"[charslot(slot="m",name="char_003_kalts_1")]
+[Dialog] 我是凯尔希。"#;
+        let result = parse_story_text(content);
+        assert_eq!(result.segments.len(), 1);
+        match &result.segments[0] {
+            StorySegment::Dialogue {
+                character_id,
+                text,
+                ..
+            } => {
+                assert_eq!(character_id.as_deref(), Some("char_003_kalts"));
+                assert!(text.contains("凯尔希"));
+            }
+            _ => panic!("Expected dialogue segment from charslot + Dialog"),
         }
     }
 }

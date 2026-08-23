@@ -11,7 +11,12 @@ export function KeepAlive({ active, children, className }: KeepAliveProps) {
   return (
     <div
       className={cn("h-full w-full overflow-hidden", className)}
-      style={{ display: active ? undefined : "none" }}
+      style={{
+        visibility: active ? "visible" : "hidden",
+        pointerEvents: active ? "auto" : "none",
+        zIndex: active ? 1 : 0,
+      }}
+      aria-hidden={!active}
     >
       {children}
     </div>

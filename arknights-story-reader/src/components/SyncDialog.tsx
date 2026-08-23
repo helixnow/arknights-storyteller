@@ -3,6 +3,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { AlertCircle, CheckCircle, Download, Loader2, Upload } from "lucide-react";
 import { useDataSyncManager } from "@/hooks/useDataSyncManager";
+import { safeConfirm } from "@/hooks/useAppUpdater";
 
 interface SyncDialogProps {
   open: boolean;
@@ -141,14 +142,27 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
             >
               关闭
             </Button>
-            <Button onClick={() => void handleSync()} disabled={syncing || importing} className="flex-1">
+            <Button
+              onClick={async () => {
+                if (status === "up-to-date") {
+                  const ok = await safeConfirm(
+                    "当前已是最新。再次同步会重新下载并覆盖本机数据，确定继续？",
+                    { title: "重新同步", kind: "warning" }
+                  );
+                  if (!ok) return;
+                }
+                void handleSync();
+              }}
+              disabled={syncing || importing}
+              className="flex-1 min-h-[44px]"
+            >
               {syncing ? (
                 <span className="inline-flex items-center gap-2">
                   <Loader2 className="h-4 w-4 animate-spin" />
                   同步中...
                 </span>
               ) : status === "up-to-date" ? (
-                "已是最新"
+                "重新同步"
               ) : (
                 "开始同步"
               )}

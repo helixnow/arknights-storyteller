@@ -7,6 +7,7 @@ import {
   SheetSectionLabel,
 } from "@/components/ui/sheet-shell";
 import { useSidePanel } from "@/hooks/useSidePanel";
+import { safeConfirm } from "@/hooks/useAppUpdater";
 import { cn } from "@/lib/utils";
 import { Trash2, X } from "lucide-react";
 
@@ -64,6 +65,7 @@ export function StoryInsightsPanel({
           <Button
             variant="ghost"
             size="icon-pill"
+            className="h-11 w-11"
             onClick={onClose}
             aria-label="关闭"
             title="关闭"
@@ -109,14 +111,22 @@ export function StoryInsightsPanel({
                   <span className="font-normal opacity-70">
                     {highlightEntries.length > 0
                       ? `${highlightEntries.length} 条划线`
-                      : "在阅读模式下点击书签可收藏段落"}
+                      : "点击段落右上角书签即可收藏"}
                   </span>
                 </span>
                 {highlightEntries.length > 0 && (
                   <button
                     type="button"
-                    className="text-[11px] font-medium text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-destructive))] transition-colors"
-                    onClick={onClearHighlights}
+                    className="-my-2 inline-flex min-h-[44px] items-center px-2 text-[11px] font-medium text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-destructive))] transition-colors"
+                    onClick={() => {
+                      void (async () => {
+                        const ok = await safeConfirm(
+                          `确定要清空这篇剧情的 ${highlightEntries.length} 条划线吗？此操作无法撤销。`,
+                          { title: "清空划线", kind: "warning" }
+                        );
+                        if (ok) onClearHighlights();
+                      })();
+                    }}
                   >
                     清空
                   </button>
@@ -126,8 +136,8 @@ export function StoryInsightsPanel({
 
             {highlightEntries.length === 0 ? (
               <SheetGroup padded>
-                <p className="text-sm text-[hsl(var(--color-muted-foreground))]">
-                  暂无划线内容
+                <p className="text-sm leading-relaxed text-[hsl(var(--color-muted-foreground))]">
+                  还没有划线。阅读时点一下段落右上角的书签，就能把这一句收进这里。
                 </p>
               </SheetGroup>
             ) : (
@@ -137,7 +147,7 @@ export function StoryInsightsPanel({
                     <div key={entry.index} className="flex items-start gap-1 px-3 py-2.5">
                       <button
                         type="button"
-                        className="flex-1 min-w-0 text-left text-sm leading-relaxed px-2 py-1 rounded-md transition-colors hover:text-[hsl(var(--color-primary))] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--color-ring))]"
+                        className="flex-1 min-w-0 min-h-[44px] text-left text-sm leading-relaxed px-2 py-2 rounded-md transition-colors hover:text-[hsl(var(--color-primary))] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--color-ring))]"
                         onClick={() => onJumpToSegment(entry.index)}
                       >
                         {entry.label}
@@ -145,7 +155,7 @@ export function StoryInsightsPanel({
                       <Button
                         variant="ghost"
                         size="icon-pill"
-                        className="h-8 w-8 flex-shrink-0 text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-destructive))]"
+                        className="h-11 w-11 flex-shrink-0 text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-destructive))]"
                         onClick={(event) => {
                           event.preventDefault();
                           event.stopPropagation();
@@ -177,7 +187,7 @@ export function StoryInsightsPanel({
                 {activeCharacter && (
                   <button
                     type="button"
-                    className="text-[11px] font-medium text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-destructive))] transition-colors"
+                    className="-my-2 inline-flex min-h-[44px] items-center px-2 text-[11px] font-medium text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-destructive))] transition-colors"
                     onClick={onClearCharacter}
                   >
                     清除高亮
@@ -251,7 +261,7 @@ export function StoryInsightsPanel({
                       <Button
                         variant="glass"
                         size="sm"
-                        className="h-7 px-3 rounded-full text-xs"
+                        className="h-9 px-4 rounded-full text-xs"
                         onClick={() => onJumpToSegment(decision.index)}
                       >
                         前往

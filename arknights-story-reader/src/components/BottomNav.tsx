@@ -16,6 +16,16 @@ const NAV_ITEMS: Array<{ id: Tab; label: string; Icon: typeof Book }> = [
   { id: "settings", label: "设置", Icon: Settings },
 ];
 
+/** 各 tab 面板通过 `aria-labelledby` 指回来的按钮 id。 */
+export function tabButtonId(tab: Tab) {
+  return `tab-button-${tab}`;
+}
+
+/** tab 按钮通过 `aria-controls` 指向的面板 id。 */
+export function tabPanelId(tab: Tab) {
+  return `tab-panel-${tab}`;
+}
+
 export function BottomNav({ activeTab, onTabChange }: BottomNavProps) {
   return (
     <nav
@@ -33,20 +43,30 @@ export function BottomNav({ activeTab, onTabChange }: BottomNavProps) {
           return (
             <button
               key={id}
+              id={tabButtonId(id)}
               type="button"
               role="tab"
               aria-selected={active}
-              aria-controls={`tab-panel-${id}`}
+              aria-controls={tabPanelId(id)}
               onClick={() => onTabChange(id)}
               className={cn(
-                "bottom-nav-pill flex flex-col items-center justify-center gap-0.5 flex-1 min-h-[52px] rounded-3xl px-2 py-1.5 select-none",
+                "bottom-nav-pill relative flex flex-col items-center justify-center gap-0.5 flex-1 min-h-[52px] rounded-3xl px-2 pt-1.5 pb-2.5 select-none",
                 active
-                  ? "text-[hsl(var(--color-primary))]"
+                  ? "font-semibold text-[hsl(var(--color-primary))]"
                   : "text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-foreground))]"
               )}
             >
               <Icon className="h-5 w-5" strokeWidth={active ? 2.4 : 2} />
               <span className="text-[11px] leading-tight">{label}</span>
+              <span
+                aria-hidden="true"
+                className={cn(
+                  "absolute bottom-1 h-0.5 w-5 rounded-full transition-opacity duration-200",
+                  active
+                    ? "bg-[hsl(var(--color-primary))] opacity-100"
+                    : "opacity-0"
+                )}
+              />
             </button>
           );
         })}

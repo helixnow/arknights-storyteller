@@ -86,6 +86,10 @@ export function SheetShell({
  * Header for a `SheetShell`. Transparent background so the glass material
  * of the shell shows through; hairline divider at the bottom hints at the
  * scroll region below without drawing a full border.
+ *
+ * The sheet is `fixed inset-0`, so on notched phones its header would slide
+ * under the status bar / dynamic island. Pick up the top safe-area inset
+ * here, mirroring what `SheetFooter` does for the home indicator.
  */
 export function SheetHeader({
   title,
@@ -100,9 +104,10 @@ export function SheetHeader({
     <header
       className={cn(
         "flex-shrink-0 flex items-center justify-between gap-3",
-        "px-5 pt-4 pb-3",
+        "px-5 pb-3",
         "border-b border-[hsl(var(--color-foreground)/0.06)]"
       )}
+      style={{ paddingTop: "calc(env(safe-area-inset-top, 0px) + 1rem)" }}
     >
       <div className="min-w-0">
         <h2 className="text-[17px] font-semibold tracking-tight truncate">

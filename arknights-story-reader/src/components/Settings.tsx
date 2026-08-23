@@ -16,9 +16,11 @@ import {
   checkAndroidUpdate,
   installAndroidUpdate,
   openAndroidInstallPermissionSettings,
+  safeConfirm,
   type UpdateAvailability,
 } from "@/hooks/useAppUpdater";
 import { useToast } from "@/components/ui/toast";
+import { api } from "@/services/api";
 
 const THEME_COLOR_OPTIONS = [
   {
@@ -50,6 +52,12 @@ const THEME_COLOR_OPTIONS = [
     darkSwatch: "#ada3ff",
   },
 ];
+
+// 插件未编译（Android）或未在 capability 中授权时，Tauri 会抛出 “not allowed” /
+// “plugin ... not found” 之类的错误，这类情况才需要回退到浏览器文件选择器。
+function isPluginUnavailableError(message: string): boolean {
+  return /not allowed|not found|unknown plugin|plugin/i.test(message);
+}
 
 export function Settings() {
   const { themeColor, setThemeColor } = useTheme();
@@ -87,7 +95,7 @@ export function Settings() {
   } = useDataSyncManager({
     active: true,
     onSuccess: () => {
-          setStatusMessage("数据版本信息已更新");
+      setStatusMessage("数据版本信息已更新");
     },
   });
 
@@ -98,18 +106,71 @@ export function Settings() {
     void loadVersionInfo();
   };
 
-  const handleSyncClick = () => {
+  const handleSyncClick = async () => {
     setStatusMessage(null);
     setError(null);
+    const confirmed = await safeConfirm(
+      status === "not-installed"
+        ? "将从 GitHub 下载完整剧情数据包并占用较多存储，确定开始？"
+        : "同步会覆盖本机已有的剧情数据并重建索引，确定继续？",
+      { title: "同步剧情数据", kind: "warning" }
+    );
+    if (!confirmed) return;
     void handleSync();
   };
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  const handleImportClick = () => {
+  const handleImportClick = async () => {
     setStatusMessage(null);
     setError(null);
-    fileInputRef.current?.click();
+    const confirmed = await safeConfirm(
+      "导入 ZIP 会覆盖本机已有的剧情数据。请确保压缩包来自 ArknightsGameData。",
+      { title: "导入 ZIP", kind: "warning" }
+    );
+    if (!confirmed) return;
+
+    // 只有在 dialog 插件确实不可用（移动端未注册 / 未授权）时才退回
+    // <input type="file">，其余错误都要如实反馈，避免又弹一个选择器。
+    let openDialog: typeof import("@tauri-apps/plugin-dialog").open;
+    try {
+      ({ open: openDialog } = await import("@tauri-apps/plugin-dialog"));
+    } catch (err) {
+      console.info("[Settings] 文件对话框插件不可用，回退到文件选择器", err);
+      fileInputRef.current?.click();
+      return;
+    }
+
+    let path: string | null;
+    try {
+      const selected = await openDialog({
+        multiple: false,
+        filters: [{ name: "ZIP", extensions: ["zip"] }],
+      });
+      path = (Array.isArray(selected) ? selected[0] : selected) ?? null;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (isPluginUnavailableError(message)) {
+        console.info("[Settings] 文件对话框不可用，回退到文件选择器", err);
+        fileInputRef.current?.click();
+      } else {
+        setError(`选择文件失败：${message}`);
+      }
+      return;
+    }
+
+    // 用户取消选择。
+    if (!path) return;
+
+    try {
+      await api.importFromZip(path);
+      window.dispatchEvent(new Event("app:data-updated"));
+      setStatusMessage("数据版本信息已更新");
+      await loadVersionInfo();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setError(`导入 ZIP 失败：${message}`);
+    }
   };
 
   const handleFileSelected = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -561,7 +622,7 @@ export function Settings() {
               </CardContent>
             </Card>
 
-          <Card className="motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-500" style={{ animationDelay: "70ms" }}>
+          <Card className="motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-500" style={{ animationDelay: "180ms" }}>
             <CardHeader>
               <CardTitle>素材与外观</CardTitle>
               <CardDescription>控制封面、头像、插画等装饰性素材</CardDescription>
@@ -617,7 +678,7 @@ export function Settings() {
             </CardContent>
           </Card>
 
-          <Card className="motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-500" style={{ animationDelay: "90ms" }}>
+          <Card className="motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-500" style={{ animationDelay: "240ms" }}>
             <CardHeader>
               <CardTitle>缓存与索引</CardTitle>
               <CardDescription>统一管理本地索引与人物统计</CardDescription>
@@ -645,7 +706,7 @@ export function Settings() {
             </CardContent>
           </Card>
 
-            <Card className="motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-500" style={{ animationDelay: "120ms" }}>
+            <Card className="motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-500" style={{ animationDelay: "300ms" }}>
               <CardHeader>
                 <CardTitle>关于</CardTitle>
                 <CardDescription>应用信息</CardDescription>
