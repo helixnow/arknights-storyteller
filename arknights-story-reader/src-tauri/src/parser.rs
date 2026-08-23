@@ -4,9 +4,10 @@ use regex::Regex;
 use std::collections::HashMap;
 
 lazy_static! {
-    /// `key="value"` 以及无引号的 `key=value`。脚本里数值型属性（`focus=2`、
-    /// `fadetime=0.7`）从来不加引号，只认带引号的写法等于看不见它们。
-    static ref ATTR_RE: Regex = Regex::new(r#"(?i)([a-z0-9_]+)\s*=\s*(?:"([^"]*)"|([^\s,()\[\]"]+))"#)
+    /// `key="value"`、`key='value'` 以及无引号的 `key=value`。数值型属性
+    /// （`focus=2`、`fadetime=0.7`）从来不加引号；act15mini 还有一批
+    /// `[name='麦哲伦']` 的单引号写法，不认单引号就会把引号一起当成名字。
+    static ref ATTR_RE: Regex = Regex::new(r#"(?i)([a-z0-9_]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s,()\[\]"]+))"#)
         .expect("invalid attribute regex");
     static ref DECISION_NUMBERED_RE: Regex =
         Regex::new(r#"(?i)option\d+="([^"]+)""#).expect("invalid decision regex");
@@ -76,8 +77,11 @@ pub fn parse_story_text(content: &str) -> ParsedStoryContent {
         // 循环而不是只看一次：`[Character(...)][name="A"]台词` 这种把状态指令
         // 和台词写在同一行的脚本并不少见，只吃掉前缀、剩下的照常解析，否则
         // 整句台词会跟着指令一起被丢掉。
+        let mut ate_state_prefix = false;
         while line.starts_with('[') {
-            let Some(cmd_end) = line.find(']') else { break };
+            let Some(cmd_end) = find_command_end(line) else {
+                break;
+            };
             let inside = &line[1..cmd_end];
             let (cmd, _) = split_command_and_attrs(inside);
             if !is_speaker_state_command(&cmd.to_ascii_lowercase()) {
@@ -85,6 +89,7 @@ pub fn parse_story_text(content: &str) -> ParsedStoryContent {
             }
             current_char_id = speaker_char_id(&parse_attributes(inside));
             line = line[cmd_end + 1..].trim();
+            ate_state_prefix = true;
         }
 
         if line.is_empty() {
@@ -101,6 +106,13 @@ pub fn parse_story_text(content: &str) -> ParsedStoryContent {
         }
 
         let text = clean_text(line);
+        // 状态指令后面偶尔粘着数据残次（`[character]]` 的多余 `]`、
+        // `[charslot(...)]4` 的手滑字符）。真实脚本里状态指令后从来没有
+        // 正经台词直接开口，这些渣走旁白就成了孤零零的 `]` 段；提高门槛，
+        // 但不动独立成行的正文（歌声淡出的 `...` 是有意写的）。
+        if ate_state_prefix && !has_meaningful_content(&text) {
+            continue;
+        }
         if !text.is_empty() {
             segments.push(StorySegment::Narration { text });
         }
@@ -110,7 +122,7 @@ pub fn parse_story_text(content: &str) -> ParsedStoryContent {
 }
 
 fn parse_command_line(line: &str, current_char_id: Option<&str>) -> Option<StorySegment> {
-    let end = line.find(']')?;
+    let end = find_command_end(line)?;
     let inside = &line[1..end];
     let remainder = line[end + 1..].trim();
 
@@ -456,6 +468,29 @@ fn is_stage_direction(command: &str) -> bool {
     )
 }
 
+/// 指令真正的闭合 `]`：引号里的 `]` 是属性值的一部分，不是指令结束。
+/// `[Sticker(text="…[DWDB-221E]建立…")]`（story_cetsyr_1_1）在引号中途截断
+/// 会让 `text` 属性解析不出来，整条贴纸文字消失。真实脚本里引号总是成对；
+/// 万一不成对，退回第一个 `]`，行为不比从前差。
+fn find_command_end(line: &str) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    for (idx, ch) in line.char_indices() {
+        match quote {
+            Some(q) => {
+                if ch == q {
+                    quote = None;
+                }
+            }
+            None => match ch {
+                '"' | '\'' => quote = Some(ch),
+                ']' => return Some(idx),
+                _ => {}
+            },
+        }
+    }
+    line.find(']')
+}
+
 fn split_command_and_attrs(inside: &str) -> (String, Option<&str>) {
     let inside = inside.trim();
     if inside.is_empty() {
@@ -484,8 +519,8 @@ fn parse_attributes(source: &str) -> HashMap<String, String> {
     let mut attrs = HashMap::new();
     for caps in ATTR_RE.captures_iter(source) {
         let Some(key) = caps.get(1) else { continue };
-        // 组 2 = 带引号（可能是空串），组 3 = 不带引号。
-        let Some(value) = caps.get(2).or_else(|| caps.get(3)) else {
+        // 组 2/3 = 双/单引号（可能是空串），组 4 = 不带引号。
+        let Some(value) = caps.get(2).or_else(|| caps.get(3)).or_else(|| caps.get(4)) else {
             continue;
         };
         attrs.insert(
@@ -1204,6 +1239,62 @@ mod tests {
         let segment = only(content);
         assert_eq!(segment.speaker(), Some("阿米娅"));
         assert_eq!(segment.character_id(), None);
+    }
+
+    /// 引号里的 `]` 是属性值不是指令结束（真实数据 story_cetsyr_1_1.txt）：
+    /// 在它身上截断，`text` 属性就解析不出来，整条贴纸文字消失。
+    #[test]
+    fn test_bracket_inside_quoted_attr_does_not_truncate_command() {
+        let segment = only(
+            r#"[Sticker(id="st1", multi = true, text="\n_与节点[DWDB-221E]建立交叉验证连接（授权码：CE）",delay=0.05, block = true)]"#,
+        );
+        assert_eq!(segment.kind(), "sticker");
+        assert_eq!(
+            segment.text(),
+            Some("_与节点[DWDB-221E]建立交叉验证连接（授权码：CE）")
+        );
+
+        // 演出指令属性里的 `[hidden]`（sandbox 脚本）也不能把 `")]` 漏成正文。
+        let parsed = parse_story_text(
+            r#"[executeactionarray(target="trap_470_tmantic", key="effect_mantic[hidden]")]"#,
+        );
+        assert!(parsed.segments.is_empty(), "leaked: {:?}", parsed.segments);
+    }
+
+    /// act15mini 有一批单引号属性（`[name='麦哲伦']`），不认单引号就会把
+    /// `'麦哲伦'` 连引号一起显示成说话人，头像反查也跟着失败。
+    #[test]
+    fn test_single_quoted_attributes_are_parsed() {
+        let segment = only(r#"[name='麦哲伦']呃，之前，在哨所里的时候，我一时兴奋。"#);
+        assert_eq!(segment.kind(), "dialogue");
+        assert_eq!(segment.speaker(), Some("麦哲伦"));
+        assert_eq!(
+            segment.text(),
+            Some("呃，之前，在哨所里的时候，我一时兴奋。")
+        );
+
+        // 双引号值里的撇号不受单引号分支影响。
+        let attrs = parse_attributes(r#"Subtitle(text="it's fine", alignment='center')"#);
+        assert_eq!(attrs.get("text").map(String::as_str), Some("it's fine"));
+        assert_eq!(attrs.get("alignment").map(String::as_str), Some("center"));
+    }
+
+    /// 状态指令后面粘着的数据残次（`[character]]` 的多余 `]`、`[charslot(...)]4`
+    /// 的手滑字符）不能泄漏成孤零零的旁白段；独立成行的 `...`（幽灵鲨的歌声
+    /// 淡出，act17side）是有意写的正文，必须保留。
+    #[test]
+    fn test_state_command_trailing_junk_does_not_leak() {
+        let content = "[character]]\n[charslot(slot = \"m\", afrom=1,ato=0, duration = 0.5)]z\n[Character(name=\"char_010_chen_1\", name2=\"char_012_misa_1\", focus=1)]=";
+        let result = parse_story_text(content);
+        assert!(
+            result.segments.is_empty(),
+            "state-command junk leaked: {:?}",
+            result.segments
+        );
+
+        let result = parse_story_text("......\n...");
+        assert_eq!(kinds(&result), vec!["narration", "narration"]);
+        assert_eq!(texts(&result), vec!["......", "..."]);
     }
 
     /// 端到端跑一段贴近真实脚本的片段：段落种类和顺序都要稳。

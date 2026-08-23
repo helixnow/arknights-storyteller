@@ -741,7 +741,11 @@ export function Settings() {
                 <div className="flex flex-wrap items-center gap-4">
                   <div>
                     <div className="text-xs text-[hsl(var(--color-muted-foreground))]">当前版本</div>
-                    <div className="font-mono text-sm">{currentVersion || "未安装"}</div>
+                    {/* 空串 = 版本还没加载出来或读取失败（status 为 unknown），不能写成
+                        「未安装」——真正未安装时后端返回的就是「未安装」字样。 */}
+                    <div className="font-mono text-sm">
+                      {currentVersion || (loadingInfo ? "读取中..." : "未知")}
+                    </div>
                   </div>
                   <div>
                     <div className="text-xs text-[hsl(var(--color-muted-foreground))]">最新版本</div>

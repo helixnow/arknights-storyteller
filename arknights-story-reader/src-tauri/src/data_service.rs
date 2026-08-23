@@ -2334,7 +2334,36 @@ impl DataService {
         let path = self.version_file_path();
         let content = serde_json::to_string_pretty(info)
             .map_err(|e| format!("Failed to serialize version info: {}", e))?;
-        fs::write(&path, content).map_err(|e| format!("Failed to write version info: {}", e))
+
+        // 直接 `fs::write` 正式文件，断电会把 version.json 截成半截——正是
+        // check_update / get_current_version 被迫兜底「版本未知」的根因。改
+        // 为先写同目录临时文件、fsync、再 rename：同目录内 rename 替换是原
+        // 子的（POSIX 保证；Windows 的 std 用 MOVEFILE_REPLACE_EXISTING），
+        // 于是正式文件任何时刻要么是旧的完整内容、要么是新的完整内容。
+        // pid+nanos 后缀避免并发/残留同名冲突；同目录也排除了跨设备 rename。
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp_path = self.data_dir.join(format!(
+            ".{}.{}.{}.tmp",
+            VERSION_FILE,
+            std::process::id(),
+            nanos
+        ));
+        let result = (|| -> std::io::Result<()> {
+            let mut file = fs::File::create(&tmp_path)?;
+            file.write_all(content.as_bytes())?;
+            file.sync_all()?;
+            fs::rename(&tmp_path, &path)
+        })();
+        if let Err(e) = result {
+            // 任一步失败都清掉临时文件：半截内容只允许出现在带 .tmp 后缀、
+            // read_version 永远不会碰的文件里。
+            let _ = fs::remove_file(&tmp_path);
+            return Err(format!("Failed to write version info: {}", e));
+        }
+        Ok(())
     }
 }
 
@@ -5196,6 +5225,83 @@ mod tests {
         // 数据目录整个不存在，才是真正的「未安装」。
         fs::remove_dir_all(&fx.service.data_dir).unwrap();
         assert_eq!(fx.service.get_current_version().unwrap(), "未安装");
+    }
+
+    // ---- Version file durability --------------------------------------------
+
+    /// write_version 走「同目录临时文件 + rename」：写完必须能原样读回（首次
+    /// 创建和覆盖旧文件都走 rename 替换），且成功路径不残留 .tmp 文件。
+    #[test]
+    fn write_version_round_trips_and_leaves_no_temp_files() {
+        let fx = Fixture::new("ver_atomic");
+
+        let info = VersionInfo {
+            commit: "abcdef1234567890".to_string(),
+            fetched_at: 1_700_000_000,
+        };
+        fx.service.write_version(&info).expect("write version");
+        let read = fx
+            .service
+            .read_version()
+            .expect("must read back what was just written");
+        assert_eq!(read.commit, info.commit);
+        assert_eq!(read.fetched_at, info.fetched_at);
+
+        let newer = VersionInfo {
+            commit: "1234567890abcdef".to_string(),
+            fetched_at: 1_700_000_001,
+        };
+        fx.service.write_version(&newer).expect("overwrite version");
+        assert_eq!(fx.service.read_version().unwrap().commit, newer.commit);
+
+        let leftovers: Vec<String> = fs::read_dir(&fx.service.data_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "残留的临时文件: {:?}", leftovers);
+    }
+
+    /// 模拟断电发生在 rename 之前：磁盘上只有半截临时文件，正式 version.json
+    /// 不存在。read_version 必须是 None，get_current_version 走「版本未知」，
+    /// check_update 不催更——绝不能把半截 JSON 当版本解析。残留的旧临时文件
+    /// 也不能妨碍下一次正常写入。
+    #[test]
+    fn half_written_temp_file_is_not_mistaken_for_the_version_file() {
+        let fx = Fixture::new("ver_tmp_only");
+
+        // Fixture 自带一份正式 version.json，先删掉才是「rename 前断电」现场。
+        fs::remove_file(fx.service.version_file_path()).unwrap();
+        let stale_tmp = fx
+            .service
+            .data_dir
+            .join(format!(".{}.12345.67890.tmp", VERSION_FILE));
+        fs::write(&stale_tmp, "{\"commit\":\"abc").unwrap();
+
+        assert!(
+            fx.service.read_version().is_none(),
+            "只有临时文件时不能读出版本"
+        );
+        assert_eq!(
+            fx.service.get_current_version().unwrap(),
+            "本地数据（版本未知）",
+            "数据集完整、只剩半截临时文件，应报「版本未知」而非解析它"
+        );
+        assert_eq!(
+            fx.service.check_update().unwrap(),
+            false,
+            "数据集完整、版本未知，不能催更"
+        );
+
+        let info = VersionInfo {
+            commit: "fedcba0987654321".to_string(),
+            fetched_at: 1_700_000_002,
+        };
+        fx.service
+            .write_version(&info)
+            .expect("write after stale tmp");
+        assert_eq!(fx.service.read_version().unwrap().commit, info.commit);
     }
 
     // ---- ZIP install safety ------------------------------------------------
