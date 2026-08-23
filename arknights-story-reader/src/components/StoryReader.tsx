@@ -1074,7 +1074,10 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
         stored?.readingMode === "scroll" && typeof stored.scrollTop === "number"
           ? stored.scrollTop
           : storedPercentage * Math.max(container.scrollHeight - container.clientHeight, 0);
-      container.scrollTo({ top: storedTop });
+      // 视口的 `.reader-scroll` 挂着 `scroll-behavior: smooth`，不显式指定
+      // behavior 的话恢复位置会从顶部一路平滑飘过去；动画途中滚动监听读到的
+      // 还是起点附近的位置，会先把一份 ~0% 的进度落盘，短暂盖掉真实记录。
+      container.scrollTo({ top: storedTop, behavior: "instant" });
       lastScrollTopRef.current = storedTop;
       const { scrollHeight, clientHeight } = container;
       const denominator = scrollHeight - clientHeight;
@@ -1247,10 +1250,29 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     if (nextTop === null) nextTop = scrollRatioRef.current * maxTop;
 
     const clampedTop = Math.max(0, Math.min(nextTop, maxTop));
-    container.scrollTo({ top: clampedTop });
+    // 排版重排是瞬时的，锚点校正也必须瞬时（instant 覆盖视口上的 CSS
+    // smooth），否则正文先跳一下再缓缓滚回去，看起来像坏了。
+    container.scrollTo({ top: clampedTop, behavior: "instant" });
     lastScrollTopRef.current = clampedTop;
     scrollRatioRef.current = clampedTop / maxTop;
   }, [typographySignature, settings.readingMode]);
+
+  /**
+   * 分页模式翻页后把视口滚回页首。单页允许高于一屏（分页只保证 min-height），
+   * 沿用上一页的 scrollTop 会让新页直接从中腰甚至页尾开始读；从连续滚动切到
+   * 分页时残留的滚动位置同理。有挂起的段落跳转时让位——那次翻页就是为了滚
+   * 到指定段落，落点由跳转兜底逻辑决定。
+   */
+  const pagedViewKeyRef = useRef<string | null>(null);
+  useLayoutEffect(() => {
+    const key = settings.readingMode === "paged" ? String(currentPage) : null;
+    const previous = pagedViewKeyRef.current;
+    pagedViewKeyRef.current = key;
+    if (key === null || previous === key) return;
+    if (pendingScrollIndexRef.current !== null) return;
+    // 显式 instant：翻页不该带滚动动画（视口 CSS 是 smooth）。
+    scrollContainerRef.current?.scrollTo({ top: 0, behavior: "instant" });
+  }, [currentPage, settings.readingMode]);
 
   // 顶栏实际高度（带关卡编号/标签时会比 3.5rem 高），收起时按这个值上移。
   useLayoutEffect(() => {
@@ -1443,10 +1465,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       }
 
       pendingScrollIndexRef.current = index;
-      if (settings.readingMode === "scroll") {
-        // 直接尝试一次，若元素未渲染，layout effect 会再次兜底
-        scrollToSegment(index);
-      } else {
+      if (settings.readingMode !== "scroll") {
         // Binary search the dynamic page boundaries to land on the right page.
         let targetPage = 0;
         for (let i = pageBoundaries.length - 1; i >= 0; i -= 1) {
@@ -1456,6 +1475,21 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
           }
         }
         setCurrentPage(Math.min(targetPage, totalPages - 1));
+      }
+
+      // 目标段已经在文档里就立刻滚：连续滚动模式必然如此；分页模式命中当前页
+      // 时也一样——那时 setCurrentPage 是 no-op，不会有新渲染去触发兜底的
+      // layout effect，之前这种跳转根本不滚。滚完必须清掉 pending：这个残留值
+      // 会在下一次正文重排（例如调字号引起 renderableSegments 变化）时被兜底
+      // 逻辑捡起来，把读者从字号锚点又拽回旧的跳转目标。元素未渲染（分页模式
+      // 跳到别的页）则保留 pending，交给 layout effect 在新页渲染后兜底。
+      const container = scrollContainerRef.current;
+      const element = container?.querySelector<HTMLElement>(
+        `[data-segment-index="${index}"]`
+      );
+      if (element) {
+        scrollToSegment(index);
+        pendingScrollIndexRef.current = null;
       }
     },
     [processedSegments, scrollToSegment, settings.readingMode, totalPages, pageBoundaries]
@@ -1538,6 +1572,11 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       if (tries < 30) {
         tries += 1;
         frame = requestAnimationFrame(tick);
+      } else {
+        // 30 帧后还找不到目标段（例如指向已因加载失败被移除的插画段），
+        // 放弃并清掉 pending，免得之后每次正文重排都重新挂一条重试链、
+        // 且换阅读模式时恢复逻辑一直被这个死目标挡住。
+        pendingScrollIndexRef.current = null;
       }
     };
     frame = requestAnimationFrame(tick);
@@ -1551,9 +1590,10 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   useEffect(() => {
     if (!initialFocus || !processedSegments.length) return;
     const token = initialFocus.issuedAt ?? Date.now();
-    if (focusAppliedRef.current === token && highlightSegmentIndex !== null) {
-      return;
-    }
+    // 只按 token 判重。曾经这里还要求 highlightSegmentIndex 非空才算“已应用”，
+    // 结果高亮一被清掉（导览里跳章节、清除人物高亮都会把它置回 null），
+    // 这个 effect 就重新触发，把读者拽回搜索命中段、盖掉用户刚刚的跳转。
+    if (focusAppliedRef.current === token) return;
 
     const targetIndex = findFocusSegmentIndex(initialFocus);
     if (targetIndex === null) {
@@ -1565,13 +1605,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     setActiveCharacter(null);
     jumpToSegment(targetIndex, { highlightSearch: true });
     focusAppliedRef.current = token;
-  }, [
-    initialFocus,
-    processedSegments,
-    findFocusSegmentIndex,
-    jumpToSegment,
-    highlightSegmentIndex,
-  ]);
+  }, [initialFocus, processedSegments, findFocusSegmentIndex, jumpToSegment]);
 
   const handleCharacterHighlight = useCallback(
     (name: string, firstIndex: number) => {
