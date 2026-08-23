@@ -1,11 +1,11 @@
 name: ci
 
+# PR 一律跑门禁;push 只看 main(功能分支走 PR 即可,不必重复触发)。
 on:
   pull_request:
   push:
     branches:
       - main
-      - cursor/sota-polish-c3ee
 
 permissions:
   contents: read
@@ -73,8 +73,8 @@ jobs:
             libxdo-dev \
             libssl-dev
 
-      # 1.89.0：Cargo.lock 未入库，CI 会重新解析依赖，其中已有 crate 使用
-      # edition2024（需要 >= 1.85），1.83 这类旧工具链会直接解析失败。
+      # 1.89.0：依赖树里已有 crate 使用 edition2024（需要 >= 1.85），
+      # 旧工具链（如 1.83）解析 Cargo.lock 会直接失败。
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@1.89.0
 
@@ -85,6 +85,7 @@ jobs:
 
       # 只跑 --lib：解析器、搜索、数据整理的单元测试都在 lib 里，
       # tests/search_recall.rs 需要真实剧情数据，不适合放进 PR 门禁。
+      # --locked：Cargo.lock 已入库，锁文件过期时直接报错而不是悄悄重新解析。
       - name: cargo test --lib
-        run: cargo test --lib
+        run: cargo test --lib --locked
         working-directory: arknights-story-reader/src-tauri

@@ -24,8 +24,9 @@ dist-ssr
 *.sw?
 
 # Tauri
+# Cargo.lock 要入库:CI 与本地按同一份锁文件构建,避免重新解析依赖时
+# 被 edition2024 之类的新 crate 版本破坏可复现性。target/ 仍然不入库。
 src-tauri/target/
-src-tauri/Cargo.lock
 
 # Data
 ArknightsGameData/
