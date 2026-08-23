@@ -31,7 +31,7 @@ import {
 import { peekAssetCandidates } from "@/hooks/useAsset";
 import { isAssetUrlDead, markAssetUrlAlive } from "@/lib/assetUrls";
 import type { DialogueSegment, StorySegment } from "@/types/story";
-import { Download, Loader2, Share2, X } from "lucide-react";
+import { Download, Loader2, RotateCcw, Share2, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const SHOW_AVATAR_STORAGE_KEY = "arknights-share-image-show-avatar";
@@ -268,8 +268,22 @@ const avatarCache = new Map<string, HTMLImageElement | null>();
  */
 const canvasFailedUrls = new Set<string>();
 
+/**
+ * 缓存上限。一张 128px 头像解码后大约几十 KB，长会话里翻遍全剧情足够把
+ * 上千张位图钉在内存里；Map 保持插入顺序，超限时淘汰最早的一条即可。
+ */
+const AVATAR_CACHE_LIMIT = 200;
+
 function avatarCacheKey(name: string | null | undefined, charId: string | null | undefined): string {
   return `${(name ?? "").trim()}::${(charId ?? "").trim()}`;
+}
+
+function rememberAvatar(key: string, img: HTMLImageElement | null): void {
+  if (!avatarCache.has(key) && avatarCache.size >= AVATAR_CACHE_LIMIT) {
+    const oldest = avatarCache.keys().next().value;
+    if (oldest !== undefined) avatarCache.delete(oldest);
+  }
+  avatarCache.set(key, img);
 }
 
 function loadImage(url: string): Promise<HTMLImageElement> {
@@ -315,7 +329,7 @@ async function loadAvatarImage(
     }
   }
   if (candidates.length === 0) {
-    avatarCache.set(key, null);
+    rememberAvatar(key, null);
     return null;
   }
 
@@ -323,12 +337,12 @@ async function loadAvatarImage(
     const img = await loadImage(url).catch(() => null);
     if (img) {
       markAssetUrlAlive(url);
-      avatarCache.set(key, img);
+      rememberAvatar(key, img);
       return img;
     }
     canvasFailedUrls.add(url);
   }
-  avatarCache.set(key, null);
+  rememberAvatar(key, null);
   return null;
 }
 
@@ -1077,7 +1091,7 @@ export function ShareImageDialog({
   const previewBoxRef = useRef<HTMLDivElement | null>(null);
 
   /*
-   * 当前 object URL 的镜像。React 18 里对已卸载组件调用 setState 是空操作，
+   * 当前 object URL 的镜像。React 18 起对已卸载组件调用 setState 是空操作，
    * updater 函数根本不会执行——原来靠 `setPreviewUrl(prev => ...)` 在卸载
    * 时释放 URL 的写法，实际上一次都没释放过，每开一次弹窗就漏一张位图。
    */
@@ -1131,6 +1145,9 @@ export function ShareImageDialog({
     // 关闭时刻意不清空：抽屉还要滑出 220ms，这段时间里把预览抹掉会看到
     // 一块空白。真正的释放交给下面那个跟着 `rendered` 走的 effect。
     if (!open) return;
+    // `rendered` 要等 useSidePanel 那一轮 state 落地才为真。抢在挂载前
+    // 开跑的话 `previewBoxRef` 还是空的，取色会白白退回默认暖纸。
+    if (!rendered) return;
     if (!segments.length) {
       clearRendered();
       setRenderError("未选择任何段落");
@@ -1220,6 +1237,9 @@ export function ShareImageDialog({
           throw new Error("当前环境不支持 Canvas 绘图，无法生成分享图");
         }
         setDataUrl(result.dataUrl);
+        // 新图的 Blob 还在编码。不把上一张的清掉，这一小段窗口里点"保存"
+        // 就会拿着旧 Blob 配新 dataUrl，落盘的是上一次的图。
+        setPngBlob(null);
         setImageMeta({ width: result.width, height: result.height, bytes: null });
         // Optimistic fallback — show the data URL instantly while the
         // Blob is encoding, so the user doesn't see an empty preview
@@ -1251,6 +1271,7 @@ export function ShareImageDialog({
     };
   }, [
     open,
+    rendered,
     segments,
     storyName,
     categoryName,
@@ -1481,13 +1502,9 @@ export function ShareImageDialog({
               role="radiogroup"
               aria-label="选择分享模板"
               className="grid grid-cols-2 gap-2"
+              onKeyDown={handleTemplateKeyDown}
             >
-              {(
-                [
-                  { value: "classic", label: "经典", hint: "长图 · 完整段落" },
-                  { value: "quote", label: "对话金句", hint: "竖版 · 单条对话" },
-                ] as const
-              ).map((opt) => {
+              {TEMPLATE_OPTIONS.map((opt) => {
                 const active = template === opt.value;
                 return (
                   <button
@@ -1495,7 +1512,10 @@ export function ShareImageDialog({
                     type="button"
                     role="radio"
                     aria-checked={active}
-                    onClick={() => setTemplate(opt.value)}
+                    // radiogroup 里只有当前选中项参与 Tab 序列，方向键负责
+                    // 在选项之间移动——这是 ARIA 对 radio 的标准交互。
+                    tabIndex={active ? 0 : -1}
+                    onClick={() => selectTemplate(opt.value)}
                     className={cn(
                       "glass glass-pane text-left px-4 py-3 transition-[background-color,color,box-shadow] duration-200 ease-spring",
                       active
@@ -1511,12 +1531,12 @@ export function ShareImageDialog({
                 );
               })}
             </div>
-            {template === "quote" && effectiveTemplate === "classic" && (
+            {template === "quote" && resolvedTemplate === "classic" && (
               <p className="text-xs text-[hsl(var(--color-muted-foreground))] px-1">
                 当前选段没有对话，已回落到经典模板。
               </p>
             )}
-            {effectiveTemplate === "classic" && (
+            {resolvedTemplate === "classic" && (
               <label className="flex items-center gap-2 px-1 py-1 text-xs text-[hsl(var(--color-muted-foreground))] cursor-pointer select-none">
                 <input
                   type="checkbox"
@@ -1527,31 +1547,64 @@ export function ShareImageDialog({
                 <span>在对话前显示角色头像</span>
               </label>
             )}
+            <label className="flex items-center gap-2 px-1 py-1 text-xs text-[hsl(var(--color-muted-foreground))] cursor-pointer select-none">
+              <input
+                type="checkbox"
+                className="h-3.5 w-3.5 accent-[hsl(var(--color-primary))]"
+                checked={themeAware}
+                onChange={(e) => setThemeAware(e.target.checked)}
+              />
+              <span>配色跟随当前阅读主题</span>
+            </label>
           </section>
 
           <section className="space-y-2">
             <SheetSectionLabel>预览</SheetSectionLabel>
             <SheetGroup padded>
-              <div className="rounded-[var(--radius-row)] bg-[hsl(var(--color-foreground)/0.04)] p-3 min-h-[220px] flex items-center justify-center">
+              <div
+                ref={previewBoxRef}
+                aria-busy={rendering}
+                className="rounded-[var(--radius-row)] bg-[hsl(var(--color-foreground)/0.04)] p-3 min-h-[220px] flex items-center justify-center"
+              >
                 {rendering && (
-                  <div className="flex items-center gap-2 text-sm text-[hsl(var(--color-muted-foreground))]">
-                    <Loader2 className="h-4 w-4 animate-spin" /> 正在生成图片...
+                  <div
+                    role="status"
+                    className="flex items-center gap-2 text-sm text-[hsl(var(--color-muted-foreground))]"
+                  >
+                    <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" /> 正在生成图片...
                   </div>
                 )}
                 {!rendering && renderError && (
-                  <div className="text-sm text-[hsl(var(--color-destructive))]">{renderError}</div>
+                  <div role="alert" className="flex flex-col items-center gap-3 text-center">
+                    <p className="text-sm text-[hsl(var(--color-destructive))]">{renderError}</p>
+                    {/* 失败不是终点：多数失败（字体没加载完、头像超时）
+                        再跑一次就好，别逼用户关掉重开抽屉。 */}
+                    {segments.length > 0 && (
+                      <Button type="button" size="pill" variant="glass" onClick={handleRetry}>
+                        <RotateCcw className="mr-2 h-4 w-4" aria-hidden="true" />
+                        重新生成
+                      </Button>
+                    )}
+                  </div>
                 )}
                 {!rendering && !renderError && previewUrl && (
                   <img
                     src={previewUrl}
-                    alt="段落截图预览"
+                    alt={`${storyName} 的分享图预览（${
+                      resolvedTemplate === "quote" ? "对话金句模板" : "经典模板"
+                    }）`}
                     className="max-w-full h-auto rounded-[var(--radius-row)] shadow-[0_8px_24px_-8px_hsl(0_0%_0%/0.25)]"
-                    loading="lazy"
+                    decoding="async"
                   />
                 )}
               </div>
               <p className="mt-3 text-xs text-[hsl(var(--color-muted-foreground))] leading-relaxed">
                 图片会按剧情原文顺序排列，分享或保存时使用同一份 PNG。
+                {imageMeta
+                  ? ` 当前 ${imageMeta.width}×${imageMeta.height}${
+                      imageMeta.bytes ? ` · 约 ${formatByteSize(imageMeta.bytes)}` : ""
+                    }。`
+                  : ""}
               </p>
             </SheetGroup>
           </section>
@@ -1584,11 +1637,12 @@ export function ShareImageDialog({
             className="flex-1"
             onClick={handleShare}
             disabled={!dataUrl || rendering || busyAction !== null}
+            aria-busy={busyAction === "share"}
           >
             {busyAction === "share" ? (
-              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" />
             ) : (
-              <Share2 className="mr-2 h-4 w-4" />
+              <Share2 className="mr-2 h-4 w-4" aria-hidden="true" />
             )}
             分享
           </Button>
@@ -1600,11 +1654,12 @@ export function ShareImageDialog({
           className="flex-1"
           onClick={handleSave}
           disabled={!dataUrl || rendering || busyAction !== null}
+          aria-busy={busyAction === "save"}
         >
           {busyAction === "save" ? (
-            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+            <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" />
           ) : (
-            <Download className="mr-2 h-4 w-4" />
+            <Download className="mr-2 h-4 w-4" aria-hidden="true" />
           )}
           {platform === "android" ? "保存到相册" : "下载图片"}
         </Button>

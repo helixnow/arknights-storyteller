@@ -229,6 +229,17 @@ function loadCacheMap<T extends { page: unknown; updatedAt: number; version: str
   }
 }
 
+/**
+ * 段级缓存落盘。零命中的条目一律不写：下次搜索会直接命中空结果，
+ * 从而永久绕开"段落搜不到就自动改搜整篇"的兜底。
+ */
+function persistSegmentCache(map: Record<string, CachedSegmentPage>) {
+  writeJson(
+    SEGMENT_CACHE_KEY,
+    Object.fromEntries(Object.entries(map).filter(([, entry]) => entry.page.hits.length > 0))
+  );
+}
+
 function writeJson(key: string, value: unknown) {
   try {
     localStorage.setItem(key, JSON.stringify(value));
@@ -591,6 +602,9 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
           setSearched(true);
           setFromCache({ used: true, updatedAt: cached.updatedAt });
           commitQuery();
+          // 命中的可能是边打边搜留在内存里的那一条；用户这次是明确要搜，
+          // 顺手补一次落盘，下个会话才能直接秒开。
+          if (!auto) persistSegmentCache(segmentCache);
           settle();
           // 旧版本可能把"零命中"写进了 localStorage；命中缓存也要照样回退，
           // 否则这条查询会永远停在空结果。
@@ -613,18 +627,9 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
           [raw]: { page: data, updatedAt: Date.now(), version },
         });
         setSegmentCache(nextCache);
-        // 零命中只留在内存里。写进持久缓存会让下次搜索直接命中空结果，
-        // 从而永久绕开自动回退。
-        // 边打边搜的中间结果同样只进内存：跨会话保留"凯"「凯尔」这种半截
-        // 查询没有意义，而每次落盘都要把整张表 stringify 一遍。
-        if (!auto) {
-          writeJson(
-            SEGMENT_CACHE_KEY,
-            Object.fromEntries(
-              Object.entries(nextCache).filter(([, entry]) => entry.page.hits.length > 0)
-            )
-          );
-        }
+        // 边打边搜的中间结果只进内存：跨会话留着「凯」「凯尔」这种半截查询
+        // 没有意义，而每次落盘都要把整张表 stringify 一遍。
+        if (!auto) persistSegmentCache(nextCache);
         settle();
 
         if (data.hits.length === 0 && allowFallback) {
@@ -641,6 +646,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
           setSearched(true);
           setFromCache({ used: true, updatedAt: cached.updatedAt });
           commitQuery();
+          if (!auto) writeJson(CACHE_KEY, cache);
           settle();
           return;
         }

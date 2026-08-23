@@ -25,7 +25,7 @@ const REPO_DOWNLOAD_URL: &str = "https://codeload.github.com/Kengxxiao/Arknights
 const DEFAULT_BRANCH: &str = "master";
 const VERSION_FILE: &str = "version.json";
 const SEARCH_RESULT_LIMIT: usize = 500;
-/// Bump when any of: FTS schema, tokenizer rules, flatten_segments format,
+/// Bump when any of: FTS schema, tokenizer rules, `searchable_text` format,
 /// or the set of stories that gets indexed. A bump drops both FTS tables at
 /// open time, so the next `rebuild_story_index_*` starts from scratch.
 ///
@@ -3089,10 +3089,9 @@ impl DataService {
         })
     }
 
-    /// `storyId -> (storyName, category)` for attaching display labels to
-    /// segment hits. Served from the memoized catalog, so this is a lookup
-    /// rather than a re-parse of the whole review table. Labels are cosmetic,
-    /// so a missing dataset degrades to no labels rather than to no hits.
+    /// 给段落命中贴显示标签用的目录（`StoryCatalog::label_for`）。走的是
+    /// memoized 目录，不会重新解析整张 review 表。标签只是装饰，数据集缺失
+    /// 时降级成没有标签，而不是没有结果。
     fn collect_story_labels(&self) -> Option<Arc<StoryCatalog>> {
         match self.catalog() {
             Ok(catalog) => Some(catalog),
@@ -4166,6 +4165,23 @@ mod tests {
     }
 
     #[test]
+    fn fts_query_or_binds_looser_than_and() {
+        // FTS5 里 AND 结合得比 OR 紧，`A OR B AND C` 会被解析成
+        // `A OR (B AND C)`；线性扫描按 `(A OR B) AND C` 判定。不显式加括号
+        // 的话，同一个查询在索引可用与否两种状态下答案不一样。
+        let q = DataService::build_fts_query_advanced("希 or 章 雪").expect("non-empty");
+        assert_eq!(q, "(\"希\" OR \"章\") AND \"雪\"");
+    }
+
+    #[test]
+    fn fts_query_negated_phrase_is_excluded() {
+        let q = DataService::build_fts_query_advanced("博士 -\"凯尔希\"").expect("non-empty");
+        let not_idx = q.find(" NOT ").expect("否定短语必须落在 NOT 子句里");
+        assert!(q[..not_idx].contains('博'), "positives first: {}", q);
+        assert!(q[not_idx..].contains('凯'), "phrase must be negated: {}", q);
+    }
+
+    #[test]
     fn fts_query_wraps_positives_before_not() {
         // FTS5 binds `NOT` tighter than we want: without the parentheses
         // `A AND B NOT C` would exclude only from `B`.
@@ -4520,6 +4536,168 @@ mod tests {
         let results = fx.service.search_stories("凯尔希 -博士").unwrap();
         let ids: Vec<&str> = results.iter().map(|r| r.story_id.as_str()).collect();
         assert_eq!(ids, vec!["Obt/Roguelike/ro2/ro2_1"]);
+    }
+
+    fn sorted_ids(results: &[SearchResult]) -> Vec<String> {
+        let mut ids: Vec<String> = results.iter().map(|r| r.story_id.clone()).collect();
+        ids.sort();
+        ids
+    }
+
+    /// 索引建好前后，同一个查询必须给出同一批剧情。两条路径各自实现一套
+    /// 判定，任何一边改了切词或语料范围都会在这里炸出来。
+    #[test]
+    fn fallback_and_index_return_the_same_stories() {
+        let fx = Fixture::new("agree");
+        let queries = [
+            "凯尔希",
+            "凯尔希 -博士",
+            "德克萨斯",
+            "\"博士，你醒了\"",
+            "凯尔希 or 德克萨斯",
+            // (凯尔希 OR 德克萨斯) AND 雪 —— 只有活动篇同时满足。
+            "凯尔希 or 德克萨斯 雪",
+            "启程",
+            // 脚本指令、素材 token：渲染出来的正文里没有，两边都不该命中。
+            "avg_1",
+            "image",
+        ];
+
+        let scanned: Vec<Vec<String>> = queries
+            .iter()
+            .map(|q| sorted_ids(&fx.service.search_stories(q).unwrap()))
+            .collect();
+
+        fx.service.rebuild_story_index().expect("index builds");
+        for (query, expected) in queries.iter().zip(scanned) {
+            let indexed = sorted_ids(&fx.service.search_stories(query).unwrap());
+            assert_eq!(indexed, expected, "查询「{}」两条路径结果不一致", query);
+        }
+    }
+
+    /// 上一条测的是「两边一样」，这条钉住具体值，免得两边一起错。
+    #[test]
+    fn scan_searches_rendered_text_not_script_commands() {
+        let fx = Fixture::new("corpus");
+
+        // 台词、说话人、标题都能搜到。
+        assert_eq!(
+            sorted_ids(&fx.service.search_stories("德克萨斯").unwrap()),
+            vec!["act1_st01".to_string()]
+        );
+        // 解析器丢掉的指令文字搜不到——它们本来就不在索引里。
+        assert!(fx.service.search_stories("avg_1").unwrap().is_empty());
+        assert!(fx.service.search_stories("image").unwrap().is_empty());
+        // OR 组与 AND 的结合律：只有同时满足「雪」的活动篇入选。
+        assert_eq!(
+            sorted_ids(&fx.service.search_stories("凯尔希 or 德克萨斯 雪").unwrap()),
+            vec!["act1_st01".to_string()]
+        );
+    }
+
+    #[test]
+    fn scan_reports_a_real_denominator() {
+        let fx = Fixture::new("scan_progress");
+        let total = fx.service.catalog().unwrap().stories.len();
+
+        let mut ticks: Vec<(usize, usize)> = Vec::new();
+        let results = fx
+            .service
+            .scan_stories("凯尔希", |done, of| ticks.push((done, of)))
+            .unwrap();
+
+        assert!(!results.is_empty());
+        // 开扫前就报出真实分母，收尾时一定走到底——进度条不会停在半路。
+        assert_eq!(ticks.first().copied(), Some((0, total)));
+        assert_eq!(ticks.last().copied(), Some((total, total)));
+        assert!(ticks.windows(2).all(|w| w[0].0 <= w[1].0), "{:?}", ticks);
+    }
+
+    #[test]
+    fn preview_never_comes_back_empty() {
+        let fx = Fixture::new("preview");
+        let content = "序章\n凯尔希：博士，你醒了。\n阿米娅：我们出发吧。";
+
+        // 整词在正文里并不连续，退回单字原子仍要给出上下文。
+        let terms = split_query_terms("凯尔希阿米娅");
+        let preview = fx.service.preview_for(content, terms.primary());
+        assert!(preview.contains("凯尔希"), "{}", preview);
+
+        // 一个字都对不上时给开头预览，而不是一个空字符串。
+        let terms = split_query_terms("缄默");
+        let preview = fx.service.preview_for(content, terms.primary());
+        assert!(!preview.trim().is_empty());
+    }
+
+    #[test]
+    fn searchable_text_is_title_plus_rendered_body() {
+        let segments = vec![
+            StorySegment::Header {
+                title: "第一节".to_string(),
+            },
+            StorySegment::Dialogue {
+                character_name: "凯尔希".to_string(),
+                text: "博士。".to_string(),
+                position: None,
+                character_id: None,
+            },
+            StorySegment::Music {
+                key: "$bgm".to_string(),
+            },
+            StorySegment::Image {
+                token: "avg_1".to_string(),
+                caption: None,
+            },
+        ];
+        // 标题参与索引；BGM 和无标题插画不参与。
+        assert_eq!(
+            DataService::searchable_text("序章", &segments),
+            "序章\n第一节\n凯尔希：博士。"
+        );
+    }
+
+    #[test]
+    fn index_rebuild_is_skipped_when_already_current() {
+        let fx = Fixture::new("index_skip");
+        let db = fx.service.index_db_path.clone();
+        let before = index_build_count(&db);
+
+        fx.service.rebuild_story_index().expect("first build");
+        assert_eq!(index_build_count(&db) - before, 1);
+
+        fx.service.rebuild_story_index().expect("second build");
+        assert_eq!(
+            index_build_count(&db) - before,
+            1,
+            "指纹没变时重建应该整个跳过"
+        );
+
+        // 换了数据集就必须重建。
+        fx.set_version("commit-2");
+        fx.service.rebuild_story_index().expect("rebuild after sync");
+        assert_eq!(index_build_count(&db) - before, 2);
+
+        // 索引被清掉（同步/导入会清）之后同样必须重建。
+        fx.service.clear_story_index().expect("clear");
+        fx.service.rebuild_story_index().expect("rebuild after clear");
+        assert_eq!(index_build_count(&db) - before, 3);
+
+        let status = fx.service.get_story_index_status().unwrap();
+        assert!(status.ready);
+        assert_eq!(status.total, 6);
+    }
+
+    #[test]
+    fn story_categories_follow_chapter_order() {
+        let fx = Fixture::new("categories");
+        let categories = fx.service.get_story_categories().unwrap();
+        assert_eq!(categories.len(), 1);
+        let ids: Vec<&str> = categories[0]
+            .stories
+            .iter()
+            .map(|s| s.story_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["main_00-01", "main_00-02"]);
     }
 
     // ---- Update checks -----------------------------------------------------
