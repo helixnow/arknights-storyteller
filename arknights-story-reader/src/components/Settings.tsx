@@ -834,6 +834,13 @@ export function Settings() {
                   </div>
                 ) : null}
 
+                {/* 禁用态的按钮吃不到 hover，占用原因必须直接写出来。 */}
+                {installBlocked && activeJob ? (
+                  <p role="status" className="text-sm text-[hsl(var(--color-muted-foreground))]">
+                    正在{describeDataJob(activeJob)}，完成后即可安装更新。
+                  </p>
+                ) : null}
+
                 <div className="flex flex-wrap gap-2">
                   <Button
                     type="button"
@@ -853,7 +860,6 @@ export function Settings() {
                       type="button"
                       onClick={handleInstallAppUpdate}
                       disabled={isInstallingUpdate || installBlocked}
-                      title={installBlocked && activeJob ? `正在${describeDataJob(activeJob)}，暂不能安装更新` : undefined}
                     >
                       {isInstallingUpdate ? (
                         <Loader2 className="mr-2 h-4 w-4 animate-spin" />
