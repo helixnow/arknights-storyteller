@@ -1257,6 +1257,11 @@ input[type="range"]::-moz-range-thumb {
  */
 .bottom-nav-glass {
   position: fixed;
+  /* 浮岛必须自己声明层级：面板是绝对定位的兄弟节点，只要它们（或内部任何
+     定位元素）拿到 z-index，`auto` 的导航就会被盖住——不只是被遮，连点击
+     命中测试都到不了导航上。40 的位置卡在「面板内部的吸顶栏/下拉(≤30)」
+     之上、「全屏弹窗(50) 与 toast(100)」之下。 */
+  z-index: 40;
   left: max(0.75rem, env(safe-area-inset-left, 0px));
   right: max(0.75rem, env(safe-area-inset-right, 0px));
   bottom: max(0.5rem, env(safe-area-inset-bottom, 0px));

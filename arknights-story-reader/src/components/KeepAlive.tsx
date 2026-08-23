@@ -21,6 +21,13 @@ interface KeepAliveProps {
  *    「掉进」看不见的面板里；
  *  - `aria-hidden`         给尚未实现 inert 的旧 WebView 兜底；
  *  - `data-keepalive-active` 供 index.css 暂停隐藏面板里的循环动画。
+ *
+ * 刻意不给 z-index：面板是内容，不该把自己抬到应用外壳之上。以前这里写
+ * `zIndex: active ? 1 : 0`，绝对定位 + z-index 让每个面板都成了一个层叠上下文，
+ * 后果有两个——面板整体盖住了 z-index:auto 的底部导航（导航因此完全点不动），
+ * 面板内部 `fixed inset-0 z-50` 的弹窗又被封在面板这一层里出不来。去掉之后
+ * 层叠顺序回到「面板 < 导航(z-40) < 弹窗(z-50) < toast(z-100)」。
+ * 面板之间不需要 z-index 分先后：非活动面板已经 hidden + inert，谁画在上面都一样。
  */
 export function KeepAlive({ active, children, className }: KeepAliveProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -45,7 +52,6 @@ export function KeepAlive({ active, children, className }: KeepAliveProps) {
       style={{
         visibility: active ? "visible" : "hidden",
         pointerEvents: active ? "auto" : "none",
-        zIndex: active ? 1 : 0,
       }}
       inert={!active}
       aria-hidden={!active}
