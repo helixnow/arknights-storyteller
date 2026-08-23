@@ -21,7 +21,7 @@ const PLUGIN_IDENTIFIER: &str = "com.arknights.storyreader.imagesharer";
 const PLUGIN_CLASS: &str = "ImageSharerPlugin";
 
 /// 插件没注册成功时所有命令共用的提示。宁可让分享功能单独失败，也不能
-/// 让整个 app 因为一个可选能力起不来（见 {@link init}）。
+/// 让整个 app 因为一个可选能力起不来（见 [`init`]）。
 const NOT_READY_MESSAGE: &str =
     "图片分享组件未就绪（Android 插件未加载），请重启应用后再试";
 
@@ -58,7 +58,7 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
 }
 
 /// 取出已注册的插件句柄。用 `try_state` 而不是 `state`——后者在状态缺失
-/// 时是 `panic!`，而"插件没注册"恰恰是 {@link init} 会容忍的正常分支。
+/// 时是 `panic!`，而"插件没注册"恰恰是 [`init`] 会容忍的正常分支。
 fn sharer<R: Runtime>(
     app: &tauri::AppHandle<R>,
 ) -> PluginResult<tauri::State<'_, AndroidImageSharer<R>>> {
@@ -279,8 +279,8 @@ impl<R: Runtime> AndroidImageSharer<R> {
         Ok(Self(handle))
     }
 
-    /// `base64` 必须已经过 {@link normalize_base64_payload}，`file_name`
-    /// 必须已经过 {@link sanitize_png_file_name}。
+    /// `base64` 必须已经过 [`normalize_base64_payload`]，`file_name`
+    /// 必须已经过 [`sanitize_png_file_name`]。
     fn save_image(
         &self,
         base64: String,

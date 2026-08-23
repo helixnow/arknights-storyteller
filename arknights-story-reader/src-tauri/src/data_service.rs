@@ -2697,14 +2697,14 @@ impl DataService {
     /// 空字符串对用户毫无意义，任何情况下都要给点上下文。
     fn preview_for(&self, content: &str, term: Option<&Term>) -> String {
         if let Some(term) = term {
-            for probe in term.snippet_probes() {
-                let snippet = self.extract_context(content, probe);
-                if !snippet.trim().is_empty() {
-                    return snippet;
-                }
+            let snippet = self.extract_context_any(content, term.snippet_probes());
+            if !snippet.trim().is_empty() {
+                return snippet;
             }
         }
-        Self::clip_preview(content, 120)
+        // 兜底预览只需要开头这点字，别为了截 120 个字符把整篇正文压平两遍。
+        let head: String = content.chars().take(400).collect();
+        Self::clip_preview(&head, 120)
     }
 
     fn search_stories_fallback(&self, query: &str) -> Result<Vec<SearchResult>, String> {
@@ -3052,7 +3052,7 @@ impl DataService {
         // result even though the title itself isn't stored as a segment.
         // Each such hit is presented as a pseudo-"header" segment at index 0
         // so the reader lands on the beginning of the story when clicked.
-        if let Ok(story_rows) = self.story_level_title_hits(&fts_query, trimmed, labels) {
+        if let Ok(story_rows) = Self::story_level_title_hits(&conn, &fts_query, trimmed, labels) {
             let remaining = SEARCH_RESULT_LIMIT.saturating_sub(hits.len());
             for hit in story_rows.into_iter().take(remaining) {
                 let key = (hit.story_id.clone(), hit.segment_index);
@@ -3117,15 +3117,15 @@ impl DataService {
     /// so only rows whose title or code actually contains the user's query
     /// survive. This catches exact title lookups like `大地惊雷` even when
     /// no body segment matches.
+    ///
+    /// 复用调用方已经打开的连接：段落检索每次都新开一条 SQLite 连接（还要
+    /// 重跑一遍 WAL pragma）纯属浪费。
     fn story_level_title_hits(
-        &self,
+        conn: &Connection,
         fts_query: &str,
         query_raw: &str,
         labels: Option<&StoryCatalog>,
     ) -> Result<Vec<SegmentHit>, String> {
-        let Some(conn) = self.try_open_index_connection()? else {
-            return Ok(Vec::new());
-        };
         let sql = "
             SELECT story_id, story_name, category, story_code
             FROM story_index
@@ -3417,15 +3417,18 @@ impl DataService {
     /// 使用归一化后文本查找匹配位置，再把"归一化字符索引"映射回"原文字节位置"，
     /// 避免 NFKC/去标点造成的字节长度变化导致越界或错位（bug A1）。
     fn extract_context(&self, content: &str, query: &str) -> String {
-        if content.is_empty() || query.is_empty() {
-            return String::new();
-        }
+        self.extract_context_any(content, std::iter::once(query))
+    }
 
-        // Normalize both sides with the fuzzy pipeline for consistency with the
-        // linear-scan fallback. `query` is expected to already be fuzzy-normalized
-        // by the caller, but re-normalizing is idempotent and cheap.
-        let query_norm = normalize_for_fuzzy(query);
-        if query_norm.is_empty() {
+    /// 依次尝试多个探针，取第一个命中的上下文。归一化映射只建一次——
+    /// 每个探针各调一次 `extract_context` 的话，整篇正文要被重新归一化
+    /// 好几遍（CJK 查询会退回逐字探针，次数正好等于字数）。
+    fn extract_context_any<'a>(
+        &self,
+        content: &str,
+        probes: impl IntoIterator<Item = &'a str>,
+    ) -> String {
+        if content.is_empty() {
             return String::new();
         }
 
@@ -3459,19 +3462,15 @@ impl DataService {
         if norm_text.is_empty() {
             return String::new();
         }
+        drop(norm_chars);
 
-        // Try full query first, then each whitespace-delimited token as a
-        // second-chance match. `query_norm` is already stripped of whitespace
-        // via normalize_for_fuzzy so the split is mostly irrelevant; kept for
-        // symmetry with how callers historically passed multi-token queries.
-        let mut probes = Vec::new();
-        probes.push(query_norm.as_str());
-
+        // 调用方给的探针一般已经归一化过了，再归一化一次是幂等的，成本也低。
         for probe in probes {
+            let probe = normalize_for_fuzzy(probe);
             if probe.is_empty() {
                 continue;
             }
-            if let Some(pos_byte) = norm_text.find(probe) {
+            if let Some(pos_byte) = norm_text.find(&probe) {
                 // Byte position in `norm_text` → norm char index.
                 let norm_char_index = norm_text[..pos_byte].chars().count();
                 if norm_char_index >= origin_char_for_norm.len() {
@@ -4627,6 +4626,22 @@ mod tests {
         let terms = split_query_terms("缄默");
         let preview = fx.service.preview_for(content, terms.primary());
         assert!(!preview.trim().is_empty());
+    }
+
+    #[test]
+    fn extract_context_takes_the_first_matching_probe() {
+        let fx = Fixture::new("context");
+        let content = "序章\n凯尔希：博士，你醒了。";
+
+        let snippet = fx.service.extract_context_any(content, ["缄默", "醒了"]);
+        assert!(snippet.contains("醒了"), "{}", snippet);
+        // 一个都对不上就返回空串，兜底交给调用方。
+        assert!(fx.service.extract_context_any(content, ["缄默"]).is_empty());
+        // 归一化对齐：查询里没有标点也能定位到原文。
+        assert!(fx
+            .service
+            .extract_context(content, "博士你醒了")
+            .contains("你醒了"));
     }
 
     #[test]

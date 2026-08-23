@@ -498,6 +498,18 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
   const navRows = mode === "segment" ? segmentHits : visibleResults;
   const navCount = listRendered ? navRows.length : 0;
 
+  /**
+   * 作废所有在途搜索。生成号一涨，正在路上的请求回来时就会被判定为过期
+   * 而丢弃；同时把 spinner 收掉，否则那个请求永远不会再走到 settle()。
+   */
+  const invalidateInFlight = useCallback(() => {
+    searchSeqRef.current += 1;
+    if (!searchingRef.current) return;
+    searchingRef.current = false;
+    setSearching(false);
+    setProgress(null);
+  }, []);
+
   // Load version for cache keying.
   useEffect(() => {
     void api
@@ -508,6 +520,9 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
 
   useEffect(() => {
     const onUpdated = () => {
+      // 数据整个换了，在途的那次搜索查的还是旧库。不作废的话它回来时会被
+      // 当成新版本的结果写进缓存，之后一直拿旧数据糊弄用户。
+      invalidateInFlight();
       setCache({});
       setSegmentCache({});
       void api
@@ -517,7 +532,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     };
     window.addEventListener("app:data-updated", onUpdated);
     return () => window.removeEventListener("app:data-updated", onUpdated);
-  }, []);
+  }, [invalidateInFlight]);
 
   const saveHistory = useCallback((q: string) => {
     setHistory((prev) => {
@@ -533,18 +548,6 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
       writeJson(HISTORY_KEY, next);
       return next;
     });
-  }, []);
-
-  /**
-   * 作废所有在途搜索。生成号一涨，正在路上的请求回来时就会被判定为过期
-   * 而丢弃；同时把 spinner 收掉，否则那个请求永远不会再走到 settle()。
-   */
-  const invalidateInFlight = useCallback(() => {
-    searchSeqRef.current += 1;
-    if (!searchingRef.current) return;
-    searchingRef.current = false;
-    setSearching(false);
-    setProgress(null);
   }, []);
 
   /** 段级搜索零命中时自动改搜整篇，避免用户卡在空结果页。 */

@@ -371,39 +371,43 @@ body {
 }
 
 /* ===== 焦点环基线 =====
- * 组件如果自己画环（Tailwind 的 `focus-visible:outline-none` + `ring-*`），
- * 类选择器会盖掉这条规则，不会出现「outline + ring」两层环；剩下那些从没写过
- * 焦点样式的元素（底部导航的 tab、卡片上的行按钮……）则落到这条基线上，拿到
- * 与 ring 同宽同色的环，而不是各浏览器各画一套默认虚线。
- * 用 `:where()` 保持 0 特异性，任何组件级样式都能覆盖。
+ * 那些从没写过焦点样式的元素（底部导航的 tab、列表里的行按钮……）落到这条
+ * 基线上，拿到与组件里 `ring-2` 同宽同色的环，而不是各浏览器各画一套默认
+ * 虚线；已经自己画环的组件（`focus-visible:outline-none` + `ring-*`）保持原样。
+ *
+ * 必须写在 `@layer base` 里：Tailwind 的工具类在 `utilities` 层，而不分层的
+ * 规则在层叠里排在所有层之上——直接裸写会反过来盖掉 `outline-none`，让每个
+ * 带 ring 的控件都多套一圈 outline（ring-inset 的地方还会被父级 overflow 裁掉）。
  */
-:where(:focus-visible) {
-  outline: var(--focus-ring-width) solid hsl(var(--color-ring));
-  outline-offset: var(--focus-ring-offset);
-}
+@layer base {
+  :where(:focus-visible) {
+    outline: var(--focus-ring-width) solid hsl(var(--color-ring));
+    outline-offset: var(--focus-ring-offset);
+  }
 
-/* iOS/Android WebView 点击时那块半透明灰色方块会盖住圆角、并且比我们自己的
-   按下反馈晚半拍。控件本身都有 hover/active 态，这里统一关掉系统高亮；
-   `touch-action: manipulation` 顺带去掉 300ms 双击缩放延迟。
-   注意不要扩到整个 `*`：正文文本的长按选择高亮要保留。 */
-:where(
-  a[href],
-  button,
-  summary,
-  label,
-  select,
-  [role="button"],
-  [role="tab"],
-  [role="switch"],
-  [role="option"],
-  [role="menuitem"]
-) {
-  -webkit-tap-highlight-color: transparent;
-  touch-action: manipulation;
-}
+  /* iOS/Android WebView 点击时那块半透明灰色方块会盖住圆角，而且比我们自己的
+     按下反馈晚半拍。控件本身都有 hover/active 态，这里统一关掉系统高亮；
+     `touch-action: manipulation` 顺带去掉 300ms 双击缩放延迟。
+     注意不要扩到整个 `*`：正文文本的长按选择高亮要保留。 */
+  :where(
+    a[href],
+    button,
+    summary,
+    label,
+    select,
+    [role="button"],
+    [role="tab"],
+    [role="switch"],
+    [role="option"],
+    [role="menuitem"]
+  ) {
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+  }
 
-:where(input, textarea) {
-  -webkit-tap-highlight-color: transparent;
+  :where(input, textarea) {
+    -webkit-tap-highlight-color: transparent;
+  }
 }
 
 /* 页面统一左右留白与最大宽度 */
