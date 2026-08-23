@@ -104,12 +104,16 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
   const persistTimerRef = useRef<number | null>(null);
   // Latest store snapshot awaiting the debounced write; null when clean.
   const pendingStoreRef = useRef<HighlightStore | null>(null);
-  // 挂载时的第一次 effect 只会把刚读出来的内容原样写回，跳过它。
-  const hydratedRef = useRef(false);
+  // 首帧的 store 就是刚从 localStorage 读出来的，回写没有意义；更糟的是：
+  // 如果读取因数据损坏回落到了 {}，这次回写会立刻用空对象覆盖掉原始数据，
+  // 连恢复的机会都不留。守卫不能用「跳过第一次 effect」的布尔标记：
+  // StrictMode 开发模式下挂载期 effect 连跑两次、ref 不会重置，第二次就把
+  // 初始状态写回去了（收藏 hook 踩过同一个坑）。改为与初始 state 做引用
+  // 比较——任何真实改动都会产生新对象，自然落盘。
+  const initialStoreRef = useRef(store);
   useEffect(() => {
     if (typeof window === "undefined") return;
-    if (!hydratedRef.current) {
-      hydratedRef.current = true;
+    if (store === initialStoreRef.current) {
       return;
     }
     pendingStoreRef.current = store;

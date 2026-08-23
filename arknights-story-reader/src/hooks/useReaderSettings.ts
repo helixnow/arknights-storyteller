@@ -78,7 +78,15 @@ const READING_MODES = new Set<ReaderSettings["readingMode"]>(["paged", "scroll"]
 const TEXT_ALIGNS = new Set<ReaderSettings["textAlign"]>(["left", "justify"]);
 
 function clampNumber(value: unknown, [min, max]: [number, number], fallback: number): number {
-  const parsed = typeof value === "number" ? value : Number(value);
+  // 只接受数字和非空数字字符串（老版本可能把滑杆值序列化成字符串）。
+  // 其余形状（null / 布尔 / 数组等）一律回落默认值：直接 Number(null) === 0
+  // 会把缺失值钳到区间下限——pageWidth 变 60%、字号变 14，页面明显不对。
+  const parsed =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" && value.trim() !== ""
+        ? Number(value)
+        : Number.NaN;
   if (!Number.isFinite(parsed)) return fallback;
   return Math.min(max, Math.max(min, parsed));
 }
@@ -135,6 +143,14 @@ function loadSettings(): ReaderSettings {
   }
 }
 
+function persistSettings(settings: ReaderSettings) {
+  try {
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+  } catch {
+    // 隐私模式 / 配额不足时写入失败是原子的：旧数据原样保留，本次改动只在会话内生效。
+  }
+}
+
 export function useReaderSettings() {
   const [settings, setSettings] = useState<ReaderSettings>(loadSettings);
 
@@ -143,36 +159,53 @@ export function useReaderSettings() {
   // knob across its full range. A single flush on unmount covers the
   // final value when the drawer closes mid-drag.
   const persistTimerRef = useRef<number | null>(null);
-  // 首次挂载只是把刚读出来的值原样写回去，纯属浪费一次同步写。
-  const hydratedRef = useRef(false);
+  // 等待防抖写入的最新快照；已落盘时为 null。
+  const pendingSettingsRef = useRef<ReaderSettings | null>(null);
+  // 首帧的值就是刚从 localStorage 读出来的，回写没有意义；更糟的是：如果
+  // 读取因数据损坏回落到了默认值，这次回写会立刻用默认值覆盖掉原始数据，
+  // 连恢复的机会都不留。守卫不能用「跳过第一次 effect」的布尔标记：
+  // StrictMode 开发模式下挂载期 effect 连跑两次、ref 不会重置，第二次就把
+  // 初始状态写回去了（收藏、划线两个 hook 都踩过同一个坑）。改为与初始
+  // state 做引用比较——任何真实改动都会经 sanitizeSettings 产生新对象。
+  const initialSettingsRef = useRef(settings);
   useEffect(() => {
     if (typeof window === "undefined") return;
-    if (!hydratedRef.current) {
-      hydratedRef.current = true;
+    if (settings === initialSettingsRef.current) {
       return;
     }
-    const persist = () => {
-      try {
-        window.localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
-      } catch {
-        // ignore quota errors
-      }
-    };
+    pendingSettingsRef.current = settings;
     if (persistTimerRef.current !== null) {
       window.clearTimeout(persistTimerRef.current);
     }
     persistTimerRef.current = window.setTimeout(() => {
-      persist();
       persistTimerRef.current = null;
+      if (pendingSettingsRef.current !== null) {
+        persistSettings(pendingSettingsRef.current);
+        pendingSettingsRef.current = null;
+      }
     }, 200);
     return () => {
+      // deps 变化触发的 cleanup 只负责拆掉旧定时器——下一次 effect 会带着
+      // 更新的值重新装上，连发才真正被合并。之前在这里顺手同步 persist()，
+      // 等于滑杆每动一格就同步写一次 localStorage，恰是上面注释要避免的事。
       if (persistTimerRef.current !== null) {
         window.clearTimeout(persistTimerRef.current);
         persistTimerRef.current = null;
-        persist();
       }
     };
   }, [settings]);
+
+  // 卸载冲刷：拖着滑杆直接关掉抽屉/离开阅读器时，把还在防抖窗口里的
+  // 最终值写掉，而不是悄悄丢弃。
+  useEffect(
+    () => () => {
+      if (pendingSettingsRef.current !== null) {
+        persistSettings(pendingSettingsRef.current);
+        pendingSettingsRef.current = null;
+      }
+    },
+    []
+  );
 
   const updateSettings = useCallback((partial: Partial<ReaderSettings>) => {
     setSettings((prev) => {
