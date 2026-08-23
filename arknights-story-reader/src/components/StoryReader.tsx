@@ -42,6 +42,7 @@ import { useAppPreferences } from "@/hooks/useAppPreferences";
 import type { StoryEntry, StoryNeighbors } from "@/types/story";
 import { ShareImageDialog } from "@/components/ShareImageDialog";
 import { AssetImage } from "@/components/AssetImage";
+import { useAssetHealthNonce } from "@/hooks/useAsset";
 import { CharacterAvatar } from "@/components/CharacterAvatar";
 import { bumpReadingStreak } from "@/components/HomePanel";
 
@@ -503,6 +504,10 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   useEffect(() => {
     if (active) return;
     setMoreMenuOpen(false);
+    // 角色意图的「已应用」记号一并清掉：同一个角色字符串没有 issuedAt 可
+    // 判重，只能把「退到后台再回来」当作一次新意图的边界——用户再次从
+    // 人物面板点「在剧情中查看」时才能重新定位到该角色。
+    characterAppliedRef.current = null;
   }, [active]);
 
   // iOS-style edge swipe back — close the reader when the user swipes from
@@ -1050,11 +1055,21 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     const restoreKey = `${storyPath}::${settings.readingMode}`;
     if (restoredKeyRef.current === restoreKey) return;
 
-    // 若正在处理搜索跳转或初始定位，避免恢复旧的阅读进度，以免覆盖滚动
+    // 若正在处理搜索跳转或初始定位，避免恢复旧的阅读进度，以免覆盖滚动。
+    // 必须以「跳转是否已应用（token 已记账）」为准：initialFocus/initialJump
+    // 这两个 prop 在整个阅读会话里都不会消失，只看 prop 是否存在的话，
+    // 搜索进来的读者之后每次切换阅读模式都会被跳过恢复、直接甩回开头，
+    // 随后的进度落盘还会把 ~0% 写回存储，真实进度就此丢失。
+    const focusPending =
+      initialFocus &&
+      initialFocus.storyId === storyId &&
+      focusAppliedRef.current !== (initialFocus.issuedAt ?? null);
+    const jumpPending =
+      initialJump &&
+      initialJump.storyId === storyId &&
+      jumpAppliedRef.current !== (initialJump.issuedAt ?? null);
     const shouldSkipRestore =
-      pendingScrollIndexRef.current !== null ||
-      (initialFocus && initialFocus.storyId === storyId) ||
-      (initialJump && initialJump.storyId === storyId);
+      pendingScrollIndexRef.current !== null || focusPending || jumpPending;
     if (shouldSkipRestore) {
       restoredKeyRef.current = restoreKey;
       return;
@@ -1547,9 +1562,14 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   // 初始角色高亮与定位（人物面板点击"在剧情中查看"）。使用 jumpToSegment，
   // 这样分页模式也会翻到该角色首次出场的那一页，而不是只在当前页滚动。
   useEffect(() => {
-    if (!processedSegments.length) return;
+    if (!active || !processedSegments.length) return;
     if (!initialCharacter) return;
-    if (characterAppliedRef.current === initialCharacter && activeCharacter === initialCharacter) return;
+    // 每个意图只应用一次。旧 guard 还要求 activeCharacter 仍等于
+    // initialCharacter，导致用户在导览里清除高亮 / 改选别的角色时，
+    // activeCharacter 一变这里就把初始角色重新套回去、还跳回其首次
+    // 出场段——角色焦点根本清不掉。角色意图没有 issuedAt 可判重，
+    // ref 在阅读器退到后台时清空，再次从人物面板进来仍会重新定位。
+    if (characterAppliedRef.current === initialCharacter) return;
 
     // 查找该角色的第一条对话段落
     let firstIndex: number | null = null;
@@ -1565,7 +1585,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     if (firstIndex !== null) {
       jumpToSegment(firstIndex, { highlightSearch: false });
     }
-  }, [processedSegments, initialCharacter, activeCharacter, jumpToSegment]);
+  }, [active, processedSegments, initialCharacter, jumpToSegment]);
 
   // 当页面或段落渲染完成后，执行挂起的滚动请求（最多尝试几次）
   useLayoutEffect(() => {
@@ -2842,6 +2862,19 @@ function ReaderImageSegment({
   selectionClass,
 }: ReaderImageSegmentProps) {
   const [failed, setFailed] = useState(false);
+  // exhausted 不一定是「素材真没了」：断网/源被墙时，一段插画只有 3 条
+  // 候选，会在主机熔断阈值（8 次）攒够之前就逐条 onerror，AssetImage 只能
+  // 上报 exhausted。此时若把段落永久删掉，等网络恢复（markAssetUrlAlive
+  // 撤销那批不可靠的失败记录）插画也回不来了——AssetImage 已被卸载，谁都
+  // 收不到健康事件。所以隐藏期间订阅健康度：事件到来（源首次被证明可达 /
+  // 熔断窗口到期）时撤销 failed、重挂 AssetImage 再试一次；真正 404 的
+  // 段落会立刻再次 exhausted，照旧隐藏。
+  const healthNonce = useAssetHealthNonce(failed);
+  const seenHealthNonceRef = useRef(healthNonce);
+  if (seenHealthNonceRef.current !== healthNonce) {
+    seenHealthNonceRef.current = healthNonce;
+    if (failed) setFailed(false);
+  }
   if (failed) return null;
   return (
     <div
