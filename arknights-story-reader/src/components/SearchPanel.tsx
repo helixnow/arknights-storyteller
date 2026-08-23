@@ -511,8 +511,17 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
   // Tauri 的 invoke 没有 abort，只能靠它让迟到的旧结果失去写状态的资格。
   const searchSeqRef = useRef(0);
   const searchingRef = useRef(false);
-  /** 在途搜索查的词、模式和是否自动触发：防抖 effect 与回车去重靠它识别"同一条已经在路上"。 */
-  const inFlightRef = useRef<{ mode: SearchMode; query: string; auto: boolean } | null>(null);
+  /**
+   * 在途搜索查的词、模式、是否自动触发、成功后是否写历史：防抖 effect 与
+   * 回车去重靠它识别"同一条已经在路上"；索引就绪上升沿的补搜靠它把在途
+   * 那条按原语义（尤其是否写历史）重发，而不是错发成更早的 lastQuery。
+   */
+  const inFlightRef = useRef<{
+    mode: SearchMode;
+    query: string;
+    auto: boolean;
+    recordsHistory: boolean;
+  } | null>(null);
   /** 上一次落定失败的 `${mode}:${query}`（手动/自动都记），避免防抖 effect 反复重试同一个错误。 */
   const autoFailedRef = useRef<string | null>(null);
   const rowRefs = useRef(new Map<number, HTMLButtonElement>());
@@ -670,7 +679,12 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     };
 
     autoFailedRef.current = null;
-    inFlightRef.current = { mode: activeMode, query: raw, auto };
+    inFlightRef.current = {
+      mode: activeMode,
+      query: raw,
+      auto,
+      recordsHistory: !auto && !opts?.skipHistory,
+    };
     setSearching(true);
     searchingRef.current = true;
     setSearchError(null);
@@ -832,6 +846,10 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     // 用户刚按下的那次搜索静默吞掉（索引未就绪时自动搜也不会兜底），界面直接
     // 安静下来，像是搜索被按钮弄丢了。
     const wasSearching = searchingRef.current;
+    // 首次搜索已落定失败时 searched 同样是 false：下面的 setSearchError(null)
+    // 会把错误卡片清掉，若不在新模式重发这条查询，点模式按钮的全部效果就是
+    // 错误提示凭空消失、面板退回语法说明——失败后换个粒度再试的意图被吞掉。
+    const hadFailure = searchError !== null;
     invalidateInFlight();
     setMode(next);
     setActiveFacet(null);
@@ -841,7 +859,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     // 手动切模式时不自动回退，否则刚点"段落"就被弹回"整篇"，像是按钮失灵。
     // 也不写历史：pending 可能是输入框里打到一半、只被自动搜碰过的词，
     // 用户真正回车过的词早在那次手动搜索时就进了历史。
-    if ((searched || wasSearching) && pending) {
+    if ((searched || wasSearching || hadFailure) && pending) {
       void handleSearch({
         queryOverride: pending,
         modeOverride: next,
@@ -1156,11 +1174,34 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     const rose = !prevIndexReadyRef.current && indexReady;
     prevIndexReadyRef.current = indexReady;
     if (!rose) return;
+    // 两条硬规则：
+    //   1. 上升沿时若还有在途搜索，它才是用户最新的意图（比如重建期间对
+    //      新词回车强搜、线性扫描跑了几秒还没回来）。此时按 lastQuery 补搜
+    //      会把在途那条作废，屏幕落回"上一条查询"的结果——输入框和结果
+    //      对不上号；不满足自动搜条件的词（如单字）还永远补不回来。所以
+    //      改成把在途那条本身 forceRefresh 重发：词、模式、写不写历史都
+    //      沿用它自己的语义。
+    //   2. 一律 noFallback：这是系统发起的补搜，不是用户回车。让它触发
+    //      "段落零命中自动改搜整篇"，等于后台重建一结束就擅自把用户刚选
+    //      的模式掰回去——和自动搜"不擅自改模式"的规则保持一致，零命中
+    //      交给空状态里的"改搜整篇"按钮。
+    const inFlight = searchingRef.current ? inFlightRef.current : null;
+    if (inFlight) {
+      void handleSearchRef.current({
+        queryOverride: inFlight.query,
+        modeOverride: inFlight.mode,
+        forceRefresh: true,
+        skipHistory: !inFlight.recordsHistory,
+        noFallback: true,
+      });
+      return;
+    }
     if (!searched || !lastQuery) return;
     void handleSearchRef.current({
       queryOverride: lastQuery,
       forceRefresh: true,
       skipHistory: true,
+      noFallback: true,
     });
   }, [indexReady, searched, lastQuery]);
 

@@ -30,7 +30,7 @@ import {
 import { useReaderSettings } from "@/hooks/useReaderSettings";
 import { ReaderSettingsPanel } from "@/components/ReaderSettings";
 import { StoryInsightsPanel } from "@/components/StoryInsightsPanel";
-import { useReadingProgress } from "@/hooks/useReadingProgress";
+import { useReadingProgress, type ReadingProgress } from "@/hooks/useReadingProgress";
 import { useFavorites } from "@/hooks/useFavorites";
 import { useHighlights } from "@/hooks/useHighlights";
 import { useBackHandler } from "@/hooks/useBackHandler";
@@ -384,6 +384,11 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   const characterAppliedRef = useRef<string | null>(null);
   const pendingScrollIndexRef = useRef<number | null>(null);
   const jumpAppliedRef = useRef<number | null>(null);
+  // 「搜索 / 跳转落点」挂起期间被跳过的进度快照。restore 逻辑让位给落点时
+  // 先把当时未被污染的进度存在这里：落点若最终应用失败（正文里命中不到、
+  // 目标段渲染不出来），用它把读者送回原位——否则读者被留在开头，随后的
+  // 进度落盘还会把 ~0% 写回存储。落点成功应用时清空。
+  const pendingLandingFallbackRef = useRef<ReadingProgress | null>(null);
   const lastScrollTopRef = useRef(0);
   // 已恢复过阅读进度的 `storyPath::readingMode`，避免"滚动→写进度→再恢复"回路。
   const restoredKeyRef = useRef<string | null>(null);
@@ -613,10 +618,26 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     const scaleFactor = 18 / Math.max(settings.fontSize, 14);
     const budget = Math.max(200, Math.round(TARGET_CHARS_PER_PAGE * scaleFactor));
 
+    // 插画被全局隐藏（关闭插画 / 极简模式）时按 0 长度计：这些段渲染为
+    // null，仍按 ~360 字符记账会让每页普遍偏空，连续几个插画段甚至会拼出
+    // 一整页什么都不渲染的空白页。
+    const imagesVisible = inlineImages && !minimalMode;
+    const lengthOf = (seg: StorySegment) =>
+      seg.type === "image" && !imagesVisible ? 0 : approximateSegmentLength(seg);
+    // 最后一个会真正渲染出内容的段。预算断点不越过它：尾部只剩隐藏插画段
+    // 时，在它们前面开新页会多出一页完全空白的「最后一页」。
+    let lastRenderableIndex = -1;
+    for (let i = processedSegments.length - 1; i >= 0; i -= 1) {
+      const seg = processedSegments[i];
+      if (seg.type === "image" && !imagesVisible) continue;
+      lastRenderableIndex = i;
+      break;
+    }
+
     const boundaries: number[] = [0];
     let acc = 0;
     processedSegments.forEach((seg, idx) => {
-      const len = approximateSegmentLength(seg);
+      const len = lengthOf(seg);
       // Always break before a Header — chapters/sections open a new page.
       const isHeader = seg.type === "header";
       if (idx > 0 && isHeader && boundaries[boundaries.length - 1] !== idx) {
@@ -624,13 +645,13 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
         acc = 0;
       }
       acc += len;
-      if (acc >= budget && idx + 1 < processedSegments.length) {
+      if (acc >= budget && idx + 1 <= lastRenderableIndex) {
         boundaries.push(idx + 1);
         acc = 0;
       }
     });
     return boundaries;
-  }, [processedSegments, settings.fontSize]);
+  }, [processedSegments, settings.fontSize, inlineImages, minimalMode]);
 
   const totalPages = useMemo(() => {
     if (!processedSegments.length) return 0;
@@ -1043,6 +1064,59 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   }, [storyId, storyPath]);
 
   /**
+   * 把一份进度记录应用到当前视图（分页翻到存储页 / 连续滚动滚到存储位置）。
+   *
+   * 抽成独立函数：除了下面的恢复 effect，搜索 / 跳转落点应用失败的兜底
+   * 路径也要用它把读者送回原位。
+   *
+   * @returns 是否应用成功（滚动容器还没挂上时返回 false，调用方可稍后重试）。
+   */
+  const applyStoredProgress = useCallback(
+    (stored: ReadingProgress | null): boolean => {
+      // 上次是另一种阅读模式时，用百分比近似换算，别一路弹回开头。
+      const storedPercentage =
+        typeof stored?.percentage === "number" && Number.isFinite(stored.percentage)
+          ? Math.max(0, Math.min(1, stored.percentage))
+          : 0;
+
+      if (settings.readingMode === "paged") {
+        const lastPage = Math.max(totalPages - 1, 0);
+        const storedPage =
+          stored?.readingMode === "paged" && typeof stored.currentPage === "number"
+            ? Math.max(0, Math.min(stored.currentPage, lastPage))
+            : Math.round(storedPercentage * lastPage);
+        setCurrentPage(storedPage);
+        progressStore.set(totalPages <= 1 ? 1 : (storedPage + 1) / totalPages);
+        return true;
+      }
+
+      const container = scrollContainerRef.current;
+      if (!container) return false;
+      const maxTop = Math.max(container.scrollHeight - container.clientHeight, 0);
+      let storedTop =
+        stored?.readingMode === "scroll" && typeof stored.scrollTop === "number"
+          ? stored.scrollTop
+          : storedPercentage * maxTop;
+      // 布局比记录进度时矮（旋转 / 缩放视口、插画被隐藏）会让绝对 scrollTop
+      // 失真：直接 scrollTo 会被夹到文末，按 storedTop 反推的 ratio 还会算出
+      // >1、把进度直接标成 100%。此时退回按百分比换算。
+      if (storedTop > maxTop) storedTop = storedPercentage * maxTop;
+      storedTop = Math.max(0, storedTop);
+      // 视口的 `.reader-scroll` 挂着 `scroll-behavior: smooth`，不显式指定
+      // behavior 的话恢复位置会从顶部一路平滑飘过去；动画途中滚动监听读到的
+      // 还是起点附近的位置，会先把一份 ~0% 的进度落盘，短暂盖掉真实记录。
+      container.scrollTo({ top: storedTop, behavior: "instant" });
+      lastScrollTopRef.current = storedTop;
+      const ratio = maxTop <= 0 ? 1 : storedTop / maxTop;
+      const clamped = Number.isFinite(ratio) ? Math.max(0, Math.min(1, ratio)) : 0;
+      scrollRatioRef.current = clamped;
+      progressStore.set(clamped);
+      return true;
+    },
+    [settings.readingMode, totalPages, progressStore]
+  );
+
+  /**
    * 恢复上次阅读位置。
    *
    * 只在"换一篇剧情"或"切换阅读模式"时执行一次（用 `restoredKeyRef` 记住
@@ -1071,58 +1145,30 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     const shouldSkipRestore =
       pendingScrollIndexRef.current !== null || focusPending || jumpPending;
     if (shouldSkipRestore) {
+      // 让位给落点前先快照当前进度。此刻它还没被本次会话的进度 effect
+      // 污染（本 effect 是 layout effect，先于它们执行）；落点应用失败时
+      // 兜底路径会用这份快照把读者送回原位。
+      if (focusPending || jumpPending) {
+        pendingLandingFallbackRef.current = getProgress() ?? progressRef.current;
+      }
       restoredKeyRef.current = restoreKey;
       return;
     }
 
     // 优先读 hook 里的实时值：state 可能还没跟上刚刚的滚动，也可能还停在上一篇。
     const stored = getProgress() ?? progressRef.current;
-
-    // 上次是另一种阅读模式时，用百分比近似换算，别一路弹回开头。
-    const storedPercentage =
-      typeof stored?.percentage === "number" && Number.isFinite(stored.percentage)
-        ? Math.max(0, Math.min(1, stored.percentage))
-        : 0;
-
-    if (settings.readingMode === "paged") {
-      const lastPage = Math.max(totalPages - 1, 0);
-      const storedPage =
-        stored?.readingMode === "paged" && typeof stored.currentPage === "number"
-          ? Math.min(stored.currentPage, lastPage)
-          : Math.round(storedPercentage * lastPage);
-      setCurrentPage(storedPage);
-      progressStore.set(totalPages <= 1 ? 1 : (storedPage + 1) / totalPages);
-    } else {
-      const container = scrollContainerRef.current;
-      if (!container) return;
-      const storedTop =
-        stored?.readingMode === "scroll" && typeof stored.scrollTop === "number"
-          ? stored.scrollTop
-          : storedPercentage * Math.max(container.scrollHeight - container.clientHeight, 0);
-      // 视口的 `.reader-scroll` 挂着 `scroll-behavior: smooth`，不显式指定
-      // behavior 的话恢复位置会从顶部一路平滑飘过去；动画途中滚动监听读到的
-      // 还是起点附近的位置，会先把一份 ~0% 的进度落盘，短暂盖掉真实记录。
-      container.scrollTo({ top: storedTop, behavior: "instant" });
-      lastScrollTopRef.current = storedTop;
-      const { scrollHeight, clientHeight } = container;
-      const denominator = scrollHeight - clientHeight;
-      const ratio = denominator <= 0 ? 1 : storedTop / denominator;
-      const clamped = Number.isFinite(ratio) ? Math.max(0, Math.min(1, ratio)) : 0;
-      scrollRatioRef.current = clamped;
-      progressStore.set(clamped);
-    }
+    if (!applyStoredProgress(stored)) return;
 
     restoredKeyRef.current = restoreKey;
   }, [
     processedSegments,
     settings.readingMode,
     storyPath,
-    totalPages,
     initialFocus,
     initialJump,
     storyId,
     getProgress,
-    progressStore,
+    applyStoredProgress,
   ]);
 
   // 阅读器退到后台时连滚动监听一起摘掉：`KeepAlive` 只是把它藏起来，容器
@@ -1415,6 +1461,10 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
         return;
       }
       if (target?.isContentEditable) return;
+      // 带系统 / 浏览器级修饰键的组合不属于阅读器：Alt+← 是历史后退、
+      // Cmd/Ctrl+方向键是系统快捷键，之前会被当成普通方向键拦下来翻页，
+      // 用户的后退手势就此失效。Shift 保留——Shift+Space 是往回翻。
+      if (event.altKey || event.ctrlKey || event.metaKey) return;
       // 抽屉 / 浮层菜单打开时把按键留给它们自己（Esc 关闭等）。
       if (settingsOpen || insightsOpen || shareDialogOpen || moreMenuOpen) return;
 
@@ -1523,6 +1573,8 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       if (element) {
         scrollToSegment(index);
         pendingScrollIndexRef.current = null;
+        // 落点已成功应用，进篇兜底快照不再需要。
+        pendingLandingFallbackRef.current = null;
       }
     },
     [processedSegments, scrollToSegment, settings.readingMode, totalPages, pageBoundaries]
@@ -1549,6 +1601,12 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     if (target >= 0 && target < processedSegments.length) {
       setActiveCharacter(null);
       jumpToSegment(target, { highlightSearch: true });
+    } else {
+      // 段号越界且预览文本也匹配不到（数据同步后正文变了）：跳转落空。
+      // 恢复被让位跳过的阅读进度，别把读者留在开头、再让进度落盘写回 ~0%。
+      const fallback = pendingLandingFallbackRef.current;
+      pendingLandingFallbackRef.current = null;
+      if (fallback) applyStoredProgress(fallback);
     }
     jumpAppliedRef.current = token;
   }, [
@@ -1556,6 +1614,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     processedSegments,
     findFocusSegmentIndex,
     jumpToSegment,
+    applyStoredProgress,
     storyId,
   ]);
 
@@ -1604,6 +1663,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
           // 找到了目标元素，执行滚动
           scrollToSegment(index);
           pendingScrollIndexRef.current = null;
+          pendingLandingFallbackRef.current = null;
           return;
         }
       }
@@ -1615,6 +1675,19 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
         // 放弃并清掉 pending，免得之后每次正文重排都重新挂一条重试链、
         // 且换阅读模式时恢复逻辑一直被这个死目标挡住。
         pendingScrollIndexRef.current = null;
+        if (settings.readingMode === "paged") {
+          // 这次翻页本是为了滚到目标段；目标没出现时至少把视口复位到页首，
+          // 否则新页会沿用跳转前残留的滚动偏移、从半腰开始读。
+          scrollContainerRef.current?.scrollTo({ top: 0, behavior: "instant" });
+        }
+        // 放弃的是「搜索 / 跳转进篇」的落点时，读者此刻停在开头、且进篇
+        // 恢复已被跳过——用让位时的快照把人送回原来的阅读位置，别让接下来
+        // 的进度落盘把 ~0% 写成真实进度。
+        const fallback = pendingLandingFallbackRef.current;
+        if (fallback) {
+          pendingLandingFallbackRef.current = null;
+          applyStoredProgress(fallback);
+        }
       }
     };
     frame = requestAnimationFrame(tick);
@@ -1623,7 +1696,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       cancelled = true;
       cancelAnimationFrame(frame);
     };
-  }, [renderableSegments, currentPage, settings.readingMode, scrollToSegment]);
+  }, [renderableSegments, currentPage, settings.readingMode, scrollToSegment, applyStoredProgress]);
 
   useEffect(() => {
     if (!initialFocus || !processedSegments.length) return;
@@ -1637,13 +1710,18 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     if (targetIndex === null) {
       focusAppliedRef.current = token;
       setHighlightSegmentIndex(null);
+      // 搜索命中在当前正文里找不到（数据版本漂移）：落点落空。恢复被让位
+      // 跳过的阅读进度，别把读者留在开头、再让进度落盘写回 ~0%。
+      const fallback = pendingLandingFallbackRef.current;
+      pendingLandingFallbackRef.current = null;
+      if (fallback) applyStoredProgress(fallback);
       return;
     }
 
     setActiveCharacter(null);
     jumpToSegment(targetIndex, { highlightSearch: true });
     focusAppliedRef.current = token;
-  }, [initialFocus, processedSegments, findFocusSegmentIndex, jumpToSegment]);
+  }, [initialFocus, processedSegments, findFocusSegmentIndex, jumpToSegment, applyStoredProgress]);
 
   const handleCharacterHighlight = useCallback(
     (name: string, firstIndex: number) => {

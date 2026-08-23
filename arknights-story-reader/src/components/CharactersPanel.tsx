@@ -223,6 +223,10 @@ export function CharactersPanel({
   const [selected, setSelected] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const loadingRef = useRef(false);
+  // 扫描进行中又收到强制刷新（数据同步在后台完成）时先记账，本轮跑完
+  // 立刻重跑。直接丢掉的话，这一轮读到的新旧混合统计会一直顶到下次
+  // 数据更新为止。
+  const pendingForceRef = useRef(false);
   const activeRef = useRef(active);
   const loadedOnceRef = useRef(false);
   const staleRef = useRef(false);
@@ -259,7 +263,12 @@ export function CharactersPanel({
   }, []);
 
   const loadAll = useCallback(async (opts?: { forceRefresh?: boolean }) => {
-    if (loadingRef.current) return;
+    if (loadingRef.current) {
+      // 数据刚换完却撞上正在跑的扫描：本轮读到的可能是新旧混合的内容，
+      // 这次刷新请求不能就地丢掉，记下来等本轮结束再重跑。
+      if (opts?.forceRefresh) pendingForceRef.current = true;
+      return;
+    }
     loadingRef.current = true;
     setLoading(true);
     setError(null);
@@ -281,13 +290,23 @@ export function CharactersPanel({
       if (!aliveRef.current) return;
       setVersion(ver);
 
+      // 本次统计是否缺斤短两：目录拉挂被 catch 吞掉、或个别剧情读取失败。
+      // 残缺结果本次会话先凑合显示，但绝不能写进缓存（见下方保存处）。
+      let statsIncomplete = false;
+
       // 使用主页同样的分组与排序数据源
       const [mainGrouped, activityGrouped, sidestoryGrouped, roguelikeGrouped, memoryStories] =
         await Promise.all([
           api.getMainStoriesGrouped(),
           api.getActivityStoriesGrouped(),
-          api.getSidestoryStoriesGrouped().catch(() => []),
-          api.getRoguelikeStoriesGrouped().catch(() => []),
+          api.getSidestoryStoriesGrouped().catch(() => {
+            statsIncomplete = true;
+            return [];
+          }),
+          api.getRoguelikeStoriesGrouped().catch(() => {
+            statsIncomplete = true;
+            return [];
+          }),
           api.getMemoryStories(),
         ]);
       if (!aliveRef.current) return;
@@ -446,6 +465,7 @@ export function CharactersPanel({
         );
         if (!aliveRef.current) return;
         if (failed > 0) {
+          statsIncomplete = true;
           console.warn(`[CharactersPanel] ${failed}/${stories.length} 篇剧情读取失败，已跳过`);
         }
       }
@@ -465,8 +485,10 @@ export function CharactersPanel({
 
       setAggregates(aggMap);
 
-      // 2) 没用缓存则保存缓存（精简 perStory 为 storyId + count）
-      if (!cacheApplied && ver) {
+      // 2) 没用缓存则保存缓存（精简 perStory 为 storyId + count）。
+      // 扫描不完整时跳过落盘：缓存 key 只随数据版本变，一次瞬时失败算出
+      // 的偏小计数一旦写进去，就会顶着「已使用缓存」活到下个数据版本。
+      if (!cacheApplied && ver && !statsIncomplete) {
         try {
           const plain: Record<string, { name: string; total: number; perStory: Array<{ storyId: string; count: number }> }> = {};
           aggMap.forEach((agg, name) => {
@@ -500,6 +522,17 @@ export function CharactersPanel({
     } finally {
       if (aliveRef.current) setLoading(false);
       loadingRef.current = false;
+      // 消化扫描期间排队的强制刷新。deps 恒定，loadAll 引用自身是安全的。
+      if (pendingForceRef.current && aliveRef.current) {
+        pendingForceRef.current = false;
+        if (activeRef.current) {
+          void loadAll({ forceRefresh: true });
+        } else {
+          // 排队期间面板被切走了：按不可见时的规矩打标，等切回来再扫。
+          staleRef.current = true;
+          loadedOnceRef.current = false;
+        }
+      }
     }
   }, [getCacheKey]);
 
@@ -571,6 +604,14 @@ export function CharactersPanel({
   );
 
   const selectedAgg = useMemo(() => (selected ? aggregates.get(selected) ?? null : null), [aggregates, selected]);
+
+  // 详情开着的时候数据可能被重扫（同步完成后改名/删档），selected 就悬空
+  // 了：详情块因为 selectedAgg 为 null 不渲染，网格又因为 selected 非空不
+  // 渲染——正文区只剩一块白屏。统计落定后名字不在了就自动退回列表。
+  useEffect(() => {
+    if (loading || !selected) return;
+    if (!aggregates.has(selected)) setSelected(null);
+  }, [aggregates, loading, selected]);
 
   const groupedByChapter = useMemo(() => {
     if (!selectedAgg)

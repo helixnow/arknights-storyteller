@@ -551,6 +551,13 @@ export function StoryList({ onSelectStory }: StoryListProps) {
   // 能保持稳定引用，effect 不会因为 state 变化重复触发。
   const loadedRef = useRef<Record<SectionKey, boolean>>(initialSectionFlags(false));
   const pendingRef = useRef<Partial<Record<SectionKey, Promise<void>>>>({});
+  /**
+   * 当前分类的镜像，供异步落地的请求判断「这块数据还与用户正看的页面
+   * 相关吗」。典型场景：在活动分类等了几秒没等到、切回主线，8 秒后活动
+   * 的超时才落地——它没有被 force 顶替（isCurrent 为真），但把「读取
+   * 活动剧情超时」立在健康的主线列表上就是把错误写到了别人的页面。
+   */
+  const activeCategoryRef = useRef<Category>(activeCategory);
   /** 每条简介已发起的请求次数 / 在途标记，配合 SUMMARY_MAX_ATTEMPTS 封顶。 */
   const summaryAttemptsRef = useRef<Map<string, number>>(new Map());
   const summaryInflightRef = useRef<Set<string>>(new Set());
@@ -570,21 +577,24 @@ export function StoryList({ onSelectStory }: StoryListProps) {
    * 把后端的失败原因归类。这里顺手把「数据目录被删/被换掉」的情况回写成
    * `installed = false`：否则界面只会显示一句干巴巴的「加载失败」，而真正
    * 该做的事（同步一次）藏在别处。
+   *
+   * `silent` 供已经与当前分类无关的过期请求使用：只记日志、不立错误卡。
+   * `installed = false` 仍然回写——数据目录没了是全局事实，与分类无关。
    */
-  const handleLoadError = useCallback((label: string, err: unknown) => {
+  const handleLoadError = useCallback((label: string, err: unknown, silent = false) => {
     const errorMsg = err instanceof Error ? err.message : String(err ?? "");
     console.error(`[StoryList] 加载${label}失败:`, errorMsg, err);
 
     if (errorMsg === "TIMEOUT") {
-      setError({ kind: "timeout", label });
+      if (!silent) setError({ kind: "timeout", label });
       return;
     }
     if (isNotInstalledError(errorMsg)) {
-      setError({ kind: "not-installed", label });
+      if (!silent) setError({ kind: "not-installed", label });
       setInstalled(false);
       return;
     }
-    setError({ kind: "unknown", label, detail: errorMsg || undefined });
+    if (!silent) setError({ kind: "unknown", label, detail: errorMsg || undefined });
   }, []);
 
   const setSectionBusy = useCallback((key: SectionKey, busy: boolean) => {
@@ -633,7 +643,12 @@ export function StoryList({ onSelectStory }: StoryListProps) {
           loadedRef.current[key] = true;
         } catch (err) {
           // 被顶替的任务连错误也不该报：数据源已换，这份失败没有意义。
-          if (isCurrent()) handleLoadError(SECTION_LABELS[key], err);
+          // 归属还在但用户已切去别的分类时，只记日志不立卡（silent）：
+          // 下次进入该分类会重新加载，真失败会在正确的页面上重新报。
+          if (isCurrent()) {
+            const relevant = CATEGORY_SECTIONS[activeCategoryRef.current].includes(key);
+            handleLoadError(SECTION_LABELS[key], err, !relevant);
+          }
         } finally {
           if (isCurrent()) {
             pendingRef.current[key] = undefined;
@@ -693,6 +708,10 @@ export function StoryList({ onSelectStory }: StoryListProps) {
     if (installed !== true) return;
     void loadSection("main");
   }, [installed, loadSection]);
+
+  useEffect(() => {
+    activeCategoryRef.current = activeCategory;
+  }, [activeCategory]);
 
   // 切分类时清掉上一个分类遗留的错误卡：目标分类若已加载完成，
   // loadSection 会直接短路返回，永远没有时机清 error，健康的列表上方
@@ -1007,7 +1026,13 @@ export function StoryList({ onSelectStory }: StoryListProps) {
           return a.storyName.localeCompare(b.storyName, "zh-Hans");
         });
 
-        const visibleStories = hasSearch ? allStories.filter(matchesSearch) : allStories;
+        // 与分组分类的搜索语义对齐：组名命中就整组保留。收藏的往往正是
+        // 「整个活动 / 整个章节」，只按条目标题过滤会让用户搜活动名时
+        // 得到「没有匹配」，而同一个词在活动分类里却能搜到。
+        const nameMatches =
+          hasSearch && group.name.toLowerCase().includes(normalizedSearch);
+        const visibleStories =
+          !hasSearch || nameMatches ? allStories : allStories.filter(matchesSearch);
         if (visibleStories.length === 0 && hasSearch) {
           return null;
         }
@@ -1022,7 +1047,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
       })
       .filter((item): item is NonNullable<typeof item> => Boolean(item))
       .sort((a, b) => a.displayName.localeCompare(b.displayName, "zh-Hans"));
-  }, [favoriteGroupEntries, hasSearch, matchesSearch]);
+  }, [favoriteGroupEntries, hasSearch, matchesSearch, normalizedSearch]);
 
   const individualFavoriteStories = useMemo(() => {
     if (favoriteStoryEntries.length === 0) return [];
@@ -1032,9 +1057,11 @@ export function StoryList({ onSelectStory }: StoryListProps) {
   const individualFavoriteGroups = useMemo(() => {
     if (individualFavoriteStories.length === 0) return [];
 
+    // 先按完整成员分组、后做搜索过滤：整组操作（「取消收藏该组」）必须
+    // 拿到全部成员，只拿搜索命中的子集会把没命中的收藏漏在原地——
+    // 清掉搜索词后分组又冒回来，看起来像操作没生效。
     const grouped = new Map<string, StoryEntry[]>();
     individualFavoriteStories.forEach((story) => {
-      if (!matchesSearch(story)) return;
       const key = story.storyGroup || "__ungrouped__";
       const list = grouped.get(key);
       if (list) {
@@ -1046,7 +1073,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
 
     return Array.from(grouped.entries())
       .map(([groupKey, stories]) => {
-        const sorted = [...stories].sort((a, b) => {
+        const allStories = [...stories].sort((a, b) => {
           if (a.storySort !== b.storySort) {
             return a.storySort - b.storySort;
           }
@@ -1058,10 +1085,18 @@ export function StoryList({ onSelectStory }: StoryListProps) {
             ? "未分组"
             : groupNameMap.get(groupKey) || groupKey || "未分组";
 
-        return { groupKey, displayName, stories: sorted };
+        // 与分组分类的搜索语义对齐：组名命中就整组保留，否则只留命中条目。
+        const nameMatches =
+          hasSearch && displayName.toLowerCase().includes(normalizedSearch);
+        const visibleStories =
+          !hasSearch || nameMatches ? allStories : allStories.filter(matchesSearch);
+        if (visibleStories.length === 0) return null;
+
+        return { groupKey, displayName, allStories, visibleStories };
       })
+      .filter((item): item is NonNullable<typeof item> => Boolean(item))
       .sort((a, b) => a.displayName.localeCompare(b.displayName, "zh-Hans"));
-  }, [groupNameMap, individualFavoriteStories, matchesSearch]);
+  }, [groupNameMap, hasSearch, individualFavoriteStories, matchesSearch, normalizedSearch]);
 
   /** 当前分类在当前筛选条件下真正会渲染出来的条目数。 */
   const visibleStoryCount = useMemo(() => {
@@ -1070,7 +1105,10 @@ export function StoryList({ onSelectStory }: StoryListProps) {
       // 两份列表互斥（individual 会排掉分组内的条目），可以直接相加。
       return (
         favoriteGroupList.reduce((total, group) => total + group.visibleStories.length, 0) +
-        individualFavoriteGroups.reduce((total, group) => total + group.stories.length, 0)
+        individualFavoriteGroups.reduce(
+          (total, group) => total + group.visibleStories.length,
+          0
+        )
       );
     }
     return filteredGroups[activeCategory].reduce(
@@ -1176,9 +1214,16 @@ export function StoryList({ onSelectStory }: StoryListProps) {
     (key: SectionKey) => {
       if (installed === null) return true;
       const empty = key === "memory" ? memoryStories.length === 0 : groups[key].length === 0;
-      return sectionLoading[key] && empty;
+      if (!empty) return false;
+      // 加载由 effect 在绘制之后才发起：首次切到一个没加载过的分类，
+      // 首帧 busy 仍是 false。若此时按「没有数据」渲染，会先闪一帧
+      // 「本地数据里没有 X，多半是数据包版本偏旧」的误导空态，再变成
+      // 骨架屏。还没加载过、也没有失败记录的分块一律先按加载中处理，
+      // 等请求真正落地再下「确实没有」的结论。失败过的（error 非空）
+      // 交给下方错误卡解释，这里不能再罩骨架把它盖住。
+      return sectionLoading[key] || (!loadedRef.current[key] && !error);
     },
-    [groups, installed, memoryStories.length, sectionLoading]
+    [error, groups, installed, memoryStories.length, sectionLoading]
   );
 
   /** 当前分组分类的列表（密录 / 收藏走各自的分支）。 */
@@ -1510,46 +1555,50 @@ export function StoryList({ onSelectStory }: StoryListProps) {
                         }
                       )}
 
-                      {individualFavoriteGroups.map(({ groupKey, displayName, stories }, index) => {
-                        const key = `favorite-individual:${groupKey}`;
-                        const open = isGroupOpen(
-                          key,
-                          favoriteGroupList.length === 0 && index === 0
-                        );
-                        return (
-                          <Collapsible
-                            key={key}
-                            title={displayName}
-                            count={stories.length}
-                            open={open}
-                            onOpenChange={(next) => setGroupOpen(key, next)}
-                            actions={
-                              <GroupFavoriteButton
-                                isFavorite
-                                onToggle={() => {
-                                  stories.forEach((story) => {
-                                    if (isFavorite(story.storyId)) {
-                                      toggleFavorite(story);
-                                    }
-                                  });
-                                }}
-                                inactiveText="收藏该组"
-                                activeText="取消收藏该组"
-                              />
-                            }
-                          >
-                            {open ? (
-                              <StoryRows
-                                stories={stories}
-                                keyPrefix="favorite-individual"
-                                listKey={`${key}|${normalizedSearch}`}
-                                renderStoryItem={renderStoryItem}
-                                rootRef={scrollRootRef}
-                              />
-                            ) : null}
-                          </Collapsible>
-                        );
-                      })}
+                      {individualFavoriteGroups.map(
+                        ({ groupKey, displayName, allStories, visibleStories }, index) => {
+                          const key = `favorite-individual:${groupKey}`;
+                          const open = isGroupOpen(
+                            key,
+                            favoriteGroupList.length === 0 && index === 0
+                          );
+                          return (
+                            <Collapsible
+                              key={key}
+                              title={displayName}
+                              count={visibleStories.length}
+                              open={open}
+                              onOpenChange={(next) => setGroupOpen(key, next)}
+                              actions={
+                                <GroupFavoriteButton
+                                  isFavorite
+                                  onToggle={() => {
+                                    // 整组取消必须作用于全部成员：搜索过滤
+                                    // 后的子集会漏掉没命中的收藏。
+                                    allStories.forEach((story) => {
+                                      if (isFavorite(story.storyId)) {
+                                        toggleFavorite(story);
+                                      }
+                                    });
+                                  }}
+                                  inactiveText="收藏该组"
+                                  activeText="取消收藏该组"
+                                />
+                              }
+                            >
+                              {open ? (
+                                <StoryRows
+                                  stories={visibleStories}
+                                  keyPrefix="favorite-individual"
+                                  listKey={`${key}|${normalizedSearch}`}
+                                  renderStoryItem={renderStoryItem}
+                                  rootRef={scrollRootRef}
+                                />
+                              ) : null}
+                            </Collapsible>
+                          );
+                        }
+                      )}
                     </div>
                   ) : hasSearch ? (
                     renderNoSearchMatchState("收藏")

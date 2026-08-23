@@ -8,6 +8,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.os.Looper
 import android.provider.MediaStore
 import android.provider.Settings
 import android.util.Base64
@@ -22,6 +23,12 @@ import app.tauri.plugin.Plugin
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 
 @InvokeArg
 class SaveImageArgs {
@@ -52,6 +59,11 @@ class ShareImageArgs {
  */
 @TauriPlugin
 class ImageSharerPlugin(private val activity: Activity) : Plugin(activity) {
+  // Tauri 的插件命令经 wry MainPipe 派发，@Command 方法一律在 Android 主
+  // 线程执行。长截图的 base64 载荷可达几十 MB，JSON 解析、Base64 解码和
+  // 落盘都必须移到 IO 线程，否则每次保存/分享都会冻结 UI 数百毫秒到数秒，
+  // 低端机上足以触发 ANR。模式与 ApkUpdaterPlugin 的下载协程一致。
+  private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
   /**
    * Open the system app-details settings page so the user can grant the
@@ -80,84 +92,103 @@ class ImageSharerPlugin(private val activity: Activity) : Plugin(activity) {
 
   @Command
   fun saveImage(invoke: Invoke) {
-    val args = invoke.parseArgs(SaveImageArgs::class.java)
-    val bytes = try {
-      decodeBase64(args.base64)
-    } catch (ex: IllegalArgumentException) {
-      invoke.reject("图片数据无效: ${ex.message}")
-      return
-    }
+    scope.launch {
+      // parseArgs 也要留在协程里：它对包含整段 base64 的 JSON 做 Jackson
+      // 反序列化，载荷大时这一步本身就是主线程卡顿的大头。
+      try {
+        val args = invoke.parseArgs(SaveImageArgs::class.java)
+        val bytes = try {
+          decodeBase64(args.base64)
+        } catch (ex: IllegalArgumentException) {
+          runOnMain { invoke.reject("图片数据无效: ${ex.message}") }
+          return@launch
+        }
 
-    val displayName = sanitizeFileName(args.fileName) ?: defaultFileName()
+        val displayName = sanitizeFileName(args.fileName) ?: defaultFileName()
 
-    // Android 9 and below still require the legacy storage permission to
-    // write into shared collections. Surface a needsPermission=true response
-    // so the web layer can decide whether to show a rationale dialog.
-    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q &&
-      ContextCompat.checkSelfPermission(
-        activity, Manifest.permission.WRITE_EXTERNAL_STORAGE
-      ) != PackageManager.PERMISSION_GRANTED
-    ) {
-      val response = JSObject()
-      response.put("saved", false)
-      response.put("needsPermission", true)
-      invoke.resolve(response)
-      return
-    }
+        // Android 9 and below still require the legacy storage permission to
+        // write into shared collections. Surface a needsPermission=true response
+        // so the web layer can decide whether to show a rationale dialog.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q &&
+          ContextCompat.checkSelfPermission(
+            activity, Manifest.permission.WRITE_EXTERNAL_STORAGE
+          ) != PackageManager.PERMISSION_GRANTED
+        ) {
+          val response = JSObject()
+          response.put("saved", false)
+          response.put("needsPermission", true)
+          runOnMain { invoke.resolve(response) }
+          return@launch
+        }
 
-    try {
-      val uri = writeImageToGallery(displayName, bytes)
-      val response = JSObject()
-      response.put("saved", true)
-      response.put("uri", uri.toString())
-      response.put("needsPermission", false)
-      invoke.resolve(response)
-    } catch (ex: Exception) {
-      invoke.reject(ex.message ?: "保存失败")
+        val uri = writeImageToGallery(displayName, bytes)
+        val response = JSObject()
+        response.put("saved", true)
+        response.put("uri", uri.toString())
+        response.put("needsPermission", false)
+        runOnMain { invoke.resolve(response) }
+      } catch (cancelled: CancellationException) {
+        // Plugin destroyed mid-save; nobody is listening for the result.
+        throw cancelled
+      } catch (ex: Exception) {
+        runOnMain { invoke.reject(ex.message ?: "保存失败") }
+      }
     }
   }
 
   @Command
   fun shareImage(invoke: Invoke) {
-    val args = invoke.parseArgs(ShareImageArgs::class.java)
-    val bytes = try {
-      decodeBase64(args.base64)
-    } catch (ex: IllegalArgumentException) {
-      invoke.reject("图片数据无效: ${ex.message}")
-      return
-    }
+    scope.launch {
+      try {
+        val args = invoke.parseArgs(ShareImageArgs::class.java)
+        val bytes = try {
+          decodeBase64(args.base64)
+        } catch (ex: IllegalArgumentException) {
+          runOnMain { invoke.reject("图片数据无效: ${ex.message}") }
+          return@launch
+        }
 
-    val displayName = sanitizeFileName(args.fileName) ?: defaultFileName()
+        val displayName = sanitizeFileName(args.fileName) ?: defaultFileName()
+        val cacheFile = writeToShareCache(displayName, bytes)
+        val uri = FileProvider.getUriForFile(
+          activity,
+          "${activity.packageName}.fileprovider",
+          cacheFile
+        )
 
-    try {
-      val cacheFile = writeToShareCache(displayName, bytes)
-      val uri = FileProvider.getUriForFile(
-        activity,
-        "${activity.packageName}.fileprovider",
-        cacheFile
-      )
+        val sendIntent = Intent(Intent.ACTION_SEND).apply {
+          type = "image/png"
+          putExtra(Intent.EXTRA_STREAM, uri)
+          // Some targets (notably mainstream Chinese IM apps) read the URI
+          // permission grant off the clip data instead of the EXTRA_STREAM
+          // flags. Attaching both keeps the broadest compatibility.
+          clipData = android.content.ClipData.newUri(activity.contentResolver, "image", uri)
+          addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
 
-      val sendIntent = Intent(Intent.ACTION_SEND).apply {
-        type = "image/png"
-        putExtra(Intent.EXTRA_STREAM, uri)
-        // Some targets (notably mainstream Chinese IM apps) read the URI
-        // permission grant off the clip data instead of the EXTRA_STREAM
-        // flags. Attaching both keeps the broadest compatibility.
-        clipData = android.content.ClipData.newUri(activity.contentResolver, "image", uri)
-        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        val chooser = Intent.createChooser(sendIntent, args.title ?: "分享图片").apply {
+          addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+          addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        runOnMain {
+          // 这里已经离开协程的 try/catch：startActivity 抛异常（个别精简
+          // ROM 上没有 chooser 组件）时必须就地兜住，主线程未捕获异常会
+          // 直接闪退——与 ApkUpdater 安装 intent 的教训相同。
+          try {
+            activity.startActivity(chooser)
+            val response = JSObject()
+            response.put("shared", true)
+            invoke.resolve(response)
+          } catch (ex: Exception) {
+            invoke.reject(ex.message ?: "分享失败")
+          }
+        }
+      } catch (cancelled: CancellationException) {
+        // Plugin destroyed mid-share; nobody is listening for the result.
+        throw cancelled
+      } catch (ex: Exception) {
+        runOnMain { invoke.reject(ex.message ?: "分享失败") }
       }
-
-      val chooser = Intent.createChooser(sendIntent, args.title ?: "分享图片").apply {
-        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-      }
-      activity.startActivity(chooser)
-
-      val response = JSObject()
-      response.put("shared", true)
-      invoke.resolve(response)
-    } catch (ex: Exception) {
-      invoke.reject(ex.message ?: "分享失败")
     }
   }
 
@@ -261,5 +292,18 @@ class ImageSharerPlugin(private val activity: Activity) : Plugin(activity) {
     }
     FileOutputStream(out).use { it.write(bytes) }
     return out
+  }
+
+  private fun runOnMain(block: () -> Unit) {
+    if (Looper.myLooper() == Looper.getMainLooper()) {
+      block()
+    } else {
+      activity.runOnUiThread(block)
+    }
+  }
+
+  override fun onDestroy() {
+    super.onDestroy()
+    scope.cancel()
   }
 }
