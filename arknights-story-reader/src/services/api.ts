@@ -100,6 +100,14 @@ export const api = {
     return invoke<void>("import_from_zip_bytes", { chunkBase64, offset, last });
   },
 
+  // 显式中止在途的分块导入。FileReader 读块失败 / 某块 IPC 没送达后端时，
+  // 后端寄存的安装互斥没有任何回调会来释放，只能干等 60 秒弃单超时，
+  // 期间点「同步」只会收到「导入正在进行」。复用同一个命令的 cancel
+  // 分支（免得后端再注册一个 invoke handler）：立刻放锁并清理暂存文件。
+  abortZipImport: async (): Promise<void> => {
+    return invoke<void>("import_from_zip_bytes", { chunkBase64: "", offset: 0, last: false, cancel: true });
+  },
+
   // 监听同步进度
   onSyncProgress: (callback: (progress: ProgressPayload) => void) => {
     return onProgress("sync-progress", callback);

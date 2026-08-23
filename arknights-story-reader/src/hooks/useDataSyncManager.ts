@@ -407,22 +407,34 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
         // 让后端按路径走统一导入流程；两端峰值内存都只有一块的量级。
         const total = file.size;
         let offset = 0;
-        do {
-          const end = Math.min(offset + IMPORT_CHUNK_BYTES, total);
-          const chunk = await blobToBase64(file.slice(offset, end));
-          if (mountedRef.current) {
-            // 传输映射到 0–30%，与后端导入进度（校验 30 → 解压 40 → 完成 100）衔接。
-            const ratio = total > 0 ? offset / total : 0;
-            setProgress({
-              phase: "导入",
-              current: Math.min(Math.round(ratio * 30), 30),
-              total: 100,
-              message: `正在传输 ZIP 数据…（${Math.round(ratio * 100)}%）`,
-            });
-          }
-          await api.importZipChunk(chunk, offset, end >= total);
-          offset = end;
-        } while (offset < total);
+        try {
+          do {
+            const end = Math.min(offset + IMPORT_CHUNK_BYTES, total);
+            const chunk = await blobToBase64(file.slice(offset, end));
+            if (mountedRef.current) {
+              // 传输映射到 0–30%，与后端导入进度（校验 30 → 解压 40 → 完成 100）衔接。
+              const ratio = total > 0 ? offset / total : 0;
+              setProgress({
+                phase: "导入",
+                current: Math.min(Math.round(ratio * 30), 30),
+                total: 100,
+                message: `正在传输 ZIP 数据…（${Math.round(ratio * 100)}%）`,
+              });
+            }
+            await api.importZipChunk(chunk, offset, end >= total);
+            offset = end;
+          } while (offset < total);
+        } catch (err) {
+          // 传输半途而废（FileReader 读块失败 / 某块 IPC 没送达）时，
+          // 后端寄存的安装互斥没人回调释放，会一直攥到 60 秒弃单超时，
+          // 期间点「同步」只会收到「导入正在进行」。主动通知后端中止：
+          // 立刻放锁并删掉半截暂存文件。中止本身失败也无妨（弃单超时
+          // 仍是兜底），原始错误照样抛给 runImport 的统一错误处理。
+          await api.abortZipImport().catch((abortErr) => {
+            devWarn("[useDataSyncManager] 通知后端中止分块导入失败:", abortErr);
+          });
+          throw err;
+        }
       });
     },
     [runImport]

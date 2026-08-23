@@ -411,6 +411,34 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
 /// 长度同样被拒。
 static IMPORT_CHUNK_LOCK: Mutex<()> = Mutex::new(());
 
+/// 显式中止在途的分块传输：取走寄存的安装互斥持有并清理暂存文件。
+/// 只有真取到持有才删 `.part`——寄存已空说明这轮传输并不占着锁
+/// （某块在后端失败时 guard 已随错误一起 Drop / 收尾块已把持有带进
+/// 导入流程 / 弃单已被收走且锁可能已易主），此时删文件反而可能误伤
+/// 新一轮传输正在写的暂存。清理失败不影响放锁：guard 在返回前无条件
+/// Drop，INSTALL_LOCK 一定回到空闲。
+fn abort_import_transfer(staging: &std::path::Path) -> Result<(), String> {
+    let Some(guard) = take_transfer_hold() else {
+        return Ok(());
+    };
+    // 删除与追加共用 IMPORT_CHUNK_LOCK：滞留在阻塞线程池里的迟到块
+    // 要么先落盘随后被删，要么在删除后看到暂存缺失报「中断」，
+    // 绝不会在删除后复活一个半截文件。
+    let removal = {
+        let _serialized = IMPORT_CHUNK_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match std::fs::remove_file(staging) {
+            Ok(()) => Ok(()),
+            // 暂存本就不存在（首块还没落盘就失败了）不算错。
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(format!("清理导入暂存文件失败: {}", err)),
+        }
+    };
+    drop(guard);
+    removal
+}
+
 /// 把解码后的一块字节追加到暂存文件。`offset == 0` 开新文件（顺带截断
 /// 上一轮半途而废的暂存）；其余块要求偏移与暂存文件当前长度严格相等，
 /// 乱序 / 串台宁可报错让用户重传，也不能悄悄拼出一个损坏的 ZIP。
@@ -464,7 +492,9 @@ fn append_import_chunk(staging: &std::path::Path, offset: u64, chunk: &[u8]) -> 
 /// 协议：`offset` 是该块在文件中的字节偏移，0 表示开启新一轮传输
 /// （创建 / 截断暂存文件）；后端校验 offset 必须等于暂存文件当前长度，
 /// 防止 WebView 重载后旧传输的尾巴混进新传输。`last` 为 true 时收尾：
-/// 把暂存文件改名为导入临时 ZIP，走统一导入流程。
+/// 把暂存文件改名为导入临时 ZIP，走统一导入流程。`cancel` 为 true 时
+/// 显式中止本轮传输（其余参数忽略）：放掉寄存的安装互斥并清理暂存
+/// 文件——复用本命令做中止是刻意的，省得再注册一个 invoke handler。
 ///
 /// 安装互斥从首块一路持到收尾，块与块之间寄存在 IMPORT_TRANSFER_HOLD：
 /// sync_data 在传输中途插进来会立刻失败，而不是等用户传完几百 MB 后
@@ -477,7 +507,28 @@ pub async fn import_from_zip_bytes(
     chunk_base64: String,
     offset: u64,
     last: bool,
+    cancel: Option<bool>,
 ) -> Result<(), String> {
+    // 显式中止分支：FileReader 读块失败 / 某块 IPC 根本没送达后端时，
+    // 前端不会再有后续块来接力，寄存的持有只能干等 60 秒弃单超时，
+    // 期间用户点同步只会看到「导入正在进行」。前端在 catch 里带
+    // cancel=true 再调一次本命令，立刻放锁并删掉半截 `.part`；
+    // 弃单超时降级为它失败时的兜底。
+    if cancel.unwrap_or(false) {
+        let service = clone_service(&state);
+        return run_blocking("import_from_zip_bytes", move || {
+            match service.import_staging_path() {
+                Ok(staging) => abort_import_transfer(&staging),
+                Err(err) => {
+                    // 放锁优先于清理：暂存路径都推导不出也不能把寄存
+                    // 持有留到弃单超时。
+                    drop(take_transfer_hold());
+                    Err(err)
+                }
+            }
+        })
+        .await;
+    }
     let guard = if offset == 0 {
         // 新一轮传输：上一轮的寄存持有（若有）直接作废——offset 0 本就
         // 会截断重写暂存文件。随后重新抢锁，抢不到说明真有同步/导入
@@ -953,6 +1004,50 @@ mod tests {
         reap_stale_transfer_hold_at(Instant::now());
         acquire_install_lock("sync_data").expect_err("新鲜持有不该被当弃单收走");
         drop(take_transfer_hold());
+    }
+
+    /// 显式中止在途传输：立刻放锁 + 清理暂存，不必等 60 秒弃单超时；
+    /// 寄存已空时必须是严格 no-op——既不删文件也不碰别人持有的锁。
+    #[test]
+    fn abort_import_transfer_releases_lock_and_cleans_staging() {
+        let _serial = serialize_global_lock_tests();
+        // 防御：清掉可能的残留寄存，保证从空闲态开始。
+        drop(take_transfer_hold());
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("askr_import_abort_{nanos}"));
+        let staging = dir.join("staging.part");
+
+        // 正主中止：传了一半失败，持有寄存在案。中止必须删掉半截
+        // 暂存并立刻释放安装互斥——这正是修的那个「点同步要等一分钟」。
+        append_import_chunk(&staging, 0, b"half transfer").expect("首块必须成功");
+        let guard = acquire_install_lock("import_from_zip_bytes").expect("空闲时必须拿到锁");
+        stow_transfer_hold(guard);
+        abort_import_transfer(&staging).expect("中止必须成功");
+        assert!(!staging.exists(), "中止后半截暂存文件必须被删掉");
+        assert!(take_transfer_hold().is_none(), "中止后寄存处必须为空");
+        drop(acquire_install_lock("sync_data").expect("中止后 sync 必须立刻拿到锁"));
+
+        // 寄存为空、锁归别人（例如 sync 正在跑）时，中止不得删文件、
+        // 不得放掉别人的锁。
+        append_import_chunk(&staging, 0, b"someone else's bytes").expect("重建暂存必须成功");
+        let others = acquire_install_lock("sync_data").expect("锁应空闲");
+        abort_import_transfer(&staging).expect("空寄存时中止必须静默成功");
+        assert!(staging.exists(), "没有取到持有就不得删暂存文件");
+        acquire_install_lock("import_from_zip").expect_err("别人持有的锁不能被中止放掉");
+        drop(others);
+
+        // 暂存文件本就不存在（首块还没落盘就失败）时中止照样成功放锁。
+        let guard = acquire_install_lock("import_from_zip_bytes").expect("锁应空闲");
+        stow_transfer_hold(guard);
+        std::fs::remove_file(&staging).unwrap();
+        abort_import_transfer(&staging).expect("暂存缺失时中止必须成功");
+        drop(acquire_install_lock("sync_data").expect("锁必须已被释放"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// DataService::new 除记路径外还会尝试接回 `_old` 暂存目录、清理导入
