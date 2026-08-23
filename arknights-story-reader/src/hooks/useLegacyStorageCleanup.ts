@@ -26,6 +26,17 @@ const CLEANUP_STEPS: Array<{ version: number; keys: string[] }> = [
       "arknights-highlight-intro-shown",
     ],
   },
+  {
+    version: 2,
+    keys: [
+      // 2026-08：INDEX_VERSION 7→8 修复了索引语料（引号内 `]`、单引号说话人、
+      // 状态残渣），但缓存按数据 commit 命中、察觉不到 parser 变化，旧缓存会
+      // 一直命中脏结果，所以 SearchPanel 把键换成了 v3/v2。旧键自此无人读写，
+      // 每条却可能压着最多 40 页搜索结果，白占配额，在这里删掉。
+      "arknights-story-search-cache-v2",
+      "arknights-story-segment-cache-v1",
+    ],
+  },
 ];
 
 const CLEANUP_VERSION = CLEANUP_STEPS[CLEANUP_STEPS.length - 1]?.version ?? 0;
