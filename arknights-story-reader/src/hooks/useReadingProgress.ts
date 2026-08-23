@@ -91,6 +91,21 @@ function isWorthPersisting(next: ReadingProgress, last: ReadingProgress | null):
   return Math.abs((next.scrollTop ?? 0) - (last.scrollTop ?? 0)) >= MIN_SCROLL_DELTA_PX;
 }
 
+/**
+ * 所有活跃 hook 实例的强制冲刷入口。
+ *
+ * 阅读器由 KeepAlive 常驻挂载，返回列表时不会卸载，卸载冲刷永远不跑；而
+ * 关闭方（App.closeReader）是同步派发 `app:home-refresh` 的——监听方会在
+ * 本组件收到 `active=false` 之前就回读 localStorage。所以只能由关闭方在
+ * 广播之前调这里，把还压在节流窗口里的进度先落盘。
+ */
+const activeFlushers = new Set<() => void>();
+
+/** 立即把所有实例待写的阅读进度强制落盘（没有待写时是 no-op）。 */
+export function flushReadingProgressWrites(): void {
+  activeFlushers.forEach((flush) => flush());
+}
+
 export interface UseReadingProgressOptions {
   /**
    * 是否让 `progress` 跟着每次落盘更新。
@@ -200,6 +215,15 @@ export function useReadingProgress(
     [storyPath, flushPending]
   );
 
+  // 注册到模块级冲刷入口，供关闭阅读器的一方在广播 home-refresh 前调用。
+  useEffect(() => {
+    const flush = () => flushPending(true);
+    activeFlushers.add(flush);
+    return () => {
+      activeFlushers.delete(flush);
+    };
+  }, [flushPending]);
+
   // 切到后台 / 关标签页时强制落盘：移动端多数情况下根本不会触发 unmount。
   useEffect(() => {
     if (!isBrowser) return;
@@ -234,6 +258,15 @@ export function useReadingProgress(
     return readProgressMap()[storyPath] ?? null;
   }, [storyPath]);
 
+  /**
+   * 强制冲刷本实例待写的进度（无待写时是 no-op）。阅读器在 `active` 翻
+   * false 时调用：KeepAlive 不卸载它，不冲的话最后 ≤1.2s 的节流写入要等
+   * 下一次 focus 才会被首页 / 列表读到。
+   */
+  const flushProgress = useCallback(() => {
+    flushPending(true);
+  }, [flushPending]);
+
   const clearProgress = useCallback(() => {
     if (!storyPath) return;
     clearTimer();
@@ -255,7 +288,8 @@ export function useReadingProgress(
       updateProgress,
       clearProgress,
       getProgress,
+      flushProgress,
     }),
-    [progress, updateProgress, clearProgress, getProgress]
+    [progress, updateProgress, clearProgress, getProgress, flushProgress]
   );
 }

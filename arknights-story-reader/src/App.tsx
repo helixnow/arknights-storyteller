@@ -15,6 +15,7 @@ import { CharactersPanel } from "@/components/CharactersPanel";
 import { useAppUpdater } from "@/hooks/useAppUpdater";
 import { BACK_PRIORITY, useBackHandler } from "@/hooks/useBackHandler";
 import { useAutoIndex } from "@/hooks/useAutoIndex";
+import { flushReadingProgressWrites } from "@/hooks/useReadingProgress";
 import { useLegacyStorageCleanup } from "@/hooks/useLegacyStorageCleanup";
 import { ToastProvider } from "@/components/ui/toast";
 
@@ -71,6 +72,10 @@ function App() {
     if (!readerVisibleRef.current) return;
     readerVisibleRef.current = false;
     setReaderVisible(false);
+    // 进度是节流落盘的（≤1.2s），而下面的事件会让列表同步回读
+    // localStorage；阅读器又被 KeepAlive 常驻挂载，等它收到 active=false
+    // 再冲刷已经晚了。先在这里强制冲刷，列表读到的才是最终进度。
+    flushReadingProgressWrites();
     window.dispatchEvent(new Event("app:home-refresh"));
   }, []);
 

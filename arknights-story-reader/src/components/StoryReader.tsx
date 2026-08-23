@@ -396,7 +396,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   // `trackState: false`：阅读器只在挂载时要一次初始值，之后一律走
   // `getProgress()`。让每 1.2s 一次的落盘去驱动 state，只会白白把整棵
   // 阅读器重渲染一遍。
-  const { progress, updateProgress, getProgress } = useReadingProgress(storyPath, {
+  const { progress, updateProgress, getProgress, flushProgress } = useReadingProgress(storyPath, {
     trackState: false,
   });
   const { isFavorite, toggleFavorite } = useFavorites();
@@ -1183,6 +1183,14 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     if (!processedSegments.length) return;
     updateProgress({ storyName, storyCode: storyEntry?.storyCode ?? null });
   }, [processedSegments, storyName, storyEntry?.storyCode, updateProgress]);
+
+  // 退到后台（KeepAlive 只隐藏、不卸载，卸载冲刷不会跑）时把节流窗口里的
+  // 进度强制落盘。关闭动线上 closeReader 在广播 home-refresh 前已经同步冲
+  // 刷过一次，这里兜住其余让 `active` 翻 false 的路径。
+  useEffect(() => {
+    if (active) return;
+    flushProgress();
+  }, [active, flushProgress]);
 
   /**
    * 字号 / 行距 / 页宽一变，分页边界会整体重算。这里用「当前页的首段」当锚点，
