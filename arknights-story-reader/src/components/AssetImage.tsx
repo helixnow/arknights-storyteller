@@ -1,4 +1,11 @@
-import { useEffect, useRef, useState, type CSSProperties } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type CSSProperties,
+} from "react";
 import { cn } from "@/lib/utils";
 import { useAsset, useAssetHealthNonce } from "@/hooks/useAsset";
 import {
@@ -58,6 +65,64 @@ function rememberNaturalSize(url: string, width: number, height: number) {
   naturalSizes.set(url, { width, height });
 }
 
+// ─────────────────────────────────────────────────────────────
+// 离线恢复
+//
+// `navigator.onLine === false` 时 img.onerror 不是「这条 URL 404」的可靠
+// 判决，此时不能往共享失败缓存里记账：host 一旦被证明可达（proven），
+// `markAssetUrlAlive` 不会再撤销它名下的失败记录，离线窗口里写进去的
+// 「死链」在网络恢复后整个会话都洗不掉——这正是「会话中途断过一次网，
+// 之后那批头像/封面永远停在兜底上」的根因（首启就离线的场景已由
+// markAssetUrlAlive 的存疑撤销覆盖，这里补上 proven host 的窗口）。
+// 所以离线期间的失败只推进本地游标、完全不落账，并在网络恢复（`online`
+// 事件）时把游标拨回 0，整条候选链原样重试。
+//
+// 与 `useAssetHealthNonce` 同一套共享订阅表模式：整个模块只挂一个
+// window listener，不随组件数量增长。
+// ─────────────────────────────────────────────────────────────
+let onlineVersion = 0;
+const onlineSubscribers = new Set<() => void>();
+if (typeof window !== "undefined") {
+  window.addEventListener("online", () => {
+    onlineVersion += 1;
+    onlineSubscribers.forEach((notify) => {
+      try {
+        notify();
+      } catch {}
+    });
+  });
+}
+
+function getOnlineVersion(): number {
+  return onlineVersion;
+}
+
+const NOOP_UNSUBSCRIBE = () => {};
+
+/** 浏览器当前是否明确处于离线状态。拿不到 navigator 时按在线算。 */
+export function isBrowserOffline(): boolean {
+  return typeof navigator !== "undefined" && navigator.onLine === false;
+}
+
+/**
+ * 订阅「网络刚恢复」。返回值本身没有意义，只是一个会变的版本号，用来把
+ * 组件重新渲染一次、让它重扫候选链。`active` 为假时不订阅：正常显示、
+ * 或没有离线失败记录的组件不该为此付出任何代价。
+ */
+export function useOnlineRecoveryNonce(active: boolean): number {
+  const subscribe = useCallback(
+    (onChange: () => void) => {
+      if (!active) return NOOP_UNSUBSCRIBE;
+      onlineSubscribers.add(onChange);
+      return () => {
+        onlineSubscribers.delete(onChange);
+      };
+    },
+    [active]
+  );
+  return useSyncExternalStore(subscribe, getOnlineVersion, getOnlineVersion);
+}
+
 /**
  * 统一的素材 `<img>` 封装。性能注意点：
  *
@@ -88,6 +153,10 @@ export function AssetImage({
   const { candidates, loading } = useAsset(kind, token ?? null);
   const [currentIdx, setCurrentIdx] = useState(0);
   const [loaded, setLoaded] = useState(false);
+  /** 成功解码并正在展示的 URL；`loaded` 只在它与当前候选一致时才算数。 */
+  const loadedUrlRef = useRef<string | null>(null);
+  /** 有失败发生在离线窗口内（没写进共享失败缓存），等 online 后要重试。 */
+  const offlineFailedRef = useRef(false);
   const exhaustedFiredRef = useRef(false);
 
   // 候选集合变了就重置。key 用字符串拼接而非数组引用比较，避免 memo
@@ -104,6 +173,8 @@ export function AssetImage({
   if (appliedKeyRef.current !== candidatesKey) {
     appliedKeyRef.current = candidatesKey;
     exhaustedFiredRef.current = false;
+    loadedUrlRef.current = null;
+    offlineFailedRef.current = false;
     setCurrentIdx(0);
     setLoaded(false);
   }
@@ -131,7 +202,37 @@ export function AssetImage({
     if (stuck) setCurrentIdx(0);
   }
 
-  const exhausted = !loading && !recoverable && candidates.length > 0 && currentUrl === null;
+  // 网络恢复时重试离线窗口内失败过的候选。那些失败没有写进共享缓存
+  // （见模块顶部说明），游标拨回 0 后会被原样重新请求。
+  const onlineNonce = useOnlineRecoveryNonce(stuck && offlineFailedRef.current);
+  const onlineNonceRef = useRef(onlineNonce);
+  if (onlineNonceRef.current !== onlineNonce) {
+    onlineNonceRef.current = onlineNonce;
+    if (stuck && offlineFailedRef.current) {
+      offlineFailedRef.current = false;
+      setCurrentIdx(0);
+    }
+  }
+
+  // `loaded` 只对当初解码成功的那条 URL 有效。正在展示的 URL 可能被另一
+  // 条渲染路径（同一张图出现在两处）标死，pickLiveCandidate 随即换到下
+  // 一条候选——此时 <img> 已换 src 但还没有像素，不能再顶着 loaded=true
+  // 把兜底藏起来，否则用户会看到一格空白、然后新图无过渡地弹出（候选被
+  // 跳空时更是整个格子直接放空）。渲染期同步纠正，与上面 candidatesKey
+  // 的重置同一套模式。
+  if (loaded && loadedUrlRef.current !== (currentUrl?.url ?? null)) {
+    setLoaded(false);
+  }
+
+  // 离线失败没有落账，共享缓存里不会产生任何能把父级叫回来的事件；此时
+  // 上报 exhausted 会让父级（如 ReaderImageSegment）把这一段卸载，online
+  // 重试就永远没机会了。先按住不报，网络恢复后重试仍全灭的才是真 404。
+  const exhausted =
+    !loading &&
+    !recoverable &&
+    !offlineFailedRef.current &&
+    candidates.length > 0 &&
+    currentUrl === null;
   const noneAvailable = !loading && candidates.length === 0;
 
   useEffect(() => {
@@ -194,6 +295,8 @@ export function AssetImage({
             rememberNaturalSize(url, img.naturalWidth, img.naturalHeight);
             const show = () => {
               if (!mountedRef.current || currentUrlRef.current !== url) return;
+              loadedUrlRef.current = url;
+              offlineFailedRef.current = false;
               setLoaded(true);
               onReady?.(url);
             };
@@ -206,7 +309,13 @@ export function AssetImage({
             }
           }}
           onError={() => {
-            markAssetUrlDead(currentUrl.url);
+            if (isBrowserOffline()) {
+              // 离线时的失败不落账（见模块顶部说明），只推进本地游标；
+              // 候选烧完后停在 stuck 态，等 online 事件拨回游标重试。
+              offlineFailedRef.current = true;
+            } else {
+              markAssetUrlDead(currentUrl.url);
+            }
             setCurrentIdx(Math.min(currentUrl.index + 1, candidates.length));
           }}
           className={cn(
@@ -221,17 +330,19 @@ export function AssetImage({
           )}
         />
       ) : null}
-      {(!loaded || exhausted || noneAvailable) && (
-        <div
-          className={cn(
-            "asset-image-fallback absolute inset-0 flex items-center justify-center motion-safe:transition-opacity motion-safe:duration-300",
-            loaded && !exhausted && !noneAvailable ? "opacity-0" : "opacity-100"
-          )}
-          aria-hidden="true"
-        >
-          {fallback ?? <GradientFallback seed={token ?? ""} />}
-        </div>
-      )}
+      {/* 兜底常驻（与 <StoryThumbnail> 同款）：此前按条件卸载，loaded 翻真
+          的那一帧兜底整个消失，而图片还要 300ms 才淡入完——交叉淡入退化
+          成「闪一下槽位底色再浮出图」。常驻只切 opacity 才是真 crossfade；
+          pointer-events-none 保证淡出后这层不挡图片的右键 / 长按。 */}
+      <div
+        className={cn(
+          "asset-image-fallback pointer-events-none absolute inset-0 flex items-center justify-center motion-safe:transition-opacity motion-safe:duration-300",
+          loaded && !exhausted && !noneAvailable ? "opacity-0" : "opacity-100"
+        )}
+        aria-hidden="true"
+      >
+        {fallback ?? <GradientFallback seed={token ?? ""} />}
+      </div>
     </div>
   );
 }

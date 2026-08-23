@@ -524,6 +524,18 @@ fn promote_import_staging(
     if !staging.exists() {
         return Err("暂存的 ZIP 数据不存在，请重新选择文件导入".to_string());
     }
+    // Windows 的 rename 不覆盖已存在的目标。上一次导入若在改名转正之后、
+    // finalize 删临时 ZIP 之前崩溃/断电（或按路径导入 fs::copy 到一半
+    // 失败），dest 会残留一个弃单——启动清理特意只删 `.part` 不碰它。
+    // 不先清掉，Windows 上此后每一轮分块导入都会在收尾报「写入 ZIP
+    // 数据失败」，重试、重启都救不回来。此刻 INSTALL_LOCK 与
+    // IMPORT_CHUNK_LOCK 都在手上，没有任何同步/导入在用这个路径，
+    // dest 只可能是弃单，删掉是安全的。
+    match std::fs::remove_file(dest) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(format!("清理残留的导入临时文件失败: {}", err)),
+    }
     std::fs::rename(staging, dest).map_err(|e| format!("写入 ZIP 数据失败: {}", e))
 }
 
@@ -988,6 +1000,35 @@ mod tests {
             std::fs::read(&dest).unwrap(),
             b"complete zip bytes",
             "转正必须原封不动地带走全部已落盘字节"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 上一次导入在改名转正之后、finalize 删临时 ZIP 之前崩溃/断电时，
+    /// dest 会残留一个弃单（启动清理特意只删 `.part` 不碰它）。Windows
+    /// 的 rename 不覆盖已存在的目标：不先删掉弃单，此后每一轮分块导入
+    /// 都会在收尾失败且用户无法自救。转正必须清掉残留的 dest 再改名，
+    /// 且带走的必须是新一轮的字节。
+    #[test]
+    fn promote_import_staging_overwrites_leftover_dest() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("askr_import_leftover_{nanos}"));
+        let staging = dir.join("staging.part");
+        let dest = dir.join("promoted.zip");
+
+        append_import_chunk(&staging, 0, b"fresh transfer bytes").expect("首块必须成功");
+        std::fs::write(&dest, b"crashed import leftover").expect("布置弃单必须成功");
+
+        promote_import_staging(&staging, &dest).expect("dest 残留弃单时转正必须成功");
+        assert!(!staging.exists(), "转正后暂存文件必须消失");
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"fresh transfer bytes",
+            "转正必须用新一轮的字节覆盖弃单"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

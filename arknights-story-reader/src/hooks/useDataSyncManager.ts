@@ -356,7 +356,16 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
 
   const runImport = useCallback(
     async (label: string, run: () => Promise<void>, transferredJob?: () => void) => {
-      if (busyRef.current) return;
+      if (busyRef.current) {
+        // 本实例正忙时也要有下文：这条路真实可达——文件选择器的取消侦测
+        // 误判提前放锁（change 姗姗来迟）后用户先点了同步，随后 change 到达、
+        // 用户又在覆盖确认框点了确定。静默 return 会把这次已确认的导入吞掉，
+        // 让用户以为导入开始了；给出和下面抢锁失败同款的冲突提示。交接来的
+        // 锁按约定由这里收场（释放函数幂等，调用方兜底再放一次无害）。
+        transferredJob?.();
+        setError(dataJobConflictMessage("导入"));
+        return;
+      }
       // 调用方可能在弹文件选择器前就抢到了 "import" 锁（见 Settings 的导入入口）。
       // 必须整把交接过来，不能先放再抢：释放会同步唤醒 acquireDataJobWhenIdle
       // 的等待者（比如自动更新安装），它们在同一个 tick 里就能把锁抢走。

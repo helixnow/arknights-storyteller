@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
 import { useStoryPreview } from "@/hooks/useStoryPreview";
+import { isBrowserOffline, useOnlineRecoveryNonce } from "@/components/AssetImage";
 import { peekAssetCandidates, useAssetHealthNonce } from "@/hooks/useAsset";
 import {
   gradientFallbackBackground,
@@ -59,6 +60,8 @@ export function StoryThumbnail({
   // URL 仍在新列表中，就保持显示，不重置。这避免了 token 异步回来后把已经
   // 显示好的图片闪掉再重新加载的问题。
   const loadedUrlRef = useRef<string | null>(null);
+  /** 有失败发生在离线窗口内（没写进共享失败缓存），等 online 后要重试。 */
+  const offlineFailedRef = useRef(false);
   const [cursor, setCursor] = useState(0);
   const [loaded, setLoaded] = useState(false);
 
@@ -68,6 +71,7 @@ export function StoryThumbnail({
   const appliedKeyRef = useRef(candidatesKey);
   if (appliedKeyRef.current !== candidatesKey) {
     appliedKeyRef.current = candidatesKey;
+    offlineFailedRef.current = false;
     const keptIdx = loadedUrlRef.current ? candidates.indexOf(loadedUrlRef.current) : -1;
     if (keptIdx >= 0) {
       setCursor(keptIdx);
@@ -93,6 +97,29 @@ export function StoryThumbnail({
   if (healthNonceRef.current !== healthNonce) {
     healthNonceRef.current = healthNonce;
     if (stuck) setCursor(0);
+  }
+
+  // 网络恢复时重试离线窗口内失败过的候选。离线时 onerror 不是「404」的
+  // 可靠判决，不会写进共享失败缓存（proven host 的失败记录一旦写入就
+  // 永远撤销不掉，断过一次网的封面会整个会话停在渐变兜底上），所以只在
+  // 本地记一笔，online 事件到来时把游标拨回 0 原样重扫。
+  const onlineNonce = useOnlineRecoveryNonce(stuck && offlineFailedRef.current);
+  const onlineNonceRef = useRef(onlineNonce);
+  if (onlineNonceRef.current !== onlineNonce) {
+    onlineNonceRef.current = onlineNonce;
+    if (stuck && offlineFailedRef.current) {
+      offlineFailedRef.current = false;
+      setCursor(0);
+    }
+  }
+
+  // `loaded` 只对当初解码成功的那条 URL 有效。正在展示的 URL 可能被另一
+  // 条渲染路径（同一张封面同时出现在列表缩略图和卡片模糊背景里）标死，
+  // pickLiveCandidate 随即换到下一条候选——此时 <img> 已换 src 但还没有
+  // 像素，不能再顶着 loaded=true 把渐变兜底藏起来，否则卡片会先放空一格、
+  // 然后新图无过渡地弹出。渲染期同步纠正，与上面 candidatesKey 同一套模式。
+  if (loaded && loadedUrlRef.current !== (live?.url ?? null)) {
+    setLoaded(false);
   }
 
   // 解码放到主线程之外：滚动时一张 1920px 的活动 KV 同步解码足以掉帧。
@@ -139,6 +166,7 @@ export function StoryThumbnail({
             const show = () => {
               if (!mountedRef.current || currentUrlRef.current !== url) return;
               loadedUrlRef.current = url;
+              offlineFailedRef.current = false;
               setLoaded(true);
             };
             if (typeof img.decode === "function") {
@@ -148,7 +176,13 @@ export function StoryThumbnail({
             }
           }}
           onError={() => {
-            markAssetUrlDead(live.url);
+            if (isBrowserOffline()) {
+              // 离线时的失败不落账，只推进本地游标；候选烧完后停在
+              // stuck 态，等 online 事件拨回游标重试。
+              offlineFailedRef.current = true;
+            } else {
+              markAssetUrlDead(live.url);
+            }
             setCursor(Math.min(live.index + 1, candidates.length));
           }}
           className={cn(
