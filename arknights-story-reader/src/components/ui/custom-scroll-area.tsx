@@ -57,6 +57,10 @@ export const CustomScrollArea = forwardRef<HTMLDivElement, CustomScrollAreaProps
 
     const scheduleHide = useCallback(() => {
       if (!hideTrackWhenIdle) return;
+      /* 拖动中按住滑块不动时滚动事件早已停发，若照常倒计时，
+         轨道会在用户手里淡出（拖动虽仍有效但滑块看不见了）。
+         拖动期间一律不排隐藏，pointerup 里松手后再排。 */
+      if (draggingRef.current) return;
       clearHideTimer();
       hideTimerRef.current = window.setTimeout(() => {
         setTrackActive(false);
@@ -168,6 +172,10 @@ export const CustomScrollArea = forwardRef<HTMLDivElement, CustomScrollAreaProps
 
     const handleThumbPointerDown = useCallback(
       (event: ReactPointerEvent<HTMLDivElement>) => {
+        /* 只认主键：右键按下会弹上下文菜单，此后 pointerup 通常不再送达，
+           拖动状态卡死，关掉菜单后滑块会粘着指针乱滚。 */
+        if (event.button !== 0) return;
+
         const viewport = viewportInnerRef.current;
         const track = trackRef.current;
         const thumb = thumbRef.current;
@@ -196,10 +204,54 @@ export const CustomScrollArea = forwardRef<HTMLDivElement, CustomScrollAreaProps
       [clearHideTimer, showTrack]
     );
 
+    const handleTrackPointerDown = useCallback(
+      (event: ReactPointerEvent<HTMLDivElement>) => {
+        if (event.button !== 0) return;
+        /* 事件从滑块冒泡上来时 handleThumbPointerDown 已经接管
+           （draggingRef 已置位）；顺带也挡掉拖动中第二根指针的抢占。 */
+        if (draggingRef.current) return;
+
+        const viewport = viewportInnerRef.current;
+        const track = trackRef.current;
+        const thumb = thumbRef.current;
+        if (!viewport || !track) return;
+
+        /* 可见的空轨道原本吃掉点击却毫无反应：既挡住了下层内容，
+           mousedown 的默认行为还会把焦点从正文/输入框上抢走。
+           对齐原生滚动条：preventDefault 保焦点，滚动跳到点击处，
+           并以滑块中心为握点进入拖动，一次按住即可继续拖。 */
+        event.preventDefault();
+        clearHideTimer();
+        showTrack();
+
+        const trackRect = track.getBoundingClientRect();
+        const thumbHeight = thumb?.offsetHeight ?? metricsRef.current.height;
+        const maxOffset = Math.max(trackRect.height - thumbHeight, 0);
+        let nextTop = event.clientY - trackRect.top - thumbHeight / 2;
+        nextTop = Math.max(0, Math.min(nextTop, maxOffset));
+
+        const scrollRange = viewport.scrollHeight - viewport.clientHeight;
+        viewport.scrollTop = maxOffset <= 0 ? 0 : (nextTop / maxOffset) * scrollRange;
+
+        metricsRef.current = { height: thumbHeight, top: nextTop };
+        setThumbMetrics({ height: thumbHeight, top: nextTop });
+
+        draggingRef.current = { pointerId: event.pointerId, offsetY: thumbHeight / 2 };
+        try {
+          thumb?.setPointerCapture?.(event.pointerId);
+        } catch {
+          /* 同滑块按下：走 window 监听的兜底路径。 */
+        }
+      },
+      [clearHideTimer, showTrack]
+    );
+
     useEffect(() => {
       const handlePointerMove = (event: PointerEvent) => {
         const drag = draggingRef.current;
-        if (!drag) return;
+        /* 多指/多设备并存时只跟随发起拖动的那个指针，否则第二根
+           手指的移动会把滚动位置直接带飞。 */
+        if (!drag || event.pointerId !== drag.pointerId) return;
 
         const viewport = viewportInnerRef.current;
         const track = trackRef.current;
@@ -227,7 +279,8 @@ export const CustomScrollArea = forwardRef<HTMLDivElement, CustomScrollAreaProps
 
       const handlePointerUp = (event: PointerEvent) => {
         const drag = draggingRef.current;
-        if (!drag) return;
+        /* 同上：别的指针抬起不应提前终止本次拖动。 */
+        if (!drag || event.pointerId !== drag.pointerId) return;
 
         draggingRef.current = null;
         // 先问 hasPointerCapture 再释放：没捕获时直接调 release 会抛，
@@ -274,6 +327,7 @@ export const CustomScrollArea = forwardRef<HTMLDivElement, CustomScrollAreaProps
           className="scroll-area__track"
           data-visible={shouldShowTrack}
           aria-hidden="true"
+          onPointerDown={handleTrackPointerDown}
         >
           <div
             className="scroll-area__thumb"

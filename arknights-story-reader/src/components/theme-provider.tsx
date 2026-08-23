@@ -101,9 +101,15 @@ export function ThemeProvider({
 
   /* 用 useLayoutEffect 而不是 useEffect：类名要和触发本次渲染的组件更新
      落在同一帧里。否则切主题时读 context 的组件（如 ThemeToggle 图标）先
-     绘制新状态，根元素的 light/dark 下一帧才翻转，会闪一帧新旧混搭。 */
+     绘制新状态，根元素的 light/dark 下一帧才翻转，会闪一帧新旧混搭。
+
+     偏好也在这里统一落盘（和下面配色的做法一致），而不是只在 setTheme 里写：
+     index.html 的引导脚本会原样信任存储值决定首帧明暗，存储里若留了非法值
+     （旧版残留 / 手动改动），仅在内存里回退默认值等于让深色用户每次冷启动
+     都先闪一帧白底。这里把校验后的值写回去，坏值最多只影响本次启动。 */
   useLayoutEffect(() => {
     const root = window.document.documentElement
+    writeStorage(storageKey, theme)
 
     if (theme !== "system") {
       applyResolvedTheme(root, theme)
@@ -118,7 +124,7 @@ export function ThemeProvider({
     }
     mediaQuery.addEventListener("change", handleChange)
     return () => mediaQuery.removeEventListener("change", handleChange)
-  }, [theme])
+  }, [storageKey, theme])
 
   useLayoutEffect(() => {
     const root = window.document.documentElement
@@ -127,13 +133,10 @@ export function ThemeProvider({
     syncBrowserChrome(root, resolvedThemeOf(root))
   }, [storageKey, themeColor])
 
-  const setTheme = useCallback(
-    (next: Theme) => {
-      writeStorage(storageKey, next)
-      setThemeState(next)
-    },
-    [storageKey]
-  )
+  /* 落盘已由上面的 layout effect 统一负责，这里只改状态，避免双写两处漂移。 */
+  const setTheme = useCallback((next: Theme) => {
+    setThemeState(next)
+  }, [])
 
   const setThemeColor = useCallback((color: ThemeColor) => {
     setThemeColorState(color)
