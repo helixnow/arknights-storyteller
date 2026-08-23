@@ -4,8 +4,10 @@ use regex::Regex;
 use std::collections::HashMap;
 
 lazy_static! {
-    static ref ATTR_RE: Regex =
-        Regex::new(r#"(?i)([a-z0-9_]+)\s*=\s*"([^"]*)""#).expect("invalid attribute regex");
+    /// `key="value"` 以及无引号的 `key=value`。脚本里数值型属性（`focus=2`、
+    /// `fadetime=0.7`）从来不加引号，只认带引号的写法等于看不见它们。
+    static ref ATTR_RE: Regex = Regex::new(r#"(?i)([a-z0-9_]+)\s*=\s*(?:"([^"]*)"|([^\s,()\[\]"]+))"#)
+        .expect("invalid attribute regex");
     static ref DECISION_NUMBERED_RE: Regex =
         Regex::new(r#"(?i)option\d+="([^"]+)""#).expect("invalid decision regex");
     static ref DECISION_VALUE_NUMBERED_RE: Regex =
@@ -13,28 +15,47 @@ lazy_static! {
     static ref GENERIC_TAG_RE: Regex = Regex::new(r#"<[^>]+>"#).expect("invalid generic tag regex");
     static ref PARAGRAPH_TAG_RE: Regex =
         Regex::new(r"(?i)<p[^>]*>").expect("invalid paragraph tag regex");
+    static ref LINE_BREAK_TAG_RE: Regex =
+        Regex::new(r"(?i)<br\s*/?>").expect("invalid line break tag regex");
+    static ref NICKNAME_RE: Regex =
+        Regex::new(r"(?i)\{@nickname\}").expect("invalid nickname regex");
+}
+
+/// 立绘变体后缀：`#4`（表情）、`$1`（差分）、`_1`/`_2`（皮肤）、`_ex`（异格）。
+/// 这些都不影响「是谁」，剥掉之后才能对上头像仓库里的文件名。
+fn strip_art_variants<'a>(token: &'a str, keep_at_least: usize) -> Vec<&'a str> {
+    let base = token
+        .split(|c| c == '#' || c == '$')
+        .next()
+        .unwrap_or(token);
+    let mut parts: Vec<&str> = base.split('_').filter(|p| !p.is_empty()).collect();
+    while parts.len() > keep_at_least {
+        let last = *parts.last().expect("non-empty by loop condition");
+        let is_variant =
+            last.eq_ignore_ascii_case("ex") || last.chars().all(|c| c.is_ascii_digit());
+        if !is_variant {
+            break;
+        }
+        parts.pop();
+    }
+    parts
 }
 
 /// Normalize a `char_XXX_name#N` / `char_XXX_name_1` token to `char_XXX_name`.
-/// Strips `#` expression suffixes and trailing `_1` / `_2` / `_ex` art
+/// Strips `#` / `$` expression suffixes and trailing `_1` / `_2` / `_ex` art
 /// variants so the frontend can map to the avatar repo (`char_345_folnic.png`).
 fn normalize_char_id(raw: &str) -> String {
     let trimmed = raw.trim().trim_matches('"').trim_start_matches('$');
-    let without_hash = trimmed.split('#').next().unwrap_or(trimmed);
-    let mut parts: Vec<&str> = without_hash.split('_').filter(|p| !p.is_empty()).collect();
+    let base = trimmed
+        .split(|c| c == '#' || c == '$')
+        .next()
+        .unwrap_or(trimmed);
+    let parts: Vec<&str> = base.split('_').filter(|p| !p.is_empty()).collect();
     if parts.len() >= 3 && parts[0] == "char" {
-        if let Some(last) = parts.last() {
-            let is_art_suffix = *last == "ex"
-                || last
-                    .chars()
-                    .all(|c| c.is_ascii_digit());
-            if is_art_suffix {
-                parts.pop();
-            }
-        }
-        return parts.join("_");
+        // `char_002_amiya` 的三段是身份本体，再往后才是立绘变体。
+        return strip_art_variants(trimmed, 3).join("_");
     }
-    without_hash.to_string()
+    base.to_string()
 }
 
 pub fn parse_story_text(content: &str) -> ParsedStoryContent {
@@ -45,31 +66,33 @@ pub fn parse_story_text(content: &str) -> ParsedStoryContent {
     let mut current_char_id: Option<String> = None;
 
     for raw_line in content.lines() {
-        let line = raw_line.trim();
+        let mut line = raw_line.trim();
+
+        // Update the current speaker's charId without emitting a segment.
+        // Newer scripts use `[charslot(name="char_xxx")]` instead of
+        // `[Character]`. Empty or missing `name` clears the state.
+        //
+        // 循环而不是只看一次：`[Character(...)][name="A"]台词` 这种把状态指令
+        // 和台词写在同一行的脚本并不少见，只吃掉前缀、剩下的照常解析，否则
+        // 整句台词会跟着指令一起被丢掉。
+        while line.starts_with('[') {
+            let Some(cmd_end) = line.find(']') else { break };
+            let inside = &line[1..cmd_end];
+            let (cmd, _) = split_command_and_attrs(inside);
+            if !is_speaker_state_command(&cmd.to_ascii_lowercase()) {
+                break;
+            }
+            current_char_id = speaker_char_id(&parse_attributes(inside));
+            line = line[cmd_end + 1..].trim();
+        }
+
         if line.is_empty() {
             continue;
         }
 
-        if line.starts_with('[') {
-            if let Some(cmd_end) = line.find(']') {
-                let inside = &line[1..cmd_end];
-                let (cmd, _) = split_command_and_attrs(inside);
-                let cmd_lower = cmd.to_ascii_lowercase();
-                if cmd_lower == "character" || cmd_lower == "charslot" {
-                    // Update the current speaker's charId without emitting a
-                    // segment. Newer scripts use `[charslot(name="char_xxx")]`
-                    // instead of `[Character]`. Empty or missing `name` clears
-                    // the state.
-                    let attrs = parse_attributes(inside);
-                    current_char_id = attrs
-                        .get("name")
-                        .or_else(|| attrs.get("a"))
-                        .or_else(|| attrs.get("b"))
-                        .map(|s| normalize_char_id(s))
-                        .filter(|s| s.starts_with("char_"));
-                    continue;
-                }
-            }
+        // 只有真正闭合的方括号才是指令。`[`  开头但没有 `]` 的行是正文
+        // （台词里出现半个括号并不稀奇），当指令处理会整行消失。
+        if line.starts_with('[') && line.contains(']') {
             if let Some(segment) = parse_command_line(line, current_char_id.as_deref()) {
                 segments.push(segment);
             }
@@ -98,7 +121,7 @@ fn parse_command_line(line: &str, current_char_id: Option<&str>) -> Option<Story
         "name" => {
             let character_name = attrs
                 .get("name")
-                .map(|s| s.trim().to_string())
+                .map(|s| normalize_speaker_name(s))
                 .unwrap_or_default();
             let text = clean_text(remainder);
             if text.is_empty() {
@@ -123,10 +146,17 @@ fn parse_command_line(line: &str, current_char_id: Option<&str>) -> Option<Story
             })
         }
         "multiline" => {
-            let character_name = attrs.get("name")?.trim().to_string();
             let text = clean_text(remainder);
             if text.is_empty() {
                 return None;
+            }
+            let character_name = attrs
+                .get("name")
+                .map(|s| normalize_speaker_name(s))
+                .unwrap_or_default();
+            if character_name.is_empty() {
+                // 续行有时省略 `name`；宁可少一个说话人，也不能把整段台词丢掉。
+                return Some(StorySegment::Narration { text });
             }
             // 同 `name`：显示名权威，不继承 current_char_id。
             Some(StorySegment::Dialogue {
@@ -194,11 +224,6 @@ fn parse_command_line(line: &str, current_char_id: Option<&str>) -> Option<Story
                 .filter(|s| !s.is_empty());
             Some(StorySegment::System { speaker, text })
         }
-        // 非文本指令一律忽略（但 Image/PlayMusic 已在上方单独处理）。
-        // Background 被有意忽略：它是 AVG 的场景切换信号，一章会出现几十条，
-        // 当成 16:9 大图渲染会把正文切得稀碎；真正值得渲染的是 `[Image]`。
-        "background" | "imagetween" | "character" | "charslot" | "stopmusic" | "playsound"
-        | "delay" | "camerashake" | "blocker" => None,
         "image" => {
             // 原始形如：[Image(image="avg_8_34",screenadapt="coverall",fadetime=2)]
             let token = attrs
@@ -295,9 +320,22 @@ fn parse_command_line(line: &str, current_char_id: Option<&str>) -> Option<Story
                 text,
             })
         }
-        // 其他命令若仍包含文本，则作为旁白处理
-        _ => {
+        // 纯演出指令：整条丢掉。极少数脚本会把旁白直接接在演出指令后面，
+        // 所以还是先看一眼 `]` 之后有没有正文，有就留成旁白。
+        cmd if is_stage_direction(cmd) => {
             let text = clean_text(remainder);
+            if has_meaningful_content(&text) {
+                Some(StorySegment::Narration { text })
+            } else {
+                None
+            }
+        }
+        // 其他命令若仍包含文本，则作为旁白处理。没写在 `]` 后面的话，
+        // `text=` 属性是脚本放正文的另一个固定位置（`[Announce(text="...")]`
+        // 之类），不看它就会把这行字整段丢掉。
+        _ => {
+            let text = clean_text(remainder)
+                .if_empty_then(|| attrs.get("text").map(|t| clean_text(t)).unwrap_or_default());
             if !has_meaningful_content(&text) {
                 None
             } else {
@@ -305,6 +343,116 @@ fn parse_command_line(line: &str, current_char_id: Option<&str>) -> Option<Story
             }
         }
     }
+}
+
+/// 只更新「当前说话人」而不产出任何段落的指令。
+fn is_speaker_state_command(command: &str) -> bool {
+    matches!(command, "character" | "charslot")
+}
+
+/// `[Character(name="A", name2="B", focus=2)]` 里 `focus` 指出正在说话的是
+/// 哪一位立绘；不看它就会把第二位的台词记成第一位，头像整段跟着错。
+fn speaker_char_id(attrs: &HashMap<String, String>) -> Option<String> {
+    let focus_second = attrs.get("focus").map(|v| v.trim() == "2").unwrap_or(false);
+    let (primary, secondary) = if focus_second {
+        ("name2", "name")
+    } else {
+        ("name", "name2")
+    };
+    attrs
+        .get(primary)
+        .or_else(|| attrs.get(secondary))
+        .or_else(|| attrs.get("a"))
+        .or_else(|| attrs.get("b"))
+        .map(|s| normalize_char_id(s))
+        .filter(|s| s.starts_with("char_"))
+}
+
+/// 纯演出 / 流程控制指令：镜头、音效、立绘、转场、分支断言等等。它们在脚本里
+/// 从不携带要显示的正文，落到兜底分支就会把 `avg_xxx`、`fx_snow` 这类素材名
+/// 当旁白印到正文里。
+///
+/// 名单只收「确定不带正文」的指令；拿不准的一律留给兜底分支，宁可多一行噪音，
+/// 也不能吃掉真台词。
+fn is_stage_direction(command: &str) -> bool {
+    matches!(
+        command,
+        // 场景与背景。Background 被有意忽略：它是 AVG 的场景切换信号，一章会
+        // 出现几十条，当成 16:9 大图渲染会把正文切得稀碎；真正值得渲染的是
+        // `[Image]`（在上面单独处理）。
+        "background"
+            | "backgroundtween"
+            | "bgeffect"
+            | "stopbgeffect"
+            | "bgshake"
+            | "imagetween"
+            | "largebg"
+            | "gridbg"
+            | "verticalbg"
+            | "fullscreencg"
+            // 立绘
+            | "character"
+            | "charslot"
+            | "charsloteasing"
+            | "chartilt"
+            | "charfade"
+            | "charrelease"
+            | "charstop"
+            | "characteraction"
+            | "charactercutin"
+            | "smallcharacter"
+            // 镜头
+            | "camerashake"
+            | "stopcamerashake"
+            | "cameraeffect"
+            | "stopcameraeffect"
+            | "camerascale"
+            | "cameraposition"
+            | "camerapan"
+            // 特效与遮罩
+            | "effect"
+            | "stopeffect"
+            | "curtain"
+            | "blocker"
+            | "stopblocker"
+            // 节奏
+            | "delay"
+            | "fadetime"
+            | "setavgspeed"
+            // 声音（PlayMusic 在上面产出 Music 段，不在此列）
+            | "stopmusic"
+            | "musicvolume"
+            | "playsound"
+            | "stopsound"
+            | "soundvolume"
+            | "playvoice"
+            | "stopvoice"
+            | "voice"
+            // 视频与图鉴
+            | "video"
+            | "playvideo"
+            | "stopvideo"
+            | "gallery"
+            // 道具
+            | "showitem"
+            | "hideitem"
+            | "obtainitem"
+            | "cgitem"
+            // 流程控制
+            | "predicate"
+            | "trigger"
+            | "timer"
+            | "skipnode"
+            | "skiptonode"
+            | "gotopage"
+            // 对话框与浮层的开关
+            | "dialogtransition"
+            | "hidedialog"
+            | "showdialog"
+            | "stickerclear"
+            | "subtitleclear"
+            | "stopsubtitle"
+    )
 }
 
 fn split_command_and_attrs(inside: &str) -> (String, Option<&str>) {
@@ -334,12 +482,15 @@ fn split_command_and_attrs(inside: &str) -> (String, Option<&str>) {
 fn parse_attributes(source: &str) -> HashMap<String, String> {
     let mut attrs = HashMap::new();
     for caps in ATTR_RE.captures_iter(source) {
-        if let (Some(key), Some(value)) = (caps.get(1), caps.get(2)) {
-            attrs.insert(
-                key.as_str().to_ascii_lowercase(),
-                value.as_str().to_string(),
-            );
-        }
+        let Some(key) = caps.get(1) else { continue };
+        // 组 2 = 带引号（可能是空串），组 3 = 不带引号。
+        let Some(value) = caps.get(2).or_else(|| caps.get(3)) else {
+            continue;
+        };
+        attrs.insert(
+            key.as_str().to_ascii_lowercase(),
+            value.as_str().to_string(),
+        );
     }
     attrs
 }
@@ -352,6 +503,18 @@ fn clean_dialog_head(raw: &str) -> String {
     humanize_identifier(trimmed)
 }
 
+/// 说话人是一行标签，不是正文：所有产出 `character_name` / `speaker` 的分支
+/// 都必须走这里，否则 `{@nickname}`、`<color=...>` 之类会原样印在名字上，
+/// 同一个角色还会因为写法不同在搜索里散成好几个人。
+fn normalize_speaker_name(raw: &str) -> String {
+    let cleaned = clean_text(raw.trim().trim_matches('"'));
+    if cleaned.is_empty() {
+        return String::new();
+    }
+    // 名字里的换行/连续空格一律折成一个半角空格（"Rhodes  Island" → "Rhodes Island"）。
+    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn clean_text(text: &str) -> String {
     if text.is_empty() {
         return String::new();
@@ -361,10 +524,13 @@ fn clean_text(text: &str) -> String {
         .replace("\\n", "\n")
         .replace('\r', "\n")
         .replace('\u{3000}', " ")
-        .replace('\u{00A0}', " ");
+        .replace('\u{00A0}', " ")
+        .replace('\u{200B}', "")
+        .replace('\u{FEFF}', "");
     cleaned = PARAGRAPH_TAG_RE.replace_all(&cleaned, "\n").to_string();
+    cleaned = LINE_BREAK_TAG_RE.replace_all(&cleaned, "\n").to_string();
     cleaned = GENERIC_TAG_RE.replace_all(&cleaned, "").to_string();
-    cleaned = cleaned.replace("{@nickname}", "博士");
+    cleaned = NICKNAME_RE.replace_all(&cleaned, "博士").to_string();
     cleaned = cleaned.trim().to_string();
 
     if cleaned.contains('\n') {
@@ -459,8 +625,9 @@ fn parse_dialog_like(
 
 fn resolve_speaker(attrs: &HashMap<String, String>) -> Option<String> {
     if let Some(name) = attrs.get("name") {
-        let cleaned = clean_text(name);
-        if has_meaningful_content(&cleaned) {
+        // 显示名是作者写死的字符串，`???` / `A` 这种也照用；只有空串算「没写」。
+        let cleaned = normalize_speaker_name(name);
+        if !cleaned.is_empty() {
             return Some(cleaned);
         }
     }
@@ -483,7 +650,10 @@ fn resolve_speaker(attrs: &HashMap<String, String>) -> Option<String> {
 }
 
 fn humanize_identifier(raw: &str) -> String {
-    let mut value = raw.trim().trim_matches('"').trim_start_matches('$');
+    let trimmed = raw.trim().trim_matches('"').trim_start_matches('$');
+    // `char_130_doberm_ex` 不去掉 `_ex` 会显示成 "Doberm Ex"。
+    let stripped = strip_art_variants(trimmed, 1).join("_");
+    let mut value = stripped.as_str();
     for prefix in &[
         "char_", "npc_", "avg_", "avatar_", "trap_", "voice_", "item_", "act_", "story_",
     ] {
@@ -539,6 +709,29 @@ impl IfEmpty for String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn kinds(parsed: &ParsedStoryContent) -> Vec<&'static str> {
+        parsed.segments.iter().map(|s| s.kind()).collect()
+    }
+
+    fn texts(parsed: &ParsedStoryContent) -> Vec<&str> {
+        parsed
+            .segments
+            .iter()
+            .filter_map(|s| s.text())
+            .collect()
+    }
+
+    fn only(content: &str) -> StorySegment {
+        let mut parsed = parse_story_text(content);
+        assert_eq!(
+            parsed.segments.len(),
+            1,
+            "expected exactly one segment, got {:?}",
+            parsed.segments
+        );
+        parsed.segments.remove(0)
+    }
 
     #[test]
     fn test_parse_dialogue() {
@@ -735,5 +928,278 @@ mod tests {
             }
             _ => panic!("Expected dialogue segment from charslot + Dialog"),
         }
+    }
+
+    #[test]
+    fn test_normalize_char_id_handles_dollar_and_stacked_variants() {
+        // `#4` 是表情差分，`$1` 是同一张立绘的第二套动作，都不换人。
+        assert_eq!(normalize_char_id("char_290_vigna_1#1$1"), "char_290_vigna");
+        assert_eq!(normalize_char_id("char_002_amiya$2"), "char_002_amiya");
+        assert_eq!(normalize_char_id("char_1012_skadi2_1"), "char_1012_skadi2");
+        // 非 char_ 的 id 原样留着，前端只拿 char_ 拼头像。
+        assert_eq!(normalize_char_id("npc_1028_texas2_1"), "npc_1028_texas2_1");
+        assert_eq!(normalize_char_id(""), "");
+    }
+
+    /// 演出指令一条都不该落进正文；只要还有一条被当成旁白印出来，
+    /// 阅读器里就会冒出 `avg_xxx` / `fx_snow` 这种素材名。
+    #[test]
+    fn test_stage_directions_never_leak_into_text() {
+        let content = r#"[Background(image="bg_rhodes_office", screenadapt="coverall", fadetime=1)]
+[BackgroundTween(fadetime=1)]
+[bgeffect(name="rain")]
+[largebg(imagegroup="g_13", screenadapt="coverall")]
+[CameraShake(duration=1, xstrength=10, ystrength=0, vibrato=10, fadeout=true, block=true)]
+[cameraScale(scale=1.2, duration=0.5)]
+[Effect(name="fx_snow", x=0.5, y=0.5)]
+[StopEffect(name="fx_snow")]
+[Curtain(alpha=1, fadetime=1)]
+[Blocker(a=1, r=0, g=0, b=0, block=true, fadetime=1.5)]
+[Delay(time=1)]
+[StopMusic(fadetime=3)]
+[PlaySound(key="$door_open", volume=0.8, channel=1)]
+[StopSound(channel=1, fadetime=0.5)]
+[Musicvolume(volume=0.3, fadetime=1)]
+[Soundvolume(volume=0.3)]
+[PlayVideo(name="avg_video_01", loop=false)]
+[Gallery(id="g_13_I01")]
+[ShowItem(id="item_token")]
+[Predicate(references="op1;op2")]
+[SkipToNode(node="node_2")]
+[dialogtransition(fadetime=0.3)]
+[characteraction(name="char_003_kalts_1", action="nod")]
+[chartilt(angle=5)]
+[stickerclear]
+[charslot]
+[dialog]"#;
+
+        let result = parse_story_text(content);
+        assert!(
+            result.segments.is_empty(),
+            "stage directions leaked as text: {:?}",
+            result.segments
+        );
+    }
+
+    /// 兜底分支不能把演出指令的素材名当旁白——但真跟在指令后面的文字要留住。
+    #[test]
+    fn test_trailing_prose_survives_a_stage_direction() {
+        let content = r#"[Delay(time=1)]天亮了。
+[Effect(name="fx_snow")]"#;
+        let result = parse_story_text(content);
+        assert_eq!(kinds(&result), vec!["narration"]);
+        assert_eq!(texts(&result), vec!["天亮了。"]);
+    }
+
+    /// 不认识的指令若把正文塞在 `text=` 里，也得捞出来，否则整句消失。
+    #[test]
+    fn test_unknown_command_falls_back_to_text_attribute() {
+        let segment = only(r#"[Announce(text="紧急广播：全体撤离。", delay=1)]"#);
+        assert_eq!(segment.kind(), "narration");
+        assert_eq!(segment.text(), Some("紧急广播：全体撤离。"));
+    }
+
+    /// `[` 开头但没有闭合方括号的行是正文，不是残缺指令。
+    #[test]
+    fn test_unclosed_bracket_line_is_kept_as_narration() {
+        let result = parse_story_text("[未闭合的一行台词\n[name=\"杜宾\"]正常台词。");
+        assert_eq!(kinds(&result), vec!["narration", "dialogue"]);
+        assert_eq!(texts(&result), vec!["[未闭合的一行台词", "正常台词。"]);
+    }
+
+    /// `[Character(...)][name="A"]台词` 写在同一行时，状态指令只能吃掉自己
+    /// 那一段，后面的台词必须照常解析。
+    #[test]
+    fn test_state_command_prefix_does_not_eat_the_rest_of_the_line() {
+        let content =
+            r#"[Character(name="char_002_amiya_1#4")][name="阿米娅"]博士，我们该出发了。"#;
+        let segment = only(content);
+        assert_eq!(segment.speaker(), Some("阿米娅"));
+        assert_eq!(segment.text(), Some("博士，我们该出发了。"));
+    }
+
+    /// `focus=2` 说明说话的是 `name2` 那位立绘。
+    #[test]
+    fn test_character_focus_picks_the_second_slot() {
+        let content = r#"[Character(name="char_290_vigna_1#1$1",name2="char_130_doberm_1#4",fadetime=0.7,focus=2)]
+[Dialog]立正！"#;
+        let segment = only(content);
+        assert_eq!(segment.character_id(), Some("char_130_doberm"));
+
+        let content = r#"[Character(name="char_290_vigna_1#1$1",name2="char_130_doberm_1#4",focus=1)]
+[Dialog]是。"#;
+        let segment = only(content);
+        assert_eq!(segment.character_id(), Some("char_290_vigna"));
+    }
+
+    /// 显示名是标签不是正文：富文本、`{@nickname}`、多余空白都得抹平，
+    /// 不然同一个角色会在搜索里散成好几个人。
+    #[test]
+    fn test_speaker_names_are_normalized() {
+        let segment = only(r#"[name="{@nickname}"]我在。"#);
+        assert_eq!(segment.speaker(), Some("博士"));
+
+        let segment = only(r#"[name="<color=#f00>杜宾</>"]集合！"#);
+        assert_eq!(segment.speaker(), Some("杜宾"));
+
+        let segment = only("[name=\"Rhodes\\n  Island\"]我们是罗德岛。");
+        assert_eq!(segment.speaker(), Some("Rhodes Island"));
+
+        // `[Dialog(head=...)]` 与 `[name=...]` 走同一套归一化，异格后缀不外泄。
+        let segment = only(r#"[Dialog(head="char_130_doberm_ex")]口令。"#);
+        assert_eq!(segment.speaker(), Some("Doberm"));
+
+        // `[PopupDialog]` 的 dialogHead 同理。
+        let segment = only(r#"[PopupDialog(dialogHead="$avatar_prts_1")]系统提示。"#);
+        assert_eq!(segment.kind(), "system");
+        assert_eq!(segment.speaker(), Some("Prts"));
+    }
+
+    /// 空名字仍旧是场景字幕，`???` 这种作者故意写的名字要原样保留。
+    #[test]
+    fn test_empty_name_is_subtitle_but_placeholder_names_survive() {
+        let segment = only(r#"[name=""]罗德岛，深夜。"#);
+        assert_eq!(segment.kind(), "subtitle");
+        assert_eq!(segment.text(), Some("罗德岛，深夜。"));
+
+        let segment = only(r#"[name="???"]你是谁？"#);
+        assert_eq!(segment.kind(), "dialogue");
+        assert_eq!(segment.speaker(), Some("???"));
+    }
+
+    /// `[multiline]` 续行常省略 `name`；宁可降级成旁白，也不能整段丢掉。
+    #[test]
+    fn test_multiline_without_name_keeps_the_text() {
+        let content = r#"[multiline(name="凯尔希", delay=1)]这件事，
+[multiline(end=true)]你迟早要知道。"#;
+        let result = parse_story_text(content);
+        assert_eq!(kinds(&result), vec!["dialogue", "narration"]);
+        assert_eq!(result.segments[0].speaker(), Some("凯尔希"));
+        assert_eq!(texts(&result), vec!["这件事，", "你迟早要知道。"]);
+    }
+
+    /// 无引号属性（`focus=2`、`image=avg_1`）以前整条看不见。
+    #[test]
+    fn test_unquoted_attributes_are_parsed() {
+        let attrs = parse_attributes(r#"Image(image=avg_8_34, fadetime=2, caption="雪原")"#);
+        assert_eq!(attrs.get("image").map(String::as_str), Some("avg_8_34"));
+        assert_eq!(attrs.get("fadetime").map(String::as_str), Some("2"));
+        assert_eq!(attrs.get("caption").map(String::as_str), Some("雪原"));
+        // 空串仍是「写了但为空」，不能被无引号分支吞掉。
+        let attrs = parse_attributes(r#"avatarId="", isAvatarRight="FALSE""#);
+        assert_eq!(attrs.get("avatarid").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn test_image_and_music_segments() {
+        let content = r#"[Image(image="avg_8_34", screenadapt="coverall", fadetime=2)]
+[PlayMusic(intro="$drift_intro", key="$drift_loop", volume=0.6)]
+[Image(screenadapt="coverall")]"#;
+        let result = parse_story_text(content);
+        assert_eq!(kinds(&result), vec!["image", "music"]);
+        match &result.segments[0] {
+            StorySegment::Image { token, caption } => {
+                assert_eq!(token, "avg_8_34");
+                assert!(caption.is_none());
+            }
+            other => panic!("expected image segment, got {:?}", other),
+        }
+        match &result.segments[1] {
+            StorySegment::Music { key } => assert_eq!(key, "$drift_loop"),
+            other => panic!("expected music segment, got {:?}", other),
+        }
+    }
+
+    /// 富文本、换行转义、零宽字符都不该出现在正文里。
+    #[test]
+    fn test_clean_text_normalizes_markup_and_whitespace() {
+        assert_eq!(clean_text(r"第一行\n第二行"), "第一行\n第二行");
+        assert_eq!(clean_text("第一行<br>第二行"), "第一行\n第二行");
+        assert_eq!(clean_text("第一行<br />第二行"), "第一行\n第二行");
+        assert_eq!(clean_text("<size=40>大字</>"), "大字");
+        assert_eq!(clean_text("你好\u{200B}，博士"), "你好，博士");
+        assert_eq!(clean_text("\u{3000}前置全角空格"), "前置全角空格");
+        assert_eq!(clean_text("{@NickName}，早上好"), "博士，早上好");
+        // 空行会被折掉，段落之间只留一个换行。
+        assert_eq!(clean_text(r"上\n\n\n下"), "上\n下");
+    }
+
+    #[test]
+    fn test_decision_keeps_option_values_paired() {
+        let segment = only(r#"[Decision(options="走;留", values="1;2")]"#);
+        match segment {
+            StorySegment::Decision { options, values } => {
+                assert_eq!(options, vec!["走".to_string(), "留".to_string()]);
+                assert_eq!(values, vec!["1".to_string(), "2".to_string()]);
+            }
+            other => panic!("expected decision segment, got {:?}", other),
+        }
+        // 一个选项都解析不出来时不产出空的选择段。
+        assert!(parse_story_text(r#"[Decision(values="1;2")]"#).segments.is_empty());
+    }
+
+    /// 场景切换后 `[Character]` 状态要跟着走；清空后不能把上一位的头像
+    /// 继续挂到无主对白上。
+    #[test]
+    fn test_speaker_state_is_replaced_and_cleared() {
+        let content = r#"[Character(name="char_003_kalts_1")]
+[Dialog]第一句。
+[Character(name="char_002_amiya_1")]
+[Dialog]第二句。
+[Character]
+[Dialog]第三句。"#;
+        let result = parse_story_text(content);
+        assert_eq!(kinds(&result), vec!["dialogue", "dialogue", "narration"]);
+        assert_eq!(result.segments[0].character_id(), Some("char_003_kalts"));
+        assert_eq!(result.segments[1].character_id(), Some("char_002_amiya"));
+        assert_eq!(result.segments[2].character_id(), None);
+    }
+
+    /// `[name=...]` 的显示名是权威来源，不继承上一条 `[Character]` 的 charId：
+    /// 多人同场时脚本经常不翻立绘就换说话人。
+    #[test]
+    fn test_name_command_does_not_inherit_character_id() {
+        let content = r#"[Character(name="char_003_kalts_1")]
+[name="阿米娅"]凯尔希医生说得对。"#;
+        let segment = only(content);
+        assert_eq!(segment.speaker(), Some("阿米娅"));
+        assert_eq!(segment.character_id(), None);
+    }
+
+    /// 端到端跑一段贴近真实脚本的片段：段落种类和顺序都要稳。
+    #[test]
+    fn test_realistic_script_excerpt_shape() {
+        let content = r#"[HEADER(key="title", is_skippable=true, fit_mode="BLACK_MASK")] 第一章
+[Background(image="bg_rhodes_office", screenadapt="coverall")]
+[PlayMusic(intro="$office_intro", key="$office_loop")]
+[Subtitle(text="罗德岛，指挥室", alignment="center", delay=1)]
+[Character(name="char_003_kalts_1#4")]
+[name="凯尔希"]博士，你终于醒了。
+[Delay(time=1)]
+[charslot(slot="m", name="char_002_amiya_1")]
+[Dialog]博士！
+[Decision(options="我没事;再让我睡会儿", values="1;2")]
+[Image(image="avg_10_1")]
+[Blocker(a=1, fadetime=1)]
+这是一段没有指令的旁白。"#;
+
+        let result = parse_story_text(content);
+        assert_eq!(
+            kinds(&result),
+            vec![
+                "header",
+                "music",
+                "subtitle",
+                "dialogue",
+                "dialogue",
+                "decision",
+                "image",
+                "narration",
+            ]
+        );
+        assert_eq!(result.segments[3].speaker(), Some("凯尔希"));
+        assert_eq!(result.segments[3].character_id(), None);
+        assert_eq!(result.segments[4].character_id(), Some("char_002_amiya"));
+        assert_eq!(result.segments[7].text(), Some("这是一段没有指令的旁白。"));
     }
 }

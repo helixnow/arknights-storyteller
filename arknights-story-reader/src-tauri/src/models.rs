@@ -148,6 +148,59 @@ pub enum StorySegment {
     },
 }
 
+/// Read-only accessors shared by the parser tests and anything that needs to
+/// treat segments uniformly. The strings returned by [`StorySegment::kind`]
+/// are the same ones stored in `story_segment_index.segment_type`, so a
+/// caller can compare against a search hit without a second mapping table.
+#[allow(dead_code)]
+impl StorySegment {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            StorySegment::Dialogue { .. } => "dialogue",
+            StorySegment::Narration { .. } => "narration",
+            StorySegment::Decision { .. } => "decision",
+            StorySegment::System { .. } => "system",
+            StorySegment::Subtitle { .. } => "subtitle",
+            StorySegment::Sticker { .. } => "sticker",
+            StorySegment::Header { .. } => "header",
+            StorySegment::Image { .. } => "image",
+            StorySegment::Music { .. } => "music",
+        }
+    }
+
+    /// 该段展示出来的正文。`Decision` 的正文散在多个选项里，`Music` 根本没有
+    /// 正文，这两种返回 `None`。
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            StorySegment::Dialogue { text, .. }
+            | StorySegment::Narration { text }
+            | StorySegment::System { text, .. }
+            | StorySegment::Subtitle { text, .. }
+            | StorySegment::Sticker { text, .. } => Some(text),
+            StorySegment::Header { title } => Some(title),
+            StorySegment::Image { caption, .. } => caption.as_deref(),
+            StorySegment::Decision { .. } | StorySegment::Music { .. } => None,
+        }
+    }
+
+    /// 说话人显示名。旁白/字幕等无主段落返回 `None`。
+    pub fn speaker(&self) -> Option<&str> {
+        match self {
+            StorySegment::Dialogue { character_name, .. } => Some(character_name),
+            StorySegment::System { speaker, .. } => speaker.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// 说话人对应的 `charId`（`char_002_amiya`），只有对白段可能有。
+    pub fn character_id(&self) -> Option<&str> {
+        match self {
+            StorySegment::Dialogue { character_id, .. } => character_id.as_deref(),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParsedStoryContent {
     pub segments: Vec<StorySegment>,
