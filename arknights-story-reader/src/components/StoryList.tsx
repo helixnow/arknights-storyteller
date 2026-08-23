@@ -592,40 +592,56 @@ export function StoryList({ onSelectStory }: StoryListProps) {
   }, []);
 
   /**
-   * 加载一块数据。同一块同时只会有一个任务在跑：后来的调用拿到的是同一个
-   * Promise，所以 `await loadSection(...)` 真的等到数据落地（旧实现是直接
-   * return，调用方会以为已经加载完）。
+   * 加载一块数据。同一块同时只会有一个「有效」任务：非 force 的后来者拿到
+   * 同一个 Promise，所以 `await loadSection(...)` 真的等到数据落地（旧实现
+   * 是直接 return，调用方会以为已经加载完）。
+   *
+   * force 是例外：它意味着数据源刚换过（同步完成 / 重试），在途任务拿到的
+   * 还是旧数据源的结果，复用它会把旧数据当新数据写进 state、把 loadedRef
+   * 标成已加载，同步好的新数据反而永远不会被拉。所以 force 直接另起新任务
+   * 顶掉 pendingRef 的归属；旧任务落地时靠归属检查放弃写入。
    */
   const loadSection = useCallback(
     (key: SectionKey, force = false): Promise<void> => {
       if (!force && loadedRef.current[key]) return Promise.resolve();
 
       const pending = pendingRef.current[key];
-      if (pending) return pending;
+      if (pending && !force) return pending;
 
-      const task = (async () => {
+      const task: Promise<void> = (async () => {
         setSectionBusy(key, true);
         setError(null);
+        // 落地时归属可能已经易主（被更新的 force 任务顶替，或被同步事件
+        // 整体作废）。不是自己就什么都不写，旧数据不能盖掉新数据。
+        const isCurrent = () => pendingRef.current[key] === task;
         try {
           if (key === "memory") {
             const data = await withTimeout(
               storyCatalog.memory(force),
               SECTION_TIMEOUT_MS.memory
             );
+            if (!isCurrent()) return;
             setMemoryStories(data);
           } else {
             const data = await withTimeout(
               storyCatalog.grouped(key, force),
               SECTION_TIMEOUT_MS[key]
             );
+            if (!isCurrent()) return;
             setGroups((prev) => ({ ...prev, [key]: data }));
           }
           loadedRef.current[key] = true;
         } catch (err) {
-          handleLoadError(SECTION_LABELS[key], err);
+          // 被顶替的任务连错误也不该报：数据源已换，这份失败没有意义。
+          if (isCurrent()) handleLoadError(SECTION_LABELS[key], err);
         } finally {
-          pendingRef.current[key] = undefined;
-          setSectionBusy(key, false);
+          if (isCurrent()) {
+            pendingRef.current[key] = undefined;
+            setSectionBusy(key, false);
+          } else if (!pendingRef.current[key]) {
+            // 被整体作废且没有后继任务接手：busy 没人清会卡住骨架屏。
+            setSectionBusy(key, false);
+          }
         }
       })();
 
@@ -699,6 +715,10 @@ export function StoryList({ onSelectStory }: StoryListProps) {
   useEffect(() => {
     const handler = () => {
       loadedRef.current = initialSectionFlags(false);
+      // 作废所有在途任务的归属：没被下面强制重载覆盖到的分块（比如之前
+      // 逛过的密录）若还在途，落地时会把同步前的旧数据写进 state 并自标
+      // 已加载。清掉归属后它们会静默放弃写入，下次进入该分类重新拉取。
+      pendingRef.current = {};
       summaryAttemptsRef.current.clear();
       summaryInflightRef.current.clear();
       setSummaryCache({});
@@ -1103,11 +1123,13 @@ export function StoryList({ onSelectStory }: StoryListProps) {
     // 同步对话框不一定广播 `app:data-updated`，这里自己把共享缓存清掉。
     invalidateStoryCatalog();
     loadedRef.current = initialSectionFlags(false);
+    // 同上面 data-updated 的处理：在途任务全部作废，免得旧数据回写。
+    pendingRef.current = {};
     summaryAttemptsRef.current.clear();
     summaryInflightRef.current.clear();
     setSummaryCache({});
     setSummaryLoadingIds({});
-    // 并发发起：loadSection 内部有 in-flight 锁，主线不会被拉两次。
+    // 并发发起：目录层有 in-flight 去重，主线不会打两次 IPC。
     await Promise.all([loadSection("main", true), loadCategory(activeCategory, true)]);
     setSyncDialogOpen(false);
   }, [activeCategory, loadCategory, loadSection]);
@@ -2020,6 +2042,10 @@ const StoryItem = memo(function StoryItem({
         .join(" · ")}
       onClick={() => onSelectStory(story)}
       onKeyDown={(event) => {
+        // 只响应焦点在卡片自身时的按键：卡片里的收藏星标也是可聚焦按钮，
+        // 它冒泡上来的 Enter/Space 若被这里 preventDefault 掐掉原生激活，
+        // 就变成「按星标却打开了阅读器、收藏没切」，键盘用户无法收藏。
+        if (event.target !== event.currentTarget) return;
         // Space 必须 preventDefault，否则会连带把滚动容器翻一页。
         if (event.key === "Enter" || event.key === " ") {
           event.preventDefault();

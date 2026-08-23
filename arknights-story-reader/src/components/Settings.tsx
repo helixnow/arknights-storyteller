@@ -418,12 +418,14 @@ export function Settings() {
 
   /**
    * 索引重建实际跑在搜索面板里（它常驻挂载，监听 `app:rebuild-story-index`），
-   * 这边只是发起方。放锁一主两备：
+   * 这边只是发起方。放锁一主一备：
    *   1. 面板重建收场（成功或失败）广播 `app:story-index-updated`
    *      （reason: rebuilt / rebuild-failed），收到立刻放锁——失败秒放，
    *      不用再吊满 30s 看门狗；
-   *   2. 后端 index-progress 到终态也放锁，广播万一丢了还有它；
-   *   3. 长时间一点动静都没有，看门狗兜底放锁，保证不死锁。
+   *   2. 广播万一丢了，由看门狗兜底放锁，保证不死锁。
+   * 后端 index-progress 事件只用来给看门狗续期，绝不能当放锁信号：事件上
+   * 没有发起方标记，sync/import 之后后端自动重建发的是同一种事件，把别人
+   * 的终态当成自己的会提前放锁（见下方监听器内的说明）。
    */
   const indexJobReleaseRef = useRef<(() => void) | null>(null);
   const indexWatchdogRef = useRef<number | null>(null);
@@ -446,10 +448,17 @@ export function Settings() {
     let cancelled = false;
     let dispose: (() => void) | null = null;
     void api
-      .onIndexProgress((p) => {
+      .onIndexProgress(() => {
         if (cancelled || !indexJobReleaseRef.current) return;
-        if (p.total > 0 && p.current >= p.total) releaseIndexJob();
-        else armIndexWatchdog();
+        // 只喂狗、不放锁。index-progress 不带发起方：sync_data / import_zip
+        // 完成后，后端会在自己的线程里自动重建索引并发同样的事件，而那段
+        // 时间前端任务锁是空闲的、本页「重新建立索引」可以点。若把
+        // 「current >= total」当作自己那次重建的终态，先收场的会是后台
+        // 自动重建——锁被提前释放，排队等锁的同步 / 更新安装立刻抢入，
+        // 与仍在跑的重建并发读写数据目录。有索引活动就给看门狗续期，
+        // 真正的放锁交给终态广播（主路径）与看门狗超时（兜底），
+        // 宁可晚放 30s，不可误放。
+        armIndexWatchdog();
       })
       .then((unlisten) => {
         if (cancelled) {
