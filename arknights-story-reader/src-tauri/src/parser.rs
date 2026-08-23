@@ -586,12 +586,29 @@ fn parse_dialog_like(
     // still inherit context.
     let resolved = resolve_speaker(attrs);
     let (character_name, character_id) = match resolved {
-        Some(name) => (Some(name), attrs
-            .get("head")
-            .or_else(|| attrs.get("name"))
-            .map(|s| normalize_char_id(s))
-            .filter(|s| s.starts_with("char_"))
-            .or_else(|| current_char_id.map(|s| s.to_string()))),
+        Some(name) => {
+            let explicit_id = attrs
+                .get("head")
+                .or_else(|| attrs.get("name"))
+                .or_else(|| attrs.get("avatarid"))
+                .map(|s| normalize_char_id(s))
+                .filter(|s| s.starts_with("char_"));
+            // `head` / `avatarid` 写的是身份 id。它们存在却解析不出 `char_`
+            // （多半是 `npc_` / `avg_`）就说明作者显式换了一个没有干员头像的
+            // 说话人，此时回退继承上一条 [Character] 的 `char_` 头像必然
+            // 张冠李戴。只有「只写了显示名」的行（charslot + `[Dialog(name=...)]`
+            // 的新脚本惯用形态）才大概率与当前立绘同属一人，才值得回退。
+            let has_explicit_identity =
+                attrs.contains_key("head") || attrs.contains_key("avatarid");
+            let character_id = explicit_id.or_else(|| {
+                if has_explicit_identity {
+                    None
+                } else {
+                    current_char_id.map(|s| s.to_string())
+                }
+            });
+            (Some(name), character_id)
+        }
         None => {
             // No explicit speaker attr on this command — try the current speaker
             // tracked from the last [Character] instruction.
@@ -1154,6 +1171,28 @@ mod tests {
         assert_eq!(result.segments[0].character_id(), Some("char_003_kalts"));
         assert_eq!(result.segments[1].character_id(), Some("char_002_amiya"));
         assert_eq!(result.segments[2].character_id(), None);
+    }
+
+    /// `[Dialog(head="npc_...")]` 显式指明说话人不是干员时，绝不能继承上一条
+    /// `[Character]` 留下的 `char_` 头像（下游还会把它带进同名对白合并）；
+    /// 但只写显示名的 `[Dialog(name=...)]`（charslot 新脚本惯用形态）仍要
+    /// 回退，否则这类对白整段丢头像。
+    #[test]
+    fn test_explicit_npc_head_does_not_inherit_stale_char_id() {
+        let content = r#"[Character(name="char_003_kalts_1")]
+[Dialog(head="npc_1028_texas2_1")]她不会回来了。
+[Dialog(name="凯尔希")]我知道。
+[Dialog]回去吧。"#;
+        let result = parse_story_text(content);
+        assert_eq!(kinds(&result), vec!["dialogue", "dialogue", "dialogue"]);
+        // NPC head 显式换人：不许挂上凯尔希的头像。
+        assert_eq!(result.segments[0].speaker(), Some("Texas2"));
+        assert_eq!(result.segments[0].character_id(), None);
+        // 只写显示名：大概率就是当前立绘本人，保留回退。
+        assert_eq!(result.segments[1].speaker(), Some("凯尔希"));
+        assert_eq!(result.segments[1].character_id(), Some("char_003_kalts"));
+        // 什么都没写：完全继承状态。
+        assert_eq!(result.segments[2].character_id(), Some("char_003_kalts"));
     }
 
     /// `[name=...]` 的显示名是权威来源，不继承上一条 `[Character]` 的 charId：

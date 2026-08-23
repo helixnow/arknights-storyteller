@@ -92,13 +92,21 @@ export function AssetImage({
 
   // 候选集合变了就重置。key 用字符串拼接而非数组引用比较，避免 memo
   // 失效时白白 setState。
+  //
+  // 重置必须在渲染期同步做（与 `<StoryThumbnail>` 同一套模式），不能放进
+  // useEffect：token 原地切换（阅读器切章时 ReaderImageSegment 按位置复用）
+  // 的那一帧里，新候选表会配上旧游标——pickLiveCandidate 从过期下标起扫，
+  // 可能扫空并把 `exhausted` 误判为真；若父级传的是内联 onExhausted（引用
+  // 每次渲染都变），上报 effect 会在重置 effect 清掉 fired 标记之后重跑，
+  // 一次虚假的 onExhausted 就把本来加载得出的插画段永久隐藏了。
   const candidatesKey = candidates.join("|");
-
-  useEffect(() => {
+  const appliedKeyRef = useRef(candidatesKey);
+  if (appliedKeyRef.current !== candidatesKey) {
+    appliedKeyRef.current = candidatesKey;
+    exhaustedFiredRef.current = false;
     setCurrentIdx(0);
     setLoaded(false);
-    exhaustedFiredRef.current = false;
-  }, [candidatesKey]);
+  }
 
   // `currentIdx` 只是游标下界；真正跳过哪些候选由共享的失败缓存 +
   // host 熔断决定，这两者都在 onLoad / onError 里 mutate，不触发 re-render。

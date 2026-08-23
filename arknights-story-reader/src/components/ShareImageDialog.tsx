@@ -905,13 +905,18 @@ function renderQuoteImage(
   if (lines.length > QUOTE_BODY_MAX_LINES) {
     const ellipsis = "…";
     lines = lines.slice(0, QUOTE_BODY_MAX_LINES);
-    let last = lines[QUOTE_BODY_MAX_LINES - 1] + ellipsis;
     // Trim one trailing glyph at a time until the ellipsised line fits.
-    // Works for CJK-heavy strings because wrapText already split by glyph.
-    while (last.length > 1 && ctx.measureText(last).width > contentWidth) {
-      last = last.slice(0, -2) + ellipsis;
+    // 必须按码点回退而不是 `slice(0, -2)`：行尾若是扩展区汉字 / emoji 这类
+    // 代理对，按 UTF-16 单元切会留下孤立代理项，导出图上就是一个 �。
+    // Array.from 的粒度与 wrapCjk 的分行粒度一致。
+    const glyphs = Array.from(lines[QUOTE_BODY_MAX_LINES - 1]);
+    while (
+      glyphs.length > 1 &&
+      ctx.measureText(glyphs.join("") + ellipsis).width > contentWidth
+    ) {
+      glyphs.pop();
     }
-    lines[QUOTE_BODY_MAX_LINES - 1] = last;
+    lines[QUOTE_BODY_MAX_LINES - 1] = glyphs.join("") + ellipsis;
   }
 
   // Vertically centre the body block between the quote marks and the

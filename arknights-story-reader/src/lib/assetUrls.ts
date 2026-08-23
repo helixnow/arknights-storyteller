@@ -396,7 +396,26 @@ function scheduleHealthNotice(at: number) {
     healthTimer = null;
     healthTimerAt = 0;
     notifyAssetHealth();
+    scheduleNextHostWake();
   }, Math.max(0, at - Date.now()) + 50);
+}
+
+/**
+ * 定时器一次只记得住一个最早的唤醒时刻，多个 host 的熔断到期时间不同时
+ * （指数退避下必然如此），较晚那些的唤醒计划会被 `scheduleHealthNotice`
+ * 的去重丢掉。所以每次唤醒触发后重扫一遍 strike 表，为下一个仍在熔断中
+ * 的 host 续排闹钟——否则候选全落在较晚 host 上的组件会一直订阅健康事件
+ * 却永远等不到通知，卡在渐变兜底上。
+ */
+function scheduleNextHostWake() {
+  const now = Date.now();
+  let next = Infinity;
+  for (const strike of hostStrikes.values()) {
+    if (strike.blockedUntil > now && strike.blockedUntil < next) {
+      next = strike.blockedUntil;
+    }
+  }
+  if (next !== Infinity) scheduleHealthNotice(next);
 }
 
 /** 订阅「候选健康度可能变好了」事件。返回取消订阅函数。 */
