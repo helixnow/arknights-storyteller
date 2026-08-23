@@ -2212,19 +2212,35 @@ impl DataService {
         self.finalize_manual_import(&temp_path, &app)
     }
 
-    pub fn import_zip_from_bytes(&self, data: &[u8], app: AppHandle) -> Result<(), String> {
+    /// 分块导入的暂存文件路径。放在导入临时 ZIP 同一个目录里，收尾改名
+    /// 时保证不跨文件系统；`.part` 后缀表明它随时可能是半截文件。半途
+    /// 而废的暂存不必专门清理：下一轮传输的首块会原地截断重写。
+    pub fn import_staging_path(&self) -> Result<PathBuf, String> {
+        let parent_dir = self
+            .data_dir
+            .parent()
+            .ok_or_else(|| "Invalid data directory".to_string())?;
+        Ok(parent_dir.join("ArknightsGameData_import_staging.part"))
+    }
+
+    /// 把已写完的暂存文件转正并执行导入。与 `import_zip_from_path` 的
+    /// 差别只在第一步：暂存文件本来就是我们自己的临时文件，直接改名成
+    /// 导入临时 ZIP 即可，省掉整包几百 MB 的磁盘复制。之后与其他导入
+    /// 入口走完全相同的 finalize 流程（校验、解压、覆盖、重建索引）。
+    pub fn import_zip_from_staging(&self, app: AppHandle) -> Result<(), String> {
+        let staging = self.import_staging_path()?;
+        if !staging.exists() {
+            return Err("暂存的 ZIP 数据不存在，请重新选择文件导入".to_string());
+        }
         let parent_dir = self
             .data_dir
             .parent()
             .ok_or_else(|| "Invalid data directory".to_string())?;
 
-        fs::create_dir_all(parent_dir).map_err(|e| format!("无法创建数据目录: {}", e))?;
-
         let temp_path = parent_dir.join("ArknightsGameData_import.zip");
-        emit_progress(&app, "导入", 0, 100, "正在写入 ZIP 数据");
-        fs::write(&temp_path, data).map_err(|e| format!("写入 ZIP 数据失败: {}", e))?;
-
         emit_progress(&app, "导入", 30, 100, "正在校验 ZIP 文件");
+        fs::rename(&staging, &temp_path).map_err(|e| format!("写入 ZIP 数据失败: {}", e))?;
+
         self.finalize_manual_import(&temp_path, &app)
     }
 
@@ -5385,6 +5401,23 @@ mod tests {
         assert!(err.contains("ZIP 校验失败"), "{}", err);
         assert!(!temp_path.exists(), "解压失败后临时导入 ZIP 必须被清理");
         assert!(fx.service.is_installed(), "拒绝无效包不能伤及现有数据");
+    }
+
+    /// 分块导入的暂存文件必须和导入临时 ZIP 同目录（改名不跨文件系统），
+    /// 且带 `.part` 后缀标明可能是半截文件。
+    #[test]
+    fn import_staging_path_sits_next_to_import_temp_zip() {
+        let fx = Fixture::new("import_staging_path");
+        let staging = fx.service.import_staging_path().expect("必须能推导暂存路径");
+        assert_eq!(
+            staging.parent(),
+            fx.service.data_dir.parent(),
+            "暂存文件必须与导入临时 ZIP 同目录"
+        );
+        assert_eq!(
+            staging.file_name().and_then(|n| n.to_str()),
+            Some("ArknightsGameData_import_staging.part")
+        );
     }
 
     #[test]

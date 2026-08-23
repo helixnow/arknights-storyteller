@@ -291,17 +291,130 @@ pub async fn import_from_zip(
     .await
 }
 
+/// 分块传输被打断（乱序 / 暂存文件失踪）时的统一话术。
+const IMPORT_STREAM_BROKEN: &str = "导入传输中断，数据块不连续，请重新选择文件导入";
+
+const IMPORT_CHUNK_ENCODING_BROKEN: &str = "ZIP 数据块编码损坏，请重新选择文件导入";
+
+/// 解码标准 base64（FileReader dataURL 用的字母表，含可选 `=` 填充）。
+/// 项目依赖里没有 base64 crate，为一个函数添依赖不值当，这里手写一个
+/// 严格版：拒绝空白与非法长度，宁可让前端整轮重传也不拼出坏数据。
+fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
+    fn sextet(c: u8) -> Result<u32, String> {
+        match c {
+            b'A'..=b'Z' => Ok(u32::from(c - b'A')),
+            b'a'..=b'z' => Ok(u32::from(c - b'a') + 26),
+            b'0'..=b'9' => Ok(u32::from(c - b'0') + 52),
+            b'+' => Ok(62),
+            b'/' => Ok(63),
+            _ => Err(IMPORT_CHUNK_ENCODING_BROKEN.to_string()),
+        }
+    }
+
+    let stripped = input
+        .strip_suffix("==")
+        .or_else(|| input.strip_suffix('='))
+        .unwrap_or(input)
+        .as_bytes();
+    // 每 4 个字符解出 3 字节；余 1 个字符连一个字节都凑不出，必是坏块。
+    if stripped.len() % 4 == 1 {
+        return Err(IMPORT_CHUNK_ENCODING_BROKEN.to_string());
+    }
+    let mut out = Vec::with_capacity(stripped.len() / 4 * 3 + 2);
+    for group in stripped.chunks(4) {
+        let mut acc = 0u32;
+        for &c in group {
+            acc = (acc << 6) | sextet(c)?;
+        }
+        match group.len() {
+            4 => out.extend_from_slice(&[(acc >> 16) as u8, (acc >> 8) as u8, acc as u8]),
+            3 => out.extend_from_slice(&[(acc >> 10) as u8, (acc >> 2) as u8]),
+            2 => out.push((acc >> 4) as u8),
+            _ => return Err(IMPORT_CHUNK_ENCODING_BROKEN.to_string()),
+        }
+    }
+    Ok(out)
+}
+
+/// 把解码后的一块字节追加到暂存文件。`offset == 0` 开新文件（顺带截断
+/// 上一轮半途而废的暂存）；其余块要求偏移与暂存文件当前长度严格相等，
+/// 乱序 / 串台宁可报错让用户重传，也不能悄悄拼出一个损坏的 ZIP。
+fn append_import_chunk(staging: &std::path::Path, offset: u64, chunk: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+
+    if let Some(parent) = staging.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("无法创建数据目录: {}", e))?;
+    }
+    let mut file = if offset == 0 {
+        std::fs::File::create(staging).map_err(|e| format!("写入 ZIP 数据失败: {}", e))?
+    } else {
+        // 暂存文件失踪（被上一轮收尾改名走了 / 用户清了缓存）说明这轮
+        // 传输已经废了，报「中断」而不是含糊的 IO 错误。
+        if !staging.exists() {
+            return Err(IMPORT_STREAM_BROKEN.to_string());
+        }
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(staging)
+            .map_err(|e| format!("写入 ZIP 数据失败: {}", e))?;
+        let len = file
+            .metadata()
+            .map_err(|e| format!("写入 ZIP 数据失败: {}", e))?
+            .len();
+        if len != offset {
+            return Err(IMPORT_STREAM_BROKEN.to_string());
+        }
+        file
+    };
+    file.write_all(chunk)
+        .map_err(|e| format!("写入 ZIP 数据失败: {}", e))?;
+    Ok(())
+}
+
+/// 分块导入 ZIP。前端把文件切成几 MB 的块，逐块 base64 后调用本命令。
+///
+/// 为什么不直接传字节：Tauri 2 在 Android 上的 IPC 走 postMessage，
+/// 参数一律 JSON 化，`Vec<u8>` 会被展开成 JSON 数字数组——本命令旧签名
+/// 一次收整包，几百 MB 的 ZIP 序列化后直接把 WebView 撑爆（OOM 事故
+/// 现场）；raw IPC body 在 Android 上同样不可用（`InvokeBody::Raw`
+/// 文档明说 Android 恒为 Json），官方给 Android 的建议正是 base64
+/// 字符串。块大小由前端控制，两端峰值内存都只有一块的量级，与文件
+/// 总大小无关。
+///
+/// 协议：`offset` 是该块在文件中的字节偏移，0 表示开启新一轮传输
+/// （创建 / 截断暂存文件）；后端校验 offset 必须等于暂存文件当前长度，
+/// 防止 WebView 重载后旧传输的尾巴混进新传输。`last` 为 true 时收尾：
+/// 拿安装互斥，把暂存文件改名为导入临时 ZIP，走统一导入流程。
 #[tauri::command]
 pub async fn import_from_zip_bytes(
     app: AppHandle,
     state: State<'_, AppState>,
-    bytes: Vec<u8>,
+    chunk_base64: String,
+    offset: u64,
+    last: bool,
 ) -> Result<(), String> {
-    let guard = acquire_install_lock("import_from_zip_bytes")?;
+    // 只有收尾块真正改写数据目录，需要全程握着安装互斥；首块只探测
+    // 一下立刻放掉——纯粹为了快速失败，免得用户传完几百 MB 才被告知
+    // 「后台正在同步」。中间的追加只写自己的暂存文件，跟谁都不冲突。
+    if offset == 0 && !last {
+        drop(acquire_install_lock("import_from_zip_bytes")?);
+    }
+    let guard = if last {
+        Some(acquire_install_lock("import_from_zip_bytes")?)
+    } else {
+        None
+    };
     let service = clone_service(&state);
     run_blocking("import_from_zip_bytes", move || {
         let _guard = guard;
-        service.import_zip_from_bytes(&bytes, app)
+        let chunk = decode_base64(&chunk_base64)?;
+        let staging = service.import_staging_path()?;
+        append_import_chunk(&staging, offset, &chunk)?;
+        if last {
+            service.import_zip_from_staging(app)
+        } else {
+            Ok(())
+        }
     })
     .await
 }
@@ -495,6 +608,116 @@ mod tests {
     fn parse_asset_kind_rejects_unknown_kind() {
         let err = parse_asset_kind("sprite").expect_err("未知 kind 必须报错");
         assert!(err.contains("sprite"), "错误信息应包含原始 kind: {err}");
+    }
+
+    /// 测试专用的参照编码器：手写解码器的正确性用「任意字节 → 编码 →
+    /// 解码 → 原样还原」来钉住，不依赖记忆中的向量表。
+    fn encode_base64(data: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for group in data.chunks(3) {
+            let b = [
+                group[0],
+                group.get(1).copied().unwrap_or(0),
+                group.get(2).copied().unwrap_or(0),
+            ];
+            let acc = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+            out.push(ALPHABET[(acc >> 18) as usize & 63] as char);
+            out.push(ALPHABET[(acc >> 12) as usize & 63] as char);
+            out.push(if group.len() > 1 {
+                ALPHABET[(acc >> 6) as usize & 63] as char
+            } else {
+                '='
+            });
+            out.push(if group.len() > 2 {
+                ALPHABET[acc as usize & 63] as char
+            } else {
+                '='
+            });
+        }
+        out
+    }
+
+    #[test]
+    fn decode_base64_matches_rfc4648_vectors() {
+        let cases: &[(&str, &[u8])] = &[
+            ("", b""),
+            ("Zg==", b"f"),
+            ("Zm8=", b"fo"),
+            ("Zm9v", b"foo"),
+            ("Zm9vYg==", b"foob"),
+            ("Zm9vYmE=", b"fooba"),
+            ("Zm9vYmFy", b"foobar"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                decode_base64(input).as_deref(),
+                Ok(*expected),
+                "输入 {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_base64_roundtrips_arbitrary_bytes() {
+        // 覆盖全部 256 个字节值，以及各种「除 3 的余数」的长度。
+        let all_bytes: Vec<u8> = (0u8..=255).collect();
+        let mut cases: Vec<&[u8]> = vec![&all_bytes];
+        for len in 0..=5 {
+            cases.push(&all_bytes[..len]);
+        }
+        for data in cases {
+            let encoded = encode_base64(data);
+            assert_eq!(
+                decode_base64(&encoded).as_deref(),
+                Ok(data),
+                "长度 {} 的字节串必须原样还原",
+                data.len()
+            );
+        }
+    }
+
+    #[test]
+    fn decode_base64_rejects_garbage() {
+        // FileReader 产出的 base64 没有空白和换行，混进来就是坏块。
+        for input in ["Zm 9v", "Zm9v\n", "A", "Z=9v", "Zm9v!!"] {
+            let err = decode_base64(input).expect_err("坏块必须被拒绝");
+            assert!(err.contains("编码损坏"), "输入 {input:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn append_import_chunk_enforces_sequential_offsets() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("askr_import_chunk_{nanos}"));
+        let staging = dir.join("staging.part");
+
+        append_import_chunk(&staging, 0, b"hello ").expect("首块必须成功（自动建目录）");
+        append_import_chunk(&staging, 6, b"world").expect("偏移衔接的追加必须成功");
+        assert_eq!(std::fs::read(&staging).unwrap(), b"hello world");
+
+        let err = append_import_chunk(&staging, 5, b"!").expect_err("乱序偏移必须被拒绝");
+        assert!(err.contains("不连续"), "{err}");
+        assert_eq!(
+            std::fs::read(&staging).unwrap(),
+            b"hello world",
+            "被拒绝的块不能污染暂存文件"
+        );
+
+        // offset 0 重开一轮：上一轮的残骸必须被截断。
+        append_import_chunk(&staging, 0, b"redo").expect("重开一轮必须成功");
+        assert_eq!(std::fs::read(&staging).unwrap(), b"redo");
+
+        // 暂存文件失踪（收尾已改名 / 缓存被清）时续传必须报「中断」。
+        std::fs::remove_file(&staging).unwrap();
+        let err = append_import_chunk(&staging, 4, b"tail").expect_err("暂存缺失必须报错");
+        assert!(err.contains("不连续"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 安装互斥的完整生命周期。INSTALL_LOCK 是进程级单例，而 cargo test

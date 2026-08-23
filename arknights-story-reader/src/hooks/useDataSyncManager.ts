@@ -110,6 +110,30 @@ export function useActiveDataJob(): DataJobKind | null {
   return useSyncExternalStore(subscribeDataJob, getActiveDataJob, getActiveDataJob);
 }
 
+/**
+ * 分块导入的块大小。太小徒增 IPC 往返；太大则单块的 base64 字符串
+ * （约 4/3 倍体积）会顶高 WebView 峰值内存——Android 的 IPC 会把整条
+ * 消息再序列化一次。4 MiB 时单块开销约 11 MB，几百 MB 的包也只要
+ * 一百来次往返。
+ */
+const IMPORT_CHUNK_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Blob 切片 → base64（去掉 dataURL 前缀）。用 FileReader 的原生编码器，
+ * 不在 JS 里手搓字节循环；每次只读一块，内存与文件总大小无关。
+ */
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error ?? new Error("读取文件失败"));
+    reader.onload = () => {
+      const text = String(reader.result);
+      resolve(text.slice(text.indexOf(",") + 1));
+    };
+    reader.readAsDataURL(blob);
+  });
+}
+
 /** 终态进度多留一会儿让用户看清「完成」，之后自动收起。 */
 const PROGRESS_DONE_LINGER_MS = 2200;
 /** 后端长时间没有新进度时的兜底，避免进度条永远卡在中间。 */
@@ -376,13 +400,29 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
   const importFromFile = useCallback(
     async (file: File) => {
       await runImport(`正在读取 ${file.name}`, async () => {
-        const buffer = await file.arrayBuffer();
-        const bytes = new Uint8Array(buffer);
-        devLog("[useDataSyncManager] 导入 ZIP 字节数:", bytes.byteLength);
-        if (mountedRef.current) {
-          setProgress({ phase: "导入", current: 20, total: 100, message: "正在传输 ZIP 数据…" });
-        }
-        await api.importZipFromBytes(bytes);
+        devLog("[useDataSyncManager] 导入 ZIP 字节数:", file.size);
+        // 绝不能 file.arrayBuffer() 一口吞：整包会先占满 JS 堆，再被
+        // IPC 序列化成 JSON 数字数组，几百 MB 的 ZIP 在 Android 上直接
+        // OOM。改成逐块 slice → base64 → 追加到后端暂存文件，最后一块
+        // 让后端按路径走统一导入流程；两端峰值内存都只有一块的量级。
+        const total = file.size;
+        let offset = 0;
+        do {
+          const end = Math.min(offset + IMPORT_CHUNK_BYTES, total);
+          const chunk = await blobToBase64(file.slice(offset, end));
+          if (mountedRef.current) {
+            // 传输映射到 0–30%，与后端导入进度（校验 30 → 解压 40 → 完成 100）衔接。
+            const ratio = total > 0 ? offset / total : 0;
+            setProgress({
+              phase: "导入",
+              current: Math.min(Math.round(ratio * 30), 30),
+              total: 100,
+              message: `正在传输 ZIP 数据…（${Math.round(ratio * 100)}%）`,
+            });
+          }
+          await api.importZipChunk(chunk, offset, end >= total);
+          offset = end;
+        } while (offset < total);
       });
     },
     [runImport]

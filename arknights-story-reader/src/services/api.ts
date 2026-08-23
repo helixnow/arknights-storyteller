@@ -91,9 +91,13 @@ export const api = {
     return invoke<void>("import_from_zip", { path });
   },
 
-  // 手动导入ZIP（字节流，移动端回退）
-  importZipFromBytes: async (bytes: Uint8Array): Promise<void> => {
-    return invoke<void>("import_from_zip_bytes", { bytes });
+  // 手动导入 ZIP 的分块通道（移动端 / <input type="file"> 回退）。
+  // 千万不要把 Uint8Array 塞进 invoke 参数：Android 的 IPC 走 postMessage，
+  // 二进制会被 JSON 化成数字数组，整包几百 MB 的 ZIP 直接 OOM——
+  // 所以按块传 base64。offset 为该块的字节偏移（0 开启新一轮传输），
+  // last 为 true 时后端把暂存文件转正并执行导入。
+  importZipChunk: async (chunkBase64: string, offset: number, last: boolean): Promise<void> => {
+    return invoke<void>("import_from_zip_bytes", { chunkBase64, offset, last });
   },
 
   // 监听同步进度
