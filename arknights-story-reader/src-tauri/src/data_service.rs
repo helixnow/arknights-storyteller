@@ -1779,6 +1779,10 @@ impl DataService {
 
         let mut downloaded: usize = 0;
         let mut buffer = [0u8; 8192];
+        // 每读一个 8KB 块就 emit 一次，一个几百 MB 的包要发几万条事件，
+        // 每条都要过一遍 JSON + IPC，事件本身比下载还贵。整数百分比（总长
+        // 未知时按整 MB）变化才发一条，整场下载至多一两百条。
+        let mut last_tick = usize::MAX;
         loop {
             let bytes_read = response
                 .read(&mut buffer)
@@ -1794,19 +1798,27 @@ impl DataService {
             let downloaded_mb = downloaded as f64 / 1_048_576.0;
             if total_bytes > 0 {
                 let percent = (downloaded as f64 / total_bytes as f64 * 100.0).min(100.0);
-                let total_mb = total_bytes as f64 / 1_048_576.0;
-                emit_progress(
-                    app,
-                    "下载",
-                    percent.round() as usize,
-                    100,
-                    format!("已下载 {:.1}/{:.1} MB", downloaded_mb, total_mb.max(0.1)),
-                );
+                let rounded = percent.round() as usize;
+                if rounded != last_tick {
+                    last_tick = rounded;
+                    let total_mb = total_bytes as f64 / 1_048_576.0;
+                    emit_progress(
+                        app,
+                        "下载",
+                        rounded,
+                        100,
+                        format!("已下载 {:.1}/{:.1} MB", downloaded_mb, total_mb.max(0.1)),
+                    );
+                }
             } else {
                 // 服务端没给 Content-Length，就没有百分比可言。以前这里一直
                 // 报 0/100，进度条整场下载都钉在 0%；改成不确定态（total = 0），
                 // 让前端只显示已下载的字节数。
-                emit_progress(app, "下载", 0, 0, format!("已下载 {:.1} MB", downloaded_mb));
+                let whole_mb = downloaded >> 20;
+                if whole_mb != last_tick {
+                    last_tick = whole_mb;
+                    emit_progress(app, "下载", 0, 0, format!("已下载 {:.1} MB", downloaded_mb));
+                }
             }
         }
         zip_file
@@ -1841,6 +1853,9 @@ impl DataService {
             ZipArchive::new(zip_file).map_err(|e| format!("Failed to read zip archive: {}", e))?;
 
         let total_entries = usize::max(archive.len(), 1);
+        // 数据包里有几万个条目，逐条 emit 会把事件总线灌满（同下载循环）；
+        // 整数百分比变了才发一条。
+        let mut last_percent = usize::MAX;
         for i in 0..archive.len() {
             let mut file = archive
                 .by_index(i)
@@ -1866,13 +1881,17 @@ impl DataService {
             }
 
             let percent = ((i + 1) as f64 / total_entries as f64 * 100.0).min(100.0);
-            emit_progress_opt(
-                app,
-                "解压",
-                percent.round() as usize,
-                100,
-                format!("解压 {}/{} ({:.1}%)", i + 1, total_entries, percent),
-            );
+            let rounded = percent.round() as usize;
+            if rounded != last_percent {
+                last_percent = rounded;
+                emit_progress_opt(
+                    app,
+                    "解压",
+                    rounded,
+                    100,
+                    format!("解压 {}/{} ({:.1}%)", i + 1, total_entries, percent),
+                );
+            }
         }
 
         emit_progress_opt(app, "解压", 100, 100, "解压完成");
@@ -2534,7 +2553,9 @@ impl DataService {
 
         let Some(fts_query) = Self::build_fts_query_advanced(query) else {
             return Ok(Some(Vec::new()));
-        };        // bm25() column weights: `story_id`(UNINDEXED)=0, `story_name`=10,
+        };
+
+        // bm25() column weights: `story_id`(UNINDEXED)=0, `story_name`=10,
         // `category`(UNINDEXED)=0, `tokenized_content`=1, `story_code`=5,
         // `raw_content`(UNINDEXED)=0. Higher = more relevant. (bug C1)
         let query_sql = format!(
@@ -3435,14 +3456,35 @@ impl DataService {
         // Build a parallel mapping: for each normalized char, remember the
         // original char index it came from. This lets us map a match position
         // back to the original content without byte-length surprises.
-        let mut norm_chars: Vec<char> = Vec::with_capacity(content.len());
-        let mut origin_char_for_norm: Vec<usize> = Vec::with_capacity(content.len());
-        for (orig_idx, ch) in content.replace("{@nickname}", "博士").chars().enumerate() {
-            // The replace above shifts indices for any passage containing
-            // `{@nickname}`, but for the common case it is benign. We still
-            // compute the best-effort mapping using the *current* char
-            // position after the textual substitution — users search "博士"
-            // and expect the snippet to show "博士" as well.
+        //
+        // `{@nickname}` 原位替换成「博士」，两个替换字符都映射回占位符开头。
+        // 以前是先对整串做 `replace` 再枚举下标——那是**替换后**字符串的
+        // 下标，最后却拿去切**原文**：占位符比「博士」长 9 个字符，命中点
+        // 之前每出现一次，窗口就整体偏 9 格。窗口只有 ±50 字符，占位符密集
+        // 的剧情里挑出的「上下文」根本不含命中的文字。
+        const NICKNAME: &str = "{@nickname}";
+        let nickname_char_len = NICKNAME.chars().count();
+        let origin_chars: Vec<char> = content.chars().collect();
+        let mut norm_chars: Vec<char> = Vec::with_capacity(origin_chars.len());
+        let mut origin_char_for_norm: Vec<usize> = Vec::with_capacity(origin_chars.len());
+        let mut orig_idx = 0usize;
+        while orig_idx < origin_chars.len() {
+            if origin_chars[orig_idx] == '{'
+                && origin_chars[orig_idx..]
+                    .iter()
+                    .take(nickname_char_len)
+                    .copied()
+                    .eq(NICKNAME.chars())
+            {
+                // 与 `normalize_for_fuzzy` 的替换语义保持一致。
+                for rep in ['博', '士'] {
+                    norm_chars.push(rep);
+                    origin_char_for_norm.push(orig_idx);
+                }
+                orig_idx += nickname_char_len;
+                continue;
+            }
+            let ch = origin_chars[orig_idx];
             for normalized in ch.to_lowercase() {
                 let nfkc: String = normalized.nfkc().collect();
                 for nch in nfkc.chars() {
@@ -3456,6 +3498,7 @@ impl DataService {
                     origin_char_for_norm.push(orig_idx);
                 }
             }
+            orig_idx += 1;
         }
 
         let norm_text: String = norm_chars.iter().collect();
@@ -3478,14 +3521,15 @@ impl DataService {
                 }
                 let origin_char_start = origin_char_for_norm[norm_char_index];
                 let probe_char_len = probe.chars().count();
-                // Original snippet window around the matched characters.
-                let origin_chars: Vec<char> = content.chars().collect();
-                if origin_chars.is_empty() {
-                    return String::new();
-                }
+                // 归一化丢掉了空白和标点，probe 的字符数换算不回原文跨度；
+                // 用命中的最后一个归一化字符对应的原文位置来定右边界。
+                let origin_char_end = origin_char_for_norm
+                    .get(norm_char_index + probe_char_len - 1)
+                    .map(|idx| idx + 1)
+                    .unwrap_or(origin_chars.len());
                 let window = 50usize;
                 let snippet_start = origin_char_start.saturating_sub(window);
-                let snippet_end = (origin_char_start + probe_char_len + window).min(origin_chars.len());
+                let snippet_end = (origin_char_end + window).min(origin_chars.len());
                 let snippet: String = origin_chars[snippet_start..snippet_end].iter().collect();
                 if snippet.is_empty() {
                     continue;
@@ -4642,6 +4686,33 @@ mod tests {
             .service
             .extract_context(content, "博士你醒了")
             .contains("你醒了"));
+    }
+
+    #[test]
+    fn extract_context_stays_aligned_after_nickname_placeholders() {
+        let fx = Fixture::new("nickname_ctx");
+
+        // `{@nickname}` 比替换出的「博士」长 9 个字符。命中点之前每出现一
+        // 次，按「替换后下标切原文」的旧算法就偏 9 格；垫 20 个占位符让偏
+        // 移（180 字符）远超窗口（±50），错位实现挑出的片段必然不含命中文本。
+        let mut content = String::new();
+        for _ in 0..20 {
+            content.push_str("{@nickname}，请听我说。\n");
+        }
+        content.push_str("凯尔希：罗德岛不会忘记你。");
+
+        let snippet = fx.service.extract_context(&content, "罗德岛不会忘记你");
+        assert!(
+            snippet.contains("罗德岛不会忘记你"),
+            "上下文必须包含命中的原文，实际: {}",
+            snippet
+        );
+
+        // 探针跨过占位符本身也要能定位，片段展示的是原文（含占位符）。
+        let snippet = fx
+            .service
+            .extract_context("{@nickname}，欢迎回来。", "博士欢迎回来");
+        assert!(snippet.contains("欢迎回来"), "{}", snippet);
     }
 
     #[test]
