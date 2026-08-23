@@ -1248,6 +1248,42 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     </div>
   );
 
+  // 连 JSX 数组一起缓存：引用没变时 React 直接跳过整棵子树，
+  // 一次搜索出几百行的情况下，敲字的重渲染成本才真正压到接近零。
+  const storyRowNodes = useMemo(
+    () =>
+      visibleResults.map((result, index) => (
+        <StoryResultRow
+          key={`${result.storyId}-${index}`}
+          result={result}
+          index={index}
+          active={activeIndex === index}
+          opening={openingStoryId === result.storyId}
+          highlight={highlight}
+          onOpen={handleOpenResult}
+          registerRow={registerRow}
+        />
+      )),
+    [visibleResults, activeIndex, openingStoryId, highlight, handleOpenResult, registerRow]
+  );
+
+  const segmentRowNodes = useMemo(
+    () =>
+      segmentHits.map((hit, index) => (
+        <SegmentResultRow
+          key={`${hit.storyId}-${hit.segmentIndex}-${index}`}
+          hit={hit}
+          index={index}
+          active={activeIndex === index}
+          opening={openingStoryId === hit.storyId}
+          highlight={highlight}
+          onOpen={handleOpenSegment}
+          registerRow={registerRow}
+        />
+      )),
+    [segmentHits, activeIndex, openingStoryId, highlight, handleOpenSegment, registerRow]
+  );
+
   const keyboardHint = navCount > 0 && (
     <span className="hidden flex-shrink-0 text-[11px] text-[hsl(var(--color-muted-foreground))] md:inline">
       ↑↓ 选择 · Enter 打开
@@ -1615,18 +1651,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
                     aria-label="段落搜索结果"
                     className="space-y-3"
                   >
-                    {segmentHits.map((hit, index) => (
-                      <SegmentResultRow
-                        key={`${hit.storyId}-${hit.segmentIndex}-${index}`}
-                        hit={hit}
-                        index={index}
-                        active={activeIndex === index}
-                        opening={openingStoryId === hit.storyId}
-                        highlight={highlight}
-                        onOpen={handleOpenSegment}
-                        registerRow={registerRow}
-                      />
-                    ))}
+                    {segmentRowNodes}
                   </div>
                 </div>
               )
@@ -1694,18 +1719,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
                       aria-label="剧情搜索结果"
                       className="space-y-3"
                     >
-                      {visibleResults.map((result, index) => (
-                        <StoryResultRow
-                          key={`${result.storyId}-${index}`}
-                          result={result}
-                          index={index}
-                          active={activeIndex === index}
-                          opening={openingStoryId === result.storyId}
-                          highlight={highlight}
-                          onOpen={handleOpenResult}
-                          registerRow={registerRow}
-                        />
-                      ))}
+                      {storyRowNodes}
                     </div>
                   )}
                 </div>
