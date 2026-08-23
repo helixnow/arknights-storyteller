@@ -120,7 +120,11 @@ export function useAutoIndex() {
         deferrals = 0;
         const rebuilt = await api.getStoryIndexStatus().catch(() => null);
         if (cancelled) return;
-        broadcast(rebuilt, "rebuilt");
+        // reason 不能叫 "rebuilt"：那是搜索面板重建收场广播的专用终态，
+        // 设置页收到就会释放它持有的 "index" 任务锁。上面 release() 之后
+        // 设置页可能立刻抢到锁发起新一轮重建，这条广播若冒用同名终态，
+        // 会把那次还在跑的重建的锁提前放掉，同步/导入就能趁虚而入。
+        broadcast(rebuilt, "auto-rebuilt");
       } catch (err) {
         // 失败不影响可用性：后端搜索会退回线性扫描，UI 也有"刷新索引"入口。
         devLog("自动索引任务失败，搜索将回退到线性扫描", err);
