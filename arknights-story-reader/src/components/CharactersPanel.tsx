@@ -1,13 +1,23 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+} from "react";
 import { api } from "@/services/api";
 import type { ParsedStoryContent, StoryEntry } from "@/types/story";
 import { Button } from "@/components/ui/button";
 import { CustomScrollArea } from "@/components/ui/custom-scroll-area";
 import { Input } from "@/components/ui/input";
 import { Collapsible } from "@/components/ui/collapsible";
-import { ArrowLeft, Loader2, Shuffle } from "lucide-react";
+import { ArrowLeft, Loader2, Shuffle, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { CharacterAvatar } from "@/components/CharacterAvatar";
+import { useCharacterResolver } from "@/hooks/useCharacterResolver";
 import { postProcessSegments } from "@/components/StoryReader";
 
 interface CharactersPanelProps {
@@ -64,6 +74,11 @@ interface GroupInfo {
   storyOrder: number; // 用于组内排序（同主页）
 }
 
+/** 过滤用的归一化：大小写、空白、各种间隔号都不参与匹配。 */
+function normalizeForSearch(value: string): string {
+  return value.trim().toLowerCase().replace(/[\s·‧•・]+/g, "");
+}
+
 /** Fisher–Yates 洗牌后取前 n 条，不改动传入数组。 */
 function pickRandomQuotes(pool: CharacterQuote[], n: number): CharacterQuote[] {
   const shuffled = [...pool];
@@ -73,6 +88,115 @@ function pickRandomQuotes(pool: CharacterQuote[], n: number): CharacterQuote[] {
   }
   return shuffled.slice(0, n);
 }
+
+/**
+ * 输入法友好的过滤输入框。
+ *
+ * 拼音/日文输入法在选词前会一路触发 change（「z」「zh」「zhong」…），
+ * 直接拿这些中间态过滤，列表会在用户还没打完字时就抖成"无匹配"。
+ * 所以合成期间只更新本地草稿，等 compositionend 才把结果提交给父级。
+ * 草稿由组件自己持有，父级只保存已提交的关键词。
+ */
+function FilterInput({
+  initialValue = "",
+  placeholder,
+  ariaLabel,
+  onCommit,
+}: {
+  initialValue?: string;
+  placeholder: string;
+  ariaLabel: string;
+  onCommit: (value: string) => void;
+}) {
+  const [draft, setDraft] = useState(initialValue);
+  const composingRef = useRef(false);
+
+  const commit = useCallback(
+    (value: string) => {
+      composingRef.current = false;
+      setDraft(value);
+      onCommit(value);
+    },
+    [onCommit],
+  );
+
+  return (
+    <div className="relative">
+      <Input
+        value={draft}
+        placeholder={placeholder}
+        aria-label={ariaLabel}
+        className="pr-9"
+        autoComplete="off"
+        autoCorrect="off"
+        spellCheck={false}
+        enterKeyHint="search"
+        onChange={(e) => {
+          const value = e.target.value;
+          setDraft(value);
+          if (!composingRef.current) onCommit(value);
+        }}
+        onCompositionStart={() => {
+          composingRef.current = true;
+        }}
+        onCompositionEnd={(e) => {
+          // 部分安卓输入法的 change 会排在 compositionend 之后，只靠
+          // 清标记会漏掉最后一次输入；这里直接用事件里的最终文本。
+          commit((e.target as HTMLInputElement).value);
+        }}
+        onKeyDown={(e) => {
+          if (e.key !== "Escape" || !draft) return;
+          if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
+          // 别让 Esc 冒到全局返回处理上，这里只清输入框。
+          e.preventDefault();
+          e.stopPropagation();
+          commit("");
+        }}
+      />
+      {draft && (
+        <button
+          type="button"
+          className="absolute right-0 top-0 flex h-full w-9 items-center justify-center rounded-r-md text-[hsl(var(--color-muted-foreground))] transition-colors hover:text-[hsl(var(--color-foreground))] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--color-ring))]"
+          onClick={() => commit("")}
+          aria-label={`清除${ariaLabel}`}
+        >
+          <X className="h-4 w-4" />
+        </button>
+      )}
+    </div>
+  );
+}
+
+/** memo 一层：搜索、选中这类 state 变化不该重渲染另外 400 张卡片。 */
+const CharacterCard = memo(function CharacterCard({
+  name,
+  total,
+  onSelect,
+}: {
+  name: string;
+  total: number;
+  onSelect: (name: string) => void;
+}) {
+  return (
+    <button
+      className={cn(
+        "character-grid-cell flex items-center gap-3 rounded-lg border border-[hsl(var(--color-border))] bg-[hsl(var(--color-card))] p-3 text-left"
+      )}
+      onClick={() => onSelect(name)}
+    >
+      <CharacterAvatar name={name} size={40} />
+      <div className="font-medium truncate flex-1 min-w-0">{name}</div>
+      <div className="text-xs text-[hsl(var(--color-muted-foreground))] shrink-0">{total} 次</div>
+    </button>
+  );
+});
+
+// 出场关卡列表可以有上千行（博士、凯尔希）。视口外的行跳过绘制与布局，
+// 展开长章节时才不会整屏 repaint。和人物网格用的是同一套办法。
+const STORY_ROW_STYLE: CSSProperties = {
+  contentVisibility: "auto",
+  containIntrinsicSize: "1px 72px",
+};
 
 function countCharactersInStory(content: ParsedStoryContent): Map<string, number> {
   const map = new Map<string, number>();
@@ -101,6 +225,9 @@ export function CharactersPanel({
   const activeRef = useRef(active);
   const loadedOnceRef = useRef(false);
   const staleRef = useRef(false);
+  // 统计要读几千篇剧情、金句要读几十篇，都远比一次面板切换活得久。
+  // 卸载后既不能继续 setState，也没必要继续发 IPC。
+  const aliveRef = useRef(true);
   const [groupInfoByStoryId, setGroupInfoByStoryId] = useState<Map<string, GroupInfo>>(new Map());
   const [groupSearch, setGroupSearch] = useState<Record<string, string>>({});
   const [cacheUsed, setCacheUsed] = useState(false);
@@ -112,6 +239,14 @@ export function CharactersPanel({
   /** 当前 quotes 属于哪位角色；和 selected 不一致就说明还没抓完。 */
   const [quotesFor, setQuotesFor] = useState<string | null>(null);
   const quotesRunRef = useRef(0);
+  const { loaded: resolverLoaded, hasIndex, refresh: refreshResolver } = useCharacterResolver();
+
+  useEffect(() => {
+    aliveRef.current = true;
+    return () => {
+      aliveRef.current = false;
+    };
+  }, []);
 
   const CACHE_PREFIX = "arknights-characters-cache";
   // 缓存 key 只取 commit hash 部分（版本字符串前 7 位），忽略时间戳。
@@ -130,6 +265,7 @@ export function CharactersPanel({
     try {
       // 数据没同步时后端每个命令都会抛错，先问一次省掉一串失败请求。
       const installed = await api.isInstalled();
+      if (!aliveRef.current) return;
       if (!installed) {
         setNotInstalled(true);
         setAggregates(new Map());
@@ -141,6 +277,7 @@ export function CharactersPanel({
       setNotInstalled(false);
 
       const ver = await api.getCurrentVersion();
+      if (!aliveRef.current) return;
       setVersion(ver);
 
       // 使用主页同样的分组与排序数据源
@@ -152,6 +289,7 @@ export function CharactersPanel({
           api.getRoguelikeStoriesGrouped().catch(() => []),
           api.getMemoryStories(),
         ]);
+      if (!aliveRef.current) return;
 
       // 生成 groupInfoByStoryId
       const groupInfo = new Map<string, GroupInfo>();
@@ -280,7 +418,8 @@ export function CharactersPanel({
           });
         };
         const worker = async () => {
-          while (true) {
+          // 面板卸载后剩下的几千次读取直接放弃，不再排队占用 IPC。
+          while (aliveRef.current) {
             const i = cursor++;
             if (i >= stories.length) return;
             const story = stories[i];
@@ -292,7 +431,7 @@ export function CharactersPanel({
               failed += 1;
             } finally {
               done += 1;
-              if (done % PROGRESS_STEP === 0 || done === stories.length) {
+              if (aliveRef.current && (done % PROGRESS_STEP === 0 || done === stories.length)) {
                 setProgress({ current: done, total: stories.length });
               }
             }
@@ -301,6 +440,7 @@ export function CharactersPanel({
         await Promise.all(
           Array.from({ length: Math.min(STATS_POOL_SIZE, stories.length) }, () => worker())
         );
+        if (!aliveRef.current) return;
         if (failed > 0) {
           console.warn(`[CharactersPanel] ${failed}/${stories.length} 篇剧情读取失败，已跳过`);
         }
@@ -347,13 +487,14 @@ export function CharactersPanel({
     } catch (err) {
       const raw = err instanceof Error ? err.message : String(err);
       loadedOnceRef.current = false;
+      if (!aliveRef.current) return;
       if (/NOT_INSTALLED|未安装/i.test(raw)) {
         setNotInstalled(true);
       } else {
         setError(raw || "加载失败");
       }
     } finally {
-      setLoading(false);
+      if (aliveRef.current) setLoading(false);
       loadingRef.current = false;
     }
   }, [getCacheKey]);
@@ -393,25 +534,49 @@ export function CharactersPanel({
       .sort((a, b) => b.total - a.total || a.name.localeCompare(b.name, "zh-Hans"));
   }, [aggregates]);
 
+  // 400+ 个人物的过滤放到低优先级更新里：输入框永远先跟上手速，列表慢一帧
+  // 重排也不会卡住输入法候选框。
+  const deferredSearch = useDeferredValue(search);
+  const searchStale = deferredSearch !== search;
+
+  // 名字里的间隔号常被漏打（「玛恩纳·临光」），两边都抹掉再比。
+  const searchNeedles = useMemo(
+    () => allCharacters.map((c) => normalizeForSearch(c.name)),
+    [allCharacters]
+  );
+
   const filteredCharacters = useMemo(() => {
-    const q = search.trim().toLowerCase();
+    const q = normalizeForSearch(deferredSearch);
     if (!q) return allCharacters;
-    return allCharacters.filter((c) => c.name.toLowerCase().includes(q));
-  }, [allCharacters, search]);
+    return allCharacters.filter((_, i) => searchNeedles[i].includes(q));
+  }, [allCharacters, searchNeedles, deferredSearch]);
+
+  const handleSelectCharacter = useCallback((name: string) => setSelected(name), []);
 
   const selectedAgg = useMemo(() => (selected ? aggregates.get(selected) ?? null : null), [aggregates, selected]);
 
   const groupedByChapter = useMemo(() => {
-    if (!selectedAgg) return [] as Array<{ groupName: string; items: CharacterStatsPerStory[]; order: number }>;
-    const buckets = new Map<string, { groupName: string; order: number; items: CharacterStatsPerStory[] }>();
+    if (!selectedAgg)
+      return [] as Array<{
+        key: string;
+        groupName: string;
+        items: CharacterStatsPerStory[];
+        order: number;
+      }>;
+    const buckets = new Map<
+      string,
+      { key: string; groupName: string; order: number; items: CharacterStatsPerStory[] }
+    >();
     selectedAgg.perStory.forEach((ps) => {
       const info = groupInfoByStoryId.get(ps.story.storyId);
+      // 不同分类下可能撞同名章节，React key 与组内搜索都用带分类前缀的 key。
       const key = info ? `${info.category}:${info.groupName}` : `other:其他`;
       const bucket = buckets.get(key);
       if (bucket) {
         bucket.items.push(ps);
       } else {
         buckets.set(key, {
+          key,
           groupName: info?.groupName ?? "其他",
           order: info?.groupOrder ?? 9999,
           items: [ps],
@@ -420,6 +585,12 @@ export function CharactersPanel({
     });
     return Array.from(buckets.values()).sort((a, b) => a.order - b.order);
   }, [groupInfoByStoryId, selectedAgg]);
+
+  // 组内搜索按章节名存。换个角色还留着上一位的关键词，展开章节就会莫名
+  // 其妙地显示"无匹配结果"。
+  useEffect(() => {
+    setGroupSearch((prev) => (Object.keys(prev).length > 0 ? {} : prev));
+  }, [selected]);
 
   useEffect(() => {
     if (!selected || !selectedAgg) {
@@ -446,15 +617,19 @@ export function CharactersPanel({
     const seenText = new Set<string>();
     let cursor = 0;
     let cancelled = false;
+    // 换角色 / 卸载后这一轮就作废：既不再取新剧情，也不解析已经拿到的，
+    // 更不会拿旧角色的金句去 setState。
+    const live = () => !cancelled && aliveRef.current && runId === quotesRunRef.current;
 
     const worker = async () => {
-      while (!cancelled && runId === quotesRunRef.current) {
+      while (live()) {
         if (collected.length >= QUOTE_HARD_CAP) return;
         const i = cursor++;
         if (i >= targets.length) return;
         const { story } = targets[i];
         try {
           const content = await api.getStoryContent(story.storyTxt);
+          if (!live()) return;
           // 必须走 postProcessSegments：阅读器渲染的就是这份下标，
           // 否则点金句跳过去会错位。
           postProcessSegments(content.segments).forEach((seg, segmentIndex) => {
@@ -476,7 +651,7 @@ export function CharactersPanel({
         worker()
       )
     ).then(() => {
-      if (cancelled || runId !== quotesRunRef.current) return;
+      if (!live()) return;
       // 长句更像"金句"，取最长的一批做候选池，再从池里随机抽几条展示。
       collected.sort((a, b) => b.text.length - a.text.length);
       const pool = collected.slice(0, QUOTE_POOL_SIZE);
@@ -499,6 +674,14 @@ export function CharactersPanel({
   const handleGoToSettings = useCallback(() => {
     window.dispatchEvent(new CustomEvent("app:go-tab", { detail: "settings" }));
   }, []);
+
+  const handleReloadResolver = useCallback(() => {
+    void refreshResolver();
+  }, [refreshResolver]);
+
+  // 索引没载进来时头像只剩首字缩写，别名解析也会失效。统计本身照常可用，
+  // 所以有数据时只提示一行，没数据时才占满整块空态。
+  const resolverIndexMissing = resolverLoaded && !hasIndex && !notInstalled;
 
   // 刚选中角色、effect 还没跑起来的那一帧也算"加载中"，否则会闪一下空态。
   const quotesPending = loadingQuotes || (selected !== null && quotesFor !== selected);
@@ -530,11 +713,12 @@ export function CharactersPanel({
         </h1>
         {!selected && (
           <div className="ml-auto min-w-0 flex-1 max-w-[14rem]">
-            <Input
+            {/* 进出角色详情会让搜索框重新挂载，initialValue 让草稿跟已提交的关键词对齐。 */}
+            <FilterInput
+              initialValue={search}
               placeholder="搜索人物"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              aria-label="搜索人物"
+              ariaLabel="搜索人物"
+              onCommit={setSearch}
             />
           </div>
         )}
@@ -606,20 +790,54 @@ export function CharactersPanel({
             </div>
           )}
 
-          {!selected && !notInstalled && (
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-              {filteredCharacters.map((c) => (
+          {!selected &&
+            !loading &&
+            resolverIndexMissing &&
+            (allCharacters.length > 0 ? (
+              // 统计还在，只是头像退化了：一行提示就够，别抢走整块空间。
+              <div className="flex flex-wrap items-center gap-x-2 rounded-xl border border-dashed border-[hsl(var(--color-border))] px-3 py-1.5 text-xs text-[hsl(var(--color-muted-foreground))]">
+                <span>角色索引没载入，头像暂时用首字缩写代替。</span>
                 <button
-                  key={c.name}
-                  className={cn(
-                    "character-grid-cell flex items-center gap-3 rounded-lg border border-[hsl(var(--color-border))] bg-[hsl(var(--color-card))] p-3 text-left"
-                  )}
-                  onClick={() => setSelected(c.name)}
+                  type="button"
+                  className="-my-2 inline-flex min-h-[44px] items-center px-1 font-medium text-[hsl(var(--color-primary))] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--color-ring))] rounded"
+                  onClick={handleReloadResolver}
                 >
-                  <CharacterAvatar name={c.name} size={40} />
-                  <div className="font-medium truncate flex-1 min-w-0">{c.name}</div>
-                  <div className="text-xs text-[hsl(var(--color-muted-foreground))] shrink-0">{c.total} 次</div>
+                  重新载入
                 </button>
+              </div>
+            ) : (
+              <div className="rounded-2xl border border-dashed border-[hsl(var(--color-border))] p-5">
+                <div className="text-sm font-medium">角色索引没有载入</div>
+                <p className="mt-1.5 text-sm leading-relaxed text-[hsl(var(--color-muted-foreground))]">
+                  角色索引是空的，人物统计也就没有可显示的内容。先重新载入一次；还是空的就到设置页同步
+                  ArknightsGameData 之后再回来。
+                </p>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <Button className="min-h-[44px]" onClick={handleReloadResolver}>
+                    重新载入索引
+                  </Button>
+                  <Button variant="ghost" className="min-h-[44px]" onClick={handleGoToSettings}>
+                    去设置同步
+                  </Button>
+                </div>
+              </div>
+            ))}
+
+          {!selected && !notInstalled && (
+            <div
+              className={cn(
+                "grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3",
+                // 过滤结果还在低优先级更新里排队时先淡一下，比列表突然跳变可读。
+                searchStale && "opacity-60 transition-opacity duration-150"
+              )}
+            >
+              {filteredCharacters.map((c) => (
+                <CharacterCard
+                  key={c.name}
+                  name={c.name}
+                  total={c.total}
+                  onSelect={handleSelectCharacter}
+                />
               ))}
               {loading &&
                 filteredCharacters.length === 0 &&
@@ -633,9 +851,11 @@ export function CharactersPanel({
                     <div className="h-3 w-24 rounded bg-[hsl(var(--color-secondary))] animate-pulse" />
                   </div>
                 ))}
-              {!loading && !error && filteredCharacters.length === 0 && (
+              {!loading && !error && !resolverIndexMissing && filteredCharacters.length === 0 && (
                 <div className="col-span-full text-sm text-[hsl(var(--color-muted-foreground))]">
-                  {search.trim() ? `没有匹配“${search.trim()}”的人物` : "还没有统计到人物"}
+                  {deferredSearch.trim()
+                    ? `没有匹配“${deferredSearch.trim()}”的人物`
+                    : "还没有统计到人物"}
                 </div>
               )}
             </div>
@@ -714,31 +934,36 @@ export function CharactersPanel({
               )}
 
           {groupedByChapter.map((group, idx) => {
-            const key = group.groupName;
-            const q = (groupSearch[key] ?? "").trim().toLowerCase();
+            const key = group.key;
+            const q = normalizeForSearch(groupSearch[key] ?? "");
             const items = q
               ? group.items.filter(({ story }) =>
                   [story.storyName, story.storyCode ?? "", story.storyGroup ?? ""].some((v) =>
-                    v.toLowerCase().includes(q)
+                    normalizeForSearch(v).includes(q)
                   )
                 )
               : group.items;
             const totalCount = group.items.reduce((sum, it) => sum + it.count, 0);
 
             return (
-              <Collapsible key={key} title={group.groupName} defaultOpen={idx === 0}>
+              // 带上角色名：换人时整棵子树重建，组内搜索框里的草稿不会串台。
+              <Collapsible
+                key={`${selected}:${key}`}
+                title={group.groupName}
+                defaultOpen={idx === 0}
+              >
                 <div className="flex items-center justify-between gap-3 px-1">
                   <div className="text-xs text-[hsl(var(--color-muted-foreground))]">
                     共 {group.items.length} 个关卡，合计 {totalCount} 次
                   </div>
                   <div className="min-w-0 flex-1 max-w-[12rem]">
-                    <Input
+                    <FilterInput
+                      initialValue={groupSearch[key] ?? ""}
                       placeholder="组内搜索"
-                      value={groupSearch[key] ?? ""}
-                      onChange={(e) =>
-                        setGroupSearch((prev) => ({ ...prev, [key]: e.target.value }))
+                      ariaLabel={`在 ${group.groupName} 中搜索关卡`}
+                      onCommit={(value) =>
+                        setGroupSearch((prev) => ({ ...prev, [key]: value }))
                       }
-                      aria-label={`在 ${group.groupName} 中搜索关卡`}
                     />
                   </div>
                 </div>
@@ -750,6 +975,7 @@ export function CharactersPanel({
                     <div
                       key={story.storyId}
                       className="flex items-center justify-between rounded-lg border border-[hsl(var(--color-border))] bg-[hsl(var(--color-card))] p-3 shadow-sm"
+                      style={STORY_ROW_STYLE}
                     >
                       <div className="min-w-0">
                         <div className="font-medium truncate">{story.storyName}</div>
