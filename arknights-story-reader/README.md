@@ -198,7 +198,7 @@ npm run tauri ios build
 
 只在推送到 `release` 分支或手动触发时跑，且**只构建 Android**：bump 版本 → 构建签名的 universal APK → 上传到 Release → 生成并上传 `android-latest.json` → 搬运上一个 Release 的桌面 `latest.json`（若存在，见下节）→ 发布 Release。所需机密：`ANDROID_KEYSTORE_B64`、`ANDROID_KEYSTORE_PASSWORD`、`ANDROID_KEY_ALIAS`、`ANDROID_KEY_PASSWORD`。
 
-注意仓库根目录的 `.github/workflows/release.yml` 才是实际生效的工作流；`arknights-story-reader/.github/workflows/release.yml` 是仓库重组前的旧文件，GitHub 不会运行它。
+注意仓库根目录的 `.github/workflows/release.yml` 才是实际生效的工作流。重组前留在 `arknights-story-reader/.github/workflows/` 的副本已删除，避免误导。
 
 ### 桌面更新源的现状
 

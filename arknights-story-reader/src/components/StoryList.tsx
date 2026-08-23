@@ -1,6 +1,7 @@
 import {
   memo,
   useCallback,
+  useDeferredValue,
   useEffect,
   useMemo,
   useRef,
@@ -775,7 +776,12 @@ export function StoryList({ onSelectStory }: StoryListProps) {
     [favoriteGroups]
   );
 
-  const trimmedSearch = searchTerm.trim();
+  // 过滤放到低优先级渲染里：searchTerm 是 CatalogSearchInput 提交上来的
+  // 已确认关键词（合成期间的拼音中间态根本到不了这里），deferred 一侧再去
+  // 重算几千行的匹配。输入框永远先跟上手速，摘要/空态文案与过滤结果
+  // 取同一个值，不会出现「计数是旧词、列表是新词」的错位。
+  const deferredSearchTerm = useDeferredValue(searchTerm);
+  const trimmedSearch = deferredSearchTerm.trim();
   const normalizedSearch = trimmedSearch.toLowerCase();
   const hasSearch = normalizedSearch.length > 0;
 
@@ -1334,15 +1340,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
               </div>
               {/* 第二行：搜索框独占一行 */}
               <div>
-                <Input
-                  type="search"
-                  value={searchTerm}
-                  onChange={(event) => setSearchTerm(event.target.value)}
-                  placeholder="搜索剧情标题或编号"
-                  aria-label="搜索剧情标题或编号"
-                  aria-describedby="story-list-search-hint"
-                  className="w-full sm:w-80 md:w-96"
-                />
+                <CatalogSearchInput value={searchTerm} onCommit={setSearchTerm} />
                 <p
                   id="story-list-search-hint"
                   className="mt-1.5 text-xs text-[hsl(var(--color-muted-foreground))]"
@@ -1560,6 +1558,70 @@ export function StoryList({ onSelectStory }: StoryListProps) {
         onSuccess={handleSyncSuccess}
       />
     </div>
+  );
+}
+
+/**
+ * 目录搜索框（输入法安全版）。与 CharactersPanel 的 FilterInput、
+ * SearchPanel 的搜索框同一思路：
+ *
+ * 拼音/日文输入法在选词上屏前会一路触发 change（「z」「zh」「zhong」…），
+ * 直接拿这些中间态去过滤，几千行的目录每敲一键就整体重算一遍，还会在
+ * 用户没打完字时闪出「无匹配」。所以合成期间只更新本组件自己的草稿，
+ * 等 compositionend 才把最终文本提交给父级；父级再用 useDeferredValue
+ * 把过滤压到低优先级渲染。草稿留在这里也意味着合成中的每次按键只
+ * 重渲染这个输入框，不会波及整棵列表树。
+ */
+function CatalogSearchInput({
+  value,
+  onCommit,
+}: {
+  /** 父级已提交的关键词。外部改动（空态里的「清除搜索」）要同步回草稿。 */
+  value: string;
+  onCommit: (value: string) => void;
+}) {
+  const [draft, setDraft] = useState(value);
+  const composingRef = useRef(false);
+
+  // 已提交值在外部被改掉时把草稿对齐（渲染期 setState 是 React 认可的
+  // 派生 state 写法，本组件会立刻带新值重渲染）。合成中不动草稿，
+  // 免得把用户正拼到一半的词冲掉。
+  const lastValueRef = useRef(value);
+  if (lastValueRef.current !== value) {
+    lastValueRef.current = value;
+    if (!composingRef.current && draft !== value) setDraft(value);
+  }
+
+  return (
+    <Input
+      type="search"
+      value={draft}
+      onChange={(event) => {
+        const next = event.target.value;
+        setDraft(next);
+        if (!composingRef.current) onCommit(next);
+      }}
+      onCompositionStart={() => {
+        composingRef.current = true;
+      }}
+      onCompositionEnd={(event) => {
+        composingRef.current = false;
+        // Safari/WKWebView 的 compositionend 排在 input 之前，部分安卓
+        // 输入法又把 change 排在 compositionend 之后——不猜顺序，直接
+        // 以事件里的最终文本为准提交一次。
+        const next = event.currentTarget.value;
+        setDraft(next);
+        onCommit(next);
+      }}
+      placeholder="搜索剧情标题或编号"
+      aria-label="搜索剧情标题或编号"
+      aria-describedby="story-list-search-hint"
+      autoComplete="off"
+      autoCorrect="off"
+      spellCheck={false}
+      enterKeyHint="search"
+      className="w-full sm:w-80 md:w-96"
+    />
   );
 }
 

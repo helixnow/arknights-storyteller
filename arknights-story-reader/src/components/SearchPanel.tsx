@@ -24,6 +24,12 @@ import {
 import { CustomScrollArea } from "@/components/ui/custom-scroll-area";
 import { cn } from "@/lib/utils";
 import { useToast } from "@/components/ui/toast";
+import {
+  acquireDataJob,
+  dataJobConflictMessage,
+  describeDataJob,
+  useActiveDataJob,
+} from "@/hooks/useDataSyncManager";
 
 type SearchMode = "story" | "segment";
 
@@ -467,8 +473,16 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
   /** 自动搜索失败过的 `${mode}:${query}`，避免 effect 反复重试同一个错误。 */
   const autoFailedRef = useRef<string | null>(null);
   const rowRefs = useRef(new Map<number, HTMLButtonElement>());
+  /** 本面板发起/承接的重建在途；state 落地前就要能拦住重复触发。 */
+  const buildingIndexRef = useRef(false);
 
   const toast = useToast();
+  const activeDataJob = useActiveDataJob();
+  /**
+   * 任务锁被本面板之外的任务占着（同步 / 导入 / 自动重建 / 安装更新）：
+   * 重建入口要禁用，并且说明现在是谁占着，而不是只把按钮灰掉。
+   */
+  const indexJobBlockedBy = activeDataJob !== null && !buildingIndex ? activeDataJob : null;
 
   // 高亮跟着"真正搜过的词"走：用户改了输入框但还没触发搜索时，
   // 结果卡片不该突然高亮一个没搜过的词。
@@ -880,7 +894,15 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     }
   }, []);
 
-  const handleBuildIndex = useCallback(async () => {
+  /**
+   * 重建主体，不负责抢锁：`app:rebuild-story-index` 事件路径的锁由派发方
+   * （设置页先 acquireDataJob("index") 再派发）持有，这里再抢一次必然失败；
+   * 面板内按钮走下面的 handleBuildIndex，由它抢锁后再进来。
+   */
+  const runBuildIndex = useCallback(async () => {
+    // 已经在建（比如设置页刚派发过事件）：重复跑只会让两次写库互相拖慢。
+    if (buildingIndexRef.current) return;
+    buildingIndexRef.current = true;
     setIndexError(null);
     setIndexMessage(null);
     // 同样先给不确定态；真实进度由挂载时注册的 index-progress 监听填。
@@ -896,10 +918,34 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
       setIndexError("建立索引失败，请重试");
       toast.error("建立索引失败");
     } finally {
+      buildingIndexRef.current = false;
       setBuildingIndex(false);
       setIndexProgress(null);
     }
   }, [refreshIndexStatus, toast]);
+
+  /**
+   * 面板内的「重建 / 立即建立 / 刷新索引」入口：必须先抢全局任务锁再动手，
+   * 否则重建会和同步 / 导入同时写数据目录。抢不到时说明是谁占着，
+   * 用和设置页一致的话术。锁不派发 `app:rebuild-story-index`——那个事件
+   * 会被本组件自己的监听器接住变成二次触发；useAutoIndex 那边靠这把锁
+   * 和后端 index-progress 就能正确让路，不需要额外通知。
+   */
+  const handleBuildIndex = useCallback(async () => {
+    if (buildingIndexRef.current) return;
+    const releaseJob = acquireDataJob("index");
+    if (!releaseJob) {
+      const message = dataJobConflictMessage("重建索引");
+      setIndexError(message);
+      toast.warn(message);
+      return;
+    }
+    try {
+      await runBuildIndex();
+    } finally {
+      releaseJob();
+    }
+  }, [runBuildIndex, toast]);
 
   useEffect(() => {
     void refreshIndexStatus();
@@ -1092,13 +1138,16 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     }
   }, [mode]);
 
+  // 设置页派发 `app:rebuild-story-index` 之前已经抢到了 "index" 任务锁
+  // （见 Settings 的 handleRebuildIndex），所以这条路径直接进重建主体，
+  // 不再抢锁——再抢必然失败，会把用户已确认的重建静默吞掉。
   useEffect(() => {
     const handler = () => {
-      void handleBuildIndex();
+      void runBuildIndex();
     };
     window.addEventListener("app:rebuild-story-index", handler);
     return () => window.removeEventListener("app:rebuild-story-index", handler);
-  }, [handleBuildIndex]);
+  }, [runBuildIndex]);
 
   // Close the ⋯ popover on outside click or Escape.
   useEffect(() => {
@@ -1143,12 +1192,17 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
       return (
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="text-xs text-[hsl(var(--color-muted-foreground))]">
-            全文索引尚未就绪：现在搜索会退化成逐篇扫描，也不会边打边搜，按回车仍可强制搜索。
+            {indexJobBlockedBy === "index"
+              ? "全文索引正在后台重建，完成后状态会自动刷新。"
+              : indexJobBlockedBy
+                ? `正在${describeDataJob(indexJobBlockedBy)}，需等它完成后才能建立全文索引。`
+                : "全文索引尚未就绪：现在搜索会退化成逐篇扫描，也不会边打边搜，按回车仍可强制搜索。"}
           </div>
           <button
             type="button"
             onClick={() => void handleBuildIndex()}
-            className="inline-flex min-h-[44px] items-center px-2 text-xs text-[hsl(var(--color-foreground))] underline"
+            disabled={indexJobBlockedBy !== null}
+            className="inline-flex min-h-[44px] items-center px-2 text-xs text-[hsl(var(--color-foreground))] underline disabled:opacity-50"
           >
             立即建立
           </button>
@@ -1159,11 +1213,12 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
       <div className="flex items-center justify-between gap-2">
         <div className="text-xs text-[hsl(var(--color-muted-foreground))]">
           索引已就绪 · {indexStatus.total} 篇
+          {indexJobBlockedBy && ` · 正在${describeDataJob(indexJobBlockedBy)}`}
         </div>
         <button
           type="button"
           onClick={() => void handleBuildIndex()}
-          disabled={buildingIndex}
+          disabled={buildingIndex || indexJobBlockedBy !== null}
           className="inline-flex min-h-[44px] items-center px-2 text-xs text-[hsl(var(--color-muted-foreground))] underline hover:text-[hsl(var(--color-foreground))] disabled:opacity-50"
         >
           重建
@@ -1187,12 +1242,14 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
           <p className="text-xs leading-relaxed text-[hsl(var(--color-muted-foreground))]">
             {buildingIndex
               ? "索引正在后台建立，完成后这条查询会更快、也更准。"
-              : "还没有可用的全文索引，当前结果可能不完整。建好之后即可边输入边搜索。"}
+              : indexJobBlockedBy
+                ? `正在${describeDataJob(indexJobBlockedBy)}，等它完成后即可建立索引。`
+                : "还没有可用的全文索引，当前结果可能不完整。建好之后即可边输入边搜索。"}
           </p>
           <Button
             variant="outline"
             className="min-h-[44px]"
-            disabled={buildingIndex}
+            disabled={buildingIndex || indexJobBlockedBy !== null}
             onClick={() => void handleBuildIndex()}
           >
             {buildingIndex ? (
@@ -1256,7 +1313,12 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
           重试
         </Button>
         {indexPending && !buildingIndex && (
-          <Button variant="outline" className="min-h-[44px]" onClick={() => void handleBuildIndex()}>
+          <Button
+            variant="outline"
+            className="min-h-[44px]"
+            disabled={indexJobBlockedBy !== null}
+            onClick={() => void handleBuildIndex()}
+          >
             <Database className="mr-2 h-4 w-4" aria-hidden="true" />
             建立索引
           </Button>
@@ -1414,12 +1476,16 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
                       setMoreOpen(false);
                       void handleBuildIndex();
                     }}
-                    disabled={buildingIndex}
+                    disabled={buildingIndex || indexJobBlockedBy !== null}
                     className="w-full min-h-[44px] rounded-sm px-2 py-2 text-left text-sm hover:bg-[hsl(var(--color-accent))] disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     <div>刷新索引</div>
                     <div className="text-[11px] text-[hsl(var(--color-muted-foreground))]">
-                      {indexStatus?.ready ? "重新建立全文索引" : "建立全文索引"}
+                      {indexJobBlockedBy
+                        ? `正在${describeDataJob(indexJobBlockedBy)}，暂不可用`
+                        : indexStatus?.ready
+                          ? "重新建立全文索引"
+                          : "建立全文索引"}
                     </div>
                   </button>
                 </div>
