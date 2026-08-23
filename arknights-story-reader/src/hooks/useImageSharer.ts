@@ -27,6 +27,21 @@ function assertAndroid() {
 }
 
 /**
+ * 归一化导出文件名：去掉路径分隔符与控制字符、补上 `.png` 后缀（后缀
+ * 比较大小写不敏感，`封面.PNG` 不该再被拼成 `封面.PNG.png`）。三条落盘
+ * 路径——相册、系统分享、浏览器下载——共用同一份规则，避免 Android
+ * MediaStore 与桌面下载给出不同的文件名。
+ */
+function normalizePngFileName(fileName: string | null | undefined): string {
+  const cleaned = (fileName ?? "")
+    .replace(/[\\/:*?"<>|\u0000-\u001f]+/g, "_")
+    .trim()
+    .replace(/^\.+/, "");
+  if (!cleaned) return "story.png";
+  return /\.png$/i.test(cleaned) ? cleaned : `${cleaned}.png`;
+}
+
+/**
  * Save a PNG (encoded as base64 / data URL) into the device's shared
  * Pictures collection via the native Android plugin. Returns the MediaStore
  * URI on success; if the OS still requires the legacy
@@ -40,7 +55,7 @@ export async function saveImageToGallery(
   assertAndroid();
   return invoke<SaveImageResponse>("plugin:image-sharer|save_image", {
     base64: payload.dataUrl,
-    fileName: payload.fileName ?? null,
+    fileName: normalizePngFileName(payload.fileName),
   });
 }
 
@@ -55,7 +70,7 @@ export async function shareImageViaSystem(
   assertAndroid();
   return invoke<ShareImageResponse>("plugin:image-sharer|share_image", {
     base64: payload.dataUrl,
-    fileName: payload.fileName ?? null,
+    fileName: normalizePngFileName(payload.fileName),
     title: payload.title ?? null,
   });
 }
@@ -84,15 +99,12 @@ export function saveImageToDesktopFile(
   payload: ShareImagePayload & { blob?: Blob | null }
 ): boolean {
   const blob =
-    payload.blob ?? new Blob([new Uint8Array(decodeDataUrl(payload.dataUrl))], { type: "image/png" });
+    payload.blob ?? new Blob([decodeDataUrl(payload.dataUrl)], { type: "image/png" });
   const blobUrl = URL.createObjectURL(blob);
   try {
     const anchor = document.createElement("a");
     anchor.href = blobUrl;
-    anchor.download =
-      payload.fileName && payload.fileName.endsWith(".png")
-        ? payload.fileName
-        : `${payload.fileName ?? "story"}.png`;
+    anchor.download = normalizePngFileName(payload.fileName);
     anchor.rel = "noopener";
     document.body.appendChild(anchor);
     anchor.click();
@@ -105,7 +117,7 @@ export function saveImageToDesktopFile(
   return true;
 }
 
-function decodeDataUrl(dataUrl: string): Uint8Array {
+function decodeDataUrl(dataUrl: string): Uint8Array<ArrayBuffer> {
   const comma = dataUrl.indexOf(",");
   const b64 = comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
   const binary = atob(b64);

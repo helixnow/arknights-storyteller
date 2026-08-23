@@ -15,7 +15,7 @@ import { api } from "@/services/api";
  *   - 等到数据已安装；
  *   - 检查索引状态；
  *   - 未就绪就触发 `build_story_index`，交给后端线程跑；
- *   - 全过程不占主线程，也不弹 toast，成功失败都只写 console。
+ *   - 全过程不占主线程，也不弹 toast；日志只在开发构建里打，线上保持安静。
  *
  * 同时派发 `app:story-index-updated` 事件，让 SearchPanel 等 UI 订阅
  * 刷新状态条。
@@ -46,13 +46,14 @@ export function useAutoIndex() {
 
         // 后端的 rebuild 是同步阻塞调用，但 Rust 侧用 spawn_blocking 跑在
         // 线程池，不会卡住 UI。前端这里直接 await；成功后再派发事件。
-        console.log("[useAutoIndex] 检测到索引未就绪，自动后台重建…");
+        devLog("检测到索引未就绪，自动后台重建…");
         await api.buildStoryIndex();
         if (cancelled) return;
-        console.log("[useAutoIndex] 索引重建完成");
+        devLog("索引重建完成");
         dispatchIndexUpdated();
       } catch (err) {
-        console.warn("[useAutoIndex] 自动索引任务失败，搜索将回退到线性扫描", err);
+        // 失败不影响可用性：后端搜索会退回线性扫描，UI 也有"刷新索引"入口。
+        devLog("自动索引任务失败，搜索将回退到线性扫描", err);
       }
     };
 
@@ -66,6 +67,15 @@ export function useAutoIndex() {
       window.clearTimeout(timer);
     };
   }, []);
+}
+
+function devLog(message: string, err?: unknown) {
+  if (!import.meta.env.DEV) return;
+  if (err === undefined) {
+    console.info(`[useAutoIndex] ${message}`);
+  } else {
+    console.warn(`[useAutoIndex] ${message}`, err);
+  }
 }
 
 function dispatchIndexUpdated() {

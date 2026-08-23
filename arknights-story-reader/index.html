@@ -3,9 +3,16 @@
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/icon-rounded.svg" />
+    <!-- 不要加 maximum-scale / user-scalable=no：正文需要保留双指缩放。 -->
     <meta
       name="viewport"
       content="width=device-width, initial-scale=1.0, viewport-fit=cover"
+    />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#fcfcfc" />
+    <meta
+      name="description"
+      content="明日方舟剧情阅读器：离线浏览、全文搜索与收藏泰拉大陆的剧情文本。"
     />
     <title>明日方舟剧情阅读器</title>
     <script>
@@ -20,8 +27,25 @@
               ? "dark"
               : "light";
           }
-          document.documentElement.classList.add(resolved);
-          document.documentElement.dataset.themeColor = color;
+          var root = document.documentElement;
+          root.classList.add(resolved);
+          root.dataset.themeColor = color;
+          // 样式表还没解析完，读不到 --color-background，这里用一份和
+          // index.css 对齐的兜底色，避免冷启动时先闪一帧白/黑再变色。
+          // 之后由 ThemeProvider 直接读实际变量接管，无需长期维护同步。
+          var BOOT_BG = {
+            default: ["#fcfcfc", "#141414"],
+            book: ["#f9f2e7", "#292019"],
+            emerald: ["#f1f9f5", "#192923"],
+            noctilucent: ["#f4f3fc", "#231b36"],
+          };
+          var bg = (BOOT_BG[color] || BOOT_BG.default)[
+            resolved === "dark" ? 1 : 0
+          ];
+          root.style.colorScheme = resolved;
+          root.style.backgroundColor = bg;
+          var meta = document.querySelector('meta[name="theme-color"]');
+          if (meta) meta.content = bg;
         } catch (e) {}
       })();
     </script>
@@ -29,6 +53,11 @@
 
   <body>
     <div id="root"></div>
+    <noscript>
+      <p style="padding: 2rem; font-family: sans-serif">
+        本应用需要启用 JavaScript 才能运行。
+      </p>
+    </noscript>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

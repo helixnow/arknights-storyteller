@@ -22,6 +22,30 @@ struct EmbeddedPayload {
 
 lazy_static! {
     static ref RUNTIME: RwLock<CharacterIndex> = RwLock::new(CharacterIndex::from_embedded());
+    /// 已经 overlay 过的 `character_table.json` 指纹（路径 + 大小 + mtime）。
+    /// 前端每次冷启动都会拉一次索引，而这张表有十几 MB，重复解析没有意义。
+    static ref OVERLAID: RwLock<Option<TableFingerprint>> = RwLock::new(None);
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TableFingerprint {
+    path: std::path::PathBuf,
+    len: u64,
+    modified_nanos: i128,
+}
+
+fn fingerprint(path: &std::path::Path) -> Option<TableFingerprint> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some(TableFingerprint {
+        path: path.to_path_buf(),
+        len: meta.len(),
+        modified_nanos: meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as i128)
+            .unwrap_or(-1),
+    })
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -50,7 +74,13 @@ impl CharacterIndex {
 }
 
 /// 用运行时的 `character_table.json` 覆盖嵌入数据。静默失败。
+/// 同一份文件只 overlay 一次；数据包换了（大小或 mtime 变化）会重新读。
 pub fn refresh_from_file(path: &std::path::Path) {
+    let current = fingerprint(path);
+    if current.is_some() && OVERLAID.read().ok().map(|g| g.clone()) == Some(current.clone()) {
+        return;
+    }
+
     let Ok(raw) = std::fs::read_to_string(path) else {
         return;
     };
@@ -88,6 +118,11 @@ pub fn refresh_from_file(path: &std::path::Path) {
                 .entry(alias.to_string())
                 .or_insert(cid.clone());
         }
+    }
+    drop(guard);
+
+    if let Ok(mut overlaid) = OVERLAID.write() {
+        *overlaid = current;
     }
 }
 

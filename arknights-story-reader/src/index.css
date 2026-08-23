@@ -105,6 +105,15 @@
   --color-ring: 0 0% 12%;
   --radius: 0.5rem;
 
+  /* 状态色（在 card/background 上直接当前景用）。
+     --color-success/warning/destructive 那组是给「实心底 + 反色文字」的
+     控件用的，直接拿来当文字色会翻车：浅色主题下前景色是白的，深色主题下
+     destructive 又暗到看不清。所以另开一组保证在两种底色上都够对比度的
+     语义色，供 toast 图标/描边这类「贴在卡片上的语义提示」使用。 */
+  --color-status-success: 152 62% 30%;
+  --color-status-warning: 32 88% 34%;
+  --color-status-error: 0 72% 44%;
+
   /* ============================================================= */
   /* Liquid Glass design tokens (v1)                                */
   /* ---                                                            */
@@ -236,6 +245,11 @@
   --color-border: 0 0% 26%;
   --color-input: 0 0% 26%;
   --color-ring: 0 0% 65%;
+
+  /* 深色下反过来：语义色要提亮才能压住近黑的卡片底。 */
+  --color-status-success: 148 58% 62%;
+  --color-status-warning: 40 92% 64%;
+  --color-status-error: 0 84% 70%;
 
   /* Dark-mode retuning of the glass tokens. The background is already
      very dark so we push opacity up — otherwise the sheet looks like a
@@ -750,6 +764,15 @@ body {
   height: 0;
 }
 
+/* 可滚动区域是键盘可聚焦的（见 CustomScrollArea 的 tabIndex），
+   焦点必须看得见，否则键盘用户会在列表里「丢失」光标。用 inset 的
+   outline，避免在贴边容器上被父级 overflow 裁掉。 */
+.scroll-area__viewport:focus-visible {
+  outline: 2px solid hsl(var(--color-ring));
+  outline-offset: -2px;
+  border-radius: 0.25rem;
+}
+
 .scroll-area__track {
   --scroll-area-track-offset-top: 0px;
   --scroll-area-track-offset-bottom: 0px;
@@ -880,6 +903,11 @@ input[type="range"]::-moz-range-thumb {
   .scroll-area__thumb {
     cursor: default;
     width: 0.3rem;
+  }
+  /* 触摸设备上滑块只当位置指示器用。轨道一旦可点击，靠近屏幕右缘的
+     滑动就会被它吃掉变成拖动滚动条，而不是正常翻页。 */
+  .scroll-area__track[data-visible="true"] {
+    pointer-events: none;
   }
 }
 

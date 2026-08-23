@@ -32,6 +32,10 @@ interface SheetShellProps {
   className?: string;
 }
 
+/** 可聚焦元素选择器，用于把 Tab 键锁在 sheet 内部。 */
+const FOCUSABLE =
+  'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
 export function SheetShell({
   state,
   onClose,
@@ -39,15 +43,63 @@ export function SheetShell({
   children,
   className,
 }: SheetShellProps) {
+  const panelRef = React.useRef<HTMLDivElement | null>(null);
+  const restoreRef = React.useRef<HTMLElement | null>(null);
+
+  /*
+   * `aria-modal` 只是给辅助技术的声明，真正的模态行为要自己实现：
+   * 打开时把焦点移进面板（面板本身可聚焦，避免直接跳到输入框弹起软键盘），
+   * 关闭时还给触发它的按钮，否则键盘/读屏用户会被扔回文档开头。
+   */
+  React.useEffect(() => {
+    if (state !== "open") return;
+    restoreRef.current = document.activeElement as HTMLElement | null;
+    panelRef.current?.focus({ preventScroll: true });
+    return () => {
+      const previous = restoreRef.current;
+      if (previous && document.contains(previous)) {
+        previous.focus({ preventScroll: true });
+      }
+    };
+  }, [state]);
+
+  React.useEffect(() => {
+    if (state !== "open") return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Tab") return;
+      const panel = panelRef.current;
+      if (!panel) return;
+      const items = Array.from(panel.querySelectorAll<HTMLElement>(FOCUSABLE)).filter(
+        (el) => el.offsetParent !== null || el === document.activeElement
+      );
+      const active = document.activeElement;
+      if (items.length === 0) {
+        event.preventDefault();
+        panel.focus({ preventScroll: true });
+        return;
+      }
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (!panel.contains(active)) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+      } else if (event.shiftKey && (active === first || active === panel)) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && active === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown, true);
+    return () => document.removeEventListener("keydown", handleKeyDown, true);
+  }, [state]);
+
   return (
-    <div
-      className="fixed inset-0 z-50 flex"
-      role="dialog"
-      aria-modal="true"
-      aria-label={ariaLabel}
-    >
+    <div className="fixed inset-0 z-50 flex">
       <div
         data-state={state}
+        aria-hidden="true"
         className={cn(
           "absolute inset-0 glass-scrim transition-opacity duration-300",
           "data-[state=closed]:opacity-0 data-[state=open]:opacity-100"
@@ -70,8 +122,14 @@ export function SheetShell({
         )}
       >
         <div
+          ref={panelRef}
+          role="dialog"
+          aria-modal="true"
+          aria-label={ariaLabel}
+          tabIndex={-1}
           className={cn(
             "pointer-events-auto h-full flex flex-col overflow-hidden",
+            "focus:outline-none",
             "glass glass-thick"
           )}
         >

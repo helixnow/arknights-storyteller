@@ -1,4 +1,13 @@
-import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 
 interface AppPreferencesContextValue {
   showSummaries: boolean;
@@ -14,6 +23,7 @@ interface AppPreferencesContextValue {
 const AppPreferencesContext = createContext<AppPreferencesContextValue | null>(null);
 
 const STORAGE_KEY = "arknights-app-prefs-v2";
+const LEGACY_STORAGE_KEY = "arknights-app-prefs-v1";
 
 interface Prefs {
   showSummaries: boolean;
@@ -27,40 +37,77 @@ const DEFAULT_PREFS: Prefs = {
   inlineImages: true,
 };
 
+function normalizePrefs(parsed: unknown): Prefs {
+  const source = (parsed ?? {}) as Partial<Record<keyof Prefs, unknown>>;
+  return {
+    showSummaries: Boolean(source.showSummaries),
+    minimalMode: Boolean(source.minimalMode),
+    inlineImages: source.inlineImages === false ? false : true,
+  };
+}
+
+function samePrefs(a: Prefs, b: Prefs): boolean {
+  return (
+    a.showSummaries === b.showSummaries &&
+    a.minimalMode === b.minimalMode &&
+    a.inlineImages === b.inlineImages
+  );
+}
+
 function readPrefs(): Prefs {
   if (typeof window === "undefined") return DEFAULT_PREFS;
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (!raw) {
-      // Back-compat: try the old v1 key.
-      const legacy = window.localStorage.getItem("arknights-app-prefs-v1");
-      if (legacy) {
-        try {
-          const p = JSON.parse(legacy);
-          return { ...DEFAULT_PREFS, showSummaries: Boolean(p?.showSummaries) };
-        } catch {}
-      }
-      return DEFAULT_PREFS;
+    if (raw) return normalizePrefs(JSON.parse(raw));
+
+    const legacy = window.localStorage.getItem(LEGACY_STORAGE_KEY);
+    if (!legacy) return DEFAULT_PREFS;
+
+    // v1 只存过 showSummaries。就地升级成 v2 并清掉旧键，否则每次启动都要走一遍回退分支。
+    let migrated = DEFAULT_PREFS;
+    try {
+      migrated = normalizePrefs({ ...DEFAULT_PREFS, showSummaries: JSON.parse(legacy)?.showSummaries });
+    } catch {
+      // 旧数据损坏，用默认值继续。
     }
-    const parsed = JSON.parse(raw);
-    return {
-      showSummaries: Boolean(parsed?.showSummaries),
-      minimalMode: Boolean(parsed?.minimalMode),
-      inlineImages: parsed?.inlineImages === false ? false : true,
-    };
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(migrated));
+    window.localStorage.removeItem(LEGACY_STORAGE_KEY);
+    return migrated;
   } catch {
     return DEFAULT_PREFS;
   }
 }
 
 export function AppPreferencesProvider({ children }: { children: ReactNode }) {
-  const [prefs, setPrefs] = useState<Prefs>(() => readPrefs());
+  const [prefs, setPrefs] = useState<Prefs>(readPrefs);
+  const hydratedRef = useRef(false);
 
   useEffect(() => {
+    // 首帧的值就是刚从 localStorage 读出来的，回写一次没有意义。
+    if (!hydratedRef.current) {
+      hydratedRef.current = true;
+      return;
+    }
     try {
       window.localStorage.setItem(STORAGE_KEY, JSON.stringify(prefs));
-    } catch {}
+    } catch {
+      // 隐私模式 / 配额不足：偏好只在本次会话内生效。
+    }
   }, [prefs]);
+
+  // 多窗口（桌面端可以开多个）时跟随其它窗口的修改，避免互相覆盖。
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onStorage = (event: StorageEvent) => {
+      if (event.key !== null && event.key !== STORAGE_KEY) return;
+      setPrefs((prev) => {
+        const next = readPrefs();
+        return samePrefs(prev, next) ? prev : next;
+      });
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, []);
 
   // Reflect minimal mode on <html> so CSS can scope rules easily.
   useEffect(() => {
@@ -73,16 +120,28 @@ export function AppPreferencesProvider({ children }: { children: ReactNode }) {
     }
   }, [prefs.minimalMode]);
 
+  const setShowSummaries = useCallback((value: boolean) => {
+    setPrefs((p) => (p.showSummaries === value ? p : { ...p, showSummaries: value }));
+  }, []);
+
+  const setMinimalMode = useCallback((value: boolean) => {
+    setPrefs((p) => (p.minimalMode === value ? p : { ...p, minimalMode: value }));
+  }, []);
+
+  const setInlineImages = useCallback((value: boolean) => {
+    setPrefs((p) => (p.inlineImages === value ? p : { ...p, inlineImages: value }));
+  }, []);
+
   const value = useMemo<AppPreferencesContextValue>(
     () => ({
       showSummaries: prefs.showSummaries,
-      setShowSummaries: (v) => setPrefs((p) => ({ ...p, showSummaries: v })),
+      setShowSummaries,
       minimalMode: prefs.minimalMode,
-      setMinimalMode: (v) => setPrefs((p) => ({ ...p, minimalMode: v })),
+      setMinimalMode,
       inlineImages: prefs.inlineImages,
-      setInlineImages: (v) => setPrefs((p) => ({ ...p, inlineImages: v })),
+      setInlineImages,
     }),
-    [prefs]
+    [prefs, setShowSummaries, setMinimalMode, setInlineImages]
   );
   return <AppPreferencesContext.Provider value={value}>{children}</AppPreferencesContext.Provider>;
 }
@@ -92,4 +151,3 @@ export function useAppPreferences() {
   if (!ctx) throw new Error("useAppPreferences must be used within AppPreferencesProvider");
   return ctx;
 }
-

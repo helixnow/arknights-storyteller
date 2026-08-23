@@ -27,9 +27,27 @@ interface UseAssetState {
 let globalCharIndex: CharacterIndex | null = null;
 let indexReady = false;
 
+// `kind|token` → candidate URL 列表。CharactersPanel 一屏几百个头像、
+// 洞察面板每次开合都会重解析同一批名字，这里缓存下来既省掉重复的字符串
+// 拼接，也保证返回的数组引用稳定（下游 useMemo / useEffect 不会误触发）。
+const candidateCache = new Map<string, string[]>();
+const CANDIDATE_CACHE_LIMIT = 4000;
+
+function resolveCandidatesCached(kind: AssetKind, token: string): string[] {
+  const key = `${kind}|${token}`;
+  const hit = candidateCache.get(key);
+  if (hit) return hit;
+  const next = resolveAssetCandidatesLocal(kind, token, globalCharIndex);
+  if (candidateCache.size >= CANDIDATE_CACHE_LIMIT) candidateCache.clear();
+  candidateCache.set(key, next);
+  return next;
+}
+
 export function setGlobalCharacterIndex(next: CharacterIndex | null) {
   globalCharIndex = next;
   indexReady = Boolean(next);
+  // 索引换了，之前按旧索引算出来的 charId 全部作废。
+  candidateCache.clear();
   if (typeof window !== "undefined") {
     try {
       window.dispatchEvent(new Event("asset:index-ready"));
@@ -74,7 +92,7 @@ export function useAsset(
   const candidates = useMemo(() => {
     if (!kind || !token) return EMPTY_CANDIDATES;
     if (needsIndex && !ready) return EMPTY_CANDIDATES;
-    return resolveAssetCandidatesLocal(kind, token, globalCharIndex);
+    return resolveCandidatesCached(kind, token);
   }, [kind, token, needsIndex, ready]);
 
   return {
@@ -91,7 +109,8 @@ const EMPTY_CANDIDATES: string[] = [];
 
 /** 直接同步返回 token 对应的 candidate 列表。给 Canvas 分享图等场景。 */
 export function peekAssetCandidates(kind: AssetKind, token: string): string[] {
-  return resolveAssetCandidatesLocal(kind, token, globalCharIndex);
+  if (!token) return EMPTY_CANDIDATES;
+  return resolveCandidatesCached(kind, token);
 }
 
 /** 用于金句卡/分享图等需要跨组件协作的用例。 */

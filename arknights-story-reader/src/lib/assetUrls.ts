@@ -73,10 +73,9 @@ function avatarCandidates(token: string, index: CharacterIndex | null): string[]
 }
 
 function portraitCandidates(token: string, index: CharacterIndex | null): string[] {
-  // NPC 立绘覆盖：使用 wiki 全尺寸图
+  // NPC 没有 char_ ID，也就没有精二/精一立绘，只能复用覆盖表里那张图。
   if (NPC_AVATAR_OVERRIDES[token]) {
-    // 立绘用全尺寸图（第二条 URL）
-    return NPC_AVATAR_OVERRIDES[token].slice().reverse();
+    return NPC_AVATAR_OVERRIDES[token];
   }
   const cid = resolveCharId(token, index);
   if (!cid) return [];
@@ -180,6 +179,121 @@ function chapterCoverCandidates(token: string): string[] {
       `${FEXLI}/avgs/${raw}_I01.png`,
     ])
   );
+}
+
+// ─────────────────────────────────────────────────────────────
+// Session 级候选健康度
+//
+// `<AssetImage>` 与 `<StoryThumbnail>` 共用同一份失败记录，否则同一张
+// 404 的封面会在两条渲染路径上各失败一次。
+// ─────────────────────────────────────────────────────────────
+
+/** 本进程内已确认加载失败的具体 URL。 */
+const deadUrls = new Set<string>();
+
+/** 至少成功返回过一张图的 host。这类 host 永不熔断。 */
+const provenHosts = new Set<string>();
+
+interface HostStrike {
+  /** 自上次成功以来的连续失败次数。 */
+  failures: number;
+  /** 熔断到期时间戳（ms）；0 表示未熔断。 */
+  blockedUntil: number;
+  /** 已熔断次数，用于指数退避。 */
+  strikes: number;
+}
+
+const hostStrikes = new Map<string, HostStrike>();
+
+/**
+ * 熔断阈值。一张活动卡最多会串行试 3–7 条 URL，所以阈值取得比单张卡的
+ * 候选数高一截：只有「这个域名从头到尾没成功过」才会触发，正常网络下
+ * 命中一次就把 host 标成 proven，之后再多 404 也不会误伤。
+ */
+const HOST_FAILURE_THRESHOLD = 8;
+const HOST_BLOCK_BASE_MS = 30_000;
+const HOST_BLOCK_MAX_MS = 10 * 60_000;
+
+/** 取 URL 的 host。相对路径（`/bundled/...`）返回 null —— 本地素材不熔断。 */
+function hostOf(url: string): string | null {
+  const schemeEnd = url.indexOf("://");
+  if (schemeEnd < 0) return null;
+  const start = schemeEnd + 3;
+  const end = url.indexOf("/", start);
+  const host = end < 0 ? url.slice(start) : url.slice(start, end);
+  return host || null;
+}
+
+/**
+ * 这条 URL 现在还值不值得请求。除了 URL 自身失败过，还包括「所属 host
+ * 正在熔断窗口内」——断网 / GitHub Raw 被墙时，这一条能把每张卡省下的
+ * 3–7 次必失败请求直接抹掉。
+ */
+export function isAssetUrlDead(url: string): boolean {
+  if (deadUrls.has(url)) return true;
+  const host = hostOf(url);
+  if (!host || provenHosts.has(host)) return false;
+  const strike = hostStrikes.get(host);
+  return strike !== undefined && strike.blockedUntil > Date.now();
+}
+
+/** 记一次加载失败，必要时熔断整个 host。 */
+export function markAssetUrlDead(url: string): void {
+  deadUrls.add(url);
+  const host = hostOf(url);
+  if (!host || provenHosts.has(host)) return;
+  const strike = hostStrikes.get(host) ?? { failures: 0, blockedUntil: 0, strikes: 0 };
+  strike.failures += 1;
+  if (strike.failures >= HOST_FAILURE_THRESHOLD) {
+    strike.failures = 0;
+    strike.strikes += 1;
+    strike.blockedUntil =
+      Date.now() + Math.min(HOST_BLOCK_BASE_MS * 2 ** (strike.strikes - 1), HOST_BLOCK_MAX_MS);
+  }
+  hostStrikes.set(host, strike);
+}
+
+/**
+ * 记一次加载成功。host 一旦证明可达就永久免疫熔断——后续的 404 都是
+ * 「这个素材不存在」而不是「这个源挂了」，不该再连坐。
+ */
+export function markAssetUrlAlive(url: string): void {
+  const host = hostOf(url);
+  if (!host) return;
+  provenHosts.add(host);
+  hostStrikes.delete(host);
+}
+
+/**
+ * 从 `from` 开始找第一条还值得试的候选。返回命中的下标，方便调用方把
+ * 游标推到它后面继续 fallback。
+ */
+export function pickLiveCandidate(
+  candidates: string[],
+  from = 0
+): { url: string; index: number } | null {
+  for (let i = Math.max(0, from); i < candidates.length; i += 1) {
+    const url = candidates[i];
+    if (!isAssetUrlDead(url)) return { url, index: i };
+  }
+  return null;
+}
+
+/** 素材兜底色块的 hue。同一 seed 在任何组件里都得到同一个颜色。 */
+export function hashHue(input: string): number {
+  let h = 0;
+  for (let i = 0; i < input.length; i += 1) {
+    h = (h * 31 + input.charCodeAt(i)) >>> 0;
+  }
+  return h % 360;
+}
+
+/** 素材兜底色块的 CSS `background`，AssetImage / StoryThumbnail 共用。 */
+export function gradientFallbackBackground(seed: string): string {
+  const hue = hashHue(seed || "ark");
+  return `linear-gradient(135deg, hsl(${hue} 26% 46% / 0.32), hsl(${
+    (hue + 40) % 360
+  } 32% 36% / 0.28))`;
 }
 
 export function resolveAssetCandidatesLocal(

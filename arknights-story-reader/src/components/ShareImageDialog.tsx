@@ -22,6 +22,7 @@ import {
   type ShareImagePayload,
 } from "@/hooks/useImageSharer";
 import { peekAssetCandidates } from "@/hooks/useAsset";
+import { isAssetUrlDead, markAssetUrlAlive } from "@/lib/assetUrls";
 import type { DialogueSegment, StorySegment } from "@/types/story";
 import { Download, Loader2, Share2, X } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -105,7 +106,10 @@ async function ensureFontsLoaded(sampleText: string): Promise<void> {
   // will pick the system font and the preview will match that choice.
   const fonts = typeof document !== "undefined" ? (document as unknown as { fonts?: FontFaceSet }).fonts : undefined;
   if (!fonts || typeof fonts.load !== "function") return;
-  const probe = sampleText && sampleText.length > 0 ? sampleText : "示例文本 Sample";
+  // 引号 / 破折号 / 省略号落在跟正文不同的 unicode-range 子集里，必须显式
+  // 带进探针，否则金句模板的大引号会在光栅化时静默 fallback 到系统字体。
+  const punctuation = `${QUOTE_MARK_GLYPHS}——…·`;
+  const probe = (sampleText && sampleText.length > 0 ? sampleText : "示例文本 Sample") + punctuation;
   await Promise.all(
     REQUIRED_FONT_SPECS.map((spec) =>
       // Passing a sample string so the browser pulls in every unicode-range
@@ -121,6 +125,14 @@ async function ensureFontsLoaded(sampleText: string): Promise<void> {
  * 分享弹窗通常会被反复开启 / 切换选段，同一张头像多次入画时不该再次下载。
  */
 const avatarCache = new Map<string, HTMLImageElement | null>();
+
+/**
+ * Canvas 侧独有的失败 URL。刻意不写回 `@/lib/assetUrls` 的共享缓存：
+ * 这里的 `<img>` 带 `crossOrigin="anonymous"`，一次 CORS 失败并不代表
+ * 这张图在普通展示路径上也拉不到，回灌会误伤列表页的封面。反过来读
+ * 共享缓存是安全的——展示路径确认过的 404 在这里同样是 404。
+ */
+const canvasFailedUrls = new Set<string>();
 
 function avatarCacheKey(name: string | null | undefined, charId: string | null | undefined): string {
   return `${(name ?? "").trim()}::${(charId ?? "").trim()}`;
@@ -160,10 +172,12 @@ async function loadAvatarImage(
   const candidates: string[] = [];
   for (const t of tokens) {
     for (const url of peekAssetCandidates("avatar", t)) {
-      if (!seen.has(url)) {
-        seen.add(url);
-        candidates.push(url);
-      }
+      if (seen.has(url)) continue;
+      seen.add(url);
+      // 展示路径已经证明拉不到（或所属 host 正在熔断）的 URL 直接跳过，
+      // 别让分享弹窗把同一批必失败请求再打一遍。
+      if (canvasFailedUrls.has(url) || isAssetUrlDead(url)) continue;
+      candidates.push(url);
     }
   }
   if (candidates.length === 0) {
@@ -174,9 +188,11 @@ async function loadAvatarImage(
   for (const url of candidates) {
     const img = await loadImage(url).catch(() => null);
     if (img) {
+      markAssetUrlAlive(url);
       avatarCache.set(key, img);
       return img;
     }
+    canvasFailedUrls.add(url);
   }
   avatarCache.set(key, null);
   return null;
@@ -645,6 +661,13 @@ const QUOTE_BODY_MAX_LINES = 4;
 const QUOTE_MARK_FONT_SIZE = 120;
 const QUOTE_ATTR_FONT_SIZE = 24;
 const QUOTE_WATERMARK_FONT_SIZE = 12;
+/**
+ * 排版引号（U+201C / U+201D），不是 ASCII 的 `"`。衬线字体里这一对是
+ * 真正的弯引号，ASCII 直引号在 120px 下会渲染成两根竖直的小棍子。
+ * 同时列进 {@link ensureFontsLoaded} 的探针文本，确保对应的 unicode-range
+ * 子集在 `toDataURL()` 之前就位。
+ */
+const QUOTE_MARK_GLYPHS = "\u201C\u201D";
 
 /**
  * Render a single-quote "poster" — one dialogue, big serif quotation
@@ -681,7 +704,7 @@ function renderQuoteImage(
   ctx.fillStyle = ACCENT_COLOR;
   ctx.font = `400 ${QUOTE_MARK_FONT_SIZE}px ${CONTENT_FONT_FAMILY}`;
   ctx.textBaseline = "top";
-  ctx.fillText('""', QUOTE_HORIZONTAL_PADDING, QUOTE_VERTICAL_PADDING);
+  ctx.fillText(QUOTE_MARK_GLYPHS, QUOTE_HORIZONTAL_PADDING, QUOTE_VERTICAL_PADDING);
   ctx.restore();
 
   // Collapse dialogue line breaks into a single paragraph, then wrap and
@@ -764,7 +787,7 @@ function renderQuoteImage(
  * the user clicks share immediately. 99% of invocations go through the
  * Blob we already hold in state.
  */
-function decodeDataUrlBytes(dataUrl: string): Uint8Array {
+function decodeDataUrlBytes(dataUrl: string): Uint8Array<ArrayBuffer> {
   const comma = dataUrl.indexOf(",");
   const b64 = comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
   const binary = atob(b64);
@@ -1035,9 +1058,7 @@ export function ShareImageDialog({
         // URL again just to build a File would pointlessly walk the
         // several-hundred-kilobyte string twice.
         const blob =
-          pngBlob ?? new Blob([new Uint8Array(decodeDataUrlBytes(payload.dataUrl))], {
-            type: "image/png",
-          });
+          pngBlob ?? new Blob([decodeDataUrlBytes(payload.dataUrl)], { type: "image/png" });
         const file = new File([blob], payload.fileName ?? "story.png", { type: "image/png" });
         // TS lib.dom doesn't always have `canShare` typed.
         const nav = navigator as Navigator & {

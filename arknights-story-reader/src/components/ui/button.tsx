@@ -3,7 +3,19 @@ import { cva, type VariantProps } from "class-variance-authority"
 import { cn } from "@/lib/utils"
 
 const buttonVariants = cva(
-  "inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium transition-[transform,background-color,color,opacity,box-shadow] duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--color-ring))] focus-visible:ring-offset-2 focus-visible:ring-offset-[hsl(var(--color-background))] disabled:pointer-events-none disabled:opacity-50 active:scale-[0.97]",
+  [
+    "inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium select-none",
+    // Tailwind v4 的 preflight 让 <button> 回到 cursor: default，桌面端要手动要回指针。
+    "cursor-pointer disabled:cursor-not-allowed touch-manipulation",
+    "transition-[transform,background-color,color,opacity,box-shadow] duration-200",
+    // 焦点环：2px 环 + 与页面同色的 2px 偏移，深浅色主题都能看清。
+    "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--color-ring))] focus-visible:ring-offset-2 focus-visible:ring-offset-[hsl(var(--color-background))]",
+    "disabled:pointer-events-none disabled:opacity-50",
+    // 图标不吃点击事件，也不会在窄按钮里被压扁。
+    "[&_svg]:pointer-events-none [&_svg]:shrink-0",
+    // 全局 reduced-motion 只把动画时长压到 0，按下缩放会变成生硬的跳变。
+    "active:scale-[0.97] motion-reduce:transition-none motion-reduce:active:scale-100",
+  ],
   {
     variants: {
       variant: {
@@ -45,13 +57,19 @@ const buttonVariants = cva(
 export interface ButtonProps
   extends React.ButtonHTMLAttributes<HTMLButtonElement>,
     VariantProps<typeof buttonVariants> {
+  /**
+   * 兼容 shadcn 的调用签名。本项目没有引入 Radix Slot，这里只是把它吃掉，
+   * 免得它作为未知属性被透传到 DOM 上引发 React 警告。
+   */
   asChild?: boolean
 }
 
 const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
-  ({ className, variant, size, ...props }, ref) => {
+  ({ className, variant, size, type, asChild: _asChild, ...props }, ref) => {
     return (
       <button
+        // 不写 type 的按钮在 <form> 里默认是 submit，会意外提交表单。
+        type={type ?? "button"}
         className={cn(buttonVariants({ variant, size, className }))}
         ref={ref}
         {...props}

@@ -1,4 +1,13 @@
-import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { api } from "@/services/api";
 import { setGlobalCharacterIndex } from "@/hooks/useAsset";
 import type { CharacterIndex } from "@/types/story";
@@ -27,28 +36,36 @@ export function CharacterResolverProvider({ children }: { children: ReactNode })
     nameToCharId: {},
   });
   const [loaded, setLoaded] = useState(false);
+  const mountedRef = useRef(true);
 
-  useEffect(() => {
-    let cancelled = false;
-    api
-      .getCharacterIndex()
-      .then((idx) => {
-        if (cancelled) return;
-        setIndex(idx);
-        // 注入到全局，让 useAsset 的本地 URL 解析能用上真正的 charId 映射
-        setGlobalCharacterIndex(idx);
-        setLoaded(true);
-      })
-      .catch((err) => {
-        console.warn("[CharacterResolver] get index failed", err);
-        setLoaded(true);
-      });
-    return () => {
-      cancelled = true;
-    };
+  const refresh = useCallback(async () => {
+    try {
+      const idx = await api.getCharacterIndex();
+      if (!mountedRef.current) return;
+      setIndex(idx);
+      // 注入到全局，让 useAsset 的本地 URL 解析能用上真正的 charId 映射
+      setGlobalCharacterIndex(idx);
+    } catch {
+      // 数据没同步时拿不到索引：头像退化成首字缩写，不影响阅读。
+    } finally {
+      if (mountedRef.current) setLoaded(true);
+    }
   }, []);
 
-  const value = useMemo<CharacterContextValue>(() => {
+  useEffect(() => {
+    mountedRef.current = true;
+    void refresh();
+    // 首次启动时数据可能还没同步，此时索引是空的。同步完成后重新拉一次，
+    // 否则头像要等到下次冷启动才出得来。
+    const handler = () => void refresh();
+    window.addEventListener("app:data-updated", handler);
+    return () => {
+      mountedRef.current = false;
+      window.removeEventListener("app:data-updated", handler);
+    };
+  }, [refresh]);
+
+  const maps = useMemo(() => {
     const nameMap = index.nameToCharId ?? {};
     const idMap = index.charIdToName ?? {};
     const simplify = (s: string) => s.trim().replace(/[\s·‧•・]+/g, "");
@@ -68,30 +85,41 @@ export function CharacterResolverProvider({ children }: { children: ReactNode })
         if (!aliasMap.has(alias)) aliasMap.set(alias, cid);
       }
     });
+    // 人物面板一次要解析几百个名字，命中结果（含 miss）缓存起来。
+    const resolved = new Map<string, string | null>();
+    const resolveCharId = (name: string | null | undefined): string | null => {
+      if (!name) return null;
+      const trimmed = name.trim();
+      if (!trimmed) return null;
+      const cached = resolved.get(trimmed);
+      if (cached !== undefined) return cached;
+      let out: string | null;
+      if (trimmed.startsWith("char_")) {
+        out = trimmed.split("#")[0];
+      } else {
+        out =
+          nameMap[trimmed] ??
+          simplifiedNameMap.get(simplify(trimmed)) ??
+          // 兜底尝试 alias（存 charId 小写英文片段），覆盖干员密录这类
+          // 只有 `story_{alias}_` 的路径。
+          aliasMap.get(trimmed.toLowerCase()) ??
+          null;
+      }
+      resolved.set(trimmed, out);
+      return out;
+    };
     return {
       charIdToName: idMap,
       nameToCharId: nameMap,
-      loaded,
-      resolveCharId: (name) => {
-        if (!name) return null;
-        const trimmed = name.trim();
-        if (!trimmed) return null;
-        if (trimmed.startsWith("char_")) return trimmed.split("#")[0];
-        if (nameMap[trimmed]) return nameMap[trimmed];
-        const fromSimple = simplifiedNameMap.get(simplify(trimmed));
-        if (fromSimple) return fromSimple;
-        // 兜底尝试 alias（存 charId 小写英文片段），覆盖干员密录这类
-        // 只有 `story_{alias}_` 的路径。
-        const lower = trimmed.toLowerCase();
-        return aliasMap.get(lower) ?? null;
-      },
-      resolveName: (charId) => {
+      resolveCharId,
+      resolveName: (charId: string | null | undefined): string | null => {
         if (!charId) return null;
-        const key = charId.split("#")[0];
-        return idMap[key] ?? null;
+        return idMap[charId.split("#")[0]] ?? null;
       },
     };
-  }, [index, loaded]);
+  }, [index]);
+
+  const value = useMemo<CharacterContextValue>(() => ({ ...maps, loaded }), [maps, loaded]);
 
   return <CharacterContext.Provider value={value}>{children}</CharacterContext.Provider>;
 }

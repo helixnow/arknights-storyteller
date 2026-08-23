@@ -124,10 +124,15 @@ function readMemo(path: string): CacheEntry | null {
   return memo;
 }
 
-/** 剧情数据重新同步：作废所有缓存并让挂载中的组件重新解析。 */
+/**
+ * 剧情数据重新同步：作废所有缓存并让挂载中的组件重新解析。
+ *
+ * 这里不清 `INFLIGHT`：在途请求的 key 带着发起时的数据版本，会由它自己的
+ * `finally` 删掉。清空反而会让旧请求结束时误删同路径的新请求条目，
+ * 导致后来的调用者重复发一次 IPC。
+ */
 function invalidateAll() {
   MEMO.clear();
-  INFLIGHT.clear();
   dataVersion += 1;
   try {
     window.localStorage.setItem(DATA_VERSION_KEY, String(dataVersion));
@@ -158,14 +163,16 @@ function resolvePreview(path: string): Promise<CacheEntry> {
     return Promise.resolve(persisted);
   }
 
-  const existing = INFLIGHT.get(path);
+  // 请求期间如果数据被重新同步，这条结果就属于旧版本，不能再写进缓存，
+  // 而且新版本的调用者应该重新发一次请求 —— 所以 key 里带上版本号。
+  const startedAt = dataVersion;
+  const inflightKey = `${startedAt}:${path}`;
+  const existing = INFLIGHT.get(inflightKey);
   if (existing) return existing;
 
   const p = new Promise<CacheEntry>((resolve) => {
     const run = async () => {
       inflightCount += 1;
-      // 请求期间如果数据被重新同步，这条结果就属于旧版本，不能再写进缓存。
-      const startedAt = dataVersion;
       const commit = (entry: CacheEntry) => {
         if (dataVersion === startedAt) {
           MEMO.set(path, entry);
@@ -182,14 +189,14 @@ function resolvePreview(path: string): Promise<CacheEntry> {
         commit({ token: null, failed: true, ts: Date.now() });
       } finally {
         inflightCount -= 1;
-        INFLIGHT.delete(path);
+        INFLIGHT.delete(inflightKey);
         runNext();
       }
     };
     QUEUE.push(run);
     runNext();
   });
-  INFLIGHT.set(path, p);
+  INFLIGHT.set(inflightKey, p);
   return p;
 }
 

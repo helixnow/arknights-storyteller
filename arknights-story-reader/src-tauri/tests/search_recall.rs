@@ -301,6 +301,64 @@ fn adversarial_query_safety() {
     }
 }
 
+/// Roguelike scripts live in `story_table.json`, not in the review table, so
+/// they are easy to drop on the floor. With a real dataset every roguelike
+/// group must be listed and every listed story must resolve through the same
+/// `get_story_entry` path the reader uses.
+#[test]
+#[ignore = "requires synced dataset; run with --ignored"]
+fn roguelike_stories_are_reachable() {
+    let Some(svc) = setup() else { return };
+
+    let groups = svc
+        .roguelike_group_names()
+        .expect("roguelike listing must not error");
+    assert!(!groups.is_empty(), "expected at least one roguelike theme");
+    eprintln!("roguelike groups: {:?}", groups);
+
+    // Story ids are the raw `Obt/Roguelike/...` table keys.
+    let page = svc.search_stories_ex("回廊").expect("search ok");
+    for result in page.results.iter().take(50) {
+        if result.story_id.to_ascii_lowercase().starts_with("obt/roguelike/") {
+            svc.story_entry(&result.story_id)
+                .unwrap_or_else(|e| panic!("roguelike {} unreachable: {}", result.story_id, e));
+            return;
+        }
+    }
+}
+
+/// Without a dataset the search commands must degrade predictably instead of
+/// panicking: story search reports `NOT_INSTALLED`, and segment search — which
+/// only ever consults the index — returns an empty page.
+#[test]
+fn missing_dataset_degrades_gracefully() {
+    let root = std::env::temp_dir().join(format!(
+        "ark_recall_empty_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let svc = DataServiceHandle::new(root.clone());
+
+    let err = svc
+        .search_stories_ex("凯尔希")
+        .expect_err("story search needs a dataset");
+    assert_eq!(err, "NOT_INSTALLED");
+
+    let page = svc
+        .search_segments("凯尔希")
+        .expect("segment search must not error without a dataset");
+    assert!(page.hits.is_empty());
+    assert_eq!(page.total_matched, 0);
+
+    assert!(svc.story_entry("main_00-01").is_err());
+    assert!(svc.roguelike_group_names().is_err());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Timing regression guard: each query should return within a soft budget.
 /// The budget is loose because these tests run in debug mode; primarily we
 /// want to catch accidental O(N*M) regressions (e.g. unbounded fallback scan

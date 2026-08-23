@@ -146,9 +146,11 @@ export const CustomScrollArea = forwardRef<HTMLDivElement, CustomScrollAreaProps
       scheduleHide();
     }, [scheduleHide]);
 
+    const isScrollable = thumbMetrics.height > 0;
+
     const shouldShowTrack = useMemo(
-      () => trackActive && thumbMetrics.height > 0,
-      [trackActive, thumbMetrics.height]
+      () => trackActive && isScrollable,
+      [trackActive, isScrollable]
     );
 
     const formatOffset = useCallback((value: number | string) => {
@@ -259,10 +261,19 @@ export const CustomScrollArea = forwardRef<HTMLDivElement, CustomScrollAreaProps
         <div
           ref={assignViewportRef}
           className={cn("scroll-area__viewport", viewportClassName)}
+          /* 内容真的溢出时才给一个 tab 停靠点：Safari 不会像 Chrome/Firefox
+             那样自动让溢出容器可聚焦，没有它键盘用户就滚不动这块区域。 */
+          tabIndex={isScrollable ? 0 : undefined}
         >
           {children}
         </div>
-        <div ref={trackRef} className="scroll-area__track" data-visible={shouldShowTrack}>
+        {/* 轨道只是原生滚动的视觉替身，对辅助技术隐藏，避免多播一个无名控件。 */}
+        <div
+          ref={trackRef}
+          className="scroll-area__track"
+          data-visible={shouldShowTrack}
+          aria-hidden="true"
+        >
           <div
             className="scroll-area__thumb"
             ref={thumbRef}
@@ -270,6 +281,7 @@ export const CustomScrollArea = forwardRef<HTMLDivElement, CustomScrollAreaProps
             style={{
               height: `${thumbMetrics.height}px`,
               transform: `translateY(${thumbMetrics.top}px)`,
+              touchAction: "none",
             }}
           />
         </div>

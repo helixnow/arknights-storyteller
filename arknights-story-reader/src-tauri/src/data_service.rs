@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use reqwest::blocking::Client;
@@ -24,14 +25,21 @@ const DEFAULT_BRANCH: &str = "master";
 const VERSION_FILE: &str = "version.json";
 const SEARCH_RESULT_LIMIT: usize = 500;
 /// Bump when any of: FTS schema, tokenizer rules, flatten_segments format,
-/// or the set of stories that gets indexed.
-/// v7 = segment post-processing de-dupes consecutive same-token Image
-///      segments (matching the reader) and roguelike stories join the index;
-///      both shift stored segment indices, so a full rebuild is required.
-/// v6 = removed jieba, switched to char-level CJK tokenization (lighter binary).
-/// v4 = added segment-level FTS table `story_segment_index` (2025-05).
-/// v5 = parser recognises [Image]/[Background]/[PlayMusic]; dialogue carries
-///      characterId; requires full rebuild.
+/// or the set of stories that gets indexed. A bump drops both FTS tables at
+/// open time, so the next `rebuild_story_index_*` starts from scratch.
+///
+/// v4 = added the segment-level FTS table `story_segment_index`, so hits can
+///      carry a `(story_id, segment_index)` pair instead of story-only.
+/// v5 = parser recognises `[Image]` / `[Background]` / `[PlayMusic]` and
+///      dialogue carries `characterId`; new segment kinds shift every stored
+///      segment index.
+/// v6 = dropped jieba in favour of char-level CJK tokenization (much smaller
+///      binary). Every `tokenized_content` / `tokenized_text` value stored by
+///      an older build is in the old word-level form and would never match
+///      the new char-level queries, hence the rebuild.
+/// v7 = segment post-processing de-dupes consecutive same-token `Image`
+///      segments (matching what the reader renders) and roguelike stories
+///      join the index; both shift stored segment indices.
 const INDEX_VERSION: i32 = 7;
 
 #[derive(Clone, serde::Serialize)]
@@ -71,6 +79,78 @@ struct IndexedStory {
     story: StoryEntry,
 }
 
+const REVIEW_TABLE_REL: &str = "zh_CN/gamedata/excel/story_review_table.json";
+const REVIEW_META_TABLE_REL: &str = "zh_CN/gamedata/excel/story_review_meta_table.json";
+const STORY_TABLE_REL: &str = "zh_CN/gamedata/excel/story_table.json";
+
+/// Identity of the installed dataset. `story_review_table.json` is several
+/// megabytes and every list/lookup command used to re-read and re-parse it,
+/// so the derived catalog is memoized under this fingerprint.
+///
+/// The `version.json` commit is the primary key — a sync or a manual import
+/// always rewrites it. Sizes and mtimes of the three tables we actually read
+/// are folded in as a safety net for datasets swapped in place (or dropped in
+/// by hand) without the commit ever changing.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct CatalogFingerprint {
+    commit: String,
+    fetched_at: i64,
+    files: Vec<(u64, i128)>,
+}
+
+/// Everything the story-list / lookup commands need, derived from one pass
+/// over `story_review_table.json` (plus the roguelike tables).
+struct StoryCatalog {
+    /// Every indexable story, sorted by `story_id` — the order
+    /// `rebuild_story_index` and the linear-scan fallback walk.
+    stories: Vec<IndexedStory>,
+    /// `story_id` → position in `stories`.
+    by_id: HashMap<String, usize>,
+    /// `story_group` → positions in `stories`, ordered by `story_sort`.
+    by_group: HashMap<String, Vec<usize>>,
+    /// `story_id` → (display name, `<类型> | <分组名>` label).
+    labels: HashMap<String, (String, String)>,
+    main_groups: Vec<(String, Vec<StoryEntry>)>,
+    activity_groups: Vec<(String, Vec<StoryEntry>)>,
+    sidestory_groups: Vec<(String, Vec<StoryEntry>)>,
+    roguelike_groups: Vec<(String, Vec<StoryEntry>)>,
+    /// Why the roguelike tables could not be read, if they could not be. The
+    /// rest of the catalog stays usable; only `get_roguelike_stories_grouped`
+    /// surfaces the failure.
+    roguelike_error: Option<String>,
+    memory_stories: Vec<StoryEntry>,
+    mainline_categories: Vec<StoryCategory>,
+}
+
+struct CatalogSlot {
+    fingerprint: CatalogFingerprint,
+    catalog: Arc<StoryCatalog>,
+}
+
+/// Keyed by data directory so that several `DataService` instances (the app
+/// has one, tests have many) never evict each other.
+static CATALOG_CACHE: Mutex<Option<HashMap<PathBuf, CatalogSlot>>> = Mutex::new(None);
+
+/// A single app only ever needs one entry; the cap just stops long test runs
+/// from holding every temp dataset they ever created.
+const CATALOG_CACHE_CAPACITY: usize = 16;
+
+/// How many times each data directory has been parsed from scratch. Tests use
+/// it to prove the memoization actually holds (and actually gives way when the
+/// dataset changes).
+#[cfg(test)]
+static CATALOG_BUILD_LOG: Mutex<Option<HashMap<PathBuf, usize>>> = Mutex::new(None);
+
+#[cfg(test)]
+fn catalog_build_count(data_dir: &Path) -> usize {
+    CATALOG_BUILD_LOG
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|map| map.get(data_dir).copied())
+        .unwrap_or(0)
+}
+
 fn emit_progress(
     app: &AppHandle,
     phase: impl Into<String>,
@@ -85,6 +165,20 @@ fn emit_progress(
         message: message.into(),
     };
     let _ = app.emit("sync-progress", progress);
+}
+
+/// `extract_zip_at` runs both from Tauri commands and from unit tests, where
+/// there is no `AppHandle` to emit to.
+fn emit_progress_opt(
+    app: Option<&AppHandle>,
+    phase: impl Into<String>,
+    current: usize,
+    total: usize,
+    message: impl Into<String>,
+) {
+    if let Some(app) = app {
+        emit_progress(app, phase, current, total, message);
+    }
 }
 
 fn emit_search_progress(
@@ -365,9 +459,7 @@ pub struct DataService {
 
 impl DataService {
     pub fn is_installed(&self) -> bool {
-        self.data_dir
-            .join("zh_CN/gamedata/excel/story_review_table.json")
-            .exists()
+        self.data_dir.join(REVIEW_TABLE_REL).exists()
     }
 
     /// 返回运行时 character_table.json 路径（若已同步），供 character_table
@@ -606,21 +698,10 @@ impl DataService {
             .collect()
     }
 
-    fn collect_stories_for_index(&self) -> Result<Vec<IndexedStory>, String> {
-        if !self.is_installed() {
-            return Err("NOT_INSTALLED".to_string());
-        }
-
-        let story_review_file = self
-            .data_dir
-            .join("zh_CN/gamedata/excel/story_review_table.json");
-
-        let content = fs::read_to_string(&story_review_file)
-            .map_err(|e| format!("Failed to read story review file: {}", e))?;
-
-        let data: HashMap<String, Value> = serde_json::from_str(&content)
-            .map_err(|e| format!("Failed to parse story review data: {}", e))?;
-
+    fn collect_indexed_stories(
+        data: &HashMap<String, Value>,
+        roguelike_groups: &[(String, Vec<StoryEntry>)],
+    ) -> Vec<IndexedStory> {
         let mut seen_ids = HashSet::new();
         let mut stories = Vec::new();
 
@@ -649,7 +730,7 @@ impl DataService {
         // Roguelike scripts live in `story_table.json`, not in the review
         // table. Without them 肉鸽 is unsearchable and `get_story_entry` /
         // `get_story_neighbors` fail for every roguelike reader session.
-        for (group_key, group_stories) in self.collect_roguelike_groups().unwrap_or_default() {
+        for (group_key, group_stories) in roguelike_groups {
             for story in group_stories {
                 if story.story_txt.trim().is_empty() {
                     continue;
@@ -658,14 +739,181 @@ impl DataService {
                     stories.push(IndexedStory {
                         category_name: group_key.clone(),
                         entry_type: "ROGUELIKE".to_string(),
-                        story,
+                        story: story.clone(),
                     });
                 }
             }
         }
 
         stories.sort_by(|a, b| a.story.story_id.cmp(&b.story.story_id));
-        Ok(stories)
+        stories
+    }
+
+    /// Cheap identity check for the installed dataset — one small read plus
+    /// three `stat` calls, versus the multi-megabyte parse it guards.
+    fn catalog_fingerprint(&self) -> CatalogFingerprint {
+        let version = self.read_version();
+        let files = [REVIEW_TABLE_REL, REVIEW_META_TABLE_REL, STORY_TABLE_REL]
+            .iter()
+            .map(|rel| {
+                fs::metadata(self.data_dir.join(rel))
+                    .map(|meta| {
+                        let modified = meta
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                            .map(|d| d.as_nanos() as i128)
+                            .unwrap_or(-1);
+                        (meta.len(), modified)
+                    })
+                    .unwrap_or((0, -1))
+            })
+            .collect();
+
+        CatalogFingerprint {
+            commit: version
+                .as_ref()
+                .map(|v| v.commit.clone())
+                .unwrap_or_default(),
+            fetched_at: version.as_ref().map(|v| v.fetched_at).unwrap_or(0),
+            files,
+        }
+    }
+
+    /// Memoized story catalog. Rebuilt whenever the dataset fingerprint
+    /// changes; see `CatalogFingerprint`.
+    fn catalog(&self) -> Result<Arc<StoryCatalog>, String> {
+        if !self.is_installed() {
+            return Err("NOT_INSTALLED".to_string());
+        }
+
+        let fingerprint = self.catalog_fingerprint();
+
+        {
+            let guard = CATALOG_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(slot) = guard.as_ref().and_then(|map| map.get(&self.data_dir)) {
+                if slot.fingerprint == fingerprint {
+                    return Ok(Arc::clone(&slot.catalog));
+                }
+            }
+        }
+
+        // Built outside the lock: parsing takes seconds on a cold start and
+        // must not serialize unrelated data directories. A concurrent caller
+        // may duplicate the work once, which is cheaper than holding the lock.
+        let catalog = Arc::new(self.build_catalog()?);
+
+        let mut guard = CATALOG_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let map = guard.get_or_insert_with(HashMap::new);
+        if map.len() >= CATALOG_CACHE_CAPACITY && !map.contains_key(&self.data_dir) {
+            map.clear();
+        }
+        map.insert(
+            self.data_dir.clone(),
+            CatalogSlot {
+                fingerprint,
+                catalog: Arc::clone(&catalog),
+            },
+        );
+        Ok(catalog)
+    }
+
+    /// Parse the catalog ahead of the first command. Called on a background
+    /// thread at startup so the story lists don't pay for it while the user is
+    /// already looking at the app.
+    pub fn prewarm_catalog(&self) {
+        if let Err(err) = self.catalog() {
+            if err != "NOT_INSTALLED" {
+                eprintln!("[CATALOG] 预热失败: {}", err);
+            }
+        }
+    }
+
+    /// Drop the memoized catalog for this data directory. Called right after
+    /// the dataset is replaced so a stale catalog can never be observed even
+    /// if the new files happen to land on the same mtime/size.
+    fn invalidate_catalog(&self) {
+        let mut guard = CATALOG_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(map) = guard.as_mut() {
+            map.remove(&self.data_dir);
+        }
+    }
+
+    fn build_catalog(&self) -> Result<StoryCatalog, String> {
+        #[cfg(test)]
+        {
+            let mut guard = CATALOG_BUILD_LOG.lock().unwrap_or_else(|e| e.into_inner());
+            *guard
+                .get_or_insert_with(HashMap::new)
+                .entry(self.data_dir.clone())
+                .or_insert(0) += 1;
+        }
+
+        let story_review_file = self.data_dir.join(REVIEW_TABLE_REL);
+        let content = fs::read_to_string(&story_review_file)
+            .map_err(|e| format!("Failed to read story review file: {}", e))?;
+        let data: HashMap<String, Value> = serde_json::from_str(&content)
+            .map_err(|e| format!("Failed to parse story review data: {}", e))?;
+        drop(content);
+
+        let (roguelike_groups, roguelike_error) = match self.collect_roguelike_groups() {
+            Ok(groups) => (groups, None),
+            Err(err) => {
+                eprintln!("[CATALOG] 肉鸽剧情不可用: {}", err);
+                (Vec::new(), Some(err))
+            }
+        };
+
+        let stories = Self::collect_indexed_stories(&data, &roguelike_groups);
+
+        let mut by_id = HashMap::with_capacity(stories.len());
+        let mut by_group: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut labels = HashMap::with_capacity(stories.len());
+        for (idx, item) in stories.iter().enumerate() {
+            by_id.insert(item.story.story_id.clone(), idx);
+            by_group
+                .entry(item.story.story_group.clone())
+                .or_default()
+                .push(idx);
+            labels.insert(
+                item.story.story_id.clone(),
+                (
+                    item.story.story_name.clone(),
+                    Self::format_category_label(&item.entry_type, &item.category_name),
+                ),
+            );
+        }
+        for positions in by_group.values_mut() {
+            // `stories` is story_id-ordered, so a stable sort on storySort
+            // keeps ties in id order — what `get_story_neighbors` used to do.
+            positions.sort_by_key(|idx| stories[*idx].story.story_sort);
+        }
+
+        let mainline_stories = Self::parse_stories_by_entry_type(&data, "MAINLINE");
+        let mainline_categories = if mainline_stories.is_empty() {
+            Vec::new()
+        } else {
+            vec![StoryCategory {
+                id: "mainline".to_string(),
+                name: "主线剧情".to_string(),
+                category_type: "chapter".to_string(),
+                stories: mainline_stories,
+            }]
+        };
+
+        Ok(StoryCatalog {
+            stories,
+            by_id,
+            by_group,
+            labels,
+            main_groups: Self::build_main_groups(&data),
+            activity_groups: Self::build_activity_groups(&data),
+            sidestory_groups: Self::build_sidestory_groups(&data),
+            roguelike_groups,
+            roguelike_error,
+            memory_stories: Self::build_memory_stories(&data),
+            mainline_categories,
+        })
     }
 
     fn flatten_segments(segments: &[StorySegment]) -> String {
@@ -1152,6 +1400,7 @@ impl DataService {
             fetched_at,
         };
         self.write_version(&info)?;
+        self.invalidate_catalog();
 
         // Auto-rebuild the FTS index so the next search is immediately fast
         // instead of silently falling back to linear scan (bug A5).
@@ -1326,7 +1575,7 @@ impl DataService {
             .map_err(|e| format!("Failed to flush zip file: {}", e))?;
 
         emit_progress(app, "下载", 100, 100, "下载完成");
-        self.extract_zip_at(&zip_path, parent_dir, app)?;
+        self.extract_zip_at(&zip_path, parent_dir, Some(app))?;
         fs::remove_file(&zip_path).ok();
 
         Ok(())
@@ -1336,9 +1585,9 @@ impl DataService {
         &self,
         zip_path: &Path,
         parent_dir: &Path,
-        app: &AppHandle,
+        app: Option<&AppHandle>,
     ) -> Result<(), String> {
-        emit_progress(app, "解压", 0, 100, "正在解压数据");
+        emit_progress_opt(app, "解压", 0, 100, "正在解压数据");
         let extract_root = parent_dir.join("ArknightsGameData_extract");
         if extract_root.exists() {
             fs::remove_dir_all(&extract_root)
@@ -1378,7 +1627,7 @@ impl DataService {
             }
 
             let percent = ((i + 1) as f64 / total_entries as f64 * 100.0).min(100.0);
-            emit_progress(
+            emit_progress_opt(
                 app,
                 "解压",
                 percent.round() as usize,
@@ -1387,7 +1636,7 @@ impl DataService {
             );
         }
 
-        emit_progress(app, "解压", 100, 100, "解压完成");
+        emit_progress_opt(app, "解压", 100, 100, "解压完成");
 
         let extracted_root = fs::read_dir(&extract_root)
             .map_err(|e| format!("Failed to read extracted directory: {}", e))?
@@ -1401,15 +1650,16 @@ impl DataService {
 
         // 先验收再动旧数据：如果这个包里没有 story_review_table.json，整个
         // 应用就是空的。此时必须保留已有 data_dir，让用户继续用旧数据。
-        if !extracted_root
-            .join("zh_CN/gamedata/excel/story_review_table.json")
-            .exists()
-        {
+        // 空文件同样算校验失败——半截下载解出来的壳子比旧数据更没用。
+        let review_ok = fs::metadata(extracted_root.join(REVIEW_TABLE_REL))
+            .map(|meta| meta.is_file() && meta.len() > 0)
+            .unwrap_or(false);
+        if !review_ok {
             fs::remove_dir_all(&extract_root).ok();
-            return Err(
-                "ZIP 校验失败：缺少 zh_CN/gamedata/excel/story_review_table.json，已保留原有数据"
-                    .to_string(),
-            );
+            return Err(format!(
+                "ZIP 校验失败：缺少或为空 {}，已保留原有数据",
+                REVIEW_TABLE_REL
+            ));
         }
 
         // 阅读器只需要 story / excel 数据；关卡、战斗、美术等目录加起来
@@ -1430,6 +1680,8 @@ impl DataService {
         }
 
         fs::remove_dir_all(&extract_root).ok();
+        // 数据目录已经整个换掉，缓存的剧情目录立刻作废。
+        self.invalidate_catalog();
         Ok(())
     }
 
@@ -1464,7 +1716,7 @@ impl DataService {
             .ok_or_else(|| "Invalid data directory".to_string())?;
 
         emit_progress(app, "导入", 40, 100, "正在解压 ZIP 文件");
-        self.extract_zip_at(temp_path, parent_dir, app)?;
+        self.extract_zip_at(temp_path, parent_dir, Some(app))?;
         fs::remove_file(temp_path).ok();
 
         if let Err(err) = self.clear_story_index() {
@@ -1480,6 +1732,7 @@ impl DataService {
             fetched_at: timestamp,
         };
         self.write_version(&info)?;
+        self.invalidate_catalog();
 
         // Auto-rebuild the FTS index (bug A5, same as sync_data).
         emit_progress(app, "索引", 0, 1, "正在重建全文索引");
@@ -1644,42 +1897,14 @@ impl DataService {
 
     /// 获取分类的剧情列表（仅返回分类，不含故事列表）
     pub fn get_story_categories(&self) -> Result<Vec<StoryCategory>, String> {
-        if !self.is_installed() {
-            return Err("NOT_INSTALLED".to_string());
-        }
-
-        let story_review_file = self
-            .data_dir
-            .join("zh_CN/gamedata/excel/story_review_table.json");
-
-        let content = fs::read_to_string(&story_review_file)
-            .map_err(|e| format!("Failed to read story review file: {}", e))?;
-
-        let data: HashMap<String, Value> = serde_json::from_str(&content)
-            .map_err(|e| format!("Failed to parse story review data: {}", e))?;
-
-        let mut categories = Vec::new();
-
-        // 主线剧情
-        let main_stories = self.parse_stories_by_entry_type(&data, "MAINLINE")?;
-        if !main_stories.is_empty() {
-            categories.push(StoryCategory {
-                id: "mainline".to_string(),
-                name: "主线剧情".to_string(),
-                category_type: "chapter".to_string(),
-                stories: main_stories,
-            });
-        }
-
-        Ok(categories)
+        Ok(self.catalog()?.mainline_categories.clone())
     }
 
     /// 根据 entryType 解析剧情
     fn parse_stories_by_entry_type(
-        &self,
         data: &HashMap<String, Value>,
         entry_type: &str,
-    ) -> Result<Vec<StoryEntry>, String> {
+    ) -> Vec<StoryEntry> {
         let mut stories = Vec::new();
 
         for (_id, value) in data.iter() {
@@ -1691,34 +1916,7 @@ impl DataService {
         }
 
         stories.sort_by_key(|s| s.story_sort);
-        Ok(stories)
-    }
-
-    /// 获取主线剧情
-    #[allow(dead_code)]
-    fn get_main_stories(&self) -> Result<Vec<StoryEntry>, String> {
-        let story_review_file = self
-            .data_dir
-            .join("zh_CN/gamedata/excel/story_review_table.json");
-
-        let content = fs::read_to_string(&story_review_file)
-            .map_err(|e| format!("Failed to read story review file: {}", e))?;
-
-        let data: HashMap<String, Value> = serde_json::from_str(&content)
-            .map_err(|e| format!("Failed to parse story review data: {}", e))?;
-
-        let mut stories = Vec::new();
-
-        for (_id, value) in data.iter() {
-            if let Some(entry_type) = value.get("entryType").and_then(|v| v.as_str()) {
-                if entry_type == "MAINLINE" {
-                    stories.extend(Self::parse_group_entries(value));
-                }
-            }
-        }
-
-        stories.sort_by_key(|s| s.story_sort);
-        Ok(stories)
+        stories
     }
 
     /// 读取剧情文本
@@ -1813,7 +2011,8 @@ impl DataService {
         tx.execute("DELETE FROM story_segment_index", [])
             .map_err(|e| format!("Failed to clear story segment index: {}", e))?;
 
-        let indexed_stories = self.collect_stories_for_index()?;
+        let catalog = self.catalog()?;
+        let indexed_stories = &catalog.stories;
         let mut story_insert_stmt = tx
             .prepare(
                 "
@@ -2143,9 +2342,9 @@ impl DataService {
         // Primary term for context extraction + raw query for display fallback.
         let primary_term = terms.primary().unwrap_or_default().to_string();
 
-        let stories = self.collect_stories_for_index()?;
+        let catalog = self.catalog()?;
 
-        for indexed in &stories {
+        for indexed in &catalog.stories {
             let story = &indexed.story;
             let category_label =
                 Self::format_category_label(&indexed.entry_type, &indexed.category_name);
@@ -2452,7 +2651,9 @@ impl DataService {
         };
 
         // Pre-fetch story_id → (story_name, category) for labels.
-        let label_map = self.collect_story_labels().unwrap_or_default();
+        let catalog = self.collect_story_labels();
+        let no_labels: HashMap<String, (String, String)> = HashMap::new();
+        let label_map = catalog.as_ref().map(|c| &c.labels).unwrap_or(&no_labels);
 
         let rows = match stmt.query_map(params![fts_query], |row| {
             let story_id: String = row.get(0)?;
@@ -2544,7 +2745,7 @@ impl DataService {
         // result even though the title itself isn't stored as a segment.
         // Each such hit is presented as a pseudo-"header" segment at index 0
         // so the reader lands on the beginning of the story when clicked.
-        if let Ok(story_rows) = self.story_level_title_hits(&fts_query, trimmed, &label_map) {
+        if let Ok(story_rows) = self.story_level_title_hits(&fts_query, trimmed, label_map) {
             let remaining = SEARCH_RESULT_LIMIT.saturating_sub(hits.len());
             for hit in story_rows.into_iter().take(remaining) {
                 let key = (hit.story_id.clone(), hit.segment_index);
@@ -2581,16 +2782,18 @@ impl DataService {
         })
     }
 
-    /// Cheap helper: build the `storyId -> (storyName, category)` map once per
-    /// call. Called by `search_segments` to attach display labels.
-    fn collect_story_labels(&self) -> Result<HashMap<String, (String, String)>, String> {
-        let indexed = self.collect_stories_for_index()?;
-        let mut map = HashMap::with_capacity(indexed.len());
-        for item in indexed {
-            let label = Self::format_category_label(&item.entry_type, &item.category_name);
-            map.insert(item.story.story_id.clone(), (item.story.story_name.clone(), label));
+    /// `storyId -> (storyName, category)` for attaching display labels to
+    /// segment hits. Served from the memoized catalog, so this is a lookup
+    /// rather than a re-parse of the whole review table. Labels are cosmetic,
+    /// so a missing dataset degrades to no labels rather than to no hits.
+    fn collect_story_labels(&self) -> Option<Arc<StoryCatalog>> {
+        match self.catalog() {
+            Ok(catalog) => Some(catalog),
+            Err(err) => {
+                eprintln!("[SEG-INDEX] 无法加载剧情标签: {}", err);
+                None
+            }
         }
-        Ok(map)
     }
 
     /// Produce segment-style hits derived from the story-level index, used
@@ -2800,7 +3003,8 @@ impl DataService {
         }
 
         // 线性扫描，实时进度
-        let stories = self.collect_stories_for_index()?;
+        let catalog = self.catalog()?;
+        let stories = &catalog.stories;
         let total = stories.len();
         emit_search_progress(app, "线性扫描", 0, total.max(1), "开始遍历");
 
@@ -2870,77 +3074,45 @@ impl DataService {
     }
 
     pub fn get_story_entry(&self, story_id: &str) -> Result<StoryEntry, String> {
-        let stories = self.collect_stories_for_index()?;
-        for indexed in stories {
-            if indexed.story.story_id == story_id {
-                return Ok(indexed.story);
-            }
-        }
-        Err(format!("Story {} 不存在", story_id))
+        let catalog = self.catalog()?;
+        catalog
+            .by_id
+            .get(story_id)
+            .map(|idx| catalog.stories[*idx].story.clone())
+            .ok_or_else(|| format!("Story {} 不存在", story_id))
     }
 
     /// Return the previous/next story in the same storyGroup ordered by
     /// storySort. If the story is the first/last, the corresponding field is
     /// None. Derived purely from `story_review_table.json`; no extra index.
     pub fn get_story_neighbors(&self, story_id: &str) -> Result<crate::models::StoryNeighbors, String> {
-        let stories = self.collect_stories_for_index()?;
-        let mut target_group: Option<String> = None;
-        let mut target_sort: i32 = 0;
-        for indexed in &stories {
-            if indexed.story.story_id == story_id {
-                target_group = Some(indexed.story.story_group.clone());
-                target_sort = indexed.story.story_sort;
-                break;
-            }
-        }
-        let Some(group) = target_group else {
+        let catalog = self.catalog()?;
+        let Some(target) = catalog.by_id.get(story_id) else {
+            return Ok(crate::models::StoryNeighbors::default());
+        };
+        let group = &catalog.stories[*target].story.story_group;
+        let Some(positions) = catalog.by_group.get(group) else {
+            return Ok(crate::models::StoryNeighbors::default());
+        };
+        let Some(pos) = positions.iter().position(|idx| idx == target) else {
             return Ok(crate::models::StoryNeighbors::default());
         };
 
-        // Collect same-group stories, sort by sort ascending.
-        let mut group_stories: Vec<StoryEntry> = stories
-            .into_iter()
-            .filter(|x| x.story.story_group == group)
-            .map(|x| x.story)
-            .collect();
-        group_stories.sort_by_key(|s| s.story_sort);
-
-        let pos = group_stories
-            .iter()
-            .position(|s| s.story_id == story_id);
-        let Some(pos) = pos else {
-            return Ok(crate::models::StoryNeighbors::default());
-        };
-
-        let _ = target_sort;
-        let prev = if pos > 0 {
-            Some(group_stories[pos - 1].clone())
-        } else {
-            None
-        };
-        let next = if pos + 1 < group_stories.len() {
-            Some(group_stories[pos + 1].clone())
-        } else {
-            None
-        };
-        Ok(crate::models::StoryNeighbors { prev, next })
+        let at = |offset: usize| catalog.stories[positions[offset]].story.clone();
+        Ok(crate::models::StoryNeighbors {
+            prev: (pos > 0).then(|| at(pos - 1)),
+            next: (pos + 1 < positions.len()).then(|| at(pos + 1)),
+        })
     }
 
     /// 查找指定 storyId 所在的 **章节 / 活动** 名。
     /// 返回如 "黑暗时代·上"、"和光同尘" 等；找不到返回 None。
     pub fn get_story_category_name(&self, story_id: &str) -> Result<Option<String>, String> {
-        let stories = self.collect_stories_for_index()?;
-        for indexed in stories {
-            if indexed.story.story_id == story_id {
-                let name = indexed.category_name.trim();
-                return Ok(if name.is_empty() {
-                    None
-                } else {
-                    Some(name.to_string())
-                });
-            }
-        }
-        Ok(None)
+        let catalog = self.catalog()?;
+        Ok(catalog.by_id.get(story_id).and_then(|idx| {
+            let name = catalog.stories[*idx].category_name.trim();
+            (!name.is_empty()).then(|| name.to_string())
+        }))
     }
 
     /// 提取匹配文本的上下文
@@ -3053,20 +3225,10 @@ impl DataService {
     }
 
     pub fn get_main_stories_grouped(&self) -> Result<Vec<(String, Vec<StoryEntry>)>, String> {
-        if !self.is_installed() {
-            return Err("NOT_INSTALLED".to_string());
-        }
+        Ok(self.catalog()?.main_groups.clone())
+    }
 
-        let story_review_file = self
-            .data_dir
-            .join("zh_CN/gamedata/excel/story_review_table.json");
-
-        let content = fs::read_to_string(&story_review_file)
-            .map_err(|e| format!("Failed to read story review file: {}", e))?;
-
-        let data: HashMap<String, Value> = serde_json::from_str(&content)
-            .map_err(|e| format!("Failed to parse story review data: {}", e))?;
-
+    fn build_main_groups(data: &HashMap<String, Value>) -> Vec<(String, Vec<StoryEntry>)> {
         // 按分组ID收集主线剧情
         let mut groups: Vec<(String, String, Vec<StoryEntry>)> = Vec::new();
 
@@ -3089,27 +3251,17 @@ impl DataService {
 
         groups.sort_by(|a, b| compare_story_group_ids(&a.0, &b.0));
 
-        Ok(groups
+        groups
             .into_iter()
             .map(|(_, name, stories)| (name, stories))
-            .collect())
+            .collect()
     }
 
     pub fn get_activity_stories_grouped(&self) -> Result<Vec<(String, Vec<StoryEntry>)>, String> {
-        if !self.is_installed() {
-            return Err("NOT_INSTALLED".to_string());
-        }
+        Ok(self.catalog()?.activity_groups.clone())
+    }
 
-        let story_review_file = self
-            .data_dir
-            .join("zh_CN/gamedata/excel/story_review_table.json");
-
-        let content = fs::read_to_string(&story_review_file)
-            .map_err(|e| format!("Failed to read story review file: {}", e))?;
-
-        let data: HashMap<String, Value> = serde_json::from_str(&content)
-            .map_err(|e| format!("Failed to parse story review data: {}", e))?;
-
+    fn build_activity_groups(data: &HashMap<String, Value>) -> Vec<(String, Vec<StoryEntry>)> {
         let mut groups: Vec<(String, Vec<StoryEntry>, i64, String)> = Vec::new();
 
         for (_id, value) in data.iter() {
@@ -3154,27 +3306,17 @@ impl DataService {
             other => other,
         });
 
-        Ok(groups
+        groups
             .into_iter()
             .map(|(name, stories, _, _)| (name, stories))
-            .collect())
+            .collect()
     }
 
     pub fn get_sidestory_stories_grouped(&self) -> Result<Vec<(String, Vec<StoryEntry>)>, String> {
-        if !self.is_installed() {
-            return Err("NOT_INSTALLED".to_string());
-        }
+        Ok(self.catalog()?.sidestory_groups.clone())
+    }
 
-        let story_review_file = self
-            .data_dir
-            .join("zh_CN/gamedata/excel/story_review_table.json");
-
-        let content = fs::read_to_string(&story_review_file)
-            .map_err(|e| format!("Failed to read story review file: {}", e))?;
-
-        let data: HashMap<String, Value> = serde_json::from_str(&content)
-            .map_err(|e| format!("Failed to parse story review data: {}", e))?;
-
+    fn build_sidestory_groups(data: &HashMap<String, Value>) -> Vec<(String, Vec<StoryEntry>)> {
         let mut groups: Vec<(String, Vec<StoryEntry>, String)> = Vec::new();
 
         for (id, value) in data.iter() {
@@ -3198,17 +3340,22 @@ impl DataService {
         }
 
         groups.sort_by(|a, b| compare_story_group_ids(&a.2, &b.2));
-        Ok(groups
+        groups
             .into_iter()
             .map(|(name, stories, _)| (name, stories))
-            .collect())
+            .collect()
     }
 
     pub fn get_roguelike_stories_grouped(&self) -> Result<Vec<(String, Vec<StoryEntry>)>, String> {
-        if !self.is_installed() {
-            return Err("NOT_INSTALLED".to_string());
+        let catalog = self.catalog()?;
+        // 只有在真的什么都没解析出来时才把读表错误抛给前端，避免为了一份
+        // 缺失的 meta 表把整页肉鸽列表变成错误提示。
+        if catalog.roguelike_groups.is_empty() {
+            if let Some(err) = &catalog.roguelike_error {
+                return Err(err.clone());
+            }
         }
-        self.collect_roguelike_groups()
+        Ok(catalog.roguelike_groups.clone())
     }
 
     /// 枚举 `story_table.json` 里的所有 `Obt/Roguelike/...` 剧情，按主题分组。
@@ -3216,9 +3363,7 @@ impl DataService {
     /// 保证肉鸽剧情同样可搜索、可取上下篇。
     fn collect_roguelike_groups(&self) -> Result<Vec<(String, Vec<StoryEntry>)>, String> {
         // 首先读取 meta，提取 contentPath -> desc 映射（用于更友好的命名）
-        let meta_file = self
-            .data_dir
-            .join("zh_CN/gamedata/excel/story_review_meta_table.json");
+        let meta_file = self.data_dir.join(REVIEW_META_TABLE_REL);
         let meta_content = fs::read_to_string(&meta_file)
             .map_err(|e| format!("Failed to read story review meta file: {}", e))?;
         let meta_value: Value = serde_json::from_str(&meta_content)
@@ -3260,7 +3405,7 @@ impl DataService {
         collect_content_paths(&mut path_desc_map, &meta_value);
 
         // 使用 story_table 作为权威来源，枚举所有 Obt/Roguelike 文本
-        let story_table_file = self.data_dir.join("zh_CN/gamedata/excel/story_table.json");
+        let story_table_file = self.data_dir.join(STORY_TABLE_REL);
         let story_table_content = fs::read_to_string(&story_table_file)
             .map_err(|e| format!("Failed to read story table file: {}", e))?;
         let table_obj: HashMap<String, Value> = serde_json::from_str(&story_table_content)
@@ -3330,21 +3475,11 @@ impl DataService {
     }
 
     pub fn get_memory_stories(&self) -> Result<Vec<StoryEntry>, String> {
-        if !self.is_installed() {
-            return Err("NOT_INSTALLED".to_string());
-        }
+        Ok(self.catalog()?.memory_stories.clone())
+    }
 
-        let story_review_file = self
-            .data_dir
-            .join("zh_CN/gamedata/excel/story_review_table.json");
-
-        let content = fs::read_to_string(&story_review_file)
-            .map_err(|e| format!("Failed to read story review file: {}", e))?;
-
-        let data: HashMap<String, Value> = serde_json::from_str(&content)
-            .map_err(|e| format!("Failed to parse story review data: {}", e))?;
-
-        let mut stories = self.parse_stories_by_entry_type(&data, "NONE")?;
+    fn build_memory_stories(data: &HashMap<String, Value>) -> Vec<StoryEntry> {
+        let mut stories = Self::parse_stories_by_entry_type(data, "NONE");
 
         // 干员密录的 storySort 在原始数据里几乎全是 0，直接按它排等于
         // 保留 HashMap 的随机顺序。改为按「干员 char token → 篇内序号 →
@@ -3358,7 +3493,7 @@ impl DataService {
                 .then_with(|| a.story_name.cmp(&b.story_name))
                 .then_with(|| a.story_id.cmp(&b.story_id))
         });
-        Ok(stories)
+        stories
     }
 
     /// 读取剧情脚本，返回第一张可用作缩略图的素材 token。
@@ -3696,5 +3831,513 @@ mod tests {
         let tokens = DataService::tokenize_for_fts("PRTS system");
         assert!(tokens.iter().any(|t| t == "prts"));
         assert!(tokens.iter().any(|t| t == "system"));
+    }
+
+    #[test]
+    fn fts_query_wraps_positives_before_not() {
+        // FTS5 binds `NOT` tighter than we want: without the parentheses
+        // `A AND B NOT C` would exclude only from `B`.
+        let q = DataService::build_fts_query_advanced("凯尔希 阿米娅 -博士").expect("non-empty");
+        assert!(q.starts_with('('), "positives must be grouped: {}", q);
+        let not_idx = q.find(" NOT ").expect("NOT clause");
+        assert!(q[..not_idx].contains("AND"), "both positives kept: {}", q);
+    }
+
+    // ---- Dataset fixture ---------------------------------------------------
+
+    static FIXTURE_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// A throw-away app-data directory holding a miniature but structurally
+    /// faithful ArknightsGameData tree: two mainline stories, one activity,
+    /// one operator memory and two roguelike scripts.
+    struct Fixture {
+        root: PathBuf,
+        service: DataService,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let mut guard = CATALOG_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(map) = guard.as_mut() {
+                map.remove(&self.service.data_dir);
+            }
+            drop(guard);
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    impl Fixture {
+        fn new(tag: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let seq = FIXTURE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!("ark_{}_{}_{}", tag, nanos, seq));
+            let data_dir = root.join("ArknightsGameData");
+            let service = DataService {
+                data_dir: data_dir.clone(),
+                index_db_path: root.join("story_index.db"),
+            };
+            let fixture = Fixture { root, service };
+            fixture.install_dataset();
+            fixture
+        }
+
+        fn excel(&self) -> PathBuf {
+            self.service.data_dir.join("zh_CN/gamedata/excel")
+        }
+
+        fn write_file(path: &Path, body: &str) {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, body).unwrap();
+        }
+
+        fn write_story(&self, rel: &str, body: &str) {
+            let path = self
+                .service
+                .data_dir
+                .join("zh_CN/gamedata/story")
+                .join(format!("{}.txt", rel));
+            Self::write_file(&path, body);
+        }
+
+        fn set_version(&self, commit: &str) {
+            Self::write_file(
+                &self.service.data_dir.join(VERSION_FILE),
+                &format!("{{\"commit\":\"{}\",\"fetched_at\":1700000000}}", commit),
+            );
+        }
+
+        fn set_review_table(&self, json: &str) {
+            Self::write_file(&self.excel().join("story_review_table.json"), json);
+        }
+
+        fn install_dataset(&self) {
+            self.set_review_table(REVIEW_TABLE_JSON);
+            Self::write_file(&self.excel().join("story_table.json"), STORY_TABLE_JSON);
+            Self::write_file(
+                &self.excel().join("story_review_meta_table.json"),
+                REVIEW_META_JSON,
+            );
+
+            // 主线一：同时出现「凯尔希」和「博士」，用来验证 NOT 排除。
+            self.write_story(
+                "obt/main/level_main_00-01",
+                "[name=\"凯尔希\"]博士，你醒了。\n",
+            );
+            self.write_story("obt/main/level_main_00-02", "[name=\"阿米娅\"]我们出发吧。\n");
+            // 活动篇开头连着两张同名插画，前端会合并，索引也必须合并，
+            // 否则对白段落号会整体偏移一位。
+            self.write_story(
+                "activities/act1/act1_st01",
+                "[Image(image=\"avg_1\")]\n[Image(image=\"avg_1\")]\n[name=\"德克萨斯\"]雪很大。\n",
+            );
+            self.write_story("obt/memory/char_002_amiya/char_002_amiya_1", "回忆片段。\n");
+            self.write_story("obt/roguelike/ro2/ro2_1", "[name=\"凯尔希\"]又见面了。\n");
+            self.write_story("obt/roguelike/ro2/ro2_2", "[name=\"缄默\"]继续前进。\n");
+            self.set_version("commit-1");
+        }
+    }
+
+    fn entry_json(id: &str, name: &str, group: &str, sort: i32, txt: &str, code: &str) -> String {
+        format!(
+            "{{\"storyId\":\"{id}\",\"storyName\":\"{name}\",\"storyCode\":\"{code}\",\
+             \"storyGroup\":\"{group}\",\"storySort\":{sort},\"storyTxt\":\"{txt}\",\
+             \"storyReviewType\":\"NORMAL\",\"unLockType\":\"AUTO\"}}"
+        )
+    }
+
+    const REVIEW_TABLE_JSON: &str = r#"{
+      "main_0": {
+        "id": "main_0",
+        "name": "黑暗时代",
+        "entryType": "MAINLINE",
+        "actType": "NONE",
+        "startTime": 100,
+        "storyPic": "chapter_cover_0",
+        "infoUnlockDatas": [
+          {"storyId":"main_00-01","storyName":"序章","storyCode":"0-1","storyGroup":"main_0","storySort":1,"storyTxt":"obt/main/level_main_00-01","storyReviewType":"NORMAL","unLockType":"AUTO"},
+          {"storyId":"main_00-02","storyName":"启程","storyCode":"0-2","storyGroup":"main_0","storySort":2,"storyTxt":"obt/main/level_main_00-02","storyReviewType":"NORMAL","unLockType":"AUTO"}
+        ]
+      },
+      "act_1": {
+        "id": "act_1",
+        "name": "骑兵与猎人",
+        "entryType": "ACTIVITY",
+        "actType": "ACTIVITY_STORY",
+        "startTime": 200,
+        "storyPic": "act1_kv",
+        "infoUnlockDatas": [
+          {"storyId":"act1_st01","storyName":"雪原","storyGroup":"act_1","storySort":1,"storyTxt":"activities/act1/act1_st01","storyReviewType":"NORMAL","unLockType":"AUTO"}
+        ]
+      },
+      "memory_amiya": {
+        "id": "memory_amiya",
+        "name": "阿米娅密录",
+        "entryType": "NONE",
+        "infoUnlockDatas": [
+          {"storyId":"memory_amiya_1","storyName":"回忆","storyGroup":"memory_amiya","storySort":0,"storyTxt":"obt/memory/char_002_amiya/char_002_amiya_1","storyReviewType":"NORMAL","unLockType":"AUTO"}
+        ]
+      }
+    }"#;
+
+    const STORY_TABLE_JSON: &str = r#"{
+      "Obt/Roguelike/ro2/ro2_1": {"id":"Obt/Roguelike/ro2/ro2_1"},
+      "Obt/Roguelike/ro2/ro2_2": {"id":"Obt/Roguelike/ro2/ro2_2"},
+      "Obt/Main/level_main_00-01": {"id":"Obt/Main/level_main_00-01"}
+    }"#;
+
+    const REVIEW_META_JSON: &str = r#"{
+      "miniActTrialData": {},
+      "roguelike": {
+        "one": {"contentPath":"obt/roguelike/ro2/ro2_1","desc":"孤钻·壹"},
+        "two": {"contentPath":"obt/roguelike/ro2/ro2_2","desc":"孤钻·贰"}
+      }
+    }"#;
+
+    // ---- Catalog memoization ----------------------------------------------
+
+    #[test]
+    fn catalog_is_parsed_once_across_commands() {
+        let fx = Fixture::new("memo");
+        let dir = fx.service.data_dir.clone();
+        let before = catalog_build_count(&dir);
+
+        fx.service.get_main_stories_grouped().unwrap();
+        fx.service.get_activity_stories_grouped().unwrap();
+        fx.service.get_sidestory_stories_grouped().unwrap();
+        fx.service.get_roguelike_stories_grouped().unwrap();
+        fx.service.get_memory_stories().unwrap();
+        fx.service.get_story_categories().unwrap();
+        fx.service.get_story_entry("main_00-01").unwrap();
+        fx.service.get_story_neighbors("main_00-01").unwrap();
+        fx.service.get_story_category_name("main_00-01").unwrap();
+
+        assert_eq!(
+            catalog_build_count(&dir) - before,
+            1,
+            "story_review_table.json must be parsed once for the whole batch"
+        );
+    }
+
+    #[test]
+    fn catalog_cache_is_invalidated_by_new_commit() {
+        let fx = Fixture::new("memo_commit");
+        let dir = fx.service.data_dir.clone();
+        let before = catalog_build_count(&dir);
+
+        fx.service.get_main_stories_grouped().unwrap();
+        assert_eq!(catalog_build_count(&dir) - before, 1);
+
+        // A sync rewrites version.json even when nothing else moved.
+        fx.set_version("commit-2");
+        fx.service.get_main_stories_grouped().unwrap();
+        assert_eq!(
+            catalog_build_count(&dir) - before,
+            2,
+            "a new commit must invalidate the cached catalog"
+        );
+    }
+
+    #[test]
+    fn catalog_cache_is_invalidated_by_table_rewrite() {
+        let fx = Fixture::new("memo_table");
+        let dir = fx.service.data_dir.clone();
+        let before = catalog_build_count(&dir);
+
+        assert!(fx.service.get_story_entry("main_00-03").is_err());
+        assert_eq!(catalog_build_count(&dir) - before, 1);
+
+        // Same commit, different table: a hand-swapped dataset must not be
+        // served from the previous parse.
+        fx.set_review_table(&format!(
+            "{{\"main_0\":{{\"id\":\"main_0\",\"name\":\"黑暗时代\",\"entryType\":\"MAINLINE\",\
+              \"infoUnlockDatas\":[{}]}}}}",
+            entry_json(
+                "main_00-03",
+                "追加",
+                "main_0",
+                3,
+                "obt/main/level_main_00-03",
+                "0-3",
+            )
+        ));
+
+        let entry = fx
+            .service
+            .get_story_entry("main_00-03")
+            .expect("rewritten table must be re-read");
+        assert_eq!(entry.story_name, "追加");
+        assert_eq!(catalog_build_count(&dir) - before, 2);
+    }
+
+    #[test]
+    fn catalog_lookups_cover_neighbors_and_category() {
+        let fx = Fixture::new("lookup");
+
+        let neighbors = fx.service.get_story_neighbors("main_00-01").unwrap();
+        assert!(neighbors.prev.is_none());
+        assert_eq!(neighbors.next.map(|s| s.story_id), Some("main_00-02".into()));
+
+        let neighbors = fx.service.get_story_neighbors("main_00-02").unwrap();
+        assert_eq!(neighbors.prev.map(|s| s.story_id), Some("main_00-01".into()));
+        assert!(neighbors.next.is_none());
+
+        assert_eq!(
+            fx.service.get_story_category_name("act1_st01").unwrap(),
+            Some("骑兵与猎人".to_string())
+        );
+        assert!(fx.service.get_story_entry("does_not_exist").is_err());
+        assert_eq!(
+            fx.service
+                .get_story_neighbors("does_not_exist")
+                .unwrap()
+                .next
+                .is_none(),
+            true
+        );
+    }
+
+    #[test]
+    fn roguelike_stories_join_catalog_and_groups() {
+        let fx = Fixture::new("rogue");
+        let catalog = fx.service.catalog().unwrap();
+
+        let rogue: Vec<&IndexedStory> = catalog
+            .stories
+            .iter()
+            .filter(|s| s.entry_type == "ROGUELIKE")
+            .collect();
+        assert_eq!(rogue.len(), 2, "both roguelike scripts must be indexable");
+        assert!(catalog.by_id.contains_key("Obt/Roguelike/ro2/ro2_1"));
+
+        let groups = fx.service.get_roguelike_stories_grouped().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, "RO2");
+        assert_eq!(groups[0].1[0].story_name, "孤钻·壹");
+    }
+
+    #[test]
+    fn memory_and_activity_groups_come_from_the_same_parse() {
+        let fx = Fixture::new("groups");
+
+        let main = fx.service.get_main_stories_grouped().unwrap();
+        assert_eq!(main.len(), 1);
+        assert_eq!(main[0].0, "黑暗时代");
+        assert_eq!(main[0].1.len(), 2);
+
+        // 大型活动同时出现在「活动」和「支线」两个入口。
+        assert_eq!(fx.service.get_activity_stories_grouped().unwrap().len(), 1);
+        assert_eq!(fx.service.get_sidestory_stories_grouped().unwrap().len(), 1);
+
+        let memory = fx.service.get_memory_stories().unwrap();
+        assert_eq!(memory.len(), 1);
+        assert_eq!(memory[0].story_id, "memory_amiya_1");
+
+        // 条目自身没有 storyPic 时，回填所在组的封面。
+        assert_eq!(main[0].1[0].story_pic.as_deref(), Some("chapter_cover_0"));
+    }
+
+    // ---- Index + search end to end ----------------------------------------
+
+    #[test]
+    fn index_search_covers_roguelike_not_and_segment_offsets() {
+        let fx = Fixture::new("search");
+        fx.service.rebuild_story_index().expect("index builds");
+
+        let page = fx.service.search_stories_ex("凯尔希").unwrap();
+        let ids: Vec<&str> = page.results.iter().map(|r| r.story_id.as_str()).collect();
+        assert!(ids.contains(&"main_00-01"), "got {:?}", ids);
+        assert!(
+            ids.contains(&"Obt/Roguelike/ro2/ro2_1"),
+            "roguelike must be searchable, got {:?}",
+            ids
+        );
+
+        // `-博士` may only drop the mainline story; the roguelike one never
+        // mentions 博士 and must survive.
+        let page = fx.service.search_stories_ex("凯尔希 -博士").unwrap();
+        let ids: Vec<&str> = page.results.iter().map(|r| r.story_id.as_str()).collect();
+        assert_eq!(ids, vec!["Obt/Roguelike/ro2/ro2_1"], "NOT semantics");
+
+        // Purely negative queries have no answer rather than "everything".
+        assert!(fx.service.search_stories_ex("-凯尔希").unwrap().results.is_empty());
+
+        // Two identical consecutive [Image] collapse into one, so the line
+        // after them is segment #1 — the index the reader scrolls to.
+        let segs = fx.service.search_segments("雪很大").unwrap();
+        assert_eq!(segs.hits.len(), 1);
+        assert_eq!(segs.hits[0].story_id, "act1_st01");
+        assert_eq!(segs.hits[0].segment_index, 1);
+        assert_eq!(segs.hits[0].character_name.as_deref(), Some("德克萨斯"));
+
+        // Title lookups surface even though no segment body carries them.
+        let segs = fx.service.search_segments("启程").unwrap();
+        assert!(segs.hits.iter().any(|h| h.story_id == "main_00-02"));
+
+        let status = fx.service.get_story_index_status().unwrap();
+        assert!(status.ready);
+        assert_eq!(status.total, 6);
+    }
+
+    #[test]
+    fn fallback_scan_matches_index_on_not_queries() {
+        let fx = Fixture::new("fallback");
+        // No index built: this exercises the linear scanner.
+        let results = fx.service.search_stories("凯尔希 -博士").unwrap();
+        let ids: Vec<&str> = results.iter().map(|r| r.story_id.as_str()).collect();
+        assert_eq!(ids, vec!["Obt/Roguelike/ro2/ro2_1"]);
+    }
+
+    // ---- Update checks -----------------------------------------------------
+
+    #[test]
+    fn check_update_never_nags_without_a_comparable_commit() {
+        let fx = Fixture::new("update");
+
+        for commit in ["unknown", "manual-1700000000", ""] {
+            fx.set_version(commit);
+            assert_eq!(
+                fx.service.check_update().unwrap(),
+                false,
+                "commit {:?} is not comparable, must not report an update",
+                commit
+            );
+        }
+
+        // 完全没有数据时才提示用户下载。
+        fs::remove_file(fx.service.data_dir.join(VERSION_FILE)).unwrap();
+        assert!(fx.service.check_update().unwrap());
+    }
+
+    // ---- ZIP install safety ------------------------------------------------
+
+    fn write_zip(path: &Path, entries: &[(&str, &str)]) {
+        let file = fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::FileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, body) in entries {
+            zip.start_file(*name, options).unwrap();
+            zip.write_all(body.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn extract_keeps_old_data_when_zip_lacks_review_table() {
+        let fx = Fixture::new("zip_bad");
+        let parent = fx.service.data_dir.parent().unwrap().to_path_buf();
+        let zip_path = parent.join("bad.zip");
+        write_zip(&zip_path, &[("pkg/README.md", "nothing useful here")]);
+
+        let err = fx
+            .service
+            .extract_zip_at(&zip_path, &parent, None)
+            .expect_err("a package without the review table must be rejected");
+        assert!(err.contains("ZIP 校验失败"), "{}", err);
+
+        assert!(
+            fx.service.is_installed(),
+            "the previous dataset must survive a rejected package"
+        );
+        assert_eq!(
+            fx.service.get_story_entry("main_00-01").unwrap().story_name,
+            "序章"
+        );
+        assert!(!parent.join("ArknightsGameData_extract").exists());
+    }
+
+    #[test]
+    fn extract_rejects_empty_review_table() {
+        let fx = Fixture::new("zip_empty");
+        let parent = fx.service.data_dir.parent().unwrap().to_path_buf();
+        let zip_path = parent.join("empty.zip");
+        write_zip(
+            &zip_path,
+            &[("pkg/zh_CN/gamedata/excel/story_review_table.json", "")],
+        );
+
+        assert!(fx.service.extract_zip_at(&zip_path, &parent, None).is_err());
+        assert!(fx.service.is_installed());
+    }
+
+    #[test]
+    fn extract_replaces_data_and_prunes_unused_dirs() {
+        let fx = Fixture::new("zip_ok");
+        let parent = fx.service.data_dir.parent().unwrap().to_path_buf();
+        let zip_path = parent.join("good.zip");
+        write_zip(
+            &zip_path,
+            &[
+                (
+                    "pkg/zh_CN/gamedata/excel/story_review_table.json",
+                    REVIEW_TABLE_JSON,
+                ),
+                ("pkg/zh_CN/gamedata/levels/obt/main/level.json", "{}"),
+                ("pkg/zh_CN/gamedata/battle/buff.json", "{}"),
+                ("pkg/zh_CN/gamedata/story/obt/main/level_main_00-01.txt", "文本"),
+            ],
+        );
+
+        // 旧目录里的东西必须被整体替换掉，而不是与新包混在一起。
+        Fixture::write_file(&fx.service.data_dir.join("stale.txt"), "old");
+
+        fx.service
+            .extract_zip_at(&zip_path, &parent, None)
+            .expect("a valid package installs");
+
+        assert!(fx.service.is_installed());
+        assert!(!fx.service.data_dir.join("stale.txt").exists());
+        assert!(!fx.service.data_dir.join("zh_CN/gamedata/levels").exists());
+        assert!(!fx.service.data_dir.join("zh_CN/gamedata/battle").exists());
+        assert!(fx
+            .service
+            .data_dir
+            .join("zh_CN/gamedata/story/obt/main/level_main_00-01.txt")
+            .exists());
+        assert!(!parent.join("ArknightsGameData_extract").exists());
+    }
+
+    #[test]
+    fn install_invalidates_the_cached_catalog() {
+        let fx = Fixture::new("zip_cache");
+        let dir = fx.service.data_dir.clone();
+        let before = catalog_build_count(&dir);
+        assert_eq!(fx.service.get_main_stories_grouped().unwrap().len(), 1);
+
+        let parent = fx.service.data_dir.parent().unwrap().to_path_buf();
+        let zip_path = parent.join("replacement.zip");
+        // 新包里只有活动，没有主线。
+        let review_without_mainline = r#"{
+          "act_1": {
+            "id": "act_1",
+            "name": "骑兵与猎人",
+            "entryType": "ACTIVITY",
+            "actType": "ACTIVITY_STORY",
+            "startTime": 200,
+            "infoUnlockDatas": [
+              {"storyId":"act1_st01","storyName":"雪原","storyGroup":"act_1","storySort":1,"storyTxt":"activities/act1/act1_st01","storyReviewType":"NORMAL","unLockType":"AUTO"}
+            ]
+          }
+        }"#;
+        write_zip(
+            &zip_path,
+            &[(
+                "pkg/zh_CN/gamedata/excel/story_review_table.json",
+                review_without_mainline,
+            )],
+        );
+
+        fx.service
+            .extract_zip_at(&zip_path, &parent, None)
+            .expect("install");
+
+        assert!(
+            fx.service.get_main_stories_grouped().unwrap().is_empty(),
+            "the catalog cached before the install must have been dropped"
+        );
+        assert!(catalog_build_count(&dir) > before);
     }
 }

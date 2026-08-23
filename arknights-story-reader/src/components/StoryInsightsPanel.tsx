@@ -6,6 +6,7 @@ import {
   SheetGroup,
   SheetSectionLabel,
 } from "@/components/ui/sheet-shell";
+import { CharacterAvatar } from "@/components/CharacterAvatar";
 import { useSidePanel } from "@/hooks/useSidePanel";
 import { safeConfirm } from "@/hooks/useAppUpdater";
 import { cn } from "@/lib/utils";
@@ -89,7 +90,7 @@ export function StoryInsightsPanel({
                       key={`toc-${h.index}`}
                       type="button"
                       className={cn(
-                        "w-full px-4 py-3 text-left text-sm transition-colors duration-150",
+                        "w-full min-h-[44px] px-4 py-3 text-left text-sm transition-colors duration-150",
                         "hover:bg-[hsl(var(--color-foreground)/0.04)] active:bg-[hsl(var(--color-foreground)/0.08)]",
                         "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[hsl(var(--color-ring))]"
                       )}
@@ -216,13 +217,14 @@ export function StoryInsightsPanel({
                           onCharacterSelect(character.name, character.firstIndex)
                         }
                         className={cn(
-                          "w-full flex items-center justify-between px-4 py-3 text-left transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[hsl(var(--color-ring))]",
+                          "w-full min-h-[44px] flex items-center gap-3 px-4 py-2.5 text-left transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[hsl(var(--color-ring))]",
                           active
                             ? "bg-[hsl(var(--color-primary)/0.12)] text-[hsl(var(--color-primary))]"
                             : "hover:bg-[hsl(var(--color-foreground)/0.04)] active:bg-[hsl(var(--color-foreground)/0.08)]"
                         )}
                       >
-                        <div className="font-medium truncate pr-2 text-sm">
+                        <CharacterAvatar name={character.name} size={28} />
+                        <div className="flex-1 min-w-0 font-medium truncate text-sm">
                           {character.name}
                         </div>
                         <div className="text-xs tabular-nums text-[hsl(var(--color-muted-foreground))] flex-shrink-0">
@@ -261,7 +263,7 @@ export function StoryInsightsPanel({
                       <Button
                         variant="glass"
                         size="sm"
-                        className="h-9 px-4 rounded-full text-xs"
+                        className="min-h-[44px] px-4 rounded-full text-xs"
                         onClick={() => onJumpToSegment(decision.index)}
                       >
                         前往

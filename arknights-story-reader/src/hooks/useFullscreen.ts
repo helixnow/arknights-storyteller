@@ -1,37 +1,62 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 const canAccessDom = typeof document !== "undefined";
 
+/** Safari（含 iPadOS）到现在仍然只认带 webkit 前缀的那套 API。 */
+interface WebkitFullscreenDocument extends Document {
+  webkitFullscreenElement?: Element | null;
+  webkitExitFullscreen?: () => Promise<void> | void;
+}
+
+interface WebkitFullscreenElement extends HTMLElement {
+  webkitRequestFullscreen?: () => Promise<void> | void;
+}
+
+function currentFullscreenElement(): Element | null {
+  if (!canAccessDom) return null;
+  const doc = document as WebkitFullscreenDocument;
+  return doc.fullscreenElement ?? doc.webkitFullscreenElement ?? null;
+}
+
 export function useFullscreen() {
-  const [isFullscreen, setIsFullscreen] = useState<boolean>(() => {
-    if (!canAccessDom) return false;
-    return Boolean(document.fullscreenElement);
-  });
+  const [isFullscreen, setIsFullscreen] = useState<boolean>(() =>
+    Boolean(currentFullscreenElement())
+  );
 
   useEffect(() => {
     if (!canAccessDom) return;
     const handleChange = () => {
-      setIsFullscreen(Boolean(document.fullscreenElement));
+      setIsFullscreen(Boolean(currentFullscreenElement()));
     };
+    // 订阅后立刻对一次账：注册前状态可能已经变了。
+    handleChange();
     document.addEventListener("fullscreenchange", handleChange);
-    return () => document.removeEventListener("fullscreenchange", handleChange);
+    document.addEventListener("webkitfullscreenchange", handleChange);
+    return () => {
+      document.removeEventListener("fullscreenchange", handleChange);
+      document.removeEventListener("webkitfullscreenchange", handleChange);
+    };
   }, []);
 
   const enter = useCallback(async (element?: HTMLElement) => {
     if (!canAccessDom) return;
-    const target = element ?? document.documentElement;
-    if (!target.requestFullscreen) return;
+    const target = (element ?? document.documentElement) as WebkitFullscreenElement;
+    const request = target.requestFullscreen ?? target.webkitRequestFullscreen;
+    if (!request) return;
     try {
-      await target.requestFullscreen();
+      await request.call(target);
     } catch {
-      // ignore
+      // 用户手势之外的调用会被拒绝，忽略即可。
     }
   }, []);
 
   const exit = useCallback(async () => {
-    if (!canAccessDom || !document.fullscreenElement || !document.exitFullscreen) return;
+    if (!canAccessDom || !currentFullscreenElement()) return;
+    const doc = document as WebkitFullscreenDocument;
+    const request = doc.exitFullscreen ?? doc.webkitExitFullscreen;
+    if (!request) return;
     try {
-      await document.exitFullscreen();
+      await request.call(doc);
     } catch {
       // ignore
     }
@@ -39,15 +64,17 @@ export function useFullscreen() {
 
   const toggle = useCallback(
     async (element?: HTMLElement) => {
-      if (isFullscreen) {
+      if (currentFullscreenElement()) {
         await exit();
       } else {
         await enter(element);
       }
     },
-    [enter, exit, isFullscreen]
+    [enter, exit]
   );
 
-  return { isFullscreen, enter, exit, toggle };
+  return useMemo(
+    () => ({ isFullscreen, enter, exit, toggle }),
+    [isFullscreen, enter, exit, toggle]
+  );
 }
-

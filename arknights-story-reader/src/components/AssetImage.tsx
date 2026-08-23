@@ -1,6 +1,12 @@
 import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { cn } from "@/lib/utils";
 import { useAsset } from "@/hooks/useAsset";
+import {
+  gradientFallbackBackground,
+  markAssetUrlAlive,
+  markAssetUrlDead,
+  pickLiveCandidate,
+} from "@/lib/assetUrls";
 import type { AssetKind } from "@/types/story";
 
 interface AssetImageProps {
@@ -32,9 +38,6 @@ interface AssetImageProps {
   fit?: "cover" | "contain" | "natural";
 }
 
-// Session 级失败缓存：同一 URL 本进程内失败过就不再尝试。
-const failedUrls = new Set<string>();
-
 /**
  * 统一的素材 `<img>` 封装。性能注意点：
  *
@@ -43,8 +46,9 @@ const failedUrls = new Set<string>();
  *    `loading="lazy"`，0 JS 成本。
  * 2. **不订阅全局 index**。index 在 provider 里一次性注入，之后 token
  *    稳定时本组件就不再重新渲染。
- * 3. **不每帧 filter**。`failedUrls` 只在 onError 时读写一次，候选链
- *    直接来自 `useAsset` 的 memo 化结果。
+ * 3. **不每帧 filter**。失败记录集中在 `@/lib/assetUrls`（与
+ *    `<StoryThumbnail>` 共用一份），只在 onLoad / onError 时读写一次，
+ *    候选链直接来自 `useAsset` 的 memo 化结果。
  */
 export function AssetImage({
   kind,
@@ -67,11 +71,6 @@ export function AssetImage({
   // 候选集合变了就重置。key 用字符串拼接而非数组引用比较，避免 memo
   // 失效时白白 setState。
   const candidatesKey = candidates.join("|");
-  const prevKeyRef = useRef(candidatesKey);
-  if (prevKeyRef.current !== candidatesKey) {
-    prevKeyRef.current = candidatesKey;
-    // skip state set in render — react batches next effect
-  }
 
   useEffect(() => {
     setCurrentIdx(0);
@@ -79,15 +78,9 @@ export function AssetImage({
     exhaustedFiredRef.current = false;
   }, [candidatesKey]);
 
-  // 过滤失败的 URL，但只在组件首次确定候选链时做一次；失败列表本身在
-  // onError 里 mutate，不触发 re-render。
-  const currentUrl = (() => {
-    for (let i = currentIdx; i < candidates.length; i += 1) {
-      const u = candidates[i];
-      if (!failedUrls.has(u)) return { url: u, idx: i };
-    }
-    return null;
-  })();
+  // `currentIdx` 只是游标下界；真正跳过哪些候选由共享的失败缓存 +
+  // host 熔断决定，这两者都在 onLoad / onError 里 mutate，不触发 re-render。
+  const currentUrl = pickLiveCandidate(candidates, currentIdx);
 
   const exhausted = candidates.length > 0 && currentUrl === null;
   const noneAvailable = candidates.length === 0;
@@ -128,16 +121,13 @@ export function AssetImage({
           referrerPolicy="no-referrer"
           draggable={false}
           onLoad={() => {
+            markAssetUrlAlive(currentUrl.url);
             setLoaded(true);
             onReady?.(currentUrl.url);
           }}
           onError={() => {
-            failedUrls.add(currentUrl.url);
-            if (currentUrl.idx + 1 < candidates.length) {
-              setCurrentIdx(currentUrl.idx + 1);
-            } else {
-              setCurrentIdx(candidates.length);
-            }
+            markAssetUrlDead(currentUrl.url);
+            setCurrentIdx(Math.min(currentUrl.index + 1, candidates.length));
           }}
           className={cn(
             "asset-image",
@@ -172,19 +162,6 @@ export function AssetImage({
  * `fallback` prop。
  */
 function GradientFallback({ seed }: { seed: string }) {
-  const hue = hashHue(seed || "ark");
-  const style: CSSProperties = {
-    background: `linear-gradient(135deg, hsl(${hue} 26% 46% / 0.32), hsl(${
-      (hue + 40) % 360
-    } 32% 36% / 0.28))`,
-  };
+  const style: CSSProperties = { background: gradientFallbackBackground(seed) };
   return <div style={style} className="h-full w-full" />;
-}
-
-function hashHue(input: string): number {
-  let h = 0;
-  for (let i = 0; i < input.length; i += 1) {
-    h = (h * 31 + input.charCodeAt(i)) >>> 0;
-  }
-  return h % 360;
 }

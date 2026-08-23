@@ -12,6 +12,12 @@
 //!
 //! 不走 PRTS MediaWiki API（异步往返成本过高），直接使用约定式 URL。
 //! 若将来需要 API 解析，可在此扩展 `resolve_prts(kind, token)`。
+//!
+//! **这个文件是 `src/lib/assetUrls.ts` 的镜像。** 前端为了省掉每张图一次
+//! IPC，把同一套规则用 JS 重写了一遍；两边任何一处改动都必须同步，否则
+//! 「Rust 说的候选」和「浏览器实际请求的候选」会各走各的。本文件末尾的
+//! 单测钉住了几个容易漂移的点：内置 `/bundled/` 前缀、精二立绘顺序、
+//! 活动 KV 的「原 token 优先」。
 
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +63,21 @@ const YUANYAN: &str = "https://raw.githubusercontent.com/yuanyan3060/ArknightsGa
 const FEXLI: &str = "https://raw.githubusercontent.com/fexli/ArknightsResource/main";
 const PUPPIIZ: &str = "https://raw.githubusercontent.com/PuppiizSunniiz/Arknight-Images/main";
 
+/// 已知 NPC 头像覆盖表。这些角色不在 character_table 里（非干员），但在
+/// 剧情中频繁出现。图片随前端一起打包在 `public/avatars/npc/`。
+/// key = 中文名，与剧情脚本 `[name="..."]` 及 assetUrls.ts 保持一致。
+const NPC_AVATAR_OVERRIDES: &[(&str, &str)] = &[
+    ("普瑞赛斯", "/avatars/npc/priestess.png"),
+    ("希尔达", "/avatars/npc/hierda.png"),
+];
+
+fn npc_override(token: &str) -> Option<&'static str> {
+    NPC_AVATAR_OVERRIDES
+        .iter()
+        .find(|(name, _)| *name == token)
+        .map(|(_, url)| *url)
+}
+
 fn resolve_char_id(token: &str) -> Option<String> {
     if token.starts_with("char_") {
         // Strip skin suffix `#N`
@@ -67,6 +88,9 @@ fn resolve_char_id(token: &str) -> Option<String> {
 }
 
 fn avatar_candidates(token: &str) -> Vec<String> {
+    if let Some(url) = npc_override(token) {
+        return vec![url.to_string()];
+    }
     let mut out = Vec::new();
     if let Some(cid) = resolve_char_id(token) {
         // 打包进 public/bundled/avatar/ 的内置头像，零网络开销，优先命中。
@@ -82,6 +106,10 @@ fn avatar_candidates(token: &str) -> Vec<String> {
 }
 
 fn portrait_candidates(token: &str) -> Vec<String> {
+    // NPC 没有 char_ ID，也就没有精二/精一立绘，只能复用覆盖表里那张图。
+    if let Some(url) = npc_override(token) {
+        return vec![url.to_string()];
+    }
     let mut out = Vec::new();
     if let Some(cid) = resolve_char_id(token) {
         // 精二立绘（`_2`）优先，缺素材时才回落到精一（`_1`）。
@@ -116,16 +144,33 @@ fn background_candidates(token: &str) -> Vec<String> {
     ]
 }
 
+/// 去掉图片扩展名。与 assetUrls.ts 的 `/\.(png|jpg|jpeg|webp)$/i` 对齐：
+/// 只削最后一层、大小写不敏感，不像 `trim_end_matches` 那样反复削。
+fn strip_image_ext(token: &str) -> &str {
+    for ext in [".png", ".jpg", ".jpeg", ".webp"] {
+        if token.len() > ext.len() {
+            let (head, tail) = token.split_at(token.len() - ext.len());
+            if tail.eq_ignore_ascii_case(ext) {
+                return head;
+            }
+        }
+    }
+    token
+}
+
 /// 从活动 id 里猜 KV 素材名的核心部分：`act17side` → `side` 之类。
-/// 猜错（削成空串）时返回 None，调用方只用原始 token。
+/// 猜错（削成空串，或压根没削掉东西）时返回 None，调用方只用原始 token。
+///
+/// 每个后缀只削一次——`trim_end_matches` 会把 `sideside` 一路削光，
+/// assetUrls.ts 那边用的是单次 `slice`，这里必须一致。
 fn strip_act_prefix(token: &str) -> Option<String> {
     let core = token
         .strip_prefix("act_")
         .or_else(|| token.strip_prefix("act"))
         .unwrap_or(token);
     let core = core.trim_start_matches(|c: char| c.is_ascii_digit());
-    let core = core.trim_end_matches("side");
-    let core = core.trim_end_matches("mini");
+    let core = core.strip_suffix("side").unwrap_or(core);
+    let core = core.strip_suffix("mini").unwrap_or(core);
     if core.is_empty() || core == token {
         None
     } else {
@@ -137,7 +182,7 @@ fn activity_kv_candidates(token: &str) -> Vec<String> {
     // token 可能已经是 story_review_table 给的图片名（`storyPic` /
     // `storyEntryPicId`，形如 `act17side_entrypic`），这种情况下再去剥
     // `act` 前缀只会把它削坏，所以原始 token 永远排在候选表最前面。
-    let base = token.trim_end_matches(".png").trim_end_matches(".jpg");
+    let base = strip_image_ext(token);
     let mut out = vec![
         format!("{}/kvimg/{}.png", FEXLI, base),
         format!("{}/kvimg/default_kv_{}.png", FEXLI, base),
@@ -153,7 +198,7 @@ fn activity_kv_candidates(token: &str) -> Vec<String> {
 }
 
 fn activity_logo_candidates(token: &str) -> Vec<String> {
-    let base = token.trim_end_matches(".png").trim_end_matches(".jpg");
+    let base = strip_image_ext(token);
     let mut out = vec![
         format!("{}/kvimg/brand_{}.png", FEXLI, base),
         format!("{}/camplogo/logo_{}.png", FEXLI, base),
@@ -168,7 +213,7 @@ fn activity_logo_candidates(token: &str) -> Vec<String> {
 fn chapter_cover_candidates(token: &str) -> Vec<String> {
     // 主线章节 token 多为 `main_8`，对应封面 `main_08-01`、背景 `bg_main_8`
     // 或剧情插画 `8_i01`。
-    let raw = token.trim_start_matches("main_").trim();
+    let raw = token.strip_prefix("main_").unwrap_or(token).trim();
     let padded = if raw.chars().all(|c| c.is_ascii_digit()) && !raw.is_empty() {
         format!("{:0>2}", raw)
     } else {
@@ -187,4 +232,58 @@ fn chapter_cover_candidates(token: &str) -> Vec<String> {
 fn dedup(urls: Vec<String>) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     urls.into_iter().filter(|u| seen.insert(u.clone())).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundled_assets_come_first() {
+        // 内置素材零网络开销，必须排在任何远端源前面；前缀也得跟前端
+        // `public/` 下的实际布局一致。
+        let avatars = avatar_candidates("char_002_amiya");
+        assert_eq!(avatars[0], "/bundled/avatar/char_002_amiya.png");
+
+        let covers = chapter_cover_candidates("main_8");
+        assert_eq!(covers[0], "/bundled/mapreview/main_08-01.png");
+        assert!(covers[1].ends_with("/mapreview/main_08-01.png"));
+    }
+
+    #[test]
+    fn portrait_prefers_elite_two() {
+        let out = portrait_candidates("char_002_amiya");
+        let first_e2 = out.iter().position(|u| u.contains("_2.png")).unwrap();
+        let first_e1 = out.iter().position(|u| u.contains("_1.png")).unwrap();
+        assert!(first_e2 < first_e1, "精二立绘必须排在精一之前: {out:?}");
+    }
+
+    #[test]
+    fn npc_overrides_bypass_char_table() {
+        assert_eq!(avatar_candidates("普瑞赛斯"), vec!["/avatars/npc/priestess.png"]);
+        assert_eq!(portrait_candidates("希尔达"), vec!["/avatars/npc/hierda.png"]);
+    }
+
+    #[test]
+    fn activity_kv_keeps_raw_token_first() {
+        // `storyEntryPicId` 这类 token 已经是成品图片名，剥 `act` 前缀只会
+        // 把它削坏，所以原始 token 永远排第一。
+        let out = activity_kv_candidates("act17side_entrypic");
+        assert_eq!(out[0], format!("{FEXLI}/kvimg/act17side_entrypic.png"));
+
+        // 扩展名只削一层、大小写不敏感。
+        let out = activity_kv_candidates("act17side_entrypic.PNG");
+        assert_eq!(out[0], format!("{FEXLI}/kvimg/act17side_entrypic.png"));
+    }
+
+    #[test]
+    fn strip_act_prefix_declines_when_it_would_empty_the_token() {
+        // 削空 → 只能用原 token。
+        assert_eq!(strip_act_prefix("act17side"), None);
+        assert_eq!(strip_act_prefix("act"), None);
+        // 什么都没削掉 → 也不值得再多发一轮请求。
+        assert_eq!(strip_act_prefix("entrypic"), None);
+        // 每个后缀只削一次，不能像 trim_end_matches 那样一路削光。
+        assert_eq!(strip_act_prefix("act1sideside").as_deref(), Some("side"));
+    }
 }

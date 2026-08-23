@@ -1,3 +1,4 @@
+import { memo, useCallback, useId } from "react";
 import { Button } from "@/components/ui/button";
 import { CustomScrollArea } from "@/components/ui/custom-scroll-area";
 import {
@@ -8,7 +9,7 @@ import {
 } from "@/components/ui/sheet-shell";
 import { FONT_FAMILIES, ReaderSettings as Settings } from "@/hooks/useReaderSettings";
 import { useSidePanel } from "@/hooks/useSidePanel";
-import { RotateCcw, X } from "lucide-react";
+import { Minus, Plus, RotateCcw, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const READING_MODES: Array<{ value: Settings["readingMode"]; label: string; description: string }> =
@@ -65,7 +66,11 @@ function pickerChipClass(active: boolean, extra?: string) {
   );
 }
 
-export function ReaderSettingsPanel({
+/**
+ * 记忆化：面板挂在阅读器里，阅读器每滚动一次就会重渲染一轮；设置项没变时
+ * 没有理由跟着重画整块玻璃面板。
+ */
+export const ReaderSettingsPanel = memo(function ReaderSettingsPanel({
   open,
   settings,
   onClose,
@@ -310,7 +315,7 @@ export function ReaderSettingsPanel({
       </CustomScrollArea>
     </SheetShell>
   );
-}
+});
 
 interface SliderRowProps {
   label: string;
@@ -324,7 +329,13 @@ interface SliderRowProps {
   maxLabel?: string;
 }
 
-function SliderRow({
+/** 浮点步进后修掉 0.30000000000000004 这类误差，否则显示值会抖。 */
+function quantize(value: number, step: number) {
+  const decimals = (String(step).split(".")[1] ?? "").length;
+  return Number(value.toFixed(decimals));
+}
+
+const SliderRow = memo(function SliderRow({
   label,
   display,
   min,
@@ -335,23 +346,62 @@ function SliderRow({
   minLabel,
   maxLabel,
 }: SliderRowProps) {
+  const inputId = useId();
+
+  const commit = useCallback(
+    (next: number) => {
+      if (!Number.isFinite(next)) return;
+      onChange(quantize(Math.min(max, Math.max(min, next)), step));
+    },
+    [onChange, min, max, step]
+  );
+
   return (
     <div className="space-y-2">
-      <div className="flex items-center justify-between">
-        <label className="text-sm font-medium">{label}</label>
-        <span className="text-sm tabular-nums text-[hsl(var(--color-muted-foreground))]">
-          {display}
-        </span>
+      <div className="flex items-center justify-between gap-2">
+        <label htmlFor={inputId} className="text-sm font-medium">
+          {label}
+        </label>
+        {/* 滑杆在手机上很难微调，配一对 44px 的步进按钮兜底。 */}
+        <div className="flex items-center gap-1">
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            onClick={() => commit(value - step)}
+            disabled={value <= min}
+            aria-label={`调小${label}`}
+          >
+            <Minus className="h-4 w-4" />
+          </Button>
+          <span className="min-w-[3.75rem] text-center text-sm tabular-nums text-[hsl(var(--color-muted-foreground))]">
+            {display}
+          </span>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            onClick={() => commit(value + step)}
+            disabled={value >= max}
+            aria-label={`调大${label}`}
+          >
+            <Plus className="h-4 w-4" />
+          </Button>
+        </div>
       </div>
       <input
+        id={inputId}
         type="range"
         min={min}
         max={max}
         step={step}
         value={value}
-        onChange={(e) => onChange(parseFloat(e.target.value))}
+        onChange={(event) => commit(parseFloat(event.target.value))}
         className="w-full"
-        aria-label={label}
+        // 全局样式把 range 定死在 24px 高，手指很难压准；用行内样式撑到 44px，
+        // 轨道与滑块本身仍由浏览器在元素内垂直居中。
+        style={{ height: "2.75rem" }}
+        aria-valuetext={display}
       />
       {(minLabel || maxLabel) && (
         <div className="flex justify-between text-xs text-[hsl(var(--color-muted-foreground))]">
@@ -361,4 +411,4 @@ function SliderRow({
       )}
     </div>
   );
-}
+});

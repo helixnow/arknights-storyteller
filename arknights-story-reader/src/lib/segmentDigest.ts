@@ -19,17 +19,33 @@ export function normalizeForDigest(input: string): string {
     .replace(/[\p{P}\p{S}\s]+/gu, "");
 }
 
+// FNV-1a 64 bit constants
+const FNV_OFFSET = 0xcbf29ce484222325n;
+const FNV_PRIME = 0x100000001b3n;
+const MASK = 0xffffffffffffffffn;
+
+/**
+ * 复用同一个 encoder。一篇长剧情要算上千次摘要，每次都 `new TextEncoder()`
+ * 是纯粹的分配开销。
+ */
+const encoder = typeof TextEncoder !== "undefined" ? new TextEncoder() : null;
+
 /** 64-bit FNV-1a 哈希。返回 `bigint`，便于使用统一的十六进制输出。 */
 export function fnv1a64(text: string): bigint {
-  // FNV-1a 64 bit constants
-  const FNV_OFFSET = 0xcbf29ce484222325n;
-  const FNV_PRIME = 0x100000001b3n;
-  const MASK = 0xffffffffffffffffn;
   let hash = FNV_OFFSET;
   // 用 TextEncoder 确保同一字符串在任何环境下产出相同字节。
-  const bytes = new TextEncoder().encode(text);
-  for (let i = 0; i < bytes.length; i += 1) {
-    hash ^= BigInt(bytes[i]);
+  const bytes = encoder ? encoder.encode(text) : null;
+  if (bytes) {
+    for (let i = 0; i < bytes.length; i += 1) {
+      hash ^= BigInt(bytes[i]);
+      hash = (hash * FNV_PRIME) & MASK;
+    }
+    return hash;
+  }
+  // 没有 TextEncoder 的环境（老 WebView）退化成按 UTF-16 码元计算：
+  // 结果与上面不同，但同一环境内保持自洽，摘要只用于本机对齐。
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= BigInt(text.charCodeAt(i) & 0xff);
     hash = (hash * FNV_PRIME) & MASK;
   }
   return hash;
@@ -40,7 +56,22 @@ export function digestToHex64(value: bigint): string {
   return value.toString(16).padStart(16, "0");
 }
 
+/**
+ * 摘要缓存。同一篇剧情在阅读器里会反复卸载/重挂（返回列表再进来、换阅读
+ * 模式），缓存能把整篇的重复计算省掉；按插入顺序淘汰，避免无限增长。
+ */
+const DIGEST_CACHE_LIMIT = 4096;
+const digestCache = new Map<string, string>();
+
 /** 便捷封装：对文本做规范化 + 计算摘要 + 十六进制输出。 */
 export function segmentDigest(text: string): string {
-  return digestToHex64(fnv1a64(normalizeForDigest(text)));
+  const cached = digestCache.get(text);
+  if (cached !== undefined) return cached;
+  const digest = digestToHex64(fnv1a64(normalizeForDigest(text)));
+  if (digestCache.size >= DIGEST_CACHE_LIMIT) {
+    const oldest = digestCache.keys().next();
+    if (!oldest.done) digestCache.delete(oldest.value);
+  }
+  digestCache.set(text, digest);
+  return digest;
 }

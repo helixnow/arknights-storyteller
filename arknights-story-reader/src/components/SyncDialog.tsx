@@ -1,4 +1,4 @@
-import { ChangeEvent, useEffect, useRef } from "react";
+import { ChangeEvent, useCallback, useEffect, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { AlertCircle, CheckCircle, Download, Loader2, Upload } from "lucide-react";
@@ -15,6 +15,7 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
   const {
     syncing,
     importing,
+    busy,
     progress,
     error,
     setError,
@@ -33,22 +34,55 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
     }
   }, [open, resetProgress, setError]);
 
+  const handleClose = useCallback(() => {
+    if (busy) return;
+    resetProgress();
+    setError(null);
+    onClose();
+  }, [busy, onClose, resetProgress, setError]);
+
+  // 同步/导入期间不允许 Esc 关闭，避免用户以为任务被取消了。
+  useEffect(() => {
+    if (!open) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") handleClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [open, handleClose]);
+
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const handleFileSelected = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     event.target.value = "";
     if (!file) return;
+    // 选完再确认：先弹确认框会丢掉用户手势，部分 WebView 就打不开文件选择器了。
+    const confirmed = await safeConfirm(
+      `导入 ${file.name} 会覆盖本机已有的剧情数据，确定继续？`,
+      { title: "导入 ZIP", kind: "warning" }
+    );
+    if (!confirmed) return;
     await importFromFile(file);
   };
 
   if (!open) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-300">
-      <Card className="w-full max-w-md mx-4 motion-safe:animate-in motion-safe:zoom-in-95 motion-safe:duration-300">
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-300"
+      onClick={handleClose}
+    >
+      <Card
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="sync-dialog-title"
+        aria-busy={busy}
+        className="w-full max-w-md mx-4 motion-safe:animate-in motion-safe:zoom-in-95 motion-safe:duration-300"
+        onClick={(event) => event.stopPropagation()}
+      >
         <CardHeader>
-          <CardTitle className="flex items-center gap-2">
+          <CardTitle id="sync-dialog-title" className="flex items-center gap-2">
             <Download className="h-5 w-5" />
             数据同步
           </CardTitle>
@@ -84,8 +118,8 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
             )}
           </div>
 
-          {(progress || syncing || importing) && (
-            <div className="space-y-2">
+          {(progress || busy) && (
+            <div className="space-y-2" aria-live="polite">
               {progress ? (
                 <>
                   <div className="flex justify-between text-sm">
@@ -124,26 +158,24 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
           )}
 
           {error && (
-            <div className="p-3 bg-[hsl(var(--color-destructive)/0.1)] border border-[hsl(var(--color-destructive))] rounded-md">
-              <p className="text-sm text-[hsl(var(--color-destructive))]">{error}</p>
+            <div
+              role="alert"
+              className="flex items-start justify-between gap-3 p-3 bg-[hsl(var(--color-destructive)/0.1)] border border-[hsl(var(--color-destructive))] rounded-md"
+            >
+              <p className="text-sm text-[hsl(var(--color-destructive))] break-words">{error}</p>
+              <Button variant="ghost" size="sm" className="flex-shrink-0" onClick={() => setError(null)}>
+                知道了
+              </Button>
             </div>
           )}
 
           <div className="flex gap-2">
-            <Button
-              variant="outline"
-              onClick={() => {
-                resetProgress();
-                setError(null);
-                onClose();
-              }}
-              disabled={syncing || importing}
-              className="flex-1"
-            >
+            <Button variant="outline" onClick={handleClose} disabled={busy} className="flex-1 min-h-[44px]">
               关闭
             </Button>
             <Button
               onClick={async () => {
+                if (busy) return;
                 if (status === "up-to-date") {
                   const ok = await safeConfirm(
                     "当前已是最新。再次同步会重新下载并覆盖本机数据，确定继续？",
@@ -153,7 +185,7 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
                 }
                 void handleSync();
               }}
-              disabled={syncing || importing}
+              disabled={busy}
               className="flex-1 min-h-[44px]"
             >
               {syncing ? (
@@ -170,8 +202,8 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
             <Button
               variant="outline"
               onClick={() => fileInputRef.current?.click()}
-              disabled={syncing || importing}
-              className="flex-1"
+              disabled={busy}
+              className="flex-1 min-h-[44px]"
             >
               {importing ? (
                 <span className="inline-flex items-center gap-2">

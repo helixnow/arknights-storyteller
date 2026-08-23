@@ -1,10 +1,10 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 import { ThemeProvider } from "@/components/theme-provider";
 import { StoryList } from "@/components/StoryList";
 import { StoryReader } from "@/components/StoryReader";
 import { SearchPanel } from "@/components/SearchPanel";
 import { Settings } from "@/components/Settings";
-import { BottomNav, tabPanelId } from "@/components/BottomNav";
+import { BottomNav, tabButtonId, tabPanelId } from "@/components/BottomNav";
 import { HomePanel } from "@/components/HomePanel";
 import type { StoryEntry } from "@/types/story";
 import { FavoritesProvider } from "@/hooks/useFavorites";
@@ -161,6 +161,18 @@ function App() {
   );
   const settingsView = useMemo(() => <Settings />, []);
 
+  const charactersActive = !readerActive && activeTab === "characters";
+  const charactersView = useMemo(
+    () => (
+      <CharactersPanel
+        active={charactersActive}
+        onOpenStory={handleOpenStoryWithCharacter}
+        onOpenStoryJump={handleOpenStoryJump}
+      />
+    ),
+    [charactersActive, handleOpenStoryJump, handleOpenStoryWithCharacter]
+  );
+
   const readerView = readerStory ? (
     <StoryReader
       key={readerStory.storyId}
@@ -187,53 +199,35 @@ function App() {
     />
   ) : null;
 
+  // 面板全部常驻挂载（KeepAlive 只切可见性，保住滚动位置），所以
+  // tabpanel 要一直存在并指回底部导航里对应的 tab 按钮。
+  const panels: Array<{ tab: Tab; content: ReactNode }> = [
+    { tab: "home", content: homeView },
+    { tab: "stories", content: storyListView },
+    { tab: "characters", content: charactersView },
+    { tab: "search", content: searchView },
+    { tab: "settings", content: settingsView },
+  ];
+
   const appContent = (
     <div className="h-full flex flex-col overflow-hidden pt-[max(env(safe-area-inset-top,0px),12px)]">
       <div className="relative flex-1 overflow-hidden">
-        <KeepAlive
-          active={!readerActive && activeTab === "home"}
-          className="absolute inset-0"
-        >
-          <div id={tabPanelId("home")} role="tabpanel" className="h-full">
-            {homeView}
-          </div>
-        </KeepAlive>
-        <KeepAlive
-          active={!readerActive && activeTab === "stories"}
-          className="absolute inset-0"
-        >
-          <div id={tabPanelId("stories")} role="tabpanel" className="h-full">
-            {storyListView}
-          </div>
-        </KeepAlive>
-        <KeepAlive
-          active={!readerActive && activeTab === "characters"}
-          className="absolute inset-0"
-        >
-          <div id={tabPanelId("characters")} role="tabpanel" className="h-full">
-            <CharactersPanel
-              active={!readerActive && activeTab === "characters"}
-              onOpenStory={handleOpenStoryWithCharacter}
-              onOpenStoryJump={(story, jump) => handleOpenStoryJump(story, jump)}
-            />
-          </div>
-        </KeepAlive>
-        <KeepAlive
-          active={!readerActive && activeTab === "search"}
-          className="absolute inset-0"
-        >
-          <div id={tabPanelId("search")} role="tabpanel" className="h-full">
-            {searchView}
-          </div>
-        </KeepAlive>
-        <KeepAlive
-          active={!readerActive && activeTab === "settings"}
-          className="absolute inset-0"
-        >
-          <div id={tabPanelId("settings")} role="tabpanel" className="h-full">
-            {settingsView}
-          </div>
-        </KeepAlive>
+        {panels.map(({ tab, content }) => (
+          <KeepAlive
+            key={tab}
+            active={!readerActive && activeTab === tab}
+            className="absolute inset-0"
+          >
+            <div
+              id={tabPanelId(tab)}
+              role="tabpanel"
+              aria-labelledby={tabButtonId(tab)}
+              className="h-full"
+            >
+              {content}
+            </div>
+          </KeepAlive>
+        ))}
         {readerStory && (
           <KeepAlive active={readerActive} className="absolute inset-0">
             {readerView}

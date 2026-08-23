@@ -39,11 +39,39 @@ interface CharacterQuote {
 
 type GroupCategory = "main" | "activity" | "memory" | "other";
 
+// 统计阶段的剧情读取并发。
+const STATS_POOL_SIZE = 6;
+// 进度条刷新粒度：每 N 篇才 setState 一次，避免几千次无意义 re-render。
+const PROGRESS_STEP = 8;
+
+// ── 金句抓取 ───────────────────────────────────────────────
+// 博士/凯尔希这类角色的 perStory 有上千条，绝不能 Promise.all 全量拉。
+// 只取发言最多的若干篇（金句密度最高），并且限制并发。
+const QUOTE_STORY_LIMIT = 36;
+const QUOTE_FETCH_CONCURRENCY = 5;
+/** 候选池上限；UI 每次从池里随机抽 5 条。 */
+const QUOTE_POOL_SIZE = 80;
+/** 收集到这么多条就提前收工，后面的剧情不再拉。 */
+const QUOTE_HARD_CAP = 400;
+const QUOTE_MIN_LEN = 10;
+const QUOTE_MAX_LEN = 160;
+const QUOTE_DISPLAY_COUNT = 5;
+
 interface GroupInfo {
   category: GroupCategory;
   groupName: string;
   groupOrder: number; // 用于排序章节/活动顺序
   storyOrder: number; // 用于组内排序（同主页）
+}
+
+/** Fisher–Yates 洗牌后取前 n 条，不改动传入数组。 */
+function pickRandomQuotes(pool: CharacterQuote[], n: number): CharacterQuote[] {
+  const shuffled = [...pool];
+  for (let i = shuffled.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  return shuffled.slice(0, n);
 }
 
 function countCharactersInStory(content: ParsedStoryContent): Map<string, number> {
@@ -65,10 +93,14 @@ export function CharactersPanel({
   const [loading, setLoading] = useState(true);
   const [progress, setProgress] = useState({ current: 0, total: 0 });
   const [error, setError] = useState<string | null>(null);
+  const [notInstalled, setNotInstalled] = useState(false);
   const [aggregates, setAggregates] = useState<Map<string, CharacterAggregate>>(new Map());
   const [selected, setSelected] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const loadingRef = useRef(false);
+  const activeRef = useRef(active);
+  const loadedOnceRef = useRef(false);
+  const staleRef = useRef(false);
   const [groupInfoByStoryId, setGroupInfoByStoryId] = useState<Map<string, GroupInfo>>(new Map());
   const [groupSearch, setGroupSearch] = useState<Record<string, string>>({});
   const [cacheUsed, setCacheUsed] = useState(false);
@@ -77,7 +109,8 @@ export function CharactersPanel({
   const [quotes, setQuotes] = useState<CharacterQuote[]>([]);
   const [quoteCandidates, setQuoteCandidates] = useState<CharacterQuote[]>([]);
   const [loadingQuotes, setLoadingQuotes] = useState(false);
-  const [quoteShuffleSeed, setQuoteShuffleSeed] = useState(0);
+  /** 当前 quotes 属于哪位角色；和 selected 不一致就说明还没抓完。 */
+  const [quotesFor, setQuotesFor] = useState<string | null>(null);
   const quotesRunRef = useRef(0);
 
   const CACHE_PREFIX = "arknights-characters-cache";
@@ -95,6 +128,18 @@ export function CharactersPanel({
     setLoading(true);
     setError(null);
     try {
+      // 数据没同步时后端每个命令都会抛错，先问一次省掉一串失败请求。
+      const installed = await api.isInstalled();
+      if (!installed) {
+        setNotInstalled(true);
+        setAggregates(new Map());
+        setProgress({ current: 0, total: 0 });
+        // 不算"已加载"：同步完数据切回来要能自动重试。
+        loadedOnceRef.current = false;
+        return;
+      }
+      setNotInstalled(false);
+
       const ver = await api.getCurrentVersion();
       setVersion(ver);
 
@@ -201,9 +246,11 @@ export function CharactersPanel({
             setCacheUsed(true);
             setCacheBuiltAt(parsed.builtAt);
           }
-        } catch (e) {
-          // ignore cache parsing errors
-          console.warn("[CharactersPanel] 缓存读取失败，将重新构建", e);
+        } catch {
+          // 缓存损坏就丢掉重建，不用打扰用户。
+          try {
+            localStorage.removeItem(getCacheKey(ver));
+          } catch {}
         }
       }
 
@@ -214,10 +261,9 @@ export function CharactersPanel({
         // Concurrency pool: process N stories in parallel so first-start on
         // slow devices doesn't take minutes. Each story's aggregation still
         // runs on a single thread — we just overlap I/O and parse work.
-        const POOL_SIZE = 6;
         let cursor = 0;
         let done = 0;
-        const aggLock = { busy: false };
+        let failed = 0;
         const applyCounts = (story: StoryEntry, counts: Map<string, number>) => {
           counts.forEach((count, name) => {
             const existing = aggMap.get(name);
@@ -240,25 +286,24 @@ export function CharactersPanel({
             const story = stories[i];
             try {
               const content = await api.getStoryContent(story.storyTxt);
-              const localCounts = countCharactersInStory(content);
-              // Simple spin-lock via async boolean — aggregation is cheap.
-              while (aggLock.busy) {
-                await new Promise((r) => setTimeout(r, 0));
-              }
-              aggLock.busy = true;
-              applyCounts(story, localCounts);
-              aggLock.busy = false;
-            } catch (e) {
-              console.warn("[CharactersPanel] 读取剧情失败:", story.storyName, e);
+              // JS 单线程，applyCounts 是同步的，不需要任何锁。
+              applyCounts(story, countCharactersInStory(content));
+            } catch {
+              failed += 1;
             } finally {
               done += 1;
-              setProgress({ current: done, total: stories.length });
+              if (done % PROGRESS_STEP === 0 || done === stories.length) {
+                setProgress({ current: done, total: stories.length });
+              }
             }
           }
         };
         await Promise.all(
-          Array.from({ length: Math.min(POOL_SIZE, stories.length) }, () => worker())
+          Array.from({ length: Math.min(STATS_POOL_SIZE, stories.length) }, () => worker())
         );
+        if (failed > 0) {
+          console.warn(`[CharactersPanel] ${failed}/${stories.length} 篇剧情读取失败，已跳过`);
+        }
       }
 
       // 整理每个角色的 perStory 排序（默认先按章节内排序）
@@ -293,33 +338,46 @@ export function CharactersPanel({
             JSON.stringify({ builtAt, data: plain })
           );
           setCacheBuiltAt(builtAt);
-        } catch (e) {
-          console.warn("[CharactersPanel] 写入缓存失败", e);
+        } catch {
+          // localStorage 写满或被禁用：统计仍然可用，只是下次要重算。
         }
       }
+
+      loadedOnceRef.current = true;
     } catch (err) {
       const raw = err instanceof Error ? err.message : String(err);
-      setError(
-        /NOT_INSTALLED|未安装/i.test(raw)
-          ? "尚未同步剧情数据。请先到设置页下载或导入 ArknightsGameData。"
-          : raw || "加载失败"
-      );
+      loadedOnceRef.current = false;
+      if (/NOT_INSTALLED|未安装/i.test(raw)) {
+        setNotInstalled(true);
+      } else {
+        setError(raw || "加载失败");
+      }
     } finally {
       setLoading(false);
       loadingRef.current = false;
     }
   }, [getCacheKey]);
 
+  // 只在面板首次可见时统计；之后除非数据变了，切回来不重跑。
   useEffect(() => {
+    activeRef.current = active;
     if (!active) return;
-    loadAll();
+    if (loadedOnceRef.current && !staleRef.current) return;
+    const force = staleRef.current;
+    staleRef.current = false;
+    void loadAll(force ? { forceRefresh: true } : undefined);
   }, [active, loadAll]);
 
   useEffect(() => {
     const handler = () => {
-      loadAll({ forceRefresh: true }).catch((error) =>
-        console.warn("[CharactersPanel] 刷新统计失败", error)
-      );
+      // 面板不可见时只打个标记，等用户切回来再重算——后台重扫几千篇
+      // 剧情会把正在阅读的页面拖卡。
+      if (!activeRef.current) {
+        staleRef.current = true;
+        loadedOnceRef.current = false;
+        return;
+      }
+      void loadAll({ forceRefresh: true });
     };
     window.addEventListener("app:refresh-character-stats", handler);
     window.addEventListener("app:data-updated", handler);
@@ -368,6 +426,7 @@ export function CharactersPanel({
       quotesRunRef.current += 1;
       setQuotes([]);
       setQuoteCandidates([]);
+      setQuotesFor(null);
       setLoadingQuotes(false);
       return;
     }
@@ -375,61 +434,74 @@ export function CharactersPanel({
     setLoadingQuotes(true);
     setQuotes([]);
     setQuoteCandidates([]);
+    setQuotesFor(null);
 
-    const perStory = selectedAgg.perStory;
-    Promise.all(
-      perStory.map(async ({ story }) => {
+    // 博士这类角色能有上千篇 perStory。只挑发言最多的几十篇，再用固定
+    // 并发去读——既够凑满候选池，又不会一次性打爆 IPC 队列。
+    const targets = [...selectedAgg.perStory]
+      .sort((a, b) => b.count - a.count)
+      .slice(0, QUOTE_STORY_LIMIT);
+
+    const collected: CharacterQuote[] = [];
+    const seenText = new Set<string>();
+    let cursor = 0;
+    let cancelled = false;
+
+    const worker = async () => {
+      while (!cancelled && runId === quotesRunRef.current) {
+        if (collected.length >= QUOTE_HARD_CAP) return;
+        const i = cursor++;
+        if (i >= targets.length) return;
+        const { story } = targets[i];
         try {
           const content = await api.getStoryContent(story.storyTxt);
-          const hits: CharacterQuote[] = [];
+          // 必须走 postProcessSegments：阅读器渲染的就是这份下标，
+          // 否则点金句跳过去会错位。
           postProcessSegments(content.segments).forEach((seg, segmentIndex) => {
-            if (seg.type === "dialogue" && seg.characterName === selected) {
-              const text = seg.text.trim();
-              if (text.length >= 10 && text.length <= 160) {
-                hits.push({ text, storyName: story.storyName, story, segmentIndex });
-              }
-            }
+            if (seg.type !== "dialogue" || seg.characterName !== selected) return;
+            const text = seg.text.trim();
+            if (text.length < QUOTE_MIN_LEN || text.length > QUOTE_MAX_LEN) return;
+            if (seenText.has(text)) return;
+            seenText.add(text);
+            collected.push({ text, storyName: story.storyName, story, segmentIndex });
           });
-          return hits;
         } catch {
-          return [] as CharacterQuote[];
+          // 单篇读不到就跳过，不影响其他金句。
         }
-      })
-    )
-      .then((all) => {
-        if (runId !== quotesRunRef.current) return;
-        const flat = all.flat();
-        // 依长度降序取较大的候选池（最多 60 条），再在 UI 层随机抽 5 条
-        flat.sort((a, b) => b.text.length - a.text.length);
-        const pool = flat.slice(0, 60);
-        setQuoteCandidates(pool);
-        setQuoteShuffleSeed((s) => s + 1);
-        setLoadingQuotes(false);
-      })
-      .catch(() => {
-        if (runId !== quotesRunRef.current) return;
-        setLoadingQuotes(false);
-      });
+      }
+    };
+
+    void Promise.all(
+      Array.from({ length: Math.min(QUOTE_FETCH_CONCURRENCY, targets.length) }, () =>
+        worker()
+      )
+    ).then(() => {
+      if (cancelled || runId !== quotesRunRef.current) return;
+      // 长句更像"金句"，取最长的一批做候选池，再从池里随机抽几条展示。
+      collected.sort((a, b) => b.text.length - a.text.length);
+      const pool = collected.slice(0, QUOTE_POOL_SIZE);
+      // 候选池和展示句一起落地，避免中间出现一帧"暂无金句"。
+      setQuoteCandidates(pool);
+      setQuotes(pickRandomQuotes(pool, QUOTE_DISPLAY_COUNT));
+      setQuotesFor(selected);
+      setLoadingQuotes(false);
+    });
+
+    return () => {
+      cancelled = true;
+    };
   }, [selected, selectedAgg]);
 
-  // 根据候选池与 shuffle 种子随机挑选 5 条作为展示金句
-  useEffect(() => {
-    if (quoteCandidates.length === 0) {
-      setQuotes([]);
-      return;
-    }
-    const pool = [...quoteCandidates];
-    // Fisher–Yates 洗牌
-    for (let i = pool.length - 1; i > 0; i -= 1) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [pool[i], pool[j]] = [pool[j], pool[i]];
-    }
-    setQuotes(pool.slice(0, 5));
-  }, [quoteCandidates, quoteShuffleSeed]);
-
   const handleShuffleQuotes = useCallback(() => {
-    setQuoteShuffleSeed((s) => s + 1);
+    setQuotes(pickRandomQuotes(quoteCandidates, QUOTE_DISPLAY_COUNT));
+  }, [quoteCandidates]);
+
+  const handleGoToSettings = useCallback(() => {
+    window.dispatchEvent(new CustomEvent("app:go-tab", { detail: "settings" }));
   }, []);
+
+  // 刚选中角色、effect 还没跑起来的那一帧也算"加载中"，否则会闪一下空态。
+  const quotesPending = loadingQuotes || (selected !== null && quotesFor !== selected);
 
   const handleQuoteClick = useCallback(
     (quote: CharacterQuote) => {
@@ -453,15 +525,18 @@ export function CharactersPanel({
             <ArrowLeft className="h-5 w-5" />
           </Button>
         )}
-        <h1 className="text-base font-semibold">
+        <h1 className="text-base font-semibold truncate">
           {selected ? `人物：${selected}` : "人物统计"}
         </h1>
         {!selected && (
-          <>
-            <div className="ml-auto w-56">
-              <Input placeholder="搜索人物" value={search} onChange={(e) => setSearch(e.target.value)} />
-            </div>
-          </>
+          <div className="ml-auto min-w-0 flex-1 max-w-[14rem]">
+            <Input
+              placeholder="搜索人物"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              aria-label="搜索人物"
+            />
+          </div>
         )}
       </header>
 
@@ -475,15 +550,53 @@ export function CharactersPanel({
             <div className="flex items-center gap-3 text-sm text-[hsl(var(--color-muted-foreground))]">
               <Loader2 className="h-4 w-4 animate-spin" />
               <span>
-                正在统计人物发言… {progress.current}/{progress.total}
+                {progress.total > 0
+                  ? `正在统计人物发言… ${progress.current}/${progress.total}`
+                  : "正在准备人物统计…"}
               </span>
             </div>
           )}
-          {error && (
-            <div className="text-sm text-[hsl(var(--color-destructive))]">{error}</div>
+
+          {notInstalled && !loading && (
+            <div className="rounded-2xl border border-dashed border-[hsl(var(--color-border))] p-5">
+              <div className="text-sm font-medium">还没有剧情数据</div>
+              <p className="mt-1.5 text-sm leading-relaxed text-[hsl(var(--color-muted-foreground))]">
+                人物统计需要先同步一次剧情文本。到设置页下载或导入 ArknightsGameData
+                之后，这里会自动统计每位干员的发言次数、出场章节和金句。
+              </p>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Button className="min-h-[44px]" onClick={handleGoToSettings}>
+                  去设置同步
+                </Button>
+                <Button
+                  variant="ghost"
+                  className="min-h-[44px]"
+                  onClick={() => void loadAll({ forceRefresh: true })}
+                >
+                  重新检测
+                </Button>
+              </div>
+            </div>
           )}
 
-          {!loading && !selected && (
+          {error && !loading && (
+            <div className="rounded-2xl border border-[hsl(var(--color-border))] p-5">
+              <div className="text-sm font-medium text-[hsl(var(--color-destructive))]">
+                统计失败
+              </div>
+              <p className="mt-1.5 text-sm leading-relaxed text-[hsl(var(--color-muted-foreground))] break-words">
+                {error}
+              </p>
+              <Button
+                className="mt-3 min-h-[44px]"
+                onClick={() => void loadAll({ forceRefresh: true })}
+              >
+                重试
+              </Button>
+            </div>
+          )}
+
+          {!loading && !selected && !notInstalled && !error && (
             <div className="text-xs text-[hsl(var(--color-muted-foreground))]">
               {cacheUsed && cacheBuiltAt
                 ? `已使用缓存，构建于 ${new Date(cacheBuiltAt).toLocaleString()}`
@@ -493,7 +606,7 @@ export function CharactersPanel({
             </div>
           )}
 
-          {!selected && (
+          {!selected && !notInstalled && (
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
               {filteredCharacters.map((c) => (
                 <button
@@ -508,9 +621,21 @@ export function CharactersPanel({
                   <div className="text-xs text-[hsl(var(--color-muted-foreground))] shrink-0">{c.total} 次</div>
                 </button>
               ))}
-              {!loading && filteredCharacters.length === 0 && (
+              {loading &&
+                filteredCharacters.length === 0 &&
+                Array.from({ length: 6 }, (_, i) => (
+                  <div
+                    key={`skeleton-${i}`}
+                    className="flex items-center gap-3 rounded-lg border border-[hsl(var(--color-border))] bg-[hsl(var(--color-card))] p-3"
+                    aria-hidden="true"
+                  >
+                    <div className="h-10 w-10 shrink-0 rounded-full bg-[hsl(var(--color-secondary))] animate-pulse" />
+                    <div className="h-3 w-24 rounded bg-[hsl(var(--color-secondary))] animate-pulse" />
+                  </div>
+                ))}
+              {!loading && !error && filteredCharacters.length === 0 && (
                 <div className="col-span-full text-sm text-[hsl(var(--color-muted-foreground))]">
-                  未找到匹配人物
+                  {search.trim() ? `没有匹配“${search.trim()}”的人物` : "还没有统计到人物"}
                 </div>
               )}
             </div>
@@ -528,7 +653,7 @@ export function CharactersPanel({
                 </div>
               </div>
 
-              {loadingQuotes && (
+              {quotesPending && (
                 <div
                   className="rounded-lg border border-[hsl(var(--color-border))] bg-[hsl(var(--color-card))] p-4 space-y-2"
                   style={{ minHeight: 80 }}
@@ -539,7 +664,7 @@ export function CharactersPanel({
                 </div>
               )}
 
-              {!loadingQuotes && quotes.length > 0 && (
+              {!quotesPending && quotes.length > 0 && (
                 <div
                   className="rounded-lg border border-[hsl(var(--color-border))] bg-[hsl(var(--color-card))] p-4 space-y-3"
                   style={{ minHeight: 80 }}
@@ -550,7 +675,7 @@ export function CharactersPanel({
                       <Button
                         variant="ghost"
                         size="sm"
-                        className="h-7 px-2 text-xs text-[hsl(var(--color-muted-foreground))]"
+                        className="-my-1 min-h-[44px] px-3 text-xs text-[hsl(var(--color-muted-foreground))]"
                         onClick={handleShuffleQuotes}
                         aria-label="换一批金句"
                       >
@@ -564,7 +689,7 @@ export function CharactersPanel({
                       key={`${quote.story.storyId}-${quote.segmentIndex}-${i}`}
                       type="button"
                       onClick={() => handleQuoteClick(quote)}
-                      className="relative block w-full pl-6 pr-2 py-1 text-left text-sm leading-relaxed text-[hsl(var(--color-foreground))] rounded-md transition-colors hover:bg-[hsl(var(--color-secondary))] focus:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--color-ring))]"
+                      className="relative block w-full min-h-[44px] pl-6 pr-2 py-2 text-left text-sm leading-relaxed text-[hsl(var(--color-foreground))] rounded-md transition-colors hover:bg-[hsl(var(--color-secondary))] focus:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--color-ring))]"
                       aria-label={`跳转到 ${quote.storyName} 中的这句话`}
                     >
                       <span
@@ -579,6 +704,12 @@ export function CharactersPanel({
                       </div>
                     </button>
                   ))}
+                </div>
+              )}
+
+              {!quotesPending && quotes.length === 0 && (
+                <div className="rounded-lg border border-dashed border-[hsl(var(--color-border))] p-4 text-sm text-[hsl(var(--color-muted-foreground))]">
+                  这位角色暂时没有合适长度的金句，往下翻可以直接看出场章节。
                 </div>
               )}
 
@@ -600,13 +731,14 @@ export function CharactersPanel({
                   <div className="text-xs text-[hsl(var(--color-muted-foreground))]">
                     共 {group.items.length} 个关卡，合计 {totalCount} 次
                   </div>
-                  <div className="w-48">
+                  <div className="min-w-0 flex-1 max-w-[12rem]">
                     <Input
                       placeholder="组内搜索"
                       value={groupSearch[key] ?? ""}
                       onChange={(e) =>
                         setGroupSearch((prev) => ({ ...prev, [key]: e.target.value }))
                       }
+                      aria-label={`在 ${group.groupName} 中搜索关卡`}
                     />
                   </div>
                 </div>
@@ -626,8 +758,14 @@ export function CharactersPanel({
                         </div>
                       </div>
                       <div className="flex items-center gap-3 ml-4">
-                        <div className="text-xs text-[hsl(var(--color-muted-foreground))]">{count} 次</div>
-                        <Button size="sm" onClick={() => onOpenStory(story, selectedAgg.name)}>
+                        <div className="text-xs tabular-nums text-[hsl(var(--color-muted-foreground))]">
+                          {count} 次
+                        </div>
+                        <Button
+                          size="sm"
+                          className="min-h-[44px] px-4"
+                          onClick={() => onOpenStory(story, selectedAgg.name)}
+                        >
                           打开
                         </Button>
                       </div>

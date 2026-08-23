@@ -36,6 +36,22 @@ pub mod data_service_test {
         pub fn search_segments(&self, q: &str) -> Result<SegmentSearchPage, String> {
             self.inner.search_segments(q)
         }
+
+        /// `(storyName, storyTxt)` for a story id, or the lookup error.
+        pub fn story_entry(&self, story_id: &str) -> Result<(String, String), String> {
+            self.inner
+                .get_story_entry(story_id)
+                .map(|entry| (entry.story_name, entry.story_txt))
+        }
+
+        pub fn roguelike_group_names(&self) -> Result<Vec<String>, String> {
+            Ok(self
+                .inner
+                .get_roguelike_stories_grouped()?
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect())
+        }
     }
 }
 
@@ -73,6 +89,11 @@ pub fn run() {
             std::fs::create_dir_all(&app_data_dir).expect("Failed to create app data directory");
 
             let data_service = DataService::new(app_data_dir);
+
+            // 目录解析要读一份数兆的 story_review_table.json；趁 WebView 还在
+            // 启动，先在后台把它嚼完，前端第一次拉列表就是缓存命中。
+            let warmup = data_service.clone();
+            std::thread::spawn(move || warmup.prewarm_catalog());
 
             app.manage(AppState {
                 data_service: Arc::new(Mutex::new(data_service)),

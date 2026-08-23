@@ -36,6 +36,10 @@ interface FavoritesState {
 interface FavoritesContextValue {
   favoriteStories: FavoriteStoryMap;
   favoriteGroups: Record<string, FavoriteGroup>;
+  /** 收藏分组展开后包含的所有 storyId。 */
+  favoriteGroupStoryIds: ReadonlySet<string>;
+  /** 收藏总数：单章 ∪ 分组，去重后的唯一口径。 */
+  favoriteCount: number;
   isFavorite: (storyId: string) => boolean;
   toggleFavorite: (story: StoryEntry) => void;
   isGroupFavorite: (groupId: string) => boolean;
@@ -127,8 +131,32 @@ function readFromStorage(): FavoritesState {
   }
 }
 
+function collectGroupStoryIds(groups: Record<string, FavoriteGroup>): Set<string> {
+  const ids = new Set<string>();
+  for (const group of Object.values(groups)) {
+    group.storyIds.forEach((id) => ids.add(id));
+  }
+  return ids;
+}
+
 export function FavoritesProvider({ children }: { children: ReactNode }) {
   const [favorites, setFavorites] = useState<FavoritesState>(() => readFromStorage());
+
+  /**
+   * 收藏口径：单章收藏 ∪ 收藏分组展开后的所有章节。
+   * 首页统计格、剧情页「收藏」分类、列表里的星标都必须用同一套判断，
+   * 否则会出现「分组已收藏、组里每一条却是空心星」这种自相矛盾的状态。
+   */
+  const groupedStoryIds = useMemo(
+    () => collectGroupStoryIds(favorites.groups),
+    [favorites.groups]
+  );
+
+  const favoriteCount = useMemo(() => {
+    const ids = new Set(groupedStoryIds);
+    Object.keys(favorites.stories).forEach((id) => ids.add(id));
+    return ids.size;
+  }, [favorites.stories, groupedStoryIds]);
 
   useEffect(() => {
     try {
@@ -139,19 +167,45 @@ export function FavoritesProvider({ children }: { children: ReactNode }) {
   }, [favorites]);
 
   const isFavorite = useCallback(
-    (storyId: string) => Boolean(favorites.stories[storyId]),
-    [favorites.stories]
+    (storyId: string) => Boolean(favorites.stories[storyId]) || groupedStoryIds.has(storyId),
+    [favorites.stories, groupedStoryIds]
   );
 
+  /**
+   * 取消收藏时也要把这一条从所在的收藏分组里摘掉，否则星标点了没反应
+   * （分组仍然把它算成收藏）。分组被摘空就整组移除。
+   */
   const toggleFavorite = useCallback((story: StoryEntry) => {
     setFavorites((prev) => {
-      const nextStories = { ...prev.stories };
-      if (nextStories[story.storyId]) {
-        delete nextStories[story.storyId];
-      } else {
-        nextStories[story.storyId] = story;
+      const inStories = Boolean(prev.stories[story.storyId]);
+      const owningGroups = Object.values(prev.groups).filter((group) =>
+        group.storyIds.includes(story.storyId)
+      );
+
+      if (!inStories && owningGroups.length === 0) {
+        return { ...prev, stories: { ...prev.stories, [story.storyId]: story } };
       }
-      return { ...prev, stories: nextStories };
+
+      const nextStories = { ...prev.stories };
+      delete nextStories[story.storyId];
+
+      if (owningGroups.length === 0) {
+        return { ...prev, stories: nextStories };
+      }
+
+      const nextGroups: Record<string, FavoriteGroup> = {};
+      for (const [groupId, group] of Object.entries(prev.groups)) {
+        if (!group.storyIds.includes(story.storyId)) {
+          nextGroups[groupId] = group;
+          continue;
+        }
+        const storyIds = group.storyIds.filter((id) => id !== story.storyId);
+        if (storyIds.length === 0) continue;
+        const { [story.storyId]: _removed, ...restStories } = group.stories;
+        nextGroups[groupId] = { ...group, storyIds, stories: restStories };
+      }
+
+      return { stories: nextStories, groups: nextGroups };
     });
   }, []);
 
@@ -201,12 +255,23 @@ export function FavoritesProvider({ children }: { children: ReactNode }) {
     () => ({
       favoriteStories: favorites.stories,
       favoriteGroups: favorites.groups,
+      favoriteGroupStoryIds: groupedStoryIds,
+      favoriteCount,
       isFavorite,
       toggleFavorite,
       isGroupFavorite,
       toggleFavoriteGroup,
     }),
-    [favorites.groups, favorites.stories, isFavorite, toggleFavorite, isGroupFavorite, toggleFavoriteGroup]
+    [
+      favorites.groups,
+      favorites.stories,
+      favoriteCount,
+      groupedStoryIds,
+      isFavorite,
+      toggleFavorite,
+      isGroupFavorite,
+      toggleFavoriteGroup,
+    ]
   );
 
   return <FavoritesContext.Provider value={value}>{children}</FavoritesContext.Provider>;

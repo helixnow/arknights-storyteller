@@ -36,8 +36,10 @@ pub async fn sync_data(app: AppHandle, state: State<'_, AppState>) -> Result<(),
 
 #[tauri::command]
 pub async fn get_current_version(state: State<'_, AppState>) -> Result<String, String> {
-    let service = lock_service(&state.data_service);
-    service.get_current_version()
+    let service = clone_service(&state);
+    tauri::async_runtime::spawn_blocking(move || service.get_current_version())
+        .await
+        .map_err(|err| format!("Failed to join current version task: {}", err))?
 }
 
 #[tauri::command]
@@ -64,26 +66,36 @@ pub async fn is_installed(state: State<'_, AppState>) -> Result<bool, String> {
 
 #[tauri::command]
 pub async fn get_chapters(state: State<'_, AppState>) -> Result<Vec<Chapter>, String> {
-    let service = lock_service(&state.data_service);
-    service.get_chapters()
+    let service = clone_service(&state);
+    tauri::async_runtime::spawn_blocking(move || service.get_chapters())
+        .await
+        .map_err(|err| format!("Failed to join chapters task: {}", err))?
 }
 
 #[tauri::command]
 pub async fn get_story_categories(
     state: State<'_, AppState>,
 ) -> Result<Vec<StoryCategory>, String> {
-    let service = lock_service(&state.data_service);
-    service.get_story_categories()
+    let service = clone_service(&state);
+    tauri::async_runtime::spawn_blocking(move || service.get_story_categories())
+        .await
+        .map_err(|err| format!("Failed to join story categories task: {}", err))?
 }
 
+/// 读盘 + 解析一整篇剧情，长的有几千行；放到阻塞线程池里，
+/// 否则 WebView 每翻一篇就把一个 async worker 占满。
 #[tauri::command]
 pub async fn get_story_content(
     state: State<'_, AppState>,
     story_path: String,
 ) -> Result<ParsedStoryContent, String> {
-    let service = lock_service(&state.data_service);
-    let content = service.read_story_text(&story_path)?;
-    Ok(parse_story_text(&content))
+    let service = clone_service(&state);
+    tauri::async_runtime::spawn_blocking(move || {
+        let content = service.read_story_text(&story_path)?;
+        Ok(parse_story_text(&content))
+    })
+    .await
+    .map_err(|err| format!("Failed to join story content task: {}", err))?
 }
 
 #[tauri::command]
@@ -91,8 +103,10 @@ pub async fn get_story_info(
     state: State<'_, AppState>,
     info_path: String,
 ) -> Result<String, String> {
-    let service = lock_service(&state.data_service);
-    service.read_story_info(&info_path)
+    let service = clone_service(&state);
+    tauri::async_runtime::spawn_blocking(move || service.read_story_info(&info_path))
+        .await
+        .map_err(|err| format!("Failed to join story info task: {}", err))?
 }
 
 #[tauri::command]
@@ -121,8 +135,10 @@ pub async fn get_story_preview_token(
 pub async fn get_story_index_status(
     state: State<'_, AppState>,
 ) -> Result<StoryIndexStatus, String> {
-    let service = lock_service(&state.data_service);
-    service.get_story_index_status()
+    let service = clone_service(&state);
+    tauri::async_runtime::spawn_blocking(move || service.get_story_index_status())
+        .await
+        .map_err(|err| format!("Failed to join index status task: {}", err))?
 }
 
 #[tauri::command]

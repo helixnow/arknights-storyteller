@@ -84,8 +84,14 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
   // clear land in the same microtask most of the time, so waiting one tick
   // lets us serialise only once per React commit.
   const persistTimerRef = useRef<number | null>(null);
+  // 挂载时的第一次 effect 只会把刚读出来的内容原样写回，跳过它。
+  const hydratedRef = useRef(false);
   useEffect(() => {
     if (typeof window === "undefined") return;
+    if (!hydratedRef.current) {
+      hydratedRef.current = true;
+      return;
+    }
     if (persistTimerRef.current !== null) {
       window.clearTimeout(persistTimerRef.current);
     }
@@ -213,10 +219,13 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
     });
   }, [storyPath]);
 
-  return {
-    highlights: highlightList,
-    toggleHighlight,
-    isHighlighted,
-    clearHighlights,
-  };
+  return useMemo(
+    () => ({
+      highlights: highlightList,
+      toggleHighlight,
+      isHighlighted,
+      clearHighlights,
+    }),
+    [highlightList, toggleHighlight, isHighlighted, clearHighlights]
+  );
 }

@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { api } from "@/services/api";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { StoryEntry } from "@/types/story";
 import { Button } from "@/components/ui/button";
 import { CustomScrollArea } from "@/components/ui/custom-scroll-area";
 import { StoryThumbnail } from "@/components/StoryThumbnail";
+import { storyCatalog } from "@/components/StoryList";
 import { useFavorites } from "@/hooks/useFavorites";
 import { BookOpen, Flame, Sparkles } from "lucide-react";
 
@@ -28,6 +28,10 @@ const PROGRESS_KEY = "reading-progress";
 const RECENT_SCAN_LIMIT = 60;
 /** 首页最多渲染几张最近阅读卡片（含「继续阅读」大卡）。 */
 const RECENT_RENDER_LIMIT = 5;
+/** 刷新超过这个时长才提示「正在刷新」，命中缓存时不闪。 */
+const REFRESH_HINT_DELAY_MS = 400;
+/** 进度到这个比例就当作读完，和列表里「已读完」的口径一致。 */
+const FINISHED_THRESHOLD = 0.99;
 
 interface StreakInfo {
   currentStreak: number;
@@ -48,18 +52,21 @@ function readStreak(): StreakInfo {
   return { currentStreak: 0, lastReadOn: "", totalDays: 0 };
 }
 
+/** 阅读进度：percentage 是 0~1，脏数据（NaN / 越界）直接夹回区间。 */
 function readRecentProgress(): RecentItem[] {
   try {
     const raw = window.localStorage.getItem(PROGRESS_KEY);
     if (!raw) return [];
-    const map = JSON.parse(raw) as Record<string, { percentage?: number; updatedAt?: number; storyPath?: string }>;
+    const map = JSON.parse(raw) as Record<string, { percentage?: number; updatedAt?: number }>;
     const entries: RecentItem[] = [];
     for (const [path, v] of Object.entries(map)) {
       if (!v || typeof v !== "object") continue;
+      const percentage = Number(v.percentage ?? 0);
+      const updatedAt = Number(v.updatedAt ?? 0);
       entries.push({
         storyPath: path,
-        percentage: Number(v.percentage ?? 0),
-        updatedAt: Number(v.updatedAt ?? 0),
+        percentage: Number.isFinite(percentage) ? Math.min(1, Math.max(0, percentage)) : 0,
+        updatedAt: Number.isFinite(updatedAt) ? updatedAt : 0,
       });
     }
     entries.sort((a, b) => b.updatedAt - a.updatedAt);
@@ -70,65 +77,84 @@ function readRecentProgress(): RecentItem[] {
 }
 
 export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePanelProps) {
-  const { favoriteStories, favoriteGroups } = useFavorites();
+  // 与剧情页「收藏」分类同口径：单章收藏 + 收藏分组展开后的去重总数。
+  const { favoriteCount } = useFavorites();
   const [recentStories, setRecentStories] = useState<Array<{ entry: StoryEntry; meta: RecentItem }>>([]);
   const [highlight, setHighlight] = useState<StoryEntry | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   // null = 还没问过后端。先渲染骨架，避免闪一下「已安装」再跳回未同步。
   const [installed, setInstalled] = useState<boolean | null>(null);
   const [streak, setStreak] = useState<StreakInfo>(() => readStreak());
+  // 聚焦、返回列表、数据同步都会触发刷新，可能叠在一起。用递增序号
+  // 保证只有最后一次的结果能写进 state。
+  const loadSeqRef = useRef(0);
 
   const loadHome = useCallback(async () => {
+    const seq = (loadSeqRef.current += 1);
+    const stale = () => seq !== loadSeqRef.current;
+    const hintTimer = window.setTimeout(() => {
+      if (!stale()) setRefreshing(true);
+    }, REFRESH_HINT_DELAY_MS);
+
     try {
-      setLoading(true);
-      const ok = await api.isInstalled();
+      const ok = await storyCatalog.isInstalled();
+      if (stale()) return;
       setInstalled(ok);
       if (!ok) {
         setRecentStories([]);
         setHighlight(null);
-        setLoading(false);
         return;
       }
-      // 1) 最近阅读 (从 localStorage 读 progress，storyPath 就是 storyTxt)
-      const entries = readRecentProgress().slice(0, RECENT_SCAN_LIMIT);
-      // 2) 主线随机一章作为"今日推荐"
-      const main = await api.getMainStoriesGrouped();
+
+      // 1) 主线：既是「今日推荐」的池子，也能覆盖大部分最近阅读记录。
+      const main = await storyCatalog.grouped("main");
+      if (stale()) return;
       const allMain: StoryEntry[] = main.flatMap(([, stories]) => stories);
-      // Deterministic per-day pick: hash of today string -> index
+
+      // 按天确定性地挑一章，同一天进来看到的推荐是同一条。
       const t = todayKey();
       let hash = 0;
       for (let i = 0; i < t.length; i += 1) hash = (hash * 31 + t.charCodeAt(i)) >>> 0;
-      const pick = allMain[hash % Math.max(allMain.length, 1)] ?? null;
-      setHighlight(pick);
+      setHighlight(allMain[hash % Math.max(allMain.length, 1)] ?? null);
 
-      // 3) 把 progress 条目中能查到的 StoryEntry 加载出来
+      // 2) 最近阅读：progress 的 key 就是 storyTxt，反查成 StoryEntry。
+      const entries = readRecentProgress().slice(0, RECENT_SCAN_LIMIT);
       const byPath = new Map<string, StoryEntry>();
-      allMain.forEach((s) => byPath.set(s.storyTxt, s));
-      // 也加载活动/支线/肉鸽/密录以尽量命中
-      const [acts, sides, rogues, mems] = await Promise.all([
-        api.getActivityStoriesGrouped().catch(() => []),
-        api.getSidestoryStoriesGrouped().catch(() => []),
-        api.getRoguelikeStoriesGrouped().catch(() => []),
-        api.getMemoryStories().catch(() => []),
-      ]);
-      (acts as Array<[string, StoryEntry[]]>).forEach(([, ss]) => ss.forEach((s) => byPath.set(s.storyTxt, s)));
-      (sides as Array<[string, StoryEntry[]]>).forEach(([, ss]) => ss.forEach((s) => byPath.set(s.storyTxt, s)));
-      (rogues as Array<[string, StoryEntry[]]>).forEach(([, ss]) => ss.forEach((s) => byPath.set(s.storyTxt, s)));
-      (mems as StoryEntry[]).forEach((s) => byPath.set(s.storyTxt, s));
+      allMain.forEach((story) => byPath.set(story.storyTxt, story));
+
+      // 主线没覆盖到的才去问活动 / 支线 / 肉鸽 / 密录。新装或只读主线的
+      // 用户因此能省掉四次 IPC；命中共享缓存时这里同样是零开销。
+      if (entries.some((entry) => !byPath.has(entry.storyPath))) {
+        const [acts, sides, rogues, mems] = await Promise.all([
+          storyCatalog.grouped("activity").catch(() => []),
+          storyCatalog.grouped("sidestory").catch(() => []),
+          storyCatalog.grouped("roguelike").catch(() => []),
+          storyCatalog.memory().catch(() => []),
+        ]);
+        if (stale()) return;
+        [acts, sides, rogues].forEach((grouped) =>
+          grouped.forEach(([, stories]) =>
+            stories.forEach((story) => byPath.set(story.storyTxt, story))
+          )
+        );
+        mems.forEach((story) => byPath.set(story.storyTxt, story));
+      }
 
       // 保留完整命中列表：渲染只取前几张，但「最近阅读 N 章」要用真实数量。
       const matched = entries
-        .map((e) => {
-          const entry = byPath.get(e.storyPath);
-          return entry ? { entry, meta: e } : null;
+        .map((item) => {
+          const entry = byPath.get(item.storyPath);
+          return entry ? { entry, meta: item } : null;
         })
         .filter((x): x is { entry: StoryEntry; meta: RecentItem } => x !== null);
       setRecentStories(matched);
     } catch (err) {
+      if (stale()) return;
       console.warn("[Home] load failed", err);
       setInstalled((prev) => prev ?? false);
     } finally {
-      setLoading(false);
+      window.clearTimeout(hintTimer);
+      if (!stale()) setRefreshing(false);
     }
   }, []);
 
@@ -153,16 +179,25 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
     };
   }, [loadHome]);
 
-  // 与剧情页「收藏」分类同口径：单章收藏 + 收藏分组展开后的去重总数。
-  const favoritesCount = useMemo(() => {
-    const ids = new Set<string>(Object.keys(favoriteStories));
-    Object.values(favoriteGroups).forEach((group) => {
-      group.storyIds.forEach((id) => ids.add(id));
-    });
-    return ids.size;
-  }, [favoriteGroups, favoriteStories]);
+  // 「继续阅读」优先挑最近一条还没读完的：刚读完一章就回首页时，
+  // 再把这章推回来没有意义。全都读完了才退回最近一条。
+  const continueItem = useMemo(
+    () =>
+      recentStories.find(({ meta }) => meta.percentage < FINISHED_THRESHOLD) ??
+      recentStories[0] ??
+      null,
+    [recentStories]
+  );
 
-  const continueItem = recentStories[0] ?? null;
+  /** 「最近阅读」列表要排掉已经占了大卡的那条，避免同一章出现两次。 */
+  const otherRecentStories = useMemo(
+    () =>
+      recentStories
+        .filter((item) => item !== continueItem)
+        .slice(0, RECENT_RENDER_LIMIT - 1),
+    [continueItem, recentStories]
+  );
+
   const showSkeleton = installed === null;
 
   const handleGoToFavorites = useCallback(() => {
@@ -217,18 +252,18 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
             {installed === true && (
               <StreakStrip
                 streak={streak}
-                favoritesCount={favoritesCount}
+                favoritesCount={favoriteCount}
                 recentCount={recentStories.length}
                 onGoToRecent={() => onGoToTab("stories")}
                 onGoToFavorites={handleGoToFavorites}
               />
             )}
 
-            {installed === true && recentStories.length > 1 && (
+            {installed === true && otherRecentStories.length > 0 && (
               <section className="space-y-3">
                 <SectionTitle icon={BookOpen} title="最近阅读" />
                 <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                  {recentStories.slice(1, RECENT_RENDER_LIMIT).map(({ entry, meta }) => (
+                  {otherRecentStories.map(({ entry, meta }) => (
                     <RecentCard
                       key={entry.storyId}
                       entry={entry}
@@ -252,7 +287,7 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
               </section>
             )}
 
-            {!showSkeleton && loading && (
+            {!showSkeleton && refreshing && (
               <div className="text-center text-sm text-[hsl(var(--color-muted-foreground))]">
                 正在刷新…
               </div>
@@ -448,6 +483,7 @@ function RecentCard({
   tag?: string;
 }) {
   const pct = Math.max(0, Math.min(100, Math.round((percentage || 0) * 100)));
+  const progressText = pct >= 99 ? "已读完" : pct > 0 ? `已读 ${pct}%` : "未开始";
   return (
     <button
       onClick={onOpen}
@@ -466,7 +502,7 @@ function RecentCard({
           )}
         </div>
         <div className="mt-0.5 text-[11px] text-[hsl(var(--color-muted-foreground))] truncate">
-          {tag ?? (pct > 0 ? `已读 ${pct}%` : "未开始")}
+          {tag ?? progressText}
         </div>
         {pct > 0 && (
           <div className="mt-1.5 h-1 rounded-full bg-[hsl(var(--color-secondary))]">

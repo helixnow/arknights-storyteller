@@ -8,6 +8,7 @@ import { Collapsible } from "@/components/ui/collapsible";
 import { CustomScrollArea } from "@/components/ui/custom-scroll-area";
 import { Input } from "@/components/ui/input";
 import { useFavorites } from "@/hooks/useFavorites";
+import type { FavoriteGroupType } from "@/hooks/useFavorites";
 import { useAppPreferences } from "@/hooks/useAppPreferences";
 import { StoryThumbnail } from "@/components/StoryThumbnail";
 import { AssetImage } from "@/components/AssetImage";
@@ -30,7 +31,13 @@ function extractCharTokenFromStoryTxt(storyTxt: string | null | undefined): stri
   return null;
 }
 
-type Category = "favorites" | "main" | "activity" | "sidestory" | "roguelike" | "memory";
+export type GroupedStories = Array<[string, StoryEntry[]]>;
+
+/** 四个「按分组返回」的剧情分类，数据形状完全一致。 */
+type GroupedKey = "main" | "activity" | "sidestory" | "roguelike";
+/** 需要向后端拉取的数据块；密录是扁平列表，单独一类。 */
+type SectionKey = GroupedKey | "memory";
+type Category = SectionKey | "favorites";
 
 const CATEGORY_TABS: Array<{ id: Category; label: string }> = [
   { id: "favorites", label: "收藏" },
@@ -48,6 +55,81 @@ const CATEGORY_DESCRIPTIONS: Record<Category, string> = {
   sidestory: "支线故事",
   roguelike: "肉鸽模式剧情",
   memory: "干员密录故事",
+};
+
+const SECTION_LABELS: Record<SectionKey, string> = {
+  main: "主线剧情",
+  activity: "活动剧情",
+  sidestory: "支线剧情",
+  roguelike: "肉鸽剧情",
+  memory: "干员密录",
+};
+
+const SECTION_TIMEOUT_MS: Record<SectionKey, number> = {
+  main: 8000,
+  activity: 8000,
+  sidestory: 8000,
+  roguelike: 8000,
+  // 密录条目多，后端要多扫一层目录，给宽一点。
+  memory: 10000,
+};
+
+/** 每个分类进入时需要哪些数据块。命中共享缓存时这些都是零 IPC。 */
+const CATEGORY_SECTIONS: Record<Category, SectionKey[]> = {
+  main: ["main"],
+  // 活动要跟支线去重，所以两边都得有数据
+  activity: ["activity", "sidestory"],
+  sidestory: ["sidestory"],
+  roguelike: ["roguelike"],
+  memory: ["memory"],
+  // 收藏项要靠各分类的映射表还原「所属章节 / 活动」的可读名字
+  favorites: ["main", "activity", "sidestory", "roguelike", "memory"],
+};
+
+const GROUPED_CATEGORY_META: Record<
+  GroupedKey,
+  {
+    /** 收藏分组 id 前缀。已写进 localStorage，不能改。 */
+    idPrefix: string;
+    favoriteType: FavoriteGroupType;
+    favoriteInactive: string;
+    favoriteActive: string;
+    emptySearch: string;
+    emptyDefault: string;
+  }
+> = {
+  main: {
+    idPrefix: "chapter",
+    favoriteType: "chapter",
+    favoriteInactive: "收藏章节",
+    favoriteActive: "取消收藏章节",
+    emptySearch: "没有匹配的主线剧情",
+    emptyDefault: "暂无主线剧情，可能需要同步。",
+  },
+  activity: {
+    idPrefix: "activity",
+    favoriteType: "activity",
+    favoriteInactive: "收藏活动",
+    favoriteActive: "取消收藏活动",
+    emptySearch: "没有匹配的活动剧情",
+    emptyDefault: "暂无活动剧情或需要同步",
+  },
+  sidestory: {
+    idPrefix: "sidestory",
+    favoriteType: "other",
+    favoriteInactive: "收藏支线",
+    favoriteActive: "取消收藏支线",
+    emptySearch: "没有匹配的支线剧情",
+    emptyDefault: "暂无支线剧情或需要同步",
+  },
+  roguelike: {
+    idPrefix: "roguelike",
+    favoriteType: "other",
+    favoriteInactive: "收藏肉鸽",
+    favoriteActive: "取消收藏肉鸽",
+    emptySearch: "没有匹配的肉鸽剧情",
+    emptyDefault: "暂无肉鸽剧情或需要同步",
+  },
 };
 
 const PROGRESS_KEY = "reading-progress";
@@ -83,6 +165,86 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
       reject(e);
     });
   });
+}
+
+/**
+ * 剧情目录的进程内共享缓存。
+ *
+ * 冷启动时首页和剧情列表是同时挂载的：两边都要 `isInstalled`，都要主线分组，
+ * 首页还会为了还原「最近阅读」去问活动 / 支线 / 肉鸽 / 密录；随后用户切分类，
+ * 剧情列表又要一遍同样的东西。这里统一收口，做三件事：
+ *
+ * 1. 短 TTL 内存缓存，冷启动阶段的重复请求直接命中；
+ * 2. in-flight 去重，并发调用共享同一个 Promise，不会打出两次 IPC；
+ * 3. 监听 `app:data-updated`（数据重新同步）整体失效。模块级监听在 import
+ *    时就注册，早于任何组件的 effect，所以组件收到同一事件时缓存必定已清空。
+ *
+ * TTL 只是兜底：首页每次获得焦点都会重新 load 一遍，没有 TTL 的话窗口切换
+ * 就会变成一串没必要的 IPC；有了 TTL，这些刷新几乎只是重读 localStorage。
+ */
+const CATALOG_TTL_MS = 60_000;
+
+interface CatalogHit {
+  value: unknown;
+  at: number;
+}
+
+const catalogValues = new Map<string, CatalogHit>();
+const catalogInflight = new Map<string, Promise<unknown>>();
+let catalogVersion = 0;
+
+function catalogFetch<T>(key: string, loader: () => Promise<T>, force: boolean): Promise<T> {
+  if (force) catalogValues.delete(key);
+
+  const hit = catalogValues.get(key);
+  if (hit && Date.now() - hit.at < CATALOG_TTL_MS) {
+    return Promise.resolve(hit.value as T);
+  }
+
+  const pending = catalogInflight.get(key) as Promise<T> | undefined;
+  if (pending) return pending;
+
+  const startedAt = catalogVersion;
+  const request = loader().then((value) => {
+    // 请求期间数据被重新同步过，这份结果已经过期，不能进缓存。
+    if (catalogVersion === startedAt) {
+      catalogValues.set(key, { value, at: Date.now() });
+    }
+    return value;
+  });
+  const release = () => {
+    if (catalogInflight.get(key) === request) catalogInflight.delete(key);
+  };
+  request.then(release, release);
+  catalogInflight.set(key, request);
+  return request;
+}
+
+const GROUPED_FETCHERS: Record<GroupedKey, () => Promise<GroupedStories>> = {
+  main: () => api.getMainStoriesGrouped(),
+  activity: () => api.getActivityStoriesGrouped(),
+  sidestory: () => api.getSidestoryStoriesGrouped(),
+  roguelike: () => api.getRoguelikeStoriesGrouped(),
+};
+
+export const storyCatalog = {
+  isInstalled: (force = false) =>
+    catalogFetch<boolean>("installed", () => api.isInstalled(), force),
+  grouped: (key: GroupedKey, force = false) =>
+    catalogFetch<GroupedStories>(`grouped:${key}`, GROUPED_FETCHERS[key], force),
+  memory: (force = false) =>
+    catalogFetch<StoryEntry[]>("memory", () => api.getMemoryStories(), force),
+};
+
+/** 剧情数据换了一批：整体失效，下一次请求重新打 IPC。 */
+export function invalidateStoryCatalog() {
+  catalogVersion += 1;
+  catalogValues.clear();
+  catalogInflight.clear();
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("app:data-updated", invalidateStoryCatalog);
 }
 
 function isNotInstalledError(message: string) {
@@ -127,22 +289,32 @@ interface StoryListProps {
   onSelectStory: (story: StoryEntry) => void;
 }
 
+function emptyGroups(): Record<GroupedKey, GroupedStories> {
+  return { main: [], activity: [], sidestory: [], roguelike: [] };
+}
+
+function initialSectionFlags(value: boolean): Record<SectionKey, boolean> {
+  return {
+    main: value,
+    activity: value,
+    sidestory: value,
+    roguelike: value,
+    memory: value,
+  };
+}
+
 export function StoryList({ onSelectStory }: StoryListProps) {
-  const rootRef = useRef<HTMLDivElement | null>(null);
-  const [mainGrouped, setMainGrouped] = useState<Array<[string, StoryEntry[]]>>([]);
-  const [loading, setLoading] = useState(true);
+  const [groups, setGroups] = useState<Record<GroupedKey, GroupedStories>>(emptyGroups);
+  const [memoryStories, setMemoryStories] = useState<StoryEntry[]>([]);
+  const [sectionLoading, setSectionLoading] = useState<Record<SectionKey, boolean>>(() => ({
+    ...initialSectionFlags(false),
+    // 主线是默认分类，进来就在加载。
+    main: true,
+  }));
   const [error, setError] = useState<string | null>(null);
   const [syncDialogOpen, setSyncDialogOpen] = useState(false);
   const [installed, setInstalled] = useState<boolean | null>(null);
   const [activeCategory, setActiveCategory] = useState<Category>("main");
-  const [activityGrouped, setActivityGrouped] = useState<Array<[string, StoryEntry[]]>>([]);
-  const [activityLoading, setActivityLoading] = useState(false);
-  const [sidestoryGrouped, setSidestoryGrouped] = useState<Array<[string, StoryEntry[]]>>([]);
-  const [sidestoryLoading, setSidestoryLoading] = useState(false);
-  const [roguelikeGrouped, setRoguelikeGrouped] = useState<Array<[string, StoryEntry[]]>>([]);
-  const [roguelikeLoading, setRoguelikeLoading] = useState(false);
-  const [memoryStories, setMemoryStories] = useState<StoryEntry[]>([]);
-  const [memoryLoading, setMemoryLoading] = useState(false);
   const [searchTerm, setSearchTerm] = useState("");
   const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({});
   const [progressMap, setProgressMap] = useState<Record<string, number>>(() =>
@@ -151,25 +323,18 @@ export function StoryList({ onSelectStory }: StoryListProps) {
   const { showSummaries, setShowSummaries } = useAppPreferences();
   const [summaryCache, setSummaryCache] = useState<Record<string, string>>({});
   const [summaryLoadingIds, setSummaryLoadingIds] = useState<Record<string, boolean>>({});
-  // memorySummaryVisible 改为全局控制
-  const memorySummaryVisible = showSummaries;
 
-  // 每个分类是否已加载 / 是否正在加载。用 ref 保存，
-  // 这样 loadXxx 能保持稳定引用，effect 不会因为 state 变化重复触发。
-  const loadedRef = useRef<Record<Category, boolean>>({
-    favorites: true,
-    main: false,
-    activity: false,
-    sidestory: false,
-    roguelike: false,
-    memory: false,
-  });
-  const inflightRef = useRef<Partial<Record<Category, boolean>>>({});
+  // 每块数据是否已加载 / 在途的 Promise。用 ref 保存，这样 loadSection
+  // 能保持稳定引用，effect 不会因为 state 变化重复触发。
+  const loadedRef = useRef<Record<SectionKey, boolean>>(initialSectionFlags(false));
+  const pendingRef = useRef<Partial<Record<SectionKey, Promise<void>>>>({});
   const summaryRequestedRef = useRef<Set<string>>(new Set());
 
   const {
     favoriteStories,
     favoriteGroups,
+    favoriteGroupStoryIds,
+    favoriteCount,
     isFavorite,
     toggleFavorite,
     isGroupFavorite,
@@ -186,143 +351,61 @@ export function StoryList({ onSelectStory }: StoryListProps) {
     }
   }, []);
 
-  const loadMainStories = useCallback(
-    async (force = false) => {
-      if (!force && loadedRef.current.main) return;
-      if (inflightRef.current.main) return;
-      inflightRef.current.main = true;
-      setLoading(true);
-      setError(null);
-      try {
-        const grouped = await withTimeout(api.getMainStoriesGrouped(), 8000);
-        console.log("[StoryList] 主线章节数:", grouped.length);
-        setMainGrouped(grouped);
-        loadedRef.current.main = true;
-      } catch (err) {
-        handleLoadError("主线剧情", err);
-      } finally {
-        inflightRef.current.main = false;
-        setLoading(false);
-      }
-    },
-    [handleLoadError]
-  );
+  const setSectionBusy = useCallback((key: SectionKey, busy: boolean) => {
+    setSectionLoading((prev) => (prev[key] === busy ? prev : { ...prev, [key]: busy }));
+  }, []);
 
-  const loadActivities = useCallback(
-    async (force = false) => {
-      if (!force && loadedRef.current.activity) return;
-      if (inflightRef.current.activity) return;
-      inflightRef.current.activity = true;
-      setActivityLoading(true);
-      setError(null);
-      try {
-        const grouped = await withTimeout(api.getActivityStoriesGrouped(), 8000);
-        console.log("[StoryList] 活动数:", grouped.length);
-        setActivityGrouped(grouped);
-        loadedRef.current.activity = true;
-      } catch (err) {
-        handleLoadError("活动剧情", err);
-      } finally {
-        inflightRef.current.activity = false;
-        setActivityLoading(false);
-      }
-    },
-    [handleLoadError]
-  );
+  /**
+   * 加载一块数据。同一块同时只会有一个任务在跑：后来的调用拿到的是同一个
+   * Promise，所以 `await loadSection(...)` 真的等到数据落地（旧实现是直接
+   * return，调用方会以为已经加载完）。
+   */
+  const loadSection = useCallback(
+    (key: SectionKey, force = false): Promise<void> => {
+      if (!force && loadedRef.current[key]) return Promise.resolve();
 
-  const loadSidestories = useCallback(
-    async (force = false) => {
-      if (!force && loadedRef.current.sidestory) return;
-      if (inflightRef.current.sidestory) return;
-      inflightRef.current.sidestory = true;
-      setSidestoryLoading(true);
-      setError(null);
-      try {
-        const grouped = await withTimeout(api.getSidestoryStoriesGrouped(), 8000);
-        console.log("[StoryList] 支线项目数:", grouped.length);
-        setSidestoryGrouped(grouped);
-        loadedRef.current.sidestory = true;
-      } catch (err) {
-        handleLoadError("支线剧情", err);
-      } finally {
-        inflightRef.current.sidestory = false;
-        setSidestoryLoading(false);
-      }
-    },
-    [handleLoadError]
-  );
+      const pending = pendingRef.current[key];
+      if (pending) return pending;
 
-  const loadRoguelike = useCallback(
-    async (force = false) => {
-      if (!force && loadedRef.current.roguelike) return;
-      if (inflightRef.current.roguelike) return;
-      inflightRef.current.roguelike = true;
-      setRoguelikeLoading(true);
-      setError(null);
-      try {
-        const grouped = await withTimeout(api.getRoguelikeStoriesGrouped(), 8000);
-        console.log("[StoryList] 肉鸽项目数:", grouped.length);
-        setRoguelikeGrouped(grouped);
-        loadedRef.current.roguelike = true;
-      } catch (err) {
-        handleLoadError("肉鸽剧情", err);
-      } finally {
-        inflightRef.current.roguelike = false;
-        setRoguelikeLoading(false);
-      }
-    },
-    [handleLoadError]
-  );
+      const task = (async () => {
+        setSectionBusy(key, true);
+        setError(null);
+        try {
+          if (key === "memory") {
+            const data = await withTimeout(
+              storyCatalog.memory(force),
+              SECTION_TIMEOUT_MS.memory
+            );
+            setMemoryStories(data);
+          } else {
+            const data = await withTimeout(
+              storyCatalog.grouped(key, force),
+              SECTION_TIMEOUT_MS[key]
+            );
+            setGroups((prev) => ({ ...prev, [key]: data }));
+          }
+          loadedRef.current[key] = true;
+        } catch (err) {
+          handleLoadError(SECTION_LABELS[key], err);
+        } finally {
+          pendingRef.current[key] = undefined;
+          setSectionBusy(key, false);
+        }
+      })();
 
-  const loadMemories = useCallback(
-    async (force = false) => {
-      if (!force && loadedRef.current.memory) return;
-      if (inflightRef.current.memory) return;
-      inflightRef.current.memory = true;
-      setMemoryLoading(true);
-      setError(null);
-      try {
-        const data = await withTimeout(api.getMemoryStories(), 10000);
-        console.log("[StoryList] 干员密录加载成功，数量:", data.length);
-        setMemoryStories(data);
-        loadedRef.current.memory = true;
-      } catch (err) {
-        handleLoadError("干员密录", err);
-      } finally {
-        inflightRef.current.memory = false;
-        setMemoryLoading(false);
-      }
+      pendingRef.current[key] = task;
+      return task;
     },
-    [handleLoadError]
+    [handleLoadError, setSectionBusy]
   );
 
   /** 分类加载的唯一入口：pill 只负责切 activeCategory，加载由 effect 统一触发。 */
   const loadCategory = useCallback(
-    async (category: Category, force = false) => {
-      switch (category) {
-        case "main":
-          await loadMainStories(force);
-          break;
-        case "activity":
-          // 活动要跟支线去重，所以两边都得有数据
-          await Promise.all([loadActivities(force), loadSidestories(force)]);
-          break;
-        case "sidestory":
-          await loadSidestories(force);
-          break;
-        case "roguelike":
-          await loadRoguelike(force);
-          break;
-        case "memory":
-          await loadMemories(force);
-          break;
-        case "favorites":
-          // 收藏分组要靠主线映射表还原章节名
-          await loadMainStories(force);
-          break;
-      }
-    },
-    [loadActivities, loadMainStories, loadMemories, loadRoguelike, loadSidestories]
+    (category: Category, force = false) =>
+      Promise.all(
+        CATEGORY_SECTIONS[category].map((section) => loadSection(section, force))
+      ).then(() => undefined),
+    [loadSection]
   );
 
   useEffect(() => {
@@ -331,13 +414,12 @@ export function StoryList({ onSelectStory }: StoryListProps) {
     (async () => {
       try {
         // 3s 安全超时，防止 isInstalled 因异常挂起
-        const ok = await withTimeout(api.isInstalled(), 3000);
+        const ok = await withTimeout(storyCatalog.isInstalled(), 3000);
         if (cancelled) return;
         setInstalled(ok);
         if (!ok) {
-          console.log("[StoryList] 未安装，打开同步对话框");
           setSyncDialogOpen(true);
-          setLoading(false);
+          setSectionBusy("main", false);
         }
       } catch (e) {
         if (cancelled) return;
@@ -345,20 +427,20 @@ export function StoryList({ onSelectStory }: StoryListProps) {
         setInstalled(false);
         setError("未安装或网络缓慢，请先同步数据");
         setSyncDialogOpen(true);
-        setLoading(false);
+        setSectionBusy("main", false);
       }
     })();
 
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [setSectionBusy]);
 
   // 数据就绪后：当前分类按需加载；主线始终加载（收藏分组名依赖它）。
   useEffect(() => {
     if (installed !== true) return;
-    void loadMainStories();
-  }, [installed, loadMainStories]);
+    void loadSection("main");
+  }, [installed, loadSection]);
 
   useEffect(() => {
     if (installed !== true) return;
@@ -366,29 +448,23 @@ export function StoryList({ onSelectStory }: StoryListProps) {
   }, [activeCategory, installed, loadCategory]);
 
   // 剧情数据重新同步：所有分类缓存作废，重新拉当前分类。
+  // 共享目录缓存由模块级监听清理，那个监听比这里先注册，所以此处一定拿新数据。
   useEffect(() => {
     const handler = () => {
-      console.log("[StoryList] 收到 app:data-updated，重置分类缓存");
-      loadedRef.current = {
-        favorites: true,
-        main: false,
-        activity: false,
-        sidestory: false,
-        roguelike: false,
-        memory: false,
-      };
+      loadedRef.current = initialSectionFlags(false);
       summaryRequestedRef.current.clear();
       setSummaryCache({});
       setSummaryLoadingIds({});
       setOpenGroups({});
       setError(null);
       setInstalled(true);
-      void loadMainStories(true);
+      // 主线不管在哪个分类都要重来一次：收藏分组名依赖它的映射表。
+      void loadSection("main", true);
       void loadCategory(activeCategory, true);
     };
     window.addEventListener("app:data-updated", handler);
     return () => window.removeEventListener("app:data-updated", handler);
-  }, [activeCategory, loadCategory, loadMainStories]);
+  }, [activeCategory, loadCategory, loadSection]);
 
   // 首页统计格 / 其他入口要求直接跳到收藏分类
   useEffect(() => {
@@ -397,7 +473,10 @@ export function StoryList({ onSelectStory }: StoryListProps) {
     return () => window.removeEventListener("app:open-favorites", handler);
   }, []);
 
-  // 阅读进度：回到列表（KeepAlive 重新 display）、窗口聚焦、数据更新时刷新。
+  // 阅读进度刷新时机：窗口重新聚焦、页面重新可见、数据更新，以及
+  // `app:home-refresh` —— 打开剧情和从阅读器返回都会广播它，这正是进度
+  // 唯一会变的时刻。（列表是 KeepAlive 常驻的，切 tab 不重新挂载，
+  // 而 visibility:hidden 仍然占布局，IntersectionObserver 探测不到切换。）
   useEffect(() => {
     const refresh = () => setProgressMap(readProgressPercentMap());
     refresh();
@@ -406,21 +485,11 @@ export function StoryList({ onSelectStory }: StoryListProps) {
     window.addEventListener("app:data-updated", refresh);
     document.addEventListener("visibilitychange", refresh);
 
-    let observer: IntersectionObserver | null = null;
-    const node = rootRef.current;
-    if (node && typeof IntersectionObserver !== "undefined") {
-      observer = new IntersectionObserver((entries) => {
-        if (entries.some((entry) => entry.isIntersecting)) refresh();
-      });
-      observer.observe(node);
-    }
-
     return () => {
       window.removeEventListener("focus", refresh);
       window.removeEventListener("app:home-refresh", refresh);
       window.removeEventListener("app:data-updated", refresh);
       document.removeEventListener("visibilitychange", refresh);
-      observer?.disconnect();
     };
   }, []);
 
@@ -450,16 +519,6 @@ export function StoryList({ onSelectStory }: StoryListProps) {
       });
     }
   }, []);
-
-  const ensureSummariesForStories = useCallback(
-    (stories: StoryEntry[]) => {
-      stories.forEach((story) => {
-        if (!story.storyInfo) return;
-        void handleRequestSummary(story);
-      });
-    },
-    [handleRequestSummary]
-  );
 
   const favoriteStoryEntries = useMemo(() => Object.values(favoriteStories), [favoriteStories]);
   const favoriteGroupEntries = useMemo(
@@ -504,22 +563,35 @@ export function StoryList({ onSelectStory }: StoryListProps) {
     [hasSearch, normalizedSearch]
   );
 
+  // 支线已经单独成一类；无论是否在搜索，都不要在活动里再出现一遍。
+  const activityGroups = useMemo(() => {
+    if (groups.sidestory.length === 0) return groups.activity;
+    const sidestoryNames = new Set(groups.sidestory.map(([name]) => name));
+    return groups.activity.filter(([name]) => !sidestoryNames.has(name));
+  }, [groups.activity, groups.sidestory]);
+
+  /** 去重后的四类分组数据，渲染与「整组收藏」都以它为准。 */
+  const visibleGroups = useMemo<Record<GroupedKey, GroupedStories>>(
+    () => ({
+      main: groups.main,
+      activity: activityGroups,
+      sidestory: groups.sidestory,
+      roguelike: groups.roguelike,
+    }),
+    [activityGroups, groups.main, groups.roguelike, groups.sidestory]
+  );
+
   const groupNameMap = useMemo(() => {
     const map = new Map<string, string>();
 
-    mainGrouped.forEach(([chapterName, stories]) => {
-      stories.forEach((story) => {
-        if (story.storyGroup) {
-          map.set(story.storyGroup, chapterName);
-        }
-      });
-    });
-
-    activityGrouped.forEach(([activityName, stories]) => {
-      stories.forEach((story) => {
-        if (story.storyGroup) {
-          map.set(story.storyGroup, activityName);
-        }
+    // 后写的覆盖先写的，所以顺序按「名字质量」从低到高排。
+    (["roguelike", "sidestory", "activity", "main"] as GroupedKey[]).forEach((key) => {
+      visibleGroups[key].forEach(([groupDisplayName, stories]) => {
+        stories.forEach((story) => {
+          if (story.storyGroup) {
+            map.set(story.storyGroup, groupDisplayName);
+          }
+        });
       });
     });
 
@@ -530,66 +602,43 @@ export function StoryList({ onSelectStory }: StoryListProps) {
     });
 
     return map;
-  }, [mainGrouped, activityGrouped, memoryStories]);
+  }, [memoryStories, visibleGroups]);
 
-  const mainChapterMap = useMemo(() => new Map(mainGrouped), [mainGrouped]);
-  const activityMap = useMemo(() => new Map(activityGrouped), [activityGrouped]);
-  const sidestoryMap = useMemo(() => new Map(sidestoryGrouped), [sidestoryGrouped]);
-  const roguelikeMap = useMemo(() => new Map(roguelikeGrouped), [roguelikeGrouped]);
+  /** 分组名 → 该组的完整剧情列表。整组收藏要收全部，不是搜索后的子集。 */
+  const fullGroupMaps = useMemo<Record<GroupedKey, Map<string, StoryEntry[]>>>(
+    () => ({
+      main: new Map(visibleGroups.main),
+      activity: new Map(visibleGroups.activity),
+      sidestory: new Map(visibleGroups.sidestory),
+      roguelike: new Map(visibleGroups.roguelike),
+    }),
+    [visibleGroups]
+  );
 
-  const filteredMainGrouped = useMemo(() => {
-    if (!hasSearch) return mainGrouped;
-    return mainGrouped
-      .map(([chapterName, stories]) => {
-        const chapterMatches = chapterName.toLowerCase().includes(normalizedSearch);
-        if (chapterMatches) {
-          return [chapterName, stories] as [string, StoryEntry[]];
-        }
-        const filteredStories = stories.filter(matchesSearch);
-        return [chapterName, filteredStories] as [string, StoryEntry[]];
-      })
-      .filter(([, stories]) => stories.length > 0);
-  }, [hasSearch, mainGrouped, matchesSearch, normalizedSearch]);
+  /** 组名命中就整组保留，否则只留命中的条目；空组直接丢掉。 */
+  const filterGrouped = useCallback(
+    (list: GroupedStories): GroupedStories => {
+      if (!hasSearch) return list;
+      return list
+        .map(([name, stories]) =>
+          name.toLowerCase().includes(normalizedSearch)
+            ? ([name, stories] as [string, StoryEntry[]])
+            : ([name, stories.filter(matchesSearch)] as [string, StoryEntry[]])
+        )
+        .filter(([, stories]) => stories.length > 0);
+    },
+    [hasSearch, matchesSearch, normalizedSearch]
+  );
 
-  const filteredActivityGrouped = useMemo(() => {
-    // 支线已经单独成一类；无论是否在搜索，都不要在活动里再出现一遍。
-    const sidestoryNames = new Set(sidestoryGrouped.map(([name]) => name));
-    return activityGrouped
-      .filter(([activityName]) => !sidestoryNames.has(activityName))
-      .map(([activityName, stories]) => {
-        const activityMatches = activityName.toLowerCase().includes(normalizedSearch);
-        if (activityMatches || !hasSearch) {
-          return [activityName, stories] as [string, StoryEntry[]];
-        }
-        const filteredStories = stories.filter(matchesSearch);
-        return [activityName, filteredStories] as [string, StoryEntry[]];
-      })
-      .filter(([, stories]) => stories.length > 0);
-  }, [activityGrouped, hasSearch, matchesSearch, normalizedSearch, sidestoryGrouped]);
-
-  const filteredSidestoryGrouped = useMemo(() => {
-    if (!hasSearch) return sidestoryGrouped;
-    return sidestoryGrouped
-      .map(([name, stories]) => {
-        const nameMatches = name.toLowerCase().includes(normalizedSearch);
-        if (nameMatches) return [name, stories] as [string, StoryEntry[]];
-        const filteredStories = stories.filter(matchesSearch);
-        return [name, filteredStories] as [string, StoryEntry[]];
-      })
-      .filter(([, stories]) => stories.length > 0);
-  }, [sidestoryGrouped, hasSearch, matchesSearch, normalizedSearch]);
-
-  const filteredRoguelikeGrouped = useMemo(() => {
-    if (!hasSearch) return roguelikeGrouped;
-    return roguelikeGrouped
-      .map(([name, stories]) => {
-        const nameMatches = name.toLowerCase().includes(normalizedSearch);
-        if (nameMatches) return [name, stories] as [string, StoryEntry[]];
-        const filteredStories = stories.filter(matchesSearch);
-        return [name, filteredStories] as [string, StoryEntry[]];
-      })
-      .filter(([, stories]) => stories.length > 0);
-  }, [roguelikeGrouped, hasSearch, matchesSearch, normalizedSearch]);
+  const filteredGroups = useMemo<Record<GroupedKey, GroupedStories>>(
+    () => ({
+      main: filterGrouped(visibleGroups.main),
+      activity: filterGrouped(visibleGroups.activity),
+      sidestory: filterGrouped(visibleGroups.sidestory),
+      roguelike: filterGrouped(visibleGroups.roguelike),
+    }),
+    [filterGrouped, visibleGroups]
+  );
 
   const filteredMemoryStories = useMemo(() => {
     if (!hasSearch) return memoryStories;
@@ -624,14 +673,6 @@ export function StoryList({ onSelectStory }: StoryListProps) {
       .filter((item): item is NonNullable<typeof item> => Boolean(item))
       .sort((a, b) => a.displayName.localeCompare(b.displayName, "zh-Hans"));
   }, [favoriteGroupEntries, hasSearch, matchesSearch]);
-
-  const favoriteGroupStoryIds = useMemo(() => {
-    const ids = new Set<string>();
-    favoriteGroupEntries.forEach((group) => {
-      group.storyIds.forEach((id) => ids.add(id));
-    });
-    return ids;
-  }, [favoriteGroupEntries]);
 
   const individualFavoriteStories = useMemo(() => {
     if (favoriteStoryEntries.length === 0) return [];
@@ -672,52 +713,53 @@ export function StoryList({ onSelectStory }: StoryListProps) {
       .sort((a, b) => a.displayName.localeCompare(b.displayName, "zh-Hans"));
   }, [groupNameMap, individualFavoriteStories, matchesSearch]);
 
-  const favoriteCount = useMemo(() => {
-    const uniqueIds = new Set<string>();
-    favoriteStoryEntries.forEach((story) => uniqueIds.add(story.storyId));
-    favoriteGroupEntries.forEach((group) => {
-      group.storyIds.forEach((id) => uniqueIds.add(id));
-    });
-    return uniqueIds.size;
-  }, [favoriteGroupEntries, favoriteStoryEntries]);
+  /** 当前分类在当前筛选条件下真正会渲染出来的条目数。 */
+  const visibleStoryCount = useMemo(() => {
+    if (activeCategory === "memory") return filteredMemoryStories.length;
+    if (activeCategory === "favorites") {
+      // 两份列表互斥（individual 会排掉分组内的条目），可以直接相加。
+      return (
+        favoriteGroupList.reduce((total, group) => total + group.visibleStories.length, 0) +
+        individualFavoriteGroups.reduce((total, group) => total + group.stories.length, 0)
+      );
+    }
+    return filteredGroups[activeCategory].reduce(
+      (total, [, stories]) => total + stories.length,
+      0
+    );
+  }, [
+    activeCategory,
+    favoriteGroupList,
+    filteredGroups,
+    filteredMemoryStories.length,
+    individualFavoriteGroups,
+  ]);
 
   const activeSummary = useMemo(() => {
     if (hasSearch) {
-      return `搜索关键字：“${trimmedSearch}”`;
+      return `搜索“${trimmedSearch}” · 命中 ${visibleStoryCount} 条`;
     }
     if (activeCategory === "favorites" && favoriteCount > 0) {
       return `已收藏 ${favoriteCount} 条剧情`;
     }
     return CATEGORY_DESCRIPTIONS[activeCategory];
-  }, [activeCategory, favoriteCount, hasSearch, trimmedSearch]);
+  }, [activeCategory, favoriteCount, hasSearch, trimmedSearch, visibleStoryCount]);
 
   const openSync = useCallback(() => setSyncDialogOpen(true), []);
 
   const handleSyncSuccess = useCallback(async () => {
-    console.log("[StoryList] 同步成功回调触发");
     setInstalled(true);
     setError(null);
-    loadedRef.current = {
-      favorites: true,
-      main: false,
-      activity: false,
-      sidestory: false,
-      roguelike: false,
-      memory: false,
-    };
+    // 同步对话框不一定广播 `app:data-updated`，这里自己把共享缓存清掉。
+    invalidateStoryCatalog();
+    loadedRef.current = initialSectionFlags(false);
     summaryRequestedRef.current.clear();
     setSummaryCache({});
-    await loadMainStories(true);
-    await loadCategory(activeCategory, true);
-    console.log("[StoryList] 关闭同步对话框");
+    setSummaryLoadingIds({});
+    // 并发发起：loadSection 内部有 in-flight 锁，主线不会被拉两次。
+    await Promise.all([loadSection("main", true), loadCategory(activeCategory, true)]);
     setSyncDialogOpen(false);
-  }, [activeCategory, loadCategory, loadMainStories]);
-
-  useEffect(() => {
-    if (showSummaries && memoryStories.length > 0) {
-      ensureSummariesForStories(memoryStories);
-    }
-  }, [showSummaries, memoryStories, ensureSummariesForStories]);
+  }, [activeCategory, loadCategory, loadSection]);
 
   const renderStoryItem = useCallback(
     (story: StoryEntry, keyPrefix?: string) => (
@@ -746,10 +788,67 @@ export function StoryList({ onSelectStory }: StoryListProps) {
     ]
   );
 
-  const mainPending = installed === null || (loading && mainGrouped.length === 0);
+  /** 只在「还没有任何数据」时铺骨架，刷新已有列表不闪。 */
+  const isSectionPending = useCallback(
+    (key: SectionKey) => {
+      if (installed === null) return true;
+      const empty = key === "memory" ? memoryStories.length === 0 : groups[key].length === 0;
+      return sectionLoading[key] && empty;
+    },
+    [groups, installed, memoryStories.length, sectionLoading]
+  );
+
+  /** 四类分组的渲染完全同构，只有文案和收藏语义不同。 */
+  const renderGroupedCategory = (key: GroupedKey) => {
+    if (isSectionPending(key)) return <ListSkeleton />;
+
+    const meta = GROUPED_CATEGORY_META[key];
+    const list = filteredGroups[key];
+
+    if (list.length === 0) {
+      return (
+        <EmptyState
+          message={hasSearch ? meta.emptySearch : meta.emptyDefault}
+          actionLabel={hasSearch ? undefined : "去同步数据"}
+          onAction={hasSearch ? undefined : openSync}
+        />
+      );
+    }
+
+    return list.map(([name, stories], index) => {
+      const fullStories = fullGroupMaps[key].get(name) ?? stories;
+      const groupId = `${meta.idPrefix}:${fullStories[0]?.storyGroup || name}`;
+      return (
+        <Collapsible
+          key={groupId}
+          title={name}
+          count={stories.length}
+          open={isGroupOpen(groupId, index === 0)}
+          onOpenChange={(open) => setGroupOpen(groupId, open)}
+          actions={
+            <GroupFavoriteButton
+              isFavorite={isGroupFavorite(groupId)}
+              onToggle={() =>
+                toggleFavoriteGroup({
+                  id: groupId,
+                  name,
+                  type: meta.favoriteType,
+                  stories: fullStories,
+                })
+              }
+              inactiveText={meta.favoriteInactive}
+              activeText={meta.favoriteActive}
+            />
+          }
+        >
+          {stories.map((story) => renderStoryItem(story))}
+        </Collapsible>
+      );
+    });
+  };
 
   return (
-    <div ref={rootRef} className="h-full flex flex-col overflow-hidden">
+    <div className="h-full flex flex-col overflow-hidden">
       <main className="flex-1 overflow-hidden">
         <CustomScrollArea
           className="h-full"
@@ -760,7 +859,11 @@ export function StoryList({ onSelectStory }: StoryListProps) {
           <div className="container py-6 pb-24 space-y-6 motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-700">
             <div className="space-y-3">
               {/* 分类 pill：移动端横向滚动，触控目标 ≥44px。加载中也保持可见。 */}
-              <div className="-mx-1 flex gap-2 overflow-x-auto px-1 pb-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+              <div
+                role="group"
+                aria-label="剧情分类"
+                className="-mx-1 flex gap-2 overflow-x-auto px-1 pb-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+              >
                 {CATEGORY_TABS.map((tab) => (
                   <Button
                     key={tab.id}
@@ -776,7 +879,10 @@ export function StoryList({ onSelectStory }: StoryListProps) {
               </div>
               {/* 顶部行：左侧摘要文本，右侧全局简介开关 */}
               <div className="flex items-center justify-between gap-3">
-                <span className="text-sm text-[hsl(var(--color-muted-foreground))]">
+                <span
+                  aria-live="polite"
+                  className="text-sm text-[hsl(var(--color-muted-foreground))]"
+                >
                   {activeSummary}
                 </span>
                 <SummaryToggleButton
@@ -816,199 +922,23 @@ export function StoryList({ onSelectStory }: StoryListProps) {
             )}
 
             <div className="space-y-4">
-              {activeCategory === "main" &&
-                (mainPending ? (
-                  <ListSkeleton />
-                ) : filteredMainGrouped.length > 0 ? (
-                  filteredMainGrouped.map(([chapterName, stories], index) => {
-                    const fullStories = mainChapterMap.get(chapterName) ?? stories;
-                    const groupKey = fullStories[0]?.storyGroup || chapterName;
-                    const groupId = `chapter:${groupKey}`;
-                    const chapterFavorite = isGroupFavorite(groupId);
-                    return (
-                      <Collapsible
-                        key={groupId}
-                        title={chapterName}
-                        open={isGroupOpen(groupId, index === 0)}
-                        onOpenChange={(open) => setGroupOpen(groupId, open)}
-                        actions={
-                          <GroupFavoriteButton
-                            isFavorite={chapterFavorite}
-                            onToggle={() =>
-                              toggleFavoriteGroup({
-                                id: groupId,
-                                name: chapterName,
-                                type: "chapter",
-                                stories: fullStories,
-                              })
-                            }
-                            inactiveText="收藏章节"
-                            activeText="取消收藏章节"
-                          />
-                        }
-                      >
-                        {stories.map((story) => renderStoryItem(story))}
-                      </Collapsible>
-                    );
-                  })
-                ) : (
-                  <EmptyState
-                    message={hasSearch ? "没有匹配的主线剧情" : "暂无主线剧情，可能需要同步。"}
-                    actionLabel={hasSearch ? undefined : "去同步数据"}
-                    onAction={hasSearch ? undefined : openSync}
-                  />
-                ))}
-
-              {activeCategory === "activity" && (
-                <div className="space-y-3">
-                  {activityLoading && <ListSkeleton />}
-                  {!activityLoading && filteredActivityGrouped.length === 0 && (
-                    <EmptyState
-                      message={hasSearch ? "没有匹配的活动剧情" : "暂无活动剧情或需要同步"}
-                      actionLabel={hasSearch ? undefined : "去同步数据"}
-                      onAction={hasSearch ? undefined : openSync}
-                    />
-                  )}
-                  {!activityLoading &&
-                    filteredActivityGrouped.map(([activityName, stories], index) => {
-                      const fullStories = activityMap.get(activityName) ?? stories;
-                      const groupKey = fullStories[0]?.storyGroup || activityName;
-                      const groupId = `activity:${groupKey}`;
-                      const activityFavorite = isGroupFavorite(groupId);
-                      return (
-                        <Collapsible
-                          key={groupId}
-                          title={activityName}
-                          open={isGroupOpen(groupId, index === 0)}
-                          onOpenChange={(open) => setGroupOpen(groupId, open)}
-                          actions={
-                            <GroupFavoriteButton
-                              isFavorite={activityFavorite}
-                              onToggle={() =>
-                                toggleFavoriteGroup({
-                                  id: groupId,
-                                  name: activityName,
-                                  type: "activity",
-                                  stories: fullStories,
-                                })
-                              }
-                              inactiveText="收藏活动"
-                              activeText="取消收藏活动"
-                            />
-                          }
-                        >
-                          {stories.map((story) => renderStoryItem(story))}
-                        </Collapsible>
-                      );
-                    })}
-                </div>
-              )}
-
-              {activeCategory === "sidestory" && (
-                <div className="space-y-3">
-                  {sidestoryLoading && <ListSkeleton />}
-                  {!sidestoryLoading && filteredSidestoryGrouped.length === 0 && (
-                    <EmptyState
-                      message={hasSearch ? "没有匹配的支线剧情" : "暂无支线剧情或需要同步"}
-                      actionLabel={hasSearch ? undefined : "去同步数据"}
-                      onAction={hasSearch ? undefined : openSync}
-                    />
-                  )}
-                  {!sidestoryLoading &&
-                    filteredSidestoryGrouped.map(([name, stories], index) => {
-                      const fullStories = sidestoryMap.get(name) ?? stories;
-                      const groupKey = fullStories[0]?.storyGroup || name;
-                      const groupId = `sidestory:${groupKey}`;
-                      const fav = isGroupFavorite(groupId);
-                      return (
-                        <Collapsible
-                          key={groupId}
-                          title={name}
-                          open={isGroupOpen(groupId, index === 0)}
-                          onOpenChange={(open) => setGroupOpen(groupId, open)}
-                          actions={
-                            <GroupFavoriteButton
-                              isFavorite={fav}
-                              onToggle={() =>
-                                toggleFavoriteGroup({ id: groupId, name, type: "other", stories: fullStories })
-                              }
-                              inactiveText="收藏支线"
-                              activeText="取消收藏支线"
-                            />
-                          }
-                        >
-                          {stories.map((story) => renderStoryItem(story))}
-                        </Collapsible>
-                      );
-                    })}
-                </div>
-              )}
-
-              {activeCategory === "roguelike" && (
-                <div className="space-y-3">
-                  {roguelikeLoading && <ListSkeleton />}
-                  {!roguelikeLoading && filteredRoguelikeGrouped.length === 0 && (
-                    <EmptyState
-                      message={hasSearch ? "没有匹配的肉鸽剧情" : "暂无肉鸽剧情或需要同步"}
-                      actionLabel={hasSearch ? undefined : "去同步数据"}
-                      onAction={hasSearch ? undefined : openSync}
-                    />
-                  )}
-                  {!roguelikeLoading &&
-                    filteredRoguelikeGrouped.map(([name, stories], index) => {
-                      const fullStories = roguelikeMap.get(name) ?? stories;
-                      const groupKey = fullStories[0]?.storyGroup || name;
-                      const groupId = `roguelike:${groupKey}`;
-                      const fav = isGroupFavorite(groupId);
-                      return (
-                        <Collapsible
-                          key={groupId}
-                          title={name}
-                          open={isGroupOpen(groupId, index === 0)}
-                          onOpenChange={(open) => setGroupOpen(groupId, open)}
-                          actions={
-                            <GroupFavoriteButton
-                              isFavorite={fav}
-                              onToggle={() =>
-                                toggleFavoriteGroup({ id: groupId, name, type: "other", stories: fullStories })
-                              }
-                              inactiveText="收藏肉鸽"
-                              activeText="取消收藏肉鸽"
-                            />
-                          }
-                        >
-                          {stories.map((story) => renderStoryItem(story))}
-                        </Collapsible>
-                      );
-                    })}
-                </div>
+              {activeCategory !== "memory" && activeCategory !== "favorites" && (
+                <div className="space-y-3">{renderGroupedCategory(activeCategory)}</div>
               )}
 
               {activeCategory === "memory" && (
                 <div className="space-y-2">
-                  {memoryLoading && <ListSkeleton />}
-                  {!memoryLoading && filteredMemoryStories.length === 0 && (
+                  {isSectionPending("memory") ? (
+                    <ListSkeleton />
+                  ) : filteredMemoryStories.length === 0 ? (
                     <EmptyState
                       message={hasSearch ? "没有匹配的密录剧情" : "暂无干员密录或需要同步"}
                       actionLabel={hasSearch ? undefined : "去同步数据"}
                       onAction={hasSearch ? undefined : openSync}
                     />
+                  ) : (
+                    filteredMemoryStories.map((story) => renderStoryItem(story))
                   )}
-                  {!memoryLoading &&
-                    filteredMemoryStories.map((story) => (
-                      <StoryItem
-                        key={story.storyId}
-                        story={story}
-                        onSelectStory={onSelectStory}
-                        isFavorite={isFavorite(story.storyId)}
-                        onToggleFavorite={() => toggleFavorite(story)}
-                        showSummary={memorySummaryVisible}
-                        summary={summaryCache[story.storyId]}
-                        summaryLoading={Boolean(summaryLoadingIds[story.storyId])}
-                        onRequestSummary={handleRequestSummary}
-                        progress={progressMap[story.storyTxt]}
-                      />
-                    ))}
                 </div>
               )}
 
@@ -1023,6 +953,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
                             <Collapsible
                               key={key}
                               title={displayName}
+                              count={visibleStories.length}
                               open={isGroupOpen(key, index === 0)}
                               onOpenChange={(open) => setGroupOpen(key, open)}
                               actions={
@@ -1055,6 +986,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
                           <Collapsible
                             key={key}
                             title={displayName}
+                            count={stories.length}
                             open={isGroupOpen(
                               key,
                               favoriteGroupList.length === 0 && index === 0

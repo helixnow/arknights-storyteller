@@ -2,6 +2,20 @@ import { useEffect, useRef } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 
+const IS_DEV = import.meta.env.DEV;
+
+/**
+ * 诊断日志只在开发构建输出。更新 / 同步流程打点很密，正式包里既刷屏又会把
+ * 更新源地址暴露在控制台里。真正异常的分支仍然走 console.error。
+ */
+export function devLog(...args: unknown[]): void {
+  if (IS_DEV) console.info(...args);
+}
+
+export function devWarn(...args: unknown[]): void {
+  if (IS_DEV) console.warn(...args);
+}
+
 function isTauriEnvironment(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
@@ -48,6 +62,16 @@ export type AndroidInstallResponse = {
   needsPermission?: boolean;
 };
 
+/** 桌面端下载进度的归一化形态，屏蔽 plugin-updater 的增量事件差异。 */
+export interface UpdateDownloadProgress {
+  downloadedBytes: number;
+  /** 服务端未给出 Content-Length 时为 null。 */
+  totalBytes: number | null;
+  /** 0-100；总长度未知时为 null。 */
+  percent: number | null;
+  done: boolean;
+}
+
 const enum CompareResult {
   Greater = 1,
   Equals = 0,
@@ -71,23 +95,89 @@ export function compareVersions(a: string, b: string): CompareResult {
   return CompareResult.Equals;
 }
 
+export type UpdateIssueTone = "info" | "warning" | "error";
+
+export interface UpdateIssue {
+  tone: UpdateIssueTone;
+  message: string;
+}
+
+/**
+ * 更新检查失败在绝大多数情况下都不是用户能修的问题（没打更新签名、没配更新源、
+ * 网络不通），所以只有签名校验这类真正危险的分支才用 error 语气。
+ */
+const UPDATE_ERROR_RULES: Array<{ test: RegExp; tone: UpdateIssueTone; message: string }> = [
+  {
+    test: /并非\s*Tauri|not a tauri/i,
+    tone: "info",
+    message: "当前环境不是桌面/移动客户端，无法检查更新。",
+  },
+  {
+    test: /VITE_ANDROID_UPDATE_FEED|未配置安卓更新源/i,
+    tone: "info",
+    message: "当前构建未配置更新源，请前往项目发布页手动下载新版本。",
+  },
+  {
+    test: /not allowed|unknown plugin|plugin .*not (?:found|registered)|updater.*disabled/i,
+    tone: "info",
+    message: "当前安装包未启用自动更新，请前往项目发布页手动下载新版本。",
+  },
+  {
+    test: /signature|pubkey|public key|verif/i,
+    tone: "error",
+    message: "更新包签名校验失败，出于安全考虑已中止安装。",
+  },
+  {
+    test: /could not fetch a valid release|releases?\.json|manifest|缺少 version|HTTP 4\d\d|HTTP 5\d\d/i,
+    tone: "warning",
+    message: "更新源暂时不可用，请稍后再试。",
+  },
+  {
+    test: /network|failed to fetch|error sending request|timed? ?out|超时|dns|connect|ECONN|ENOTFOUND|offline|网络/i,
+    tone: "warning",
+    message: "无法连接更新服务器，请检查网络后重试。",
+  },
+];
+
+/** 把更新流程里的异常翻译成一句不吓人的中文，同时保留原文便于排查。 */
+export function describeUpdateError(
+  error: unknown,
+  fallback = "本次更新检查没有完成，可稍后再试。"
+): UpdateIssue {
+  const raw = error instanceof Error ? error.message : String(error ?? "");
+  const text = raw.trim();
+  for (const rule of UPDATE_ERROR_RULES) {
+    if (rule.test.test(text)) {
+      return { tone: rule.tone, message: rule.message };
+    }
+  }
+  if (!text) return { tone: "warning", message: fallback };
+  return { tone: "warning", message: `${fallback}（${text}）` };
+}
+
 type ManifestOptions = {
   suppressErrors?: boolean;
+  timeoutMs?: number;
 };
 
+const MANIFEST_TIMEOUT_MS = 10_000;
+
 async function fetchAndroidManifest(options: ManifestOptions = {}): Promise<AndroidUpdateManifest | null> {
-  const { suppressErrors = false } = options;
+  const { suppressErrors = false, timeoutMs = MANIFEST_TIMEOUT_MS } = options;
   const feed = import.meta.env.VITE_ANDROID_UPDATE_FEED as string | undefined;
   if (!feed) {
     if (!suppressErrors) {
       throw new Error("未配置安卓更新源 VITE_ANDROID_UPDATE_FEED");
     }
-    console.info("[Updater] 未配置 VITE_ANDROID_UPDATE_FEED，跳过安卓更新检查");
+    devLog("[Updater] 未配置 VITE_ANDROID_UPDATE_FEED，跳过安卓更新检查");
     return null;
   }
 
+  // 更新源挂掉时不能让请求一直吊着，否则启动期的自动检查会一直占着连接。
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(feed, { cache: "no-store" });
+    const response = await fetch(feed, { cache: "no-store", signal: controller.signal });
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`);
     }
@@ -97,11 +187,19 @@ async function fetchAndroidManifest(options: ManifestOptions = {}): Promise<Andr
     }
     return data;
   } catch (error) {
+    const normalized =
+      error instanceof DOMException && error.name === "AbortError"
+        ? new Error("请求更新信息超时")
+        : error instanceof Error
+        ? error
+        : new Error(String(error));
     if (!suppressErrors) {
-      throw error instanceof Error ? error : new Error(String(error));
+      throw normalized;
     }
-    console.error("[Updater] 获取安卓更新信息失败", error);
+    devWarn("[Updater] 获取安卓更新信息失败", normalized);
     return null;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -124,12 +222,12 @@ export async function safeConfirm(
       return await dialog.ask(message, { title, kind });
     }
   } catch (error) {
-    console.info("[Dialog] 对话框插件不可用，回退到 window.confirm", error);
+    devLog("[Dialog] 对话框插件不可用，回退到 window.confirm", error);
   }
   try {
     return window.confirm(message);
   } catch (error) {
-    console.error("[Dialog] window.confirm 不可用", error);
+    devWarn("[Dialog] window.confirm 不可用", error);
     return false;
   }
 }
@@ -140,7 +238,7 @@ export async function checkDesktopUpdate(currentVersionOverride?: string): Promi
     return null;
   }
 
-  const [{ check }] = await Promise.all([import("@tauri-apps/plugin-updater")]);
+  const { check } = await import("@tauri-apps/plugin-updater");
   const update = await check();
   if (!update) {
     return null;
@@ -159,13 +257,37 @@ export async function checkDesktopUpdate(currentVersionOverride?: string): Promi
 
 export async function installDesktopUpdate(
   update: DesktopUpdateAvailable,
-  onProgress?: (event: { event: string; data?: unknown }) => void,
+  onProgress?: (progress: UpdateDownloadProgress) => void,
   options: { relaunch?: boolean } = {}
 ): Promise<void> {
   const { relaunch = true } = options;
+
+  let totalBytes: number | null = null;
+  let downloadedBytes = 0;
+
   await update.handle.downloadAndInstall((event) => {
-    onProgress?.(event);
+    if (!onProgress) return;
+    switch (event.event) {
+      case "Started":
+        totalBytes = event.data.contentLength ?? null;
+        downloadedBytes = 0;
+        break;
+      case "Progress":
+        downloadedBytes += event.data.chunkLength ?? 0;
+        break;
+      case "Finished":
+        if (totalBytes !== null) downloadedBytes = totalBytes;
+        break;
+    }
+    const total: number | null = totalBytes;
+    onProgress({
+      downloadedBytes,
+      totalBytes: total,
+      percent: total && total > 0 ? Math.min(100, Math.round((downloadedBytes / total) * 100)) : null,
+      done: event.event === "Finished",
+    });
   });
+
   if (relaunch) {
     const { relaunch: relaunchApp } = await import("@tauri-apps/plugin-process");
     await relaunchApp();
@@ -215,66 +337,50 @@ export function useAppUpdater() {
     startedRef.current = true;
 
     let cancelled = false;
+    const isCancelled = () => cancelled;
 
-    const runUpdateFlow = async () => {
-      try {
-        const platform = detectRuntimePlatform();
-        if (platform === "android") {
-          await runAndroidUpdateFlow(cancelled);
-        } else if (platform === "desktop") {
-          await runDesktopUpdateFlow(cancelled);
-        }
-      } catch (error) {
-        if (!cancelled) {
-          console.error("[Updater] 自动更新流程失败", error);
-        }
-      }
-    };
-
-    const runDesktopUpdateFlow = async (isCancelled: boolean) => {
+    const runDesktopUpdateFlow = async () => {
       try {
         const updateInfo = await checkDesktopUpdate();
-        if (!updateInfo || isCancelled) return;
+        if (!updateInfo || isCancelled()) return;
 
         const shouldInstall = await safeConfirm(
           `检测到新版本 ${updateInfo.availableVersion}，是否立即下载并安装更新？`,
           { title: "发现更新" }
         );
-        if (!shouldInstall || isCancelled) {
-          console.info("[Updater] 用户取消更新");
+        if (!shouldInstall || isCancelled()) {
+          devLog("[Updater] 用户取消更新");
           return;
         }
 
-        console.info("[Updater] 开始下载更新", updateInfo);
-        await installDesktopUpdate(updateInfo, (event) => {
-          if (isCancelled) return;
-          console.info("[Updater] 下载事件", event);
+        devLog("[Updater] 开始下载更新", updateInfo.availableVersion);
+        await installDesktopUpdate(updateInfo, (progress) => {
+          if (isCancelled() || !progress.done) return;
+          devLog("[Updater] 更新包下载完成", progress.downloadedBytes);
         });
       } catch (error) {
-        if (!isCancelled) {
-          // Tauri 未授予 `updater:allow-check` 权限时会抛 "not allowed" 错误，
-          // 这是配置缺失、不是运行时问题，吞成 info，免得每次启动都在控制台
-          // 刷红。
-          const msg = error instanceof Error ? error.message : String(error);
-          if (/plugin/i.test(msg) || /not allowed/i.test(msg)) {
-            console.info("[Updater] 桌面更新不可用：", msg);
-          } else {
-            console.error("[Updater] 桌面更新失败", error);
-          }
+        if (isCancelled()) return;
+        // 缺少 `updater:allow-check` 权限、未配置更新源之类都是打包配置问题，
+        // 启动期没必要在控制台刷红。
+        const issue = describeUpdateError(error);
+        if (issue.tone === "error") {
+          console.error("[Updater] 桌面更新失败", error);
+        } else {
+          devLog("[Updater] 桌面更新不可用：", issue.message);
         }
       }
     };
 
-    const runAndroidUpdateFlow = async (isCancelled: boolean) => {
+    const runAndroidUpdateFlow = async () => {
       try {
         const manifest = await fetchAndroidManifest({ suppressErrors: true });
-        if (!manifest || isCancelled) return;
+        if (!manifest || isCancelled()) return;
 
         const currentVersion = await getVersion();
-        if (isCancelled) return;
+        if (isCancelled()) return;
 
         if (compareVersions(manifest.version, currentVersion) <= CompareResult.Equals) {
-          console.info("[Updater] 安卓端已是最新版本", { currentVersion, remote: manifest.version });
+          devLog("[Updater] 安卓端已是最新版本", currentVersion, manifest.version);
           return;
         }
 
@@ -283,8 +389,8 @@ export function useAppUpdater() {
           { title: "发现更新" }
         );
 
-        if (!shouldInstall || isCancelled) {
-          console.info("[Updater] 用户取消安卓更新");
+        if (!shouldInstall || isCancelled()) {
+          devLog("[Updater] 用户取消安卓更新");
           return;
         }
 
@@ -294,18 +400,31 @@ export function useAppUpdater() {
           manifest,
         });
 
-        if (isCancelled) return;
+        if (isCancelled()) return;
 
         if (response?.needsPermission) {
-          console.warn("[Updater] 需要开启未知来源安装权限");
+          devLog("[Updater] 需要开启未知来源安装权限");
           await openAndroidInstallPermissionSettings();
         } else {
-          console.info("[Updater] 已触发 APK 安装流程", response);
+          devLog("[Updater] 已触发 APK 安装流程", response?.status);
         }
       } catch (error) {
-        if (!isCancelled) {
-          console.error("[Updater] 下载或安装安卓更新失败", error);
+        if (isCancelled()) return;
+        const issue = describeUpdateError(error);
+        if (issue.tone === "error") {
+          console.error("[Updater] 安卓更新失败", error);
+        } else {
+          devLog("[Updater] 安卓更新不可用：", issue.message);
         }
+      }
+    };
+
+    const runUpdateFlow = async () => {
+      const platform = detectRuntimePlatform();
+      if (platform === "android") {
+        await runAndroidUpdateFlow();
+      } else if (platform === "desktop") {
+        await runDesktopUpdateFlow();
       }
     };
 

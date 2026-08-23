@@ -1,7 +1,13 @@
 import { useMemo, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
 import { useStoryPreview } from "@/hooks/useStoryPreview";
-import { resolveAssetCandidatesLocal } from "@/lib/assetUrls";
+import {
+  gradientFallbackBackground,
+  markAssetUrlAlive,
+  markAssetUrlDead,
+  pickLiveCandidate,
+  resolveAssetCandidatesLocal,
+} from "@/lib/assetUrls";
 import type { StoryEntry } from "@/types/story";
 
 /**
@@ -52,40 +58,30 @@ export function StoryThumbnail({
   // URL 仍在新列表中，就保持显示，不重置。这避免了 token 异步回来后把已经
   // 显示好的图片闪掉再重新加载的问题。
   const loadedUrlRef = useRef<string | null>(null);
-  const prevCandidatesKeyRef = useRef<string>("");
+  const [cursor, setCursor] = useState(0);
+  const [loaded, setLoaded] = useState(false);
 
+  // candidates 变了就同步 state（React 允许在 render 中条件性 setState，
+  // 只要不会无限循环）。
   const candidatesKey = candidates.join("|");
-  let initialCursor = 0;
-  let initialLoaded = false;
-
-  if (candidatesKey !== prevCandidatesKeyRef.current) {
-    // candidates 变了
-    if (loadedUrlRef.current && candidates.includes(loadedUrlRef.current)) {
-      // 已成功的 URL 仍在新列表中，保持它
-      initialCursor = candidates.indexOf(loadedUrlRef.current);
-      initialLoaded = true;
+  const appliedKeyRef = useRef(candidatesKey);
+  if (appliedKeyRef.current !== candidatesKey) {
+    appliedKeyRef.current = candidatesKey;
+    const keptIdx = loadedUrlRef.current ? candidates.indexOf(loadedUrlRef.current) : -1;
+    if (keptIdx >= 0) {
+      setCursor(keptIdx);
+      setLoaded(true);
     } else {
-      // 需要重新加载
-      initialCursor = 0;
-      initialLoaded = false;
       loadedUrlRef.current = null;
+      setCursor(0);
+      setLoaded(false);
     }
-    prevCandidatesKeyRef.current = candidatesKey;
   }
 
-  const [cursor, setCursor] = useState(initialCursor);
-  const [loaded, setLoaded] = useState(initialLoaded);
-
-  // 当 candidates 变化时同步 state（React 允许在 render 中 setState，
-  // 只要是条件性的且不会无限循环）
-  const lastAppliedKeyRef = useRef(candidatesKey);
-  if (lastAppliedKeyRef.current !== candidatesKey) {
-    lastAppliedKeyRef.current = candidatesKey;
-    setCursor(initialCursor);
-    setLoaded(initialLoaded);
-  }
-
-  const currentUrl = candidates[cursor] ?? null;
+  // 与 `<AssetImage>` 共用同一份失败缓存 / host 熔断：同一张 404 的封面
+  // 不会因为走了两条渲染路径就被请求两遍。
+  const live = pickLiveCandidate(candidates, cursor);
+  const currentUrl = live?.url ?? null;
   const tintClass = tint === "soft" ? "filter saturate-[0.85]" : "";
 
   return (
@@ -95,25 +91,23 @@ export function StoryThumbnail({
         className
       )}
     >
-      {currentUrl ? (
+      {live ? (
         <img
-          key={currentUrl}
-          src={currentUrl}
+          key={live.url}
+          src={live.url}
           alt={alt ?? story.storyName}
           loading={lazy ? "lazy" : "eager"}
           decoding="async"
           referrerPolicy="no-referrer"
           draggable={false}
           onLoad={() => {
-            loadedUrlRef.current = currentUrl;
+            markAssetUrlAlive(live.url);
+            loadedUrlRef.current = live.url;
             setLoaded(true);
           }}
           onError={() => {
-            if (cursor + 1 < candidates.length) {
-              setCursor(cursor + 1);
-            } else {
-              setCursor(candidates.length);
-            }
+            markAssetUrlDead(live.url);
+            setCursor(Math.min(live.index + 1, candidates.length));
           }}
           className={cn(
             "absolute inset-0 h-full w-full object-cover",
@@ -129,25 +123,17 @@ export function StoryThumbnail({
   );
 }
 
+/**
+ * 纯渐变兜底。`.story-thumbnail-fallback` 是 index.css 里约定好的钩子——
+ * `.story-card-memory-bg` 靠它把这块装饰色块藏掉，否则封面加载失败时卡片
+ * 背后会冒出一块跟卡片底色打架的渐变。
+ */
 function GradientFallback({ seed }: { seed: string }) {
-  const hue = hashHue(seed || "ark");
   return (
     <div
       aria-hidden="true"
-      className="absolute inset-0"
-      style={{
-        background: `linear-gradient(135deg, hsl(${hue} 26% 46% / 0.32), hsl(${
-          (hue + 40) % 360
-        } 32% 36% / 0.28))`,
-      }}
+      className="story-thumbnail-fallback absolute inset-0"
+      style={{ background: gradientFallbackBackground(seed) }}
     />
   );
-}
-
-function hashHue(input: string): number {
-  let h = 0;
-  for (let i = 0; i < input.length; i += 1) {
-    h = (h * 31 + input.charCodeAt(i)) >>> 0;
-  }
-  return h % 360;
 }

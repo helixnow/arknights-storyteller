@@ -35,15 +35,29 @@ function installGlobalListener() {
 
   window.addEventListener("app-back", (event) => {
     const consumed = dispatchBack();
-    if (consumed) (event as Event).preventDefault?.();
+    if (consumed) event.preventDefault();
   });
 
-  window.history.replaceState({ __appRoot: true }, "");
-  window.addEventListener("popstate", () => {
-    const consumed = dispatchBack();
-    if (consumed) {
-      window.history.pushState({ __appRoot: true }, "");
+  // 浏览器 / WebView 的手势返回只能靠 popstate 感知，而 popstate 需要历史里
+  // 有东西可弹。只 replaceState 的话第一次返回会直接离开页面，处理器根本没
+  // 机会跑，所以这里先垫一层哨兵条目，消费掉一次返回后再补回来。
+  const pushGuard = () => {
+    try {
+      window.history.pushState({ __appBack: true }, "");
+    } catch {
+      // 某些 WebView 会限制 pushState 次数，失败就退回默认返回行为。
     }
+  };
+
+  try {
+    window.history.replaceState({ __appRoot: true }, "");
+  } catch {
+    // 同上：history 不可用时只依赖 app-back 事件。
+  }
+  pushGuard();
+
+  window.addEventListener("popstate", () => {
+    if (dispatchBack()) pushGuard();
   });
 }
 

@@ -1,6 +1,7 @@
 import {
   type CSSProperties,
   type MouseEvent as ReactMouseEvent,
+  memo,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -73,6 +74,21 @@ interface RenderableSegment {
   segment: StorySegment;
   index: number;
 }
+
+/** 只影响单个段落的渲染状态。见 `renderSegment` / `ReaderSegmentRow`。 */
+interface SegmentRowState {
+  highlighted: boolean;
+  searchHighlighted: boolean;
+  searchPulseActive: boolean;
+  characterHighlighted: boolean;
+  selected: boolean;
+}
+
+type SegmentRenderer = (
+  item: RenderableSegment,
+  isLast: boolean,
+  state: SegmentRowState
+) => React.ReactNode;
 
 const BASE_MAX_WIDTH = 768; // px
 const TARGET_CHARS_PER_PAGE = 900; // approximate characters we aim to fit per page
@@ -159,6 +175,42 @@ export function postProcessSegments(segments: readonly StorySegment[]): StorySeg
   return merged;
 }
 
+/**
+ * 把带换行的正文拆成 `<span>` + `<br />`。定义在模块级：它不依赖任何组件
+ * 状态，放在组件里只会让每次渲染都产出一个新引用，白白破坏 memo。
+ */
+function renderLines(text: string) {
+  const parts = text.split("\n");
+  return parts.map((line, index) => (
+    <span key={index}>
+      {line}
+      {index < parts.length - 1 ? <br /> : null}
+    </span>
+  ));
+}
+
+/**
+ * 找到滚动容器顶部当前贴着的段落，并记下它相对容器顶的偏移。
+ *
+ * 命中测试是 O(1)，比遍历上千个段落节点便宜得多；拿不到结果时调用方会退回
+ * 按百分比恢复。
+ */
+function captureTopAnchor(
+  container: HTMLElement | null
+): { index: number; offset: number } | null {
+  if (!container || typeof document === "undefined") return null;
+  const rect = container.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return null;
+  const x = rect.left + rect.width / 2;
+  const y = rect.top + 4;
+  const hit = document.elementFromPoint(x, y) as HTMLElement | null;
+  const node = hit?.closest?.("[data-segment-index]") as HTMLElement | null;
+  if (!node || !container.contains(node)) return null;
+  const index = Number(node.dataset.segmentIndex);
+  if (!Number.isFinite(index)) return null;
+  return { index, offset: node.getBoundingClientRect().top - rect.top };
+}
+
 function approximateSegmentLength(segment: StorySegment): number {
   switch (segment.type) {
     case "dialogue":
@@ -212,10 +264,14 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   const lastScrollTopRef = useRef(0);
   // 已恢复过阅读进度的 `storyPath::readingMode`，避免"滚动→写进度→再恢复"回路。
   const restoredKeyRef = useRef<string | null>(null);
+  // 连续滚动模式下贴着容器顶部的段落。字号/行距一变正文整体重排，靠它把
+  // 读者钉回原来那一段，而不是让百分比把人甩到别处。
+  const topAnchorRef = useRef<{ index: number; offset: number } | null>(null);
+  const scrollRatioRef = useRef(0);
 
   const { settings, updateSettings, resetSettings } = useReaderSettings();
   const { showSummaries, minimalMode, inlineImages } = useAppPreferences();
-  const { progress, updateProgress } = useReadingProgress(storyPath);
+  const { progress, updateProgress, getProgress } = useReadingProgress(storyPath);
   const { isFavorite, toggleFavorite } = useFavorites();
   const [neighbors, setNeighbors] = useState<StoryNeighbors>({ prev: null, next: null });
   const [categoryName, setCategoryName] = useState<string | null>(null);
@@ -289,6 +345,13 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       window.removeEventListener("keydown", handleKey);
     };
   }, [active, moreMenuOpen]);
+
+  // 阅读器退到后台（列表页盖在上面）时收掉浮层菜单：它挂着全局 pointerdown /
+  // keydown，状态留着不但会占返回栈，回到阅读器时还会看到一张过期的菜单。
+  useEffect(() => {
+    if (active) return;
+    setMoreMenuOpen(false);
+  }, [active]);
 
   // iOS-style edge swipe back — close the reader when the user swipes from
   // the left edge. Only active when none of the inner modals are open so the
@@ -455,16 +518,6 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     [settings.paragraphSpacing]
   );
 
-  const renderLines = useCallback((text: string) => {
-    const parts = text.split("\n");
-    return parts.map((line, index) => (
-      <span key={index}>
-        {line}
-        {index < parts.length - 1 ? <br /> : null}
-      </span>
-    ));
-  }, []);
-
   const getSegmentSearchText = useCallback((segment: StorySegment) => {
     switch (segment.type) {
       case "dialogue":
@@ -576,7 +629,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
         element.scrollIntoView({ behavior, block: "start" });
       } catch {}
     },
-    [settings.readingMode]
+    []
   );
 
   const renderableSegments = useMemo<RenderableSegment[]>(() => {
@@ -722,7 +775,10 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
         const normalized = raw.replace(/\r\n/g, "\n").trim();
         setStoryInfoText(normalized.length > 0 ? normalized : null);
       } catch (err) {
-        console.warn("[StoryReader] Failed to load story summary:", err);
+        // 概述缺失是常态（社区镜像并不是每关都有），只在开发期提示。
+        if (import.meta.env.DEV) {
+          console.warn("[StoryReader] Failed to load story summary:", err);
+        }
         if (!cancelled) {
           setStoryInfoText(null);
         }
@@ -763,7 +819,8 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       return;
     }
 
-    const stored = progressRef.current;
+    // 优先读 hook 里的实时值：state 可能还没跟上刚刚的滚动，也可能还停在上一篇。
+    const stored = getProgress() ?? progressRef.current;
 
     // 上次是另一种阅读模式时，用百分比近似换算，别一路弹回开头。
     const storedPercentage =
@@ -792,7 +849,9 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       const { scrollHeight, clientHeight } = container;
       const denominator = scrollHeight - clientHeight;
       const ratio = denominator <= 0 ? 1 : storedTop / denominator;
-      setProgressValue(Number.isFinite(ratio) ? ratio : 0);
+      const clamped = Number.isFinite(ratio) ? Math.max(0, Math.min(1, ratio)) : 0;
+      scrollRatioRef.current = clamped;
+      setProgressValue(clamped);
     }
 
     restoredKeyRef.current = restoreKey;
@@ -804,6 +863,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     initialFocus,
     initialJump,
     storyId,
+    getProgress,
   ]);
 
   useEffect(() => {
@@ -819,13 +879,21 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
         const denominator = scrollHeight - clientHeight;
         const ratio = denominator <= 0 ? 1 : scrollTop / denominator;
         const clamped = Number.isFinite(ratio) ? Math.max(0, Math.min(1, ratio)) : 0;
-        setProgressValue(clamped);
+        scrollRatioRef.current = clamped;
+        // 进度条只精确到 0.1%，比这更细的变化没必要惊动 React。
+        setProgressValue((prev) => (Math.abs(prev - clamped) < 0.0005 ? prev : clamped));
         updateProgress({
           readingMode: "scroll",
           scrollTop,
           percentage: clamped,
           updatedAt: Date.now(),
         });
+
+        // 抽屉盖住正文时命中测试会打在遮罩上，这时保留上一次的锚点。
+        if (!overlayOpenRef.current) {
+          const anchor = captureTopAnchor(container);
+          if (anchor) topAnchorRef.current = anchor;
+        }
 
         // 沉浸阅读：向下滚动收起顶栏腾出屏幕，向上滚动或靠近顶部时复原。
         // 抽屉/选段工具栏打开时保持顶栏可见，避免操作路径消失。
@@ -855,7 +923,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     if (!processedSegments.length || settings.readingMode !== "paged" || totalPages === 0) return;
     const ratio = totalPages <= 1 ? 1 : (currentPage + 1) / totalPages;
     const clamped = Number.isFinite(ratio) ? Math.max(0, Math.min(1, ratio)) : 0;
-    setProgressValue(clamped);
+    setProgressValue((prev) => (Math.abs(prev - clamped) < 0.0005 ? prev : clamped));
     updateProgress({
       readingMode: "paged",
       currentPage,
@@ -863,6 +931,84 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       updatedAt: Date.now(),
     });
   }, [processedSegments, currentPage, settings.readingMode, totalPages, updateProgress]);
+
+  // 把标题 / 关卡号一并写进进度记录，首页的「继续阅读」卡片就不用等索引
+  // 加载完才知道自己在显示哪一话。旧记录没有这两个字段，读取方按可选处理。
+  useEffect(() => {
+    if (!processedSegments.length) return;
+    updateProgress({ storyName, storyCode: storyEntry?.storyCode ?? null });
+  }, [processedSegments, storyName, storyEntry?.storyCode, updateProgress]);
+
+  /**
+   * 字号 / 行距 / 页宽一变，分页边界会整体重算。这里用「当前页的首段」当锚点，
+   * 在新的边界表里找回它所在的页，避免调大一号字就被弹回第 1 页。
+   */
+  const currentPageRef = useRef(currentPage);
+  currentPageRef.current = currentPage;
+  const pagedAnchorRef = useRef<{ key: string; boundaries: number[] } | null>(null);
+  useLayoutEffect(() => {
+    const previous = pagedAnchorRef.current;
+    pagedAnchorRef.current = { key: storyPath, boundaries: pageBoundaries };
+    if (!previous || previous.key !== storyPath || previous.boundaries === pageBoundaries) return;
+    if (settings.readingMode !== "paged") return;
+
+    const prevBoundaries = previous.boundaries;
+    const page = Math.min(Math.max(currentPageRef.current, 0), prevBoundaries.length - 1);
+    const anchorSegment = prevBoundaries[page] ?? 0;
+    let target = 0;
+    for (let i = pageBoundaries.length - 1; i >= 0; i -= 1) {
+      if (anchorSegment >= pageBoundaries[i]) {
+        target = i;
+        break;
+      }
+    }
+    setCurrentPage((prev) => (prev === target ? prev : target));
+  }, [pageBoundaries, settings.readingMode, storyPath]);
+
+  /**
+   * 连续滚动模式下的同类问题：正文重排后滚动位置会漂。优先把顶部那一段钉
+   * 回原位，拿不到锚点时退回按百分比恢复。
+   */
+  const typographySignature = [
+    settings.fontFamily,
+    settings.fontSize,
+    settings.lineHeight,
+    settings.letterSpacing,
+    settings.paragraphSpacing,
+    settings.pageWidth,
+    settings.textAlign,
+    settings.paragraphIndent ? 1 : 0,
+  ].join("|");
+  const typographyRef = useRef<string | null>(null);
+  useLayoutEffect(() => {
+    const previous = typographyRef.current;
+    typographyRef.current = typographySignature;
+    if (previous === null || previous === typographySignature) return;
+    if (settings.readingMode !== "scroll") return;
+
+    const container = scrollContainerRef.current;
+    if (!container) return;
+    const maxTop = Math.max(container.scrollHeight - container.clientHeight, 0);
+    if (maxTop <= 0) return;
+
+    let nextTop: number | null = null;
+    const anchor = topAnchorRef.current;
+    if (anchor) {
+      const element = container.querySelector<HTMLElement>(
+        `[data-segment-index="${anchor.index}"]`
+      );
+      if (element) {
+        const delta = element.getBoundingClientRect().top - container.getBoundingClientRect().top;
+        nextTop = container.scrollTop + delta - anchor.offset;
+      }
+    }
+    if (nextTop === null) nextTop = scrollRatioRef.current * maxTop;
+
+    const clampedTop = Math.max(0, Math.min(nextTop, maxTop));
+    container.scrollTo({ top: clampedTop });
+    lastScrollTopRef.current = clampedTop;
+    scrollRatioRef.current = clampedTop / maxTop;
+  }, [typographySignature, settings.readingMode]);
 
   // 顶栏实际高度（带关卡编号/标签时会比 3.5rem 高），收起时按这个值上移。
   useLayoutEffect(() => {
@@ -1121,7 +1267,10 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   useLayoutEffect(() => {
     if (pendingScrollIndexRef.current === null) return;
     let tries = 0;
+    let cancelled = false;
+    let frame = 0;
     const tick = () => {
+      if (cancelled) return;
       const index = pendingScrollIndexRef.current;
       if (index === null) return;
       const container = scrollContainerRef.current;
@@ -1136,10 +1285,15 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       }
       if (tries < 30) {
         tries += 1;
-        requestAnimationFrame(tick);
+        frame = requestAnimationFrame(tick);
       }
     };
-    requestAnimationFrame(tick);
+    frame = requestAnimationFrame(tick);
+    // 不取消的话，重渲染会不断叠加新的重试链，卸载后还在跑。
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(frame);
+    };
   }, [renderableSegments, currentPage, settings.readingMode, scrollToSegment]);
 
   useEffect(() => {
@@ -1181,6 +1335,10 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     },
     [activeCharacter, jumpToSegment]
   );
+
+  // 段落渲染时按 O(1) 判断是否选中；`selectedSegments` 本身保留数组，
+  // 因为分享图要按用户点选的先后顺序排版。
+  const selectedSegmentSet = useMemo(() => new Set(selectedSegments), [selectedSegments]);
 
   // Toggle multi-select entry for an index. Kept separate from the
   // highlight store so "分享为图片" can compose an ad-hoc selection without
@@ -1228,6 +1386,10 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     },
     [jumpToSegment]
   );
+
+  // 稳定的关闭回调：设置面板是 memo 组件，每次渲染都换一个新的箭头函数会让
+  // memo 形同虚设。
+  const closeSettings = useCallback(() => setSettingsOpen(false), []);
 
   // Auto-clear the pulse token shortly after it fires so the CSS animation
   // attribute detaches. The underlying ring remains (static highlight)
@@ -1284,18 +1446,24 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     }
   }, [selectedSegments, processedSegments, isHighlighted, toggleHighlight]);
 
+  /**
+   * 渲染单个段落。
+   *
+   * 所有「只影响某一段」的状态（是否收藏 / 是否命中搜索 / 是否被选中）都通过
+   * `state` 传进来，而不是从闭包里读——这样这个函数的身份只跟排版级设置有关，
+   * `ReaderSegmentRow` 的 `memo` 才拦得住上千段的无谓重渲染。
+   */
   const renderSegment = useCallback(
-    ({ segment, index }: RenderableSegment, isLast: boolean) => {
+    ({ segment, index }: RenderableSegment, isLast: boolean, state: SegmentRowState) => {
       const spacing = isLast ? "0" : readerSpacing;
       const highlightable = isSegmentHighlightable(segment);
-      const annotationHighlight = highlightable ? isHighlighted(index) : false;
-      const searchHighlighted = highlightSegmentIndex === index;
+      const annotationHighlight = highlightable && state.highlighted;
+      const searchHighlighted = state.searchHighlighted;
       // When true, the segment is the freshly-navigated-to search hit —
       // attach `data-search-pulse` so the CSS keyframe runs once.
-      const searchPulseActive = searchHighlighted && searchPulseToken > 0;
-      const characterHighlighted =
-        highlightable && segment.type === "dialogue" && activeCharacter === segment.characterName;
-      const isSelected = selectedSegments.includes(index);
+      const searchPulseActive = state.searchPulseActive;
+      const characterHighlighted = highlightable && state.characterHighlighted;
+      const isSelected = state.selected;
       const selectable = selectMode && segment.type !== "decision"; // selecting a decision block is awkward; skip
 
       const segmentStyle: CSSProperties = { marginBottom: spacing };
@@ -1637,16 +1805,10 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       return null;
     },
     [
-      activeCharacter,
-      highlightSegmentIndex,
       inlineImages,
-      isHighlighted,
       minimalMode,
       readerSpacing,
-      renderLines,
-      searchPulseToken,
       selectMode,
-      selectedSegments,
       toggleHighlight,
       toggleSegmentSelection,
     ]
@@ -1680,37 +1842,33 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
 
   if (error) {
     return (
-      <div className="flex flex-col items-center justify-center h-full gap-4 px-6 text-center">
-        <div className="text-[hsl(var(--color-destructive))]">加载失败: {error}</div>
-        <div className="flex flex-wrap items-center justify-center gap-2">
-          <Button onClick={() => void loadStory()} className="min-h-[44px]">
-            <RefreshCw className="mr-2 h-4 w-4" />
-            重试
-          </Button>
-          <Button onClick={onBack} variant="outline" className="min-h-[44px]">
-            <ArrowLeft className="mr-2 h-4 w-4" />
-            返回
-          </Button>
-        </div>
-      </div>
+      <ReaderStatusScreen
+        theme={settings.theme}
+        storyName={storyName}
+        onBack={onBack}
+        tone="error"
+        title="加载失败"
+        description={error}
+        hint="剧情数据可能还没同步完，或者这一话在当前数据版本里缺失。"
+        actionLabel="重试"
+        onAction={() => void loadStory()}
+      />
     );
   }
 
   if (!content || processedSegments.length === 0) {
     return (
-      <div className="flex flex-col items-center justify-center h-full gap-4 px-6 text-center">
-        <div className="text-[hsl(var(--color-muted-foreground))]">暂无内容</div>
-        <div className="flex flex-wrap items-center justify-center gap-2">
-          <Button onClick={() => void loadStory()} variant="outline" className="min-h-[44px]">
-            <RefreshCw className="mr-2 h-4 w-4" />
-            重新加载
-          </Button>
-          <Button onClick={onBack} variant="outline" className="min-h-[44px]">
-            <ArrowLeft className="mr-2 h-4 w-4" />
-            返回
-          </Button>
-        </div>
-      </div>
+      <ReaderStatusScreen
+        theme={settings.theme}
+        storyName={storyName}
+        onBack={onBack}
+        tone="empty"
+        title="暂无内容"
+        description="这一话解析后没有可显示的段落。"
+        hint="换一话看看，或在设置里重新同步剧情数据后再试。"
+        actionLabel="重新加载"
+        onAction={() => void loadStory()}
+      />
     );
   }
 
@@ -1864,9 +2022,15 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
                   </div>
                 </div>
               )}
-              {renderableSegments.map((segment, idx) =>
-                renderSegment(segment, idx === renderableSegments.length - 1)
-              )}
+              <ReaderSegmentList
+                segments={renderableSegments}
+                render={renderSegment}
+                isHighlighted={isHighlighted}
+                selectedSet={selectedSegmentSet}
+                searchIndex={highlightSegmentIndex}
+                searchPulseActive={searchPulseToken > 0}
+                activeCharacter={activeCharacter}
+              />
             </div>
           </div>
         </CustomScrollArea>
@@ -2068,7 +2232,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       <ReaderSettingsPanel
         open={active && settingsOpen}
         settings={settings}
-        onClose={() => setSettingsOpen(false)}
+        onClose={closeSettings}
         onUpdateSettings={updateSettings}
         onReset={resetSettings}
       />
@@ -2085,6 +2249,168 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   );
 }
 
+
+interface ReaderStatusScreenProps {
+  theme: string;
+  storyName: string;
+  onBack: () => void;
+  tone: "error" | "empty";
+  title: string;
+  description: string;
+  hint: string;
+  actionLabel: string;
+  onAction: () => void;
+}
+
+/**
+ * 失败 / 空内容时的整屏状态页。
+ *
+ * 沿用加载态的顶栏结构（返回键 + 标题），这样从骨架屏切到错误页时版式不会
+ * 整个塌一次；返回入口也始终在同一个位置，不必靠正中间那颗按钮找路。
+ */
+function ReaderStatusScreen({
+  theme,
+  storyName,
+  onBack,
+  tone,
+  title,
+  description,
+  hint,
+  actionLabel,
+  onAction,
+}: ReaderStatusScreenProps) {
+  return (
+    <div
+      className="h-full flex flex-col overflow-hidden reader-surface"
+      data-reader-theme={theme}
+    >
+      <header className="flex-shrink-0 z-20 bg-[hsl(var(--color-background)/0.95)] backdrop-blur border-b">
+        <div className="container flex items-center gap-2 h-14">
+          <Button variant="ghost" size="icon" onClick={onBack} aria-label="返回剧情列表">
+            <ArrowLeft className="h-5 w-5" />
+          </Button>
+          <h1 className="flex-1 min-w-0 text-base font-semibold truncate">{storyName}</h1>
+        </div>
+      </header>
+      <div
+        className="flex-1 flex flex-col items-center justify-center gap-3 px-6 text-center"
+        role={tone === "error" ? "alert" : undefined}
+        aria-live="polite"
+      >
+        <div
+          className={cn(
+            "text-base font-medium",
+            tone === "error"
+              ? "text-[hsl(var(--color-destructive))]"
+              : "text-[hsl(var(--color-foreground))]"
+          )}
+        >
+          {title}
+        </div>
+        <p className="max-w-[28rem] text-sm text-[hsl(var(--color-muted-foreground))] break-words">
+          {description}
+        </p>
+        <p className="max-w-[28rem] text-xs text-[hsl(var(--color-muted-foreground))]">{hint}</p>
+        <div className="mt-2 flex flex-wrap items-center justify-center gap-2">
+          <Button onClick={onAction} className="min-h-[44px]">
+            <RefreshCw className="mr-2 h-4 w-4" />
+            {actionLabel}
+          </Button>
+          <Button onClick={onBack} variant="outline" className="min-h-[44px]">
+            <ArrowLeft className="mr-2 h-4 w-4" />
+            返回列表
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+interface ReaderSegmentRowProps extends SegmentRowState {
+  item: RenderableSegment;
+  isLast: boolean;
+  render: SegmentRenderer;
+}
+
+/**
+ * 单个段落的记忆化外壳。
+ *
+ * 一篇主线剧情动辄上千段，任何一次「收藏某段 / 选中某段 / 跳到搜索命中」
+ * 都会让父组件重渲染；如果每段都跟着重建 DOM，手机上一眼就能看出卡顿。
+ * 这里把每段的渲染结果按上面那几个布尔值缓存住，只有真正变化的那一段
+ * 会重新渲染。
+ */
+const ReaderSegmentRow = memo(function ReaderSegmentRow({
+  item,
+  isLast,
+  render,
+  highlighted,
+  searchHighlighted,
+  searchPulseActive,
+  characterHighlighted,
+  selected,
+}: ReaderSegmentRowProps) {
+  return (
+    <>
+      {render(item, isLast, {
+        highlighted,
+        searchHighlighted,
+        searchPulseActive,
+        characterHighlighted,
+        selected,
+      })}
+    </>
+  );
+});
+
+interface ReaderSegmentListProps {
+  segments: RenderableSegment[];
+  render: SegmentRenderer;
+  isHighlighted: (index: number) => boolean;
+  selectedSet: ReadonlySet<number>;
+  searchIndex: number | null;
+  searchPulseActive: boolean;
+  activeCharacter: string | null;
+}
+
+/**
+ * 正文列表。整体再包一层 `memo`：滚动进度、顶栏收起、上一话/下一话加载完成
+ * 这些只影响外壳的状态，不该让正文重新走一遍 diff。
+ */
+const ReaderSegmentList = memo(function ReaderSegmentList({
+  segments,
+  render,
+  isHighlighted,
+  selectedSet,
+  searchIndex,
+  searchPulseActive,
+  activeCharacter,
+}: ReaderSegmentListProps) {
+  const lastIndex = segments.length - 1;
+  return (
+    <>
+      {segments.map((item, position) => {
+        const { segment, index } = item;
+        const searchHit = searchIndex === index;
+        return (
+          <ReaderSegmentRow
+            key={index}
+            item={item}
+            isLast={position === lastIndex}
+            render={render}
+            highlighted={isHighlighted(index)}
+            searchHighlighted={searchHit}
+            searchPulseActive={searchHit && searchPulseActive}
+            characterHighlighted={
+              segment.type === "dialogue" && activeCharacter === segment.characterName
+            }
+            selected={selectedSet.has(index)}
+          />
+        );
+      })}
+    </>
+  );
+});
 
 /**
  * 加载态骨架屏：用几条灰条模拟"头像 + 角色名 + 正文"的节奏，比一行

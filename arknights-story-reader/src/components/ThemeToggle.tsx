@@ -16,6 +16,8 @@ export function ThemeToggle() {
     setTheme(next);
   };
 
+  const current =
+    theme === "light" ? "浅色模式" : theme === "dark" ? "深色模式" : "跟随系统";
   const label =
     theme === "light" ? "切换到深色模式" : theme === "dark" ? "切换到跟随系统" : "切换到浅色模式";
 
@@ -28,10 +30,16 @@ export function ThemeToggle() {
       title={label}
       className="relative"
     >
-      {theme === "light" && <Sun className="h-[1.2rem] w-[1.2rem]" />}
-      {theme === "dark" && <Moon className="h-[1.2rem] w-[1.2rem]" />}
-      {theme === "system" && <MonitorSmartphone className="h-[1.2rem] w-[1.2rem]" />}
-      <span className="sr-only">切换主题</span>
+      {theme === "light" && <Sun className="h-[1.2rem] w-[1.2rem]" aria-hidden="true" />}
+      {theme === "dark" && <Moon className="h-[1.2rem] w-[1.2rem]" aria-hidden="true" />}
+      {theme === "system" && (
+        <MonitorSmartphone className="h-[1.2rem] w-[1.2rem]" aria-hidden="true" />
+      )}
+      {/* 按钮本身的 aria-label 描述的是「下一步动作」，再补一个 live region
+          播报切换后的当前状态，读屏用户才知道点完落在了哪一档。 */}
+      <span className="sr-only" aria-live="polite">
+        当前主题：{current}
+      </span>
     </Button>
   );
 }

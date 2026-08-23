@@ -51,13 +51,16 @@ function CharacterAvatarImpl({
       // 让头像保持彩色——这也更符合"看清楚谁是谁"的直觉。
       tint={tint === "mono" ? "tint" : tint === "soft" ? "soft" : "none"}
       className={cn(
-        "character-avatar rounded-full ring-1 ring-[hsl(var(--color-border)/0.8)]",
+        // `shrink-0`：头像常放在 flex 行里（人物卡片、剧情导览的角色行），
+        // 名字过长时不能把头像压扁。
+        "character-avatar shrink-0 rounded-full ring-1 ring-[hsl(var(--color-border)/0.8)]",
         className
       )}
-      style={{ width: size, height: size, ...style }}
+      style={{ width: size, height: size, minWidth: size, ...style }}
       fallback={
         <div
-          className="character-avatar-monogram flex h-full w-full items-center justify-center rounded-full bg-[hsl(var(--color-secondary))] text-[hsl(var(--color-muted-foreground))] text-xs font-semibold tracking-wide select-none"
+          className="character-avatar-monogram flex h-full w-full items-center justify-center rounded-full bg-[hsl(var(--color-secondary))] text-[hsl(var(--color-muted-foreground))] font-semibold tracking-wide select-none"
+          style={{ fontSize: Math.max(9, Math.round(size * 0.34)) }}
           aria-hidden="true"
         >
           {initials || "?"}

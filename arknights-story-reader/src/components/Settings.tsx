@@ -6,21 +6,24 @@ import { useTheme } from "@/components/theme-provider";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { AlertCircle, CheckCircle, Download, Eye, EyeOff, ImageOff, Loader2, RefreshCw, Upload } from "lucide-react";
-import { useDataSyncManager } from "@/hooks/useDataSyncManager";
+import { localizeBackendError, useDataSyncManager } from "@/hooks/useDataSyncManager";
 import { useAppPreferences } from "@/hooks/useAppPreferences";
 import { getVersion as getAppVersion } from "@tauri-apps/api/app";
 import {
   detectRuntimePlatform,
   checkDesktopUpdate,
+  describeUpdateError,
+  devLog,
   installDesktopUpdate,
   checkAndroidUpdate,
   installAndroidUpdate,
   openAndroidInstallPermissionSettings,
   safeConfirm,
   type UpdateAvailability,
+  type UpdateDownloadProgress,
+  type UpdateIssue,
 } from "@/hooks/useAppUpdater";
 import { useToast } from "@/components/ui/toast";
-import { api } from "@/services/api";
 
 const THEME_COLOR_OPTIONS = [
   {
@@ -59,10 +62,23 @@ function isPluginUnavailableError(message: string): boolean {
   return /not allowed|not found|unknown plugin|plugin/i.test(message);
 }
 
+function formatMegabytes(bytes: number): string {
+  return `${(bytes / 1_048_576).toFixed(1)} MB`;
+}
+
+/** 状态提示带一个自增序号，重复设置同一句话时也能重新计时。 */
+interface StatusNotice {
+  text: string;
+  seq: number;
+}
+
+const STATUS_NOTICE_TTL_MS = 4000;
+
 export function Settings() {
   const { themeColor, setThemeColor } = useTheme();
   const { minimalMode, setMinimalMode, inlineImages, setInlineImages } = useAppPreferences();
-  const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const [statusNotice, setStatusNotice] = useState<StatusNotice | null>(null);
+  const statusSeqRef = useRef(0);
   const [appVersion, setAppVersion] = useState<string>("");
   const [updateStatus, setUpdateStatus] = useState<
     | "idle"
@@ -75,12 +91,34 @@ export function Settings() {
     | "error"
   >("idle");
   const [updateMessage, setUpdateMessage] = useState<string | null>(null);
+  const [updateIssue, setUpdateIssue] = useState<UpdateIssue | null>(null);
+  const [downloadProgress, setDownloadProgress] = useState<UpdateDownloadProgress | null>(null);
   const [availableUpdate, setAvailableUpdate] = useState<UpdateAvailability | null>(null);
   const runtimePlatform = detectRuntimePlatform();
+
+  const showStatus = useCallback((text: string | null) => {
+    if (!text) {
+      setStatusNotice(null);
+      return;
+    }
+    statusSeqRef.current += 1;
+    setStatusNotice({ text, seq: statusSeqRef.current });
+  }, []);
+
+  useEffect(() => {
+    if (!statusNotice) return;
+    const timer = window.setTimeout(() => setStatusNotice(null), STATUS_NOTICE_TTL_MS);
+    return () => window.clearTimeout(timer);
+  }, [statusNotice]);
+
+  const handleSyncSuccess = useCallback(() => {
+    showStatus("数据版本信息已更新");
+  }, [showStatus]);
 
   const {
     syncing,
     importing,
+    busy,
     loadingInfo,
     progress,
     error,
@@ -90,24 +128,30 @@ export function Settings() {
     status,
     handleSync,
     importFromFile,
+    importFromPath,
     loadVersionInfo,
     resetProgress,
   } = useDataSyncManager({
     active: true,
-    onSuccess: () => {
-      setStatusMessage("数据版本信息已更新");
-    },
+    onSuccess: handleSyncSuccess,
   });
 
+  // 文件对话框弹出期间按钮必须先锁上：确认框与系统选择器都是异步的，
+  // 此时 hook 的 importing 还没置起来，连点两下会开出两个选择器。
+  const [preparingImport, setPreparingImport] = useState(false);
+  const importBusy = importing || preparingImport;
+  const dataBusy = busy || preparingImport;
+
   const handleRefreshInfo = () => {
-    setStatusMessage(null);
+    showStatus(null);
     setError(null);
     resetProgress();
     void loadVersionInfo();
   };
 
   const handleSyncClick = async () => {
-    setStatusMessage(null);
+    if (dataBusy) return;
+    showStatus(null);
     setError(null);
     const confirmed = await safeConfirm(
       status === "not-installed"
@@ -122,54 +166,53 @@ export function Settings() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const handleImportClick = async () => {
-    setStatusMessage(null);
+    if (dataBusy) return;
+    showStatus(null);
     setError(null);
-    const confirmed = await safeConfirm(
-      "导入 ZIP 会覆盖本机已有的剧情数据。请确保压缩包来自 ArknightsGameData。",
-      { title: "导入 ZIP", kind: "warning" }
-    );
-    if (!confirmed) return;
-
-    // 只有在 dialog 插件确实不可用（移动端未注册 / 未授权）时才退回
-    // <input type="file">，其余错误都要如实反馈，避免又弹一个选择器。
-    let openDialog: typeof import("@tauri-apps/plugin-dialog").open;
+    setPreparingImport(true);
     try {
-      ({ open: openDialog } = await import("@tauri-apps/plugin-dialog"));
-    } catch (err) {
-      console.info("[Settings] 文件对话框插件不可用，回退到文件选择器", err);
-      fileInputRef.current?.click();
-      return;
-    }
+      const confirmed = await safeConfirm(
+        "导入 ZIP 会覆盖本机已有的剧情数据。请确保压缩包来自 ArknightsGameData。",
+        { title: "导入 ZIP", kind: "warning" }
+      );
+      // 用户点了取消：安静退出，不要再弹文件选择器。
+      if (!confirmed) return;
 
-    let path: string | null;
-    try {
-      const selected = await openDialog({
-        multiple: false,
-        filters: [{ name: "ZIP", extensions: ["zip"] }],
-      });
-      path = (Array.isArray(selected) ? selected[0] : selected) ?? null;
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      if (isPluginUnavailableError(message)) {
-        console.info("[Settings] 文件对话框不可用，回退到文件选择器", err);
+      // 只有在 dialog 插件确实不可用（移动端未注册 / 未授权）时才退回
+      // <input type="file">，其余错误都要如实反馈，避免又弹一个选择器。
+      let openDialog: typeof import("@tauri-apps/plugin-dialog").open;
+      try {
+        ({ open: openDialog } = await import("@tauri-apps/plugin-dialog"));
+      } catch (err) {
+        devLog("[Settings] 文件对话框插件不可用，回退到文件选择器", err);
         fileInputRef.current?.click();
-      } else {
-        setError(`选择文件失败：${message}`);
+        return;
       }
-      return;
-    }
 
-    // 用户取消选择。
-    if (!path) return;
+      let path: string | null;
+      try {
+        const selected = await openDialog({
+          multiple: false,
+          filters: [{ name: "ZIP", extensions: ["zip"] }],
+        });
+        path = (Array.isArray(selected) ? selected[0] : selected) ?? null;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (isPluginUnavailableError(message)) {
+          devLog("[Settings] 文件对话框不可用，回退到文件选择器", err);
+          fileInputRef.current?.click();
+        } else {
+          setError(localizeBackendError(err, "选择文件失败"));
+        }
+        return;
+      }
 
-    try {
-      await api.importFromZip(path);
-      window.dispatchEvent(new Event("app:data-updated"));
-      setStatusMessage("数据版本信息已更新");
-      await loadVersionInfo();
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      setError(`导入 ZIP 失败：${message}`);
+      // 用户取消选择。
+      if (!path) return;
+
+      await importFromPath(path);
+    } finally {
+      setPreparingImport(false);
     }
   };
 
@@ -183,18 +226,18 @@ export function Settings() {
   const toast = useToast();
 
   const handleRebuildIndex = useCallback(() => {
-    setStatusMessage("已请求重新建立全文索引");
+    showStatus("已请求重新建立全文索引");
     setError(null);
     toast.show("已请求重新建立全文索引");
     window.dispatchEvent(new Event("app:rebuild-story-index"));
-  }, [setError, toast]);
+  }, [setError, showStatus, toast]);
 
   const handleRefreshCharacters = useCallback(() => {
-    setStatusMessage("已请求刷新人物统计");
+    showStatus("已请求刷新人物统计");
     setError(null);
     toast.show("已请求刷新人物统计");
     window.dispatchEvent(new Event("app:refresh-character-stats"));
-  }, [setError, toast]);
+  }, [setError, showStatus, toast]);
 
   useEffect(() => {
     if (runtimePlatform === "unknown") return;
@@ -213,49 +256,49 @@ export function Settings() {
 
   const handleCheckAppUpdate = useCallback(async () => {
     setUpdateStatus("checking");
-    setUpdateMessage(null);
+    setUpdateMessage("正在向更新源查询最新版本…");
+    setUpdateIssue(null);
     setAvailableUpdate(null);
     try {
       if (runtimePlatform === "unknown") {
         throw new Error("当前环境并非 Tauri 应用，无法检查更新。");
       }
 
-      if (runtimePlatform === "android") {
-        const result = await checkAndroidUpdate(appVersion || undefined);
-        if (!result) {
-          setUpdateStatus("up-to-date");
-          setUpdateMessage("当前已是最新版本");
-          return;
-        }
-        setAvailableUpdate(result);
-        setUpdateStatus("available");
-      } else {
-        const result = await checkDesktopUpdate(appVersion || undefined);
-        if (!result) {
-          setUpdateStatus("up-to-date");
-          setUpdateMessage("当前已是最新版本");
-          return;
-        }
-        setAvailableUpdate(result);
-        setUpdateStatus("available");
+      const result =
+        runtimePlatform === "android"
+          ? await checkAndroidUpdate(appVersion || undefined)
+          : await checkDesktopUpdate(appVersion || undefined);
+
+      if (!result) {
+        setUpdateStatus("up-to-date");
+        setUpdateMessage(null);
+        return;
       }
+      setAvailableUpdate(result);
+      setUpdateStatus("available");
+      setUpdateMessage(null);
     } catch (error) {
+      // 检查更新失败几乎都是打包配置或网络问题，说清楚就行，别用报错语气吓人。
+      devLog("[Settings] 检查更新失败", error);
       setUpdateStatus("error");
-      setUpdateMessage(error instanceof Error ? error.message : String(error));
+      setUpdateMessage(null);
+      setUpdateIssue(describeUpdateError(error));
     }
   }, [runtimePlatform, appVersion]);
 
   const handleInstallAppUpdate = useCallback(async () => {
     if (!availableUpdate) return;
     setUpdateStatus("installing");
+    setUpdateIssue(null);
+    setDownloadProgress(null);
     setUpdateMessage(
       availableUpdate.platform === "desktop"
-        ? "正在下载并安装最新版本，请稍候..."
-        : "正在下载最新安装包，请稍候..."
+        ? "正在下载并安装最新版本，请保持网络连接…"
+        : "正在下载最新安装包，请保持网络连接…"
     );
     try {
       if (availableUpdate.platform === "desktop") {
-        await installDesktopUpdate(availableUpdate, undefined, { relaunch: true });
+        await installDesktopUpdate(availableUpdate, setDownloadProgress, { relaunch: true });
         setUpdateStatus("installed");
         setUpdateMessage("更新已安装，应用即将重启");
         setAvailableUpdate(null);
@@ -272,13 +315,23 @@ export function Settings() {
         setAvailableUpdate(null);
       }
     } catch (error) {
+      devLog("[Settings] 安装更新失败", error);
       setUpdateStatus("error");
-      setUpdateMessage(error instanceof Error ? error.message : String(error));
+      setUpdateMessage(null);
+      setUpdateIssue(describeUpdateError(error, "更新安装未完成，可稍后重试。"));
+    } finally {
+      setDownloadProgress(null);
     }
   }, [availableUpdate]);
 
   const isCheckingUpdate = updateStatus === "checking";
   const isInstallingUpdate = updateStatus === "installing";
+  const updateIssueClass =
+    updateIssue?.tone === "error"
+      ? "text-[hsl(var(--color-destructive))]"
+      : updateIssue?.tone === "warning"
+      ? "text-[hsl(var(--color-warning))]"
+      : "text-[hsl(var(--color-muted-foreground))]";
 
   const renderStatusBadge = () => {
     if (status === "not-installed") {
@@ -404,7 +457,7 @@ export function Settings() {
                     variant="ghost"
                     size="sm"
                     onClick={handleRefreshInfo}
-                    disabled={loadingInfo || syncing || importing}
+                    disabled={loadingInfo || dataBusy}
                     className="sm:ml-auto"
                   >
                     {loadingInfo ? (
@@ -421,8 +474,8 @@ export function Settings() {
                   </Button>
                 </div>
 
-                {(progress || syncing || importing) && (
-                  <div className="space-y-2">
+                {(progress || dataBusy) && (
+                  <div className="space-y-2" aria-live="polite">
                     {progress ? (
                       <>
                         <div className="flex justify-between text-sm">
@@ -445,7 +498,7 @@ export function Settings() {
                       <>
                         <div className="flex justify-between text-sm">
                           <span className="text-[hsl(var(--color-muted-foreground))]">
-                            {syncing ? "连接中" : "正在导入"}
+                            {syncing ? "连接中" : preparingImport && !importing ? "等待选择文件" : "正在导入"}
                           </span>
                           <span className="font-mono">…</span>
                         </div>
@@ -453,7 +506,11 @@ export function Settings() {
                           <div className="bg-[hsl(var(--color-primary))] h-full animate-pulse" style={{ width: "30%" }} />
                         </div>
                         <p className="text-xs text-[hsl(var(--color-muted-foreground))]">
-                          {syncing ? "正在开始同步…" : "请稍候"}
+                          {syncing
+                            ? "正在开始同步…"
+                            : preparingImport && !importing
+                            ? "请在系统对话框中选择 ZIP 压缩包"
+                            : "请稍候"}
                         </p>
                       </>
                     )}
@@ -461,20 +518,28 @@ export function Settings() {
                 )}
 
                 {error && (
-                  <div className="flex items-center justify-between gap-3 rounded-md border border-[hsl(var(--color-destructive))] bg-[hsl(var(--color-destructive)/0.08)] px-3 py-2">
-                    <span className="text-sm text-[hsl(var(--color-destructive))]">{error}</span>
-                    <Button variant="ghost" size="sm" onClick={() => setError(null)}>
+                  <div
+                    role="alert"
+                    className="flex items-start justify-between gap-3 rounded-md border border-[hsl(var(--color-destructive))] bg-[hsl(var(--color-destructive)/0.08)] px-3 py-2"
+                  >
+                    <span className="text-sm text-[hsl(var(--color-destructive))] break-words">{error}</span>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="flex-shrink-0"
+                      onClick={() => setError(null)}
+                    >
                       知道了
                     </Button>
                   </div>
                 )}
 
-                {statusMessage && !error && (
-                  <div className="text-xs text-[hsl(var(--color-success))]">{statusMessage}</div>
+                {statusNotice && !error && (
+                  <div className="text-xs text-[hsl(var(--color-success))]">{statusNotice.text}</div>
                 )}
 
                 <div className="flex flex-wrap gap-3">
-                  <Button onClick={handleSyncClick} disabled={syncing || importing}>
+                  <Button onClick={handleSyncClick} disabled={dataBusy}>
                     {syncing ? (
                       <span className="inline-flex items-center gap-2">
                         <Loader2 className="h-4 w-4 animate-spin" />
@@ -490,12 +555,12 @@ export function Settings() {
                   <Button
                     variant="outline"
                     onClick={handleImportClick}
-                    disabled={syncing || importing}
+                    disabled={dataBusy}
                   >
-                    {importing ? (
+                    {importBusy ? (
                       <span className="inline-flex items-center gap-2">
                         <Loader2 className="h-4 w-4 animate-spin" />
-                        导入中...
+                        {importing ? "导入中..." : "等待选择..."}
                       </span>
                     ) : (
                       <span className="inline-flex items-center gap-2">
@@ -581,17 +646,51 @@ export function Settings() {
                   </p>
                 ) : null}
 
+                {isInstallingUpdate ? (
+                  <div className="space-y-2" aria-live="polite">
+                    <div className="flex justify-between text-sm">
+                      <span className="text-[hsl(var(--color-muted-foreground))]">
+                        {downloadProgress?.done ? "准备安装" : "下载中"}
+                      </span>
+                      <span className="font-mono text-xs">
+                        {downloadProgress
+                          ? downloadProgress.totalBytes
+                            ? `${formatMegabytes(downloadProgress.downloadedBytes)} / ${formatMegabytes(
+                                downloadProgress.totalBytes
+                              )}`
+                            : formatMegabytes(downloadProgress.downloadedBytes)
+                          : "…"}
+                      </span>
+                    </div>
+                    <div className="w-full bg-[hsl(var(--color-secondary))] rounded-full h-2 overflow-hidden">
+                      {downloadProgress?.percent != null ? (
+                        <div
+                          className="bg-[hsl(var(--color-primary))] h-full transition-all duration-300"
+                          style={{ width: `${downloadProgress.percent}%` }}
+                        />
+                      ) : (
+                        <div
+                          className="bg-[hsl(var(--color-primary))] h-full animate-pulse"
+                          style={{ width: "30%" }}
+                        />
+                      )}
+                    </div>
+                  </div>
+                ) : null}
+
                 {updateMessage && updateStatus !== "available" ? (
-                  <p
-                    className={cn(
-                      "text-sm",
-                      updateStatus === "error"
-                        ? "text-[hsl(var(--color-destructive))]"
-                        : "text-[hsl(var(--color-muted-foreground))]"
-                    )}
-                  >
-                    {updateMessage}
-                  </p>
+                  <p className="text-sm text-[hsl(var(--color-muted-foreground))]">{updateMessage}</p>
+                ) : null}
+
+                {updateIssue ? (
+                  <div className="space-y-1">
+                    <p className={cn("text-sm", updateIssueClass)}>{updateIssue.message}</p>
+                    {updateIssue.tone !== "error" ? (
+                      <p className="text-xs text-[hsl(var(--color-muted-foreground))]">
+                        这不影响继续使用当前版本。
+                      </p>
+                    ) : null}
+                  </div>
                 ) : null}
 
                 <div className="flex flex-wrap gap-2">
@@ -606,7 +705,7 @@ export function Settings() {
                     ) : (
                       <RefreshCw className="mr-2 h-4 w-4" />
                     )}
-                    检查更新
+                    {isCheckingUpdate ? "检查中..." : updateIssue ? "重试检查" : "检查更新"}
                   </Button>
                   {availableUpdate ? (
                     <Button type="button" onClick={handleInstallAppUpdate} disabled={isInstallingUpdate}>
@@ -615,7 +714,7 @@ export function Settings() {
                       ) : (
                         <Download className="mr-2 h-4 w-4" />
                       )}
-                      立即更新
+                      {isInstallingUpdate ? "更新中..." : "立即更新"}
                     </Button>
                   ) : null}
                 </div>
