@@ -25,6 +25,9 @@ function copyViaTextarea(text: string): boolean {
   textarea.style.opacity = "0";
   document.body.appendChild(textarea);
   textarea.select();
+  // iOS WebView 里 select() 常常不产生实际选区，execCommand("copy") 会静默
+  // 失败（按钮点了没反应）。显式设置选区是这条兜底路径在 iOS 上能用的前提。
+  textarea.setSelectionRange(0, textarea.value.length);
   let ok = false;
   try {
     ok = document.execCommand("copy");
@@ -36,11 +39,37 @@ function copyViaTextarea(text: string): boolean {
 }
 
 /**
+ * 「主题类由 ThemeProvider 挂在根元素上、崩溃后依然生效」只对成功渲染过至少
+ * 一帧的情况成立。如果应用在首帧渲染就崩溃，被丢弃的子树里的 ThemeProvider
+ * 根本没执行过副作用，根元素上没有 light/dark 类——深色环境的用户会看到
+ * 刺眼的纯白兜底页。这里按「用户显式选择 > 系统偏好」补一个解析结果；
+ * 类名已存在（正常崩溃路径）时什么也不做。storage key 与 App.tsx 传给
+ * ThemeProvider 的一致，读不到（受限 WebView / key 变更）就落回系统偏好。
+ */
+function ensureThemeClass() {
+  const root = document.documentElement;
+  if (root.classList.contains("light") || root.classList.contains("dark")) return;
+  let stored: string | null = null;
+  try {
+    stored = localStorage.getItem("story-teller-theme");
+  } catch {
+    stored = null;
+  }
+  const dark =
+    stored === "dark" ||
+    (stored !== "light" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+  root.classList.add(dark ? "dark" : "light");
+  // 原生控件（错误详情 pre 的滚动条等）的明暗也要跟上，否则深色页里是白色滚动条。
+  root.style.colorScheme = dark ? "dark" : "light";
+}
+
+/**
  * 顶层错误边界：接住渲染期的未捕获异常，避免整个应用白屏。
  *
  * 放在 main.tsx 的最外层而不是 App 内部：主题类（light/dark 与配色）由
  * ThemeProvider 以副作用挂在 documentElement 上，React 子树崩掉后依然生效，
  * 所以兜底页照常能拿到主题色；放最外层还能连 provider 自身的崩溃一起接住。
+ * （首帧渲染就崩、主题类根本没挂上的例外由 ensureThemeClass 兜底。）
  *
  * 注意：错误边界只覆盖渲染/生命周期里的异常，事件回调与异步错误仍由
  * main.tsx 里的 window `error` / `unhandledrejection` 监听器负责记录。
@@ -56,6 +85,9 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
 
   componentDidCatch(error: Error, info: ErrorInfo) {
     console.error("[ErrorBoundary] 渲染崩溃:", error, info.componentStack);
+    // componentDidCatch 在提交阶段、浏览器绘制之前运行，此时补主题类
+    // 兜底页第一帧就是正确的明暗，不会闪白。
+    ensureThemeClass();
     this.setState({ componentStack: info.componentStack ?? null });
   }
 
