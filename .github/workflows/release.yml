@@ -1,5 +1,14 @@
 name: release-android
 
+# TODO(desktop-updater): 桌面端 updater 的更新源写死在
+# arknights-story-reader/src-tauri/tauri.conf.json（plugins.updater.endpoints）：
+#   https://github.com/helixnow/arknights-storyteller/releases/latest/download/latest.json
+# 本工作流只构建 Android 产物（APK + android-latest.json），不会构建桌面安装包，也不会
+# 生成新的桌面 feed；下方的 "Carry over desktop updater feed" 步骤只是把上一个 Release
+# 里已有的 latest.json 原样带到新 Release，避免每次 Android 发布后该 URL 变成 404。
+# 桌面 feed 的首次上传与桌面版本更新仍需手工完成（需要与 pubkey 配对的
+# TAURI_SIGNING_PRIVATE_KEY），步骤见 arknights-story-reader/README.md「桌面更新源的现状」。
+
 on:
   workflow_dispatch:
   push:
@@ -225,6 +234,34 @@ jobs:
           cat "$JSON_PATH"
           gh release upload "$TAG" "$JSON_PATH#$JSON_PATH" --clobber
         working-directory: arknights-story-reader
+
+      # 桌面 updater 从 releases/latest/download/latest.json 读取更新 feed（见 TODO 注释）。
+      # 本工作流每次都会创建新的 latest Release，若不搬运，手工上传过的桌面 feed 会被
+      # 留在旧 Release 上导致该 URL 404。feed 内的下载链接指向 releases/download/<旧 tag>/…，
+      # 旧资产与 minisign 签名保持有效，因此原样搬运是安全的。此步骤任何失败都不会
+      # 中断 Android 发布。
+      - name: Carry over desktop updater feed (latest.json)
+        env:
+          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          TAG: "${{ steps.create_release.outputs.tag }}"
+          REPO: "${{ github.repository }}"
+        run: |
+          PREV_TAG=$(gh api "repos/$REPO/releases?per_page=30" \
+            --jq '[.[] | select(.draft == false) | select(any(.assets[]; .name == "latest.json"))][0].tag_name // empty' \
+            || true)
+          if [ -z "$PREV_TAG" ]; then
+            echo "No previous release carries latest.json; skipping desktop feed carry-over."
+            echo "Desktop updater feed must be seeded manually, see arknights-story-reader/README.md."
+            exit 0
+          fi
+          echo "Carrying over latest.json from $PREV_TAG to $TAG"
+          TMP_DIR=$(mktemp -d)
+          if gh release download "$PREV_TAG" --pattern latest.json --dir "$TMP_DIR" \
+            && gh release upload "$TAG" "$TMP_DIR/latest.json" --clobber; then
+            echo "Desktop updater feed carried over to $TAG."
+          else
+            echo "::warning::Failed to carry over latest.json from $PREV_TAG; desktop updater feed may 404 until re-uploaded manually."
+          fi
 
       - name: Publish release
         env:

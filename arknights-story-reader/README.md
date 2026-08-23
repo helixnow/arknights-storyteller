@@ -196,7 +196,9 @@ npm run tauri ios build
 
 ### 发布：`.github/workflows/release.yml`
 
-只在推送到 `release` 分支或手动触发时跑，且**只负责 Android**：bump 版本 → 构建签名的 universal APK → 上传到 Release → 生成并上传 `android-latest.json` → 发布 Release。所需机密：`ANDROID_KEYSTORE_B64`、`ANDROID_KEYSTORE_PASSWORD`、`ANDROID_KEY_ALIAS`、`ANDROID_KEY_PASSWORD`。
+只在推送到 `release` 分支或手动触发时跑，且**只构建 Android**：bump 版本 → 构建签名的 universal APK → 上传到 Release → 生成并上传 `android-latest.json` → 搬运上一个 Release 的桌面 `latest.json`（若存在，见下节）→ 发布 Release。所需机密：`ANDROID_KEYSTORE_B64`、`ANDROID_KEYSTORE_PASSWORD`、`ANDROID_KEY_ALIAS`、`ANDROID_KEY_PASSWORD`。
+
+注意仓库根目录的 `.github/workflows/release.yml` 才是实际生效的工作流；`arknights-story-reader/.github/workflows/release.yml` 是仓库重组前的旧文件，GitHub 不会运行它。
 
 ### 桌面更新源的现状
 
@@ -206,7 +208,39 @@ npm run tauri ios build
 https://github.com/helixnow/arknights-storyteller/releases/latest/download/latest.json
 ```
 
-也就是说桌面端**期望**在 latest release 里能下载到这个 `latest.json`。但仓库里目前没有任何工作流会生成或上传它——`release.yml` 产出的是 APK 和 `android-latest.json`。桌面安装包与 `latest.json`（`tauri build` 在开启 `createUpdaterArtifacts` 后连同签名一起产出）现在需要手工构建并附加到同一个 Release，否则桌面端的「检查更新」会拿不到 feed。
+也就是说桌面端**期望**在被标记为 latest 的 Release 里能下载到 `latest.json`。但没有任何工作流会**构建**桌面安装包或**生成**这个文件——`release.yml` 只产出 APK 和 `android-latest.json`。它对桌面 feed 只做一件事：发布新 Release 前，把上一个 Release 里已有的 `latest.json` 原样搬运过来（"Carry over desktop updater feed" 步骤）。因为工作流每次都会新建 Release 并标记为 latest，不搬运的话，手工上传过的桌面 feed 会被留在旧 Release 上，导致上面这个 URL 每次 Android 发布后都变成 404。feed 里的下载链接指向 `releases/download/app-v<旧版本>/…`，旧资产与 minisign 签名依然有效，所以搬运是安全的。但如果从来没有人上传过 `latest.json`（当前状态），这一步会直接跳过，桌面端「检查更新」仍然拿不到 feed。
+
+**首次上传桌面 feed（或发布新的桌面版本）必须手工完成**，步骤如下：
+
+1. 在各目标平台上用配套私钥构建。私钥必须与 `tauri.conf.json` 里 `plugins.updater.pubkey` 配对，**不要**重新生成一对新钥匙，否则已安装的客户端会校验失败、拒绝更新：
+
+   ```bash
+   export TAURI_SIGNING_PRIVATE_KEY="<私钥内容或文件路径>"
+   export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="<私钥口令，没有则不设>"
+   npm run tauri build
+   ```
+
+   `createUpdaterArtifacts` 已在 `tauri.conf.json` 开启，`src-tauri/target/release/bundle/` 会同时产出安装包与配套 `.sig`：Linux 为 `*.AppImage` + `.sig`，Windows 为 NSIS `*-setup.exe` + `.sig`，macOS 为 `*.app.tar.gz` + `.sig`。
+
+2. 手写 `latest.json`（Tauri 2 updater 的静态 JSON 格式）。`version` 填本次桌面构建的应用版本；`signature` 填对应 `.sig` 文件的**内容**（不是路径）；`url` 指向同一个 Release 里上传后的资产：
+
+   ```json
+   {
+     "version": "1.10.52",
+     "notes": "",
+     "pub_date": "2026-08-23T00:00:00Z",
+     "platforms": {
+       "linux-x86_64":   { "signature": "<AppImage.sig 内容>",   "url": "https://github.com/helixnow/arknights-storyteller/releases/download/app-v1.10.52/arknights-story-reader_1.10.52_amd64.AppImage" },
+       "windows-x86_64": { "signature": "<setup.exe.sig 内容>",  "url": "https://github.com/helixnow/arknights-storyteller/releases/download/app-v1.10.52/arknights-story-reader_1.10.52_x64-setup.exe" },
+       "darwin-x86_64":  { "signature": "<app.tar.gz.sig 内容>", "url": "https://github.com/helixnow/arknights-storyteller/releases/download/app-v1.10.52/arknights-story-reader_x64.app.tar.gz" },
+       "darwin-aarch64": { "signature": "<app.tar.gz.sig 内容>", "url": "https://github.com/helixnow/arknights-storyteller/releases/download/app-v1.10.52/arknights-story-reader_aarch64.app.tar.gz" }
+     }
+   }
+   ```
+
+   两个注意点：`productName` 是中文，`tauri build` 产出的文件名会带中文，上传前建议重命名为纯 ASCII 并保证 `url` 与重命名后的资产名一致，避免 URL 编码问题导致 updater 404；`version` 是桌面端自己的版本，落后于 Android 的版本号是正常状态——updater 只拿它与本机版本比较，不会与 Android 版本混淆。
+
+3. 把安装包与 `latest.json` 一起上传到**当前 latest** 的 `app-v*` Release（`gh release upload <tag> <文件> --clobber`）。此后每次 Android 发布都会自动把这份 `latest.json` 搬运到新 Release，feed 不会再丢；但发布新桌面版本时仍需重复上述手工步骤。
 
 ## 🙌 开源依赖与致谢
 
