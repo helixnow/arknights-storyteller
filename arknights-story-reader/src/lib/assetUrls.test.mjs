@@ -256,6 +256,24 @@ test("markAssetUrlAlive：host 一旦证明可达就永久免疫熔断", () => {
   assert.equal(isAssetUrlDead(`${host}/fresh.png`), false);
 });
 
+test("host 首次证明可达时撤销此前的 URL 级失败；之后的失败才永久记账", () => {
+  const host = "https://mirror-f.invalid";
+  // proven 之前的失败：可能是断网/被墙，判决不可靠。
+  markAssetUrlDead(`${host}/suspect.png`);
+  markAssetUrlDead("https://mirror-g.invalid/other.png");
+  assert.equal(isAssetUrlDead(`${host}/suspect.png`), true);
+
+  markAssetUrlAlive(`${host}/proof.png`);
+  assert.equal(isAssetUrlDead(`${host}/suspect.png`), false, "存疑失败应被撤销、允许重试");
+  // 其他 host 的记录不连坐。
+  assert.equal(isAssetUrlDead("https://mirror-g.invalid/other.png"), true);
+
+  // proven 之后的失败是真 404，永久记账；重复 markAlive 也不再撤销。
+  markAssetUrlDead(`${host}/really-missing.png`);
+  markAssetUrlAlive(`${host}/proof2.png`);
+  assert.equal(isAssetUrlDead(`${host}/really-missing.png`), true);
+});
+
 test("host 熔断：达到阈值后整 host 拒答，到期自动唤醒订阅者，退避翻倍", (t) => {
   t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
   const host = "https://mirror-c.invalid";

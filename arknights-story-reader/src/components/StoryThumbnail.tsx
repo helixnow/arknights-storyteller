@@ -4,7 +4,6 @@ import { useStoryPreview } from "@/hooks/useStoryPreview";
 import { peekAssetCandidates, useAssetHealthNonce } from "@/hooks/useAsset";
 import {
   gradientFallbackBackground,
-  hasRecoverableCandidate,
   markAssetUrlAlive,
   markAssetUrlDead,
   pickLiveCandidate,
@@ -83,9 +82,18 @@ export function StoryThumbnail({
   // 与 `<AssetImage>` 共用同一份失败缓存 / host 熔断：同一张 404 的封面
   // 不会因为走了两条渲染路径就被请求两遍。
   const live = pickLiveCandidate(candidates, cursor);
-  // 候选被熔断跳光时，订阅一次健康度事件：窗口结束后自动再试，而不是把
-  // 卡片永久钉在渐变兜底上。图片正常显示时不订阅，零开销。
-  useAssetHealthNonce(live === null && hasRecoverableCandidate(candidates, cursor));
+  // 候选全被跳过（host 熔断或 URL 标死）都订阅健康度事件：host 首次被
+  // 证明可达时 markAssetUrlAlive 会撤销此前的存疑失败记录，此时把游标
+  // 拨回 0 重扫候选链——否则断网期间看过的封面在网络恢复后永远停在
+  // 渐变兜底上。真正失败过的 URL 仍被 deadUrls 跳过，不会原地打转；
+  // 图片正常显示时不订阅，零开销。
+  const stuck = live === null && candidates.length > 0;
+  const healthNonce = useAssetHealthNonce(stuck);
+  const healthNonceRef = useRef(healthNonce);
+  if (healthNonceRef.current !== healthNonce) {
+    healthNonceRef.current = healthNonce;
+    if (stuck) setCursor(0);
+  }
 
   // 解码放到主线程之外：滚动时一张 1920px 的活动 KV 同步解码足以掉帧。
   // 解码完成前保持兜底色块，完成后再淡入，避免"半张图"闪现。

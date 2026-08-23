@@ -2014,10 +2014,21 @@ impl DataService {
     /// 只认里面有非空 `story_review_table.json` 的暂存目录；半截壳子恢复
     /// 回去也撑不起应用，一概不碰，留给下一次换入开场清理。同时存在多个
     /// 候选时取时间戳最大的：带时间戳的名字只在固定名残骸清不掉时才会
-    /// 启用，必然比固定名新。`data_dir` 尚在时什么都不做——成功换入后
+    /// 启用，必然比固定名新。
+    ///
+    /// 目录不变量：`data_dir` 装着**有效数据集**时绝不动它——成功换入后
     /// 清理失败留下的 `_old` 是上一份数据，抢着恢复反而会顶掉新数据。
+    /// 判定用 `holds_valid_dataset` 而不是 `exists`：`swap_in_extracted`
+    /// 的跨设备回退拷贝（`copy_dir_all` 分支）中途断电会留下一个没有
+    /// review 表的半截新树占住 `data_dir`，完整旧数据还躺在 `_old` 里。
+    /// 只认「目录存在」的话这份旧数据永远接不回来，还会在下一次换入
+    /// 开场被 `old_data_aside_path` 当陈骸删掉——离线用户就此丢失唯一
+    /// 完整副本。壳子撑不起应用，必须让位；且只有手里握着有效暂存时
+    /// 才清壳子，没有恢复来源时 `data_dir` 一个字节都不碰。
+    /// 本方法只在 `DataService::new`（setup，单线程）里跑，动这些目录
+    /// 没有并发之忧。
     fn restore_data_dir_from_aside(&self) {
-        if self.data_dir.exists() {
+        if Self::holds_valid_dataset(&self.data_dir) {
             return;
         }
         let Some(parent) = self.data_dir.parent() else {
@@ -2056,6 +2067,24 @@ impl DataService {
         let Some((_, aside)) = candidates.into_iter().max_by_key(|(stamp, _)| *stamp) else {
             return;
         };
+
+        // 走到这里说明 data_dir 要么不存在，要么是撑不起应用的半截壳子
+        // （见上：跨设备拷贝断电）。rename 不能覆盖非空目录，先把壳子
+        // 清掉。删不掉就保持现状：旧数据仍完整躺在暂存目录里，下次启动
+        // 重试——绝不能反过来先动暂存目录。
+        if self.data_dir.exists() {
+            if let Err(err) = fs::remove_dir_all(&self.data_dir) {
+                eprintln!(
+                    "[RECOVER] 发现无效的数据目录残骸 {:?}，但清理失败（{}），本次不恢复；旧数据仍完整保留在 {:?}",
+                    self.data_dir, err, aside
+                );
+                return;
+            }
+            eprintln!(
+                "[RECOVER] 已清除换入中断留下的无效数据目录残骸 {:?}",
+                self.data_dir
+            );
+        }
 
         match fs::rename(&aside, &self.data_dir) {
             Ok(()) => {
@@ -2910,7 +2939,15 @@ impl DataService {
             // in play we still have to read the body, since an exclusion may
             // only appear there.
             let hit = if title_hits && terms.negative.is_empty() {
-                Some(story.story_name.clone())
+                // 与索引同一份语料：rebuild 里 read_story_text 失败的剧情
+                // 整篇不入库（FTS 搜不到），标题快路径必须做同样的取舍。
+                // 否则脚本缺失的条目（残缺手工包）在索引没建好时能凭标题
+                // 命中、索引建好后又消失，两条路径的结果集就不一致了；
+                // 点开也只会得到读文件错误。读得出来本身就是判定，正文
+                // 内容这里用不上。
+                self.read_story_text(&story.story_txt)
+                    .is_ok()
+                    .then(|| story.story_name.clone())
             } else {
                 // 扫的是「标题 + 解析后的正文」，也就是索引里 `raw_content`
                 // 的同一份文本。直接扫原始脚本的话，`[name=...]`、素材 token
@@ -4877,6 +4914,57 @@ mod tests {
         );
     }
 
+    /// 目录里列了、脚本文件却读不出来的剧情（残缺的手工包）在两条搜索
+    /// 路径上必须同样不可见：rebuild 会整篇跳过（不入 FTS 库），线性
+    /// 扫描的标题快路径也必须跳过——否则索引建好前后同一查询的结果集
+    /// 不一致，且命中的条目点开只会报读文件错误。
+    #[test]
+    fn fallback_title_hit_skips_stories_whose_script_is_unreadable() {
+        let fx = Fixture::new("ghost_script");
+        // 追加一篇脚本文件不存在的剧情；正常的 main_00-01 保留作对照。
+        fx.set_review_table(&format!(
+            "{{\"main_0\":{{\"id\":\"main_0\",\"name\":\"黑暗时代\",\"entryType\":\"MAINLINE\",\
+              \"infoUnlockDatas\":[{},{}]}}}}",
+            entry_json(
+                "main_00-01",
+                "序章",
+                "main_0",
+                1,
+                "obt/main/level_main_00-01",
+                "0-1",
+            ),
+            entry_json(
+                "ghost_01",
+                "幽灵篇章",
+                "main_0",
+                9,
+                "obt/main/level_main_ghost",
+                "9-9",
+            )
+        ));
+
+        // 索引没建好：线性扫描。标题对得上，但脚本读不出来——不该命中。
+        let scanned = fx.service.search_stories("幽灵篇章").unwrap();
+        assert!(
+            scanned.is_empty(),
+            "缺脚本的剧情不该凭标题命中: {:?}",
+            sorted_ids(&scanned)
+        );
+        // 对照组：脚本齐全的剧情照常凭标题命中。
+        assert_eq!(
+            sorted_ids(&fx.service.search_stories("序章").unwrap()),
+            vec!["main_00-01".to_string()]
+        );
+
+        // 建好索引后同样为空——两条路径语料一致。
+        fx.service.rebuild_story_index().expect("index builds");
+        assert!(fx.service.search_stories("幽灵篇章").unwrap().is_empty());
+        assert_eq!(
+            sorted_ids(&fx.service.search_stories("序章").unwrap()),
+            vec!["main_00-01".to_string()]
+        );
+    }
+
     #[test]
     fn scan_reports_a_real_denominator() {
         let fx = Fixture::new("scan_progress");
@@ -5392,6 +5480,77 @@ mod tests {
         assert!(!relaunched.is_installed(), "空壳残骸不该被当成数据恢复");
         assert!(!relaunched.data_dir.exists());
         assert!(shell.exists(), "无效残骸原样保留，等下一次换入开场清理");
+    }
+
+    /// 跨设备回退拷贝（swap_in_extracted 的 copy_dir_all 分支）中途断电：
+    /// data_dir 是个没有 review 表的半截新树，完整旧数据还在 `_old`。
+    /// 启动必须清掉壳子、接回旧数据，否则用户明明有完整数据却看到
+    /// 「未安装」，而 `_old` 会在下一次换入开场被当陈骸删掉。
+    #[test]
+    fn new_replaces_invalid_husk_with_valid_aside() {
+        let fx = Fixture::new("recover_husk");
+        let parent = fx.service.data_dir.parent().unwrap().to_path_buf();
+        let aside = parent.join("ArknightsGameData_old");
+        fs::rename(&fx.service.data_dir, &aside).unwrap();
+        // 半截新树：拷了一些文件，review 表还没落地。
+        Fixture::write_file(
+            &fx.service.data_dir.join("zh_CN/gamedata/story/partial.txt"),
+            "half copy",
+        );
+        assert!(!fx.service.is_installed(), "崩溃现场：壳子撑不起应用");
+
+        let relaunched = DataService::new(fx.root.clone());
+        assert!(relaunched.is_installed(), "半截壳子必须让位给完整旧数据");
+        assert!(!aside.exists(), "恢复即改名回 data_dir，不留副本");
+        assert!(
+            !relaunched
+                .data_dir
+                .join("zh_CN/gamedata/story/partial.txt")
+                .exists(),
+            "壳子的残余不得混进恢复后的数据"
+        );
+        assert_eq!(
+            relaunched.get_story_entry("main_00-01").unwrap().story_name,
+            "序章"
+        );
+    }
+
+    /// 空的 review 表同样是壳子（holds_valid_dataset 要求非空）：
+    /// is_installed 只看文件存在会误报「已安装」，恢复判定不能跟着错。
+    #[test]
+    fn new_replaces_husk_with_empty_review_table() {
+        let fx = Fixture::new("recover_husk_empty");
+        let parent = fx.service.data_dir.parent().unwrap().to_path_buf();
+        let aside = parent.join("ArknightsGameData_old");
+        fs::rename(&fx.service.data_dir, &aside).unwrap();
+        Fixture::write_file(&fx.service.data_dir.join(REVIEW_TABLE_REL), "");
+
+        let relaunched = DataService::new(fx.root.clone());
+        assert!(!aside.exists(), "空表壳子必须让位给完整旧数据");
+        assert_eq!(
+            relaunched.get_story_entry("main_00-01").unwrap().story_name,
+            "序章"
+        );
+    }
+
+    /// 没有可恢复的完整旧数据时，启动绝不能清 data_dir——哪怕它当前
+    /// 不是一份有效数据集，删东西没有任何收益，只会雪上加霜。
+    #[test]
+    fn new_keeps_invalid_data_dir_when_no_valid_aside() {
+        let fx = Fixture::new("recover_husk_keep");
+        // review 表清空：data_dir 变成无效壳子，且周围没有 _old 候选。
+        fs::write(fx.service.data_dir.join(REVIEW_TABLE_REL), "").unwrap();
+        Fixture::write_file(&fx.service.data_dir.join("user_note.txt"), "keep me");
+
+        let relaunched = DataService::new(fx.root.clone());
+        assert!(
+            relaunched.data_dir.join("user_note.txt").exists(),
+            "没有恢复来源时不得清理 data_dir"
+        );
+        assert!(
+            relaunched.data_dir.join(REVIEW_TABLE_REL).exists(),
+            "壳子里的文件一个都不该动"
+        );
     }
 
     /// data_dir 还健在时绝不能动：成功换入后清理失败留下的 `_old` 是上

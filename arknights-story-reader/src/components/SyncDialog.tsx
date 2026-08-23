@@ -77,13 +77,17 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
   useEffect(() => {
     if (!open) return;
     const onKeyDown = (event: KeyboardEvent) => {
+      const card = cardRef.current;
+      // 对话框挂在 StoryList 里，数据未安装时会在后台自动打开；此时所在的
+      // KeepAlive 面板是 inert 的，对话框并没有呈现在用户面前，不能再吃
+      // Esc/Tab——否则 Tab 被 preventDefault 而焦点又进不了 inert 子树，
+      // 整个应用的 Tab 键就失灵了（同 SheetShell 的 isPresented 守卫）。
+      if (!card || card.closest("[inert]")) return;
       if (event.key === "Escape") {
         handleClose();
         return;
       }
       if (event.key !== "Tab") return;
-      const card = cardRef.current;
-      if (!card) return;
       const focusable = Array.from(card.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
         (element) => element.getClientRects().length > 0
       );

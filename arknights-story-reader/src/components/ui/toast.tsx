@@ -29,7 +29,7 @@ interface ToastContextValue {
 
 const ToastContext = createContext<ToastContextValue | null>(null);
 
-/** 同屏最多堆叠的条数，再多就挤掉最旧的一条。 */
+/** 同屏最多堆叠的条数，再多就按 show() 里的优先级挤掉旧的。 */
 const MAX_VISIBLE = 3;
 
 /* 失败信息通常更长、也更需要用户读完再决定下一步，所以给它明显更长的停留
@@ -83,7 +83,14 @@ export function ToastProvider({ children }: { children: ReactNode }) {
         kind,
         duration: options?.duration ?? DEFAULT_DURATION[kind],
       };
-      setToasts((prev) => [...prev, payload].slice(-MAX_VISIBLE));
+      setToasts((prev) => {
+        if (prev.length < MAX_VISIBLE) return [...prev, payload];
+        // 满员时优先挤掉最旧的普通/成功提示：错误和警告承载着「操作失败」
+        // 这类必须被读到的信息，不能被连发的成功提示无声顶掉；只有整屏都
+        // 是紧急提示时才挤最旧那条。刚弹出的新提示永远保留。
+        const evict = prev.findIndex((t) => t.kind !== "error" && t.kind !== "warning");
+        return [...prev.filter((_, i) => i !== (evict === -1 ? 0 : evict)), payload];
+      });
     },
     []
   );

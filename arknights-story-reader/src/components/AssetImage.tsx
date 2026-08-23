@@ -113,10 +113,23 @@ export function AssetImage({
   const currentUrl = pickLiveCandidate(candidates, currentIdx);
 
   // 全部候选都被跳过时区分两种情况：URL 自己 404（真没了）和 host 正在
-  // 熔断（等窗口结束还能再试）。后者订阅一次健康度事件等待重试，并且
-  // 先不上报 exhausted —— 否则一次断网会让阅读器把插画段永久删掉。
-  const recoverable = currentUrl === null && hasRecoverableCandidate(candidates, currentIdx);
-  useAssetHealthNonce(recoverable);
+  // 熔断（等窗口结束还能再试）。后者先不上报 exhausted —— 否则一次断网
+  // 会让阅读器把插画段永久删掉。
+  //
+  // 健康度订阅不能只看「熔断中」：markAssetUrlAlive 在 host 首次被证明
+  // 可达时会撤销该 host 此前的 URL 级失败记录（那些失败发生在源不可达的
+  // 窗口内，判决不可靠），候选全部标死的组件也要被叫醒重试，否则断网
+  // 期间打开过的头像/封面在网络恢复后永远停在兜底上。
+  const stuck = currentUrl === null && candidates.length > 0;
+  const recoverable = stuck && hasRecoverableCandidate(candidates, currentIdx);
+  const healthNonce = useAssetHealthNonce(stuck);
+  // 健康事件到来时把游标拨回 0 重扫整条候选链：被撤销失败记录的 URL 可能
+  // 排在游标之前；真正失败过的仍会被 deadUrls 跳过，不会原地打转。
+  const healthNonceRef = useRef(healthNonce);
+  if (healthNonceRef.current !== healthNonce) {
+    healthNonceRef.current = healthNonce;
+    if (stuck) setCurrentIdx(0);
+  }
 
   const exhausted = !loading && !recoverable && candidates.length > 0 && currentUrl === null;
   const noneAvailable = !loading && candidates.length === 0;

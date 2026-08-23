@@ -331,6 +331,13 @@ export function markAssetUrlAlive(url: string): void {
   if (provenHosts.has(host)) return;
   provenHosts.add(host);
   hostStrikes.delete(host);
+  // 撤销这个 host 在「尚未证明可达」期间记下的 URL 级失败：断网/被墙时
+  // img.onerror 与真 404 无法区分，那些判决不可靠。不撤销的话，断网期间
+  // 打开过的头像/封面会在网络恢复后仍被 deadUrls 永久跳过，直到重启。
+  // 此后（host 已 proven）再失败的才是真 404，照旧永久记账。
+  for (const dead of deadUrls) {
+    if (hostOf(dead) === host) deadUrls.delete(dead);
+  }
   // 这个源刚被证明可达：之前因它熔断而放弃的候选现在值得重试。
   notifyAssetHealth();
 }
