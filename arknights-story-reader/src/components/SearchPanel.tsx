@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "@/services/api";
 import type {
   SearchResult,
@@ -12,11 +12,14 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import {
   Search,
+  SearchX,
   X,
   BookOpen,
   MessageSquare,
   MoreHorizontal,
   Loader2,
+  AlertTriangle,
+  Database,
 } from "lucide-react";
 import { CustomScrollArea } from "@/components/ui/custom-scroll-area";
 import { cn } from "@/lib/utils";
@@ -62,6 +65,21 @@ const HISTORY_LIMIT = 10;
 const CACHE_LIMIT = 40;
 const MAX_HIGHLIGHT_TERMS = 12;
 
+/** 少于两个字符不自动搜：中文单字命中面太大，等于把整库拉一遍。 */
+const AUTO_SEARCH_MIN_LEN = 2;
+/** 已经有结果、用户在改词：给足停顿时间再发请求。 */
+const AUTO_DEBOUNCE_MS = 320;
+/** 空面板里敲下的第一个词：延迟压到一眼看不出来的量级，别让首字发木。 */
+const AUTO_DEBOUNCE_FIRST_MS = 140;
+/** 本地缓存里已经有答案：几乎零成本，跟着输入走就行。 */
+const AUTO_DEBOUNCE_CACHED_MS = 60;
+
+const RESULT_LISTBOX_ID = "search-result-listbox";
+
+/** 空数组常量：给 memo 化的行提供稳定引用，避免每帧新建。 */
+const NO_RESULTS: SearchResult[] = [];
+const NO_HITS: SegmentHit[] = [];
+
 const SEGMENT_TYPE_LABEL: Record<SegmentHit["segmentType"], string> = {
   dialogue: "对话",
   narration: "旁白",
@@ -77,6 +95,37 @@ function devLog(scope: string, err: unknown) {
   if (import.meta.env.DEV) {
     console.warn(`[SearchPanel] ${scope}`, err);
   }
+}
+
+/** Tauri 的 invoke 失败时抛出来的可能是字符串、Error，也可能是后端序列化的对象。 */
+function describeSearchError(err: unknown): string {
+  const raw =
+    typeof err === "string"
+      ? err
+      : err instanceof Error
+        ? err.message
+        : err && typeof err === "object" && typeof (err as { message?: unknown }).message === "string"
+          ? (err as { message: string }).message
+          : "";
+  const text = raw.trim();
+  if (!text) return "后端未返回错误信息";
+  return text.length > 160 ? `${text.slice(0, 160)}…` : text;
+}
+
+/**
+ * 半截的查询串先别发出去：引号还没配对、或者停在 `-` / `OR` 上时，
+ * 后端只会返回一堆噪音，用户每敲一个符号就闪一次"没有结果"。
+ */
+function isAutoSearchable(raw: string): boolean {
+  if (raw.length < AUTO_SEARCH_MIN_LEN) return false;
+  if ((raw.match(/"/g)?.length ?? 0) % 2 === 1) return false;
+  if (/-$/.test(raw)) return false;
+  if (/\b(or|and|not)$/i.test(raw)) return false;
+  return true;
+}
+
+function optionDomId(index: number): string {
+  return `search-result-option-${index}`;
 }
 
 // ─────────────────────────────────────────────────────────
@@ -189,6 +238,160 @@ function writeJson(key: string, value: unknown) {
   }
 }
 
+// ─────────────────────────────────────────────────────────
+// 结果行
+// ─────────────────────────────────────────────────────────
+
+const ROW_BASE_CLASS =
+  "w-full p-4 rounded-lg border text-left transition-all duration-200 motion-safe:animate-in motion-safe:fade-in-0 disabled:opacity-60 disabled:cursor-wait";
+/** 键盘选中的那一行必须自己看得见，不能只靠鼠标 hover 的背景色。 */
+const ROW_ACTIVE_CLASS =
+  "border-[hsl(var(--color-primary))] bg-[hsl(var(--color-accent))] ring-2 ring-[hsl(var(--color-ring))]";
+const ROW_IDLE_CLASS =
+  "border-[hsl(var(--color-border))] hover:bg-[hsl(var(--color-accent))] hover:-translate-y-0.5";
+
+interface StoryRowProps {
+  result: SearchResult;
+  index: number;
+  active: boolean;
+  opening: boolean;
+  highlight: Highlighter;
+  onOpen: (result: SearchResult) => void;
+  registerRow: (index: number, el: HTMLButtonElement | null) => void;
+}
+
+/**
+ * 结果行单独 memo：输入框是受控的，用户每敲一个字整个面板就重渲染一轮，
+ * 而一次搜索能出上百行。行的 props 里只有 `active` / `opening` 会变，
+ * 其余（高亮函数、回调）都在父层用 ref 稳住了引用。
+ */
+const StoryResultRow = memo(function StoryResultRow({
+  result,
+  index,
+  active,
+  opening,
+  highlight,
+  onOpen,
+  registerRow,
+}: StoryRowProps) {
+  return (
+    <button
+      type="button"
+      id={optionDomId(index)}
+      role="option"
+      aria-selected={active}
+      // 焦点始终留在输入框，由 aria-activedescendant 指路，
+      // 所以行本身不进 Tab 序列，免得几百个按钮把 Tab 键淹了。
+      tabIndex={-1}
+      ref={(el) => {
+        registerRow(index, el);
+      }}
+      onClick={() => onOpen(result)}
+      disabled={opening}
+      className={cn(ROW_BASE_CLASS, active ? ROW_ACTIVE_CLASS : ROW_IDLE_CLASS)}
+      style={{ animationDelay: `${Math.min(index, 10) * 40}ms` }}
+    >
+      <div className="font-medium mb-1">
+        {highlight(result.storyName)}
+        {opening && (
+          <span className="ml-2 text-xs text-[hsl(var(--color-muted-foreground))]">打开中...</span>
+        )}
+      </div>
+      <div className="text-xs text-[hsl(var(--color-muted-foreground))] mb-2">
+        {result.category}
+      </div>
+      {result.matchedText && (
+        <div className="text-sm text-[hsl(var(--color-muted-foreground))] line-clamp-2">
+          {highlight(result.matchedText)}
+        </div>
+      )}
+    </button>
+  );
+});
+
+interface SegmentRowProps {
+  hit: SegmentHit;
+  index: number;
+  active: boolean;
+  opening: boolean;
+  highlight: Highlighter;
+  onOpen: (hit: SegmentHit) => void;
+  registerRow: (index: number, el: HTMLButtonElement | null) => void;
+}
+
+/** 段落行：结构比整篇行重（角色 chip、命中来源徽标），更值得 memo。 */
+const SegmentResultRow = memo(function SegmentResultRow({
+  hit,
+  index,
+  active,
+  opening,
+  highlight,
+  onOpen,
+  registerRow,
+}: SegmentRowProps) {
+  const speakerOnly = hit.matchTarget === "speaker";
+  const titleOnly = hit.matchTarget === "title";
+  return (
+    <button
+      type="button"
+      id={optionDomId(index)}
+      role="option"
+      aria-selected={active}
+      tabIndex={-1}
+      ref={(el) => {
+        registerRow(index, el);
+      }}
+      onClick={() => onOpen(hit)}
+      disabled={opening}
+      className={cn(ROW_BASE_CLASS, active ? ROW_ACTIVE_CLASS : ROW_IDLE_CLASS)}
+      style={{ animationDelay: `${Math.min(index, 10) * 40}ms` }}
+    >
+      <div className="flex items-baseline justify-between gap-2 mb-1">
+        <div className="font-medium truncate">{highlight(hit.storyName)}</div>
+        <span className="flex-shrink-0 text-[10px] uppercase tracking-widest text-[hsl(var(--color-muted-foreground))]">
+          {SEGMENT_TYPE_LABEL[hit.segmentType] ?? hit.segmentType}
+          {" · #"}
+          {hit.segmentIndex}
+        </span>
+      </div>
+      <div className="flex flex-wrap items-center gap-2 text-xs text-[hsl(var(--color-muted-foreground))] mb-2">
+        <span className="truncate">{hit.category}</span>
+        {hit.characterName && (
+          <span
+            className={cn(
+              "inline-flex items-center rounded-full border px-2 py-0.5 text-[11px]",
+              speakerOnly
+                ? "border-[hsl(var(--color-primary)/0.5)] bg-[hsl(var(--color-primary)/0.1)] text-[hsl(var(--color-foreground))]"
+                : "border-[hsl(var(--color-border))]"
+            )}
+          >
+            {/* When the badge itself already calls out the speaker as the
+                reason the row matched, skip the term highlight inside the
+                chip — a double visual accent muddies the card. */}
+            {speakerOnly ? hit.characterName : highlight(hit.characterName)}
+          </span>
+        )}
+        {speakerOnly && (
+          <span className="inline-flex items-center rounded-full bg-[hsl(var(--color-primary)/0.12)] px-2 py-0.5 text-[10px] text-[hsl(var(--color-primary))]">
+            按说话人命中
+          </span>
+        )}
+        {titleOnly && (
+          <span className="inline-flex items-center rounded-full bg-[hsl(var(--color-primary)/0.12)] px-2 py-0.5 text-[10px] text-[hsl(var(--color-primary))]">
+            按剧情标题命中
+          </span>
+        )}
+        {opening && <span className="text-[11px]">打开中...</span>}
+      </div>
+      {hit.matchedText && (
+        <div className="text-sm text-[hsl(var(--color-foreground))] whitespace-pre-wrap leading-relaxed">
+          {highlight(hit.matchedText)}
+        </div>
+      )}
+    </button>
+  );
+});
+
 export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProps) {
   const [query, setQuery] = useState("");
   const [mode, setMode] = useState<SearchMode>(() => {
@@ -202,6 +405,8 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
   const [segmentPage, setSegmentPage] = useState<SegmentSearchPage | null>(null);
   const [searching, setSearching] = useState(false);
   const [searched, setSearched] = useState(false);
+  /** 出错的那次搜索：连查询串一起记下来，重试才不会重试成上一条成功的词。 */
+  const [searchError, setSearchError] = useState<{ query: string; message: string } | null>(null);
   const [indexStatus, setIndexStatus] = useState<StoryIndexStatus | null>(null);
   const [buildingIndex, setBuildingIndex] = useState(false);
   const [indexError, setIndexError] = useState<string | null>(null);
@@ -228,31 +433,59 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
   const [lastQuery, setLastQuery] = useState("");
   const [activeFacet, setActiveFacet] = useState<string | null>(null);
   const [moreOpen, setMoreOpen] = useState(false);
+  // 输入法组合态同时存 state 和 ref：ref 给同步的按键判断用，
+  // state 让防抖 effect 能在组合开始/结束时重新决策。
+  const [composing, setComposing] = useState(false);
+  /** 防抖计时器已排上但还没发请求——用来立刻给一点"收到了"的反馈。 */
+  const [autoPending, setAutoPending] = useState(false);
+  /** 键盘上下键选中的行号，-1 表示焦点还停在输入框上。 */
+  const [activeIndex, setActiveIndex] = useState(-1);
+  /** 单一播报口径：只在结果落定时更新，避免进度事件把屏幕阅读器刷屏。 */
+  const [announcement, setAnnouncement] = useState("");
 
   const moreMenuRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
   // 输入法组合中：Enter 只是确认候选词，不该触发搜索。
   const composingRef = useRef(false);
-  // 请求序号：只有最后一次搜索有资格写状态，避免连点导致结果错位。
+  // 生成号：每次发起搜索 +1，输入变化 / 清空 / 换数据版本时也 +1。
+  // Tauri 的 invoke 没有 abort，只能靠它让迟到的旧结果失去写状态的资格。
   const searchSeqRef = useRef(0);
   const searchingRef = useRef(false);
+  /** 自动搜索失败过的 `${mode}:${query}`，避免 effect 反复重试同一个错误。 */
+  const autoFailedRef = useRef<string | null>(null);
+  const rowRefs = useRef(new Map<number, HTMLButtonElement>());
 
   const toast = useToast();
 
-  // 高亮跟着"真正搜过的词"走：用户改了输入框但还没回车时，
+  // 高亮跟着"真正搜过的词"走：用户改了输入框但还没触发搜索时，
   // 结果卡片不该突然高亮一个没搜过的词。
-  const highlight = useMemo(() => createHighlighter(lastQuery || query), [lastQuery, query]);
+  // 注意这里先收敛成字符串再 memo——直接把 query 放进依赖会让高亮函数
+  // 每敲一个字就换一次引用，下面所有 memo 化的结果行会跟着全量重渲染。
+  const highlightSource = lastQuery || query;
+  const highlight = useMemo(() => createHighlighter(highlightSource), [highlightSource]);
 
   const visibleResults = useMemo(() => {
-    if (!page) return [] as SearchResult[];
+    if (!page) return NO_RESULTS;
     if (!activeFacet) return page.results;
     return page.results.filter((r) => facetKeyOf(r.category) === activeFacet);
   }, [page, activeFacet]);
+
+  const segmentHits = segmentPage?.hits ?? NO_HITS;
 
   const facetEntries = useMemo(
     () => (page?.facets ? Object.entries(page.facets) : []),
     [page]
   );
+
+  const indexReady = Boolean(indexStatus?.ready) && !buildingIndex;
+  /** 索引"还没有"和"搜不到"是两回事，空结果的文案要靠它分流。 */
+  const indexPending = buildingIndex || (indexStatus != null && !indexStatus.ready);
+
+  const hitCount = mode === "segment" ? segmentHits.length : page?.results.length ?? 0;
+  // 边打边搜时旧结果留在原地（只压暗），不然每敲一个字整页都要闪一次白。
+  const listRendered = !searchError && hitCount > 0;
+  const navRows = mode === "segment" ? segmentHits : visibleResults;
+  const navCount = listRendered ? navRows.length : 0;
 
   // Load version for cache keying.
   useEffect(() => {
@@ -291,6 +524,18 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     });
   }, []);
 
+  /**
+   * 作废所有在途搜索。生成号一涨，正在路上的请求回来时就会被判定为过期
+   * 而丢弃；同时把 spinner 收掉，否则那个请求永远不会再走到 settle()。
+   */
+  const invalidateInFlight = useCallback(() => {
+    searchSeqRef.current += 1;
+    if (!searchingRef.current) return;
+    searchingRef.current = false;
+    setSearching(false);
+    setProgress(null);
+  }, []);
+
   /** 段级搜索零命中时自动改搜整篇，避免用户卡在空结果页。 */
   const fallbackToStory = async (raw: string) => {
     toast.warn("段级索引暂无命中，已自动改搜整篇", 2500);
@@ -304,10 +549,19 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     modeOverride?: SearchMode;
     /** 明确禁用"段落零命中自动改搜整篇"，用于回退自身与手动切模式。 */
     noFallback?: boolean;
+    /** 防抖自动触发：不写历史、不自动改模式，失败也不弹 toast。 */
+    auto?: boolean;
   }): Promise<void> => {
     const raw = (opts?.queryOverride ?? query).trim();
     if (!raw) return;
     const activeMode = opts?.modeOverride ?? mode;
+    const auto = opts?.auto === true;
+    // 自动搜索绝不把用户"打到一半"的词写进历史，也不擅自把模式掰回整篇。
+    const allowFallback = !opts?.noFallback && !auto;
+    const commitQuery = () => {
+      setLastQuery(raw);
+      if (!auto) saveHistory(raw);
+    };
 
     const seq = ++searchSeqRef.current;
     const isStale = () => seq !== searchSeqRef.current;
@@ -318,9 +572,12 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
       setProgress(null);
     };
 
+    autoFailedRef.current = null;
     setSearching(true);
     searchingRef.current = true;
+    setSearchError(null);
     setActiveFacet(null);
+    setActiveIndex(-1);
     // 还没收到后端进度事件之前保持 total = 0：UI 走不确定态 spinner，
     // 而不是显示一条永远停在 0% 的假进度条。
     setProgress({ phase: "搜索中", current: 0, total: 0, message: "" });
@@ -333,12 +590,11 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
           setPage(null);
           setSearched(true);
           setFromCache({ used: true, updatedAt: cached.updatedAt });
-          setLastQuery(raw);
-          saveHistory(raw);
+          commitQuery();
           settle();
           // 旧版本可能把"零命中"写进了 localStorage；命中缓存也要照样回退，
           // 否则这条查询会永远停在空结果。
-          if (cached.page.hits.length === 0 && !opts?.noFallback) {
+          if (cached.page.hits.length === 0 && allowFallback) {
             await fallbackToStory(raw);
           }
           return;
@@ -350,8 +606,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
         setPage(null);
         setFromCache({ used: false });
         setSearched(true);
-        setLastQuery(raw);
-        saveHistory(raw);
+        commitQuery();
 
         const nextCache = prune({
           ...segmentCache,
@@ -360,15 +615,19 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
         setSegmentCache(nextCache);
         // 零命中只留在内存里。写进持久缓存会让下次搜索直接命中空结果，
         // 从而永久绕开自动回退。
-        writeJson(
-          SEGMENT_CACHE_KEY,
-          Object.fromEntries(
-            Object.entries(nextCache).filter(([, entry]) => entry.page.hits.length > 0)
-          )
-        );
+        // 边打边搜的中间结果同样只进内存：跨会话保留"凯"「凯尔」这种半截
+        // 查询没有意义，而每次落盘都要把整张表 stringify 一遍。
+        if (!auto) {
+          writeJson(
+            SEGMENT_CACHE_KEY,
+            Object.fromEntries(
+              Object.entries(nextCache).filter(([, entry]) => entry.page.hits.length > 0)
+            )
+          );
+        }
         settle();
 
-        if (data.hits.length === 0 && !opts?.noFallback) {
+        if (data.hits.length === 0 && allowFallback) {
           await fallbackToStory(raw);
         }
         return;
@@ -381,8 +640,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
           setSegmentPage(null);
           setSearched(true);
           setFromCache({ used: true, updatedAt: cached.updatedAt });
-          setLastQuery(raw);
-          saveHistory(raw);
+          commitQuery();
           settle();
           return;
         }
@@ -413,25 +671,44 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
           [raw]: { page: data, updatedAt: Date.now(), version },
         });
         setCache(nextCache);
-        writeJson(CACHE_KEY, nextCache);
+        if (!auto) writeJson(CACHE_KEY, nextCache);
         setFromCache({ used: false });
       }
       setSearched(true);
-      setLastQuery(raw);
-      saveHistory(raw);
+      commitQuery();
     } catch (err) {
       if (isStale()) return;
       devLog("搜索失败", err);
-      toast.error("搜索失败，请重试");
+      const detail = describeSearchError(err);
+      // 失败要留在界面上：只弹一条会自己消失的 toast，用户回头就不知道
+      // 到底是"搜不到"还是"搜挂了"。
+      setSearchError({ query: raw, message: detail });
+      setPage(null);
+      setSegmentPage(null);
+      if (auto) {
+        autoFailedRef.current = `${activeMode}:${raw}`;
+      } else {
+        toast.error("搜索失败，请重试");
+      }
     } finally {
       settle();
     }
   };
 
+  // handleSearch 依赖了一大票 state（cache / version / mode / debugMode…），
+  // 直接进 effect 依赖会让防抖计时器每敲一个字就重建。这里只把最新实现挂到
+  // ref 上，计时器就只依赖真正的触发条件。
+  const handleSearchRef = useRef(handleSearch);
+  const openResultRef = useRef<(result: SearchResult) => void>(() => {});
+  const openSegmentRef = useRef<(hit: SegmentHit) => void>(() => {});
+
   const switchMode = (next: SearchMode) => {
     if (next === mode) return;
+    invalidateInFlight();
     setMode(next);
     setActiveFacet(null);
+    setActiveIndex(-1);
+    setSearchError(null);
     const pending = query.trim() || lastQuery;
     // 手动切模式时不自动回退，否则刚点"段落"就被弹回"整篇"，像是按钮失灵。
     if (searched && pending) {
@@ -480,8 +757,89 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     }
   };
 
+  useEffect(() => {
+    handleSearchRef.current = handleSearch;
+    openResultRef.current = (result) => void openResult(result);
+    openSegmentRef.current = (hit) => void openSegment(hit);
+  });
+
+  // 传给 memo 化行的回调必须是常量引用，所以统一走上面的 latest ref。
+  const handleOpenResult = useCallback((result: SearchResult) => {
+    openResultRef.current(result);
+  }, []);
+  const handleOpenSegment = useCallback((hit: SegmentHit) => {
+    openSegmentRef.current(hit);
+  }, []);
+  const registerRow = useCallback((index: number, el: HTMLButtonElement | null) => {
+    if (el) rowRefs.current.set(index, el);
+    else rowRefs.current.delete(index);
+  }, []);
+
+  const clearSearch = () => {
+    invalidateInFlight();
+    setQuery("");
+    setPage(null);
+    setSegmentPage(null);
+    setSearched(false);
+    setSearchError(null);
+    setAutoPending(false);
+    setDebugLogs([]);
+    setDebugExpanded(false);
+    setOpeningStoryId(null);
+    setFromCache({ used: false });
+    setActiveFacet(null);
+    setActiveIndex(-1);
+    setLastQuery("");
+    autoFailedRef.current = null;
+    inputRef.current?.focus();
+  };
+
+  const moveActive = (delta: number) => {
+    setActiveIndex((prev) => {
+      if (navCount === 0) return -1;
+      if (prev < 0) return delta > 0 ? 0 : navCount - 1;
+      const next = prev + delta;
+      // 从第一行再往上就回到输入框：不做环绕，免得用户以为列表跳到了底。
+      if (next < 0) return -1;
+      return Math.min(next, navCount - 1);
+    });
+  };
+
+  const openActiveRow = () => {
+    if (activeIndex < 0) return false;
+    if (mode === "segment") {
+      const hit = segmentHits[activeIndex];
+      if (!hit) return false;
+      handleOpenSegment(hit);
+      return true;
+    }
+    const result = visibleResults[activeIndex];
+    if (!result) return false;
+    handleOpenResult(result);
+    return true;
+  };
+
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    // 三重保险：compositionstart/end 自己记的状态、标准 isComposing、
+    // 以及部分安卓输入法只给的 keyCode 229。组合期间方向键在选候选词，
+    // 回车在上屏，一个都不能被我们截走。
+    const composingNow =
+      composingRef.current || e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229;
+
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      if (composingNow || navCount === 0) return;
+      e.preventDefault();
+      moveActive(e.key === "ArrowDown" ? 1 : -1);
+      return;
+    }
     if (e.key === "Escape") {
+      if (composingNow) return;
+      // 先退出列表选择，再退出搜索：一次 Esc 只做一件事。
+      if (activeIndex >= 0) {
+        e.preventDefault();
+        setActiveIndex(-1);
+        return;
+      }
       if (query) {
         e.preventDefault();
         clearSearch();
@@ -489,31 +847,10 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
       return;
     }
     if (e.key !== "Enter") return;
-    // 三重保险：compositionstart/end 自己记的状态、标准 isComposing、
-    // 以及部分安卓输入法只给的 keyCode 229。
-    if (composingRef.current || e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) {
-      return;
-    }
+    if (composingNow) return;
     e.preventDefault();
+    if (openActiveRow()) return;
     void handleSearch();
-  };
-
-  const clearSearch = () => {
-    searchSeqRef.current += 1;
-    searchingRef.current = false;
-    setQuery("");
-    setPage(null);
-    setSegmentPage(null);
-    setSearched(false);
-    setSearching(false);
-    setProgress(null);
-    setDebugLogs([]);
-    setDebugExpanded(false);
-    setOpeningStoryId(null);
-    setFromCache({ used: false });
-    setActiveFacet(null);
-    setLastQuery("");
-    inputRef.current?.focus();
   };
 
   const refreshIndexStatus = useCallback(async () => {
@@ -572,6 +909,87 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
       )
     );
   }, [refreshIndexStatus]);
+
+  // 输入防抖自动搜索。几条硬性前提：
+  //   - 输入法组合中一个字都不发，半截拼音（"nihao" / "凯尔x"）搜出来全是噪音；
+  //   - 索引没就绪时不自动搜，那条路径是全量扫盘，边打边搜会把机器拖死，
+  //     用户仍然可以按回车强搜；
+  //   - 调试模式不自动搜，每次都要拉一大坨日志并展开面板。
+  useEffect(() => {
+    const raw = query.trim();
+    const cancel = () => setAutoPending(false);
+
+    if (composing || debugMode || !indexReady) return cancel();
+    if (!isAutoSearchable(raw)) return cancel();
+    // 已经就是当前展示的结果，或者刚刚自动搜失败过，都别再发一遍。
+    if (raw === lastQuery && searched && !searchError) return cancel();
+    if (autoFailedRef.current === `${mode}:${raw}`) return cancel();
+
+    const cached =
+      mode === "segment"
+        ? segmentCache[raw]?.version === version
+        : cache[raw]?.version === version;
+    // 首字不能发木：空面板里的第一次几乎立刻走，改词时才给足停顿。
+    const delay = cached
+      ? AUTO_DEBOUNCE_CACHED_MS
+      : searched
+        ? AUTO_DEBOUNCE_MS
+        : AUTO_DEBOUNCE_FIRST_MS;
+
+    setAutoPending(true);
+    const timer = window.setTimeout(() => {
+      setAutoPending(false);
+      void handleSearchRef.current({ queryOverride: raw, auto: true });
+    }, delay);
+    return () => window.clearTimeout(timer);
+  }, [
+    query,
+    composing,
+    debugMode,
+    indexReady,
+    lastQuery,
+    searched,
+    searchError,
+    mode,
+    cache,
+    segmentCache,
+    version,
+  ]);
+
+  // 结果集换了就取消选中：行号对应的已经是另一批内容了。
+  // 引用表不用在这里清——行卸载时 ref 回调会带着 null 回来自己删。
+  useEffect(() => {
+    setActiveIndex(-1);
+  }, [page, segmentPage, activeFacet, mode]);
+
+  // 选中行滚进可视区。`nearest` 只在真的看不见时才动，键盘浏览不会一路乱跳。
+  useEffect(() => {
+    if (activeIndex < 0) return;
+    rowRefs.current.get(activeIndex)?.scrollIntoView({ block: "nearest" });
+  }, [activeIndex]);
+
+  // 唯一的播报口径：只在搜索落定后说一句话。搜索中交给 aria-busy，
+  // 进度条和状态条都不再挂 live 区域，否则每个进度事件都要念一遍。
+  useEffect(() => {
+    if (searching) return;
+    if (searchError) {
+      setAnnouncement(`搜索出错：${searchError.message}`);
+      return;
+    }
+    if (!searched) {
+      setAnnouncement("");
+      return;
+    }
+    const scope = lastQuery ? `「${lastQuery}」` : "";
+    if (hitCount > 0) {
+      const unit = mode === "segment" ? "段" : "条";
+      setAnnouncement(`${scope}找到 ${hitCount} ${unit}结果，可用上下方向键浏览，回车打开`);
+    } else if (indexPending) {
+      setAnnouncement(`${scope}暂时没有结果：全文索引还没建好`);
+    } else {
+      setAnnouncement(`${scope}没有找到匹配结果`);
+    }
+  }, [searching, searched, searchError, hitCount, lastQuery, mode, indexPending]);
 
   // 搜索进度：挂载时注册一次，卸载时解绑；只在真的在搜的时候写状态，
   // 免得上一次搜索的迟到事件把 spinner 又点亮。
@@ -688,11 +1106,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     if (buildingIndex) {
       const determinate = indexProgress && indexProgress.total > 0;
       return (
-        <div
-          className="flex items-center gap-2 text-xs text-[hsl(var(--color-muted-foreground))]"
-          role="status"
-          aria-live="polite"
-        >
+        <div className="flex items-center gap-2 text-xs text-[hsl(var(--color-muted-foreground))]">
           <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
           <span className="truncate">
             {determinate && indexProgress
@@ -704,8 +1118,17 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     }
     if (!indexStatus.ready) {
       return (
-        <div className="text-xs text-[hsl(var(--color-muted-foreground))]">
-          全文索引正在后台准备中，首次进入或更新数据后可能稍慢，稍候片刻即可使用高速搜索。
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="text-xs text-[hsl(var(--color-muted-foreground))]">
+            全文索引尚未就绪：现在搜索会退化成逐篇扫描，也不会边打边搜，按回车仍可强制搜索。
+          </div>
+          <button
+            type="button"
+            onClick={() => void handleBuildIndex()}
+            className="inline-flex min-h-[44px] items-center px-2 text-xs text-[hsl(var(--color-foreground))] underline"
+          >
+            立即建立
+          </button>
         </div>
       );
     }
@@ -726,32 +1149,104 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     );
   };
 
-  const emptyHint =
-    mode === "segment" ? (
-      <div className="flex flex-col items-center gap-3 text-center">
-        <div className="text-[hsl(var(--color-muted-foreground))]">未找到包含该关键词的段落</div>
-        <Button
-          variant="outline"
-          className="min-h-[44px]"
-          onClick={() => switchMode("story")}
-        >
-          <BookOpen className="mr-2 h-4 w-4" />
-          改搜整篇
-        </Button>
-      </div>
-    ) : (
-      <div className="flex flex-col items-center gap-3 text-center">
-        <div className="text-[hsl(var(--color-muted-foreground))]">未找到相关剧情</div>
-        <Button
-          variant="outline"
-          className="min-h-[44px]"
-          onClick={() => switchMode("segment")}
-        >
-          <MessageSquare className="mr-2 h-4 w-4" />
-          改搜段落
-        </Button>
+  /**
+   * 空结果分三种，文案和出口都不一样：
+   *   1. 索引还没建好 —— 不是"搜不到"，是"还搜不了"，给建立索引的入口；
+   *   2. 真的零命中 —— 给换一种粒度再搜的入口；
+   *   3. 出错 —— 单独由错误卡片处理（见下方 renderSearchError）。
+   */
+  const renderEmptyState = () => {
+    if (indexPending) {
+      return (
+        <div className="mx-auto flex max-w-md flex-col items-center gap-3 rounded-lg border border-dashed border-[hsl(var(--color-border))] p-6 text-center">
+          <Database className="h-6 w-6 text-[hsl(var(--color-muted-foreground))]" aria-hidden="true" />
+          <div className="text-sm font-medium">全文索引还没准备好</div>
+          <p className="text-xs leading-relaxed text-[hsl(var(--color-muted-foreground))]">
+            {buildingIndex
+              ? "索引正在后台建立，完成后这条查询会更快、也更准。"
+              : "还没有可用的全文索引，当前结果可能不完整。建好之后即可边输入边搜索。"}
+          </p>
+          <Button
+            variant="outline"
+            className="min-h-[44px]"
+            disabled={buildingIndex}
+            onClick={() => void handleBuildIndex()}
+          >
+            {buildingIndex ? (
+              <>
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" />
+                建立中…
+              </>
+            ) : (
+              <>
+                <Database className="mr-2 h-4 w-4" aria-hidden="true" />
+                建立索引
+              </>
+            )}
+          </Button>
+        </div>
+      );
+    }
+    return (
+      <div className="mx-auto flex max-w-md flex-col items-center gap-3 rounded-lg border border-dashed border-[hsl(var(--color-border))] p-6 text-center">
+        <SearchX className="h-6 w-6 text-[hsl(var(--color-muted-foreground))]" aria-hidden="true" />
+        <div className="text-sm font-medium">
+          {mode === "segment" ? "未找到包含该关键词的段落" : "未找到相关剧情"}
+        </div>
+        <p className="text-xs leading-relaxed text-[hsl(var(--color-muted-foreground))]">
+          索引是完整的，确实没有匹配项。可以换个说法，或者改用另一种搜索粒度。
+        </p>
+        {mode === "segment" ? (
+          <Button variant="outline" className="min-h-[44px]" onClick={() => switchMode("story")}>
+            <BookOpen className="mr-2 h-4 w-4" aria-hidden="true" />
+            改搜整篇
+          </Button>
+        ) : (
+          <Button variant="outline" className="min-h-[44px]" onClick={() => switchMode("segment")}>
+            <MessageSquare className="mr-2 h-4 w-4" aria-hidden="true" />
+            改搜段落
+          </Button>
+        )}
       </div>
     );
+  };
+
+  const renderSearchError = (failure: { query: string; message: string }) => (
+    <div className="mx-auto flex max-w-md flex-col items-center gap-3 rounded-lg border border-[hsl(var(--color-status-error)/0.5)] bg-[hsl(var(--color-status-error)/0.06)] p-6 text-center">
+      <AlertTriangle className="h-6 w-6 text-[hsl(var(--color-status-error))]" aria-hidden="true" />
+      <div className="text-sm font-medium">「{failure.query}」没能搜完</div>
+      <p className="break-words text-xs leading-relaxed text-[hsl(var(--color-muted-foreground))]">
+        {failure.message}
+      </p>
+      {indexPending && (
+        <p className="text-xs text-[hsl(var(--color-muted-foreground))]">
+          全文索引尚未就绪，很可能就是原因所在。
+        </p>
+      )}
+      <div className="flex flex-wrap items-center justify-center gap-2">
+        <Button
+          variant="outline"
+          className="min-h-[44px]"
+          onClick={() => void handleSearch({ queryOverride: failure.query, forceRefresh: true })}
+        >
+          <Search className="mr-2 h-4 w-4" aria-hidden="true" />
+          重试
+        </Button>
+        {indexPending && !buildingIndex && (
+          <Button variant="outline" className="min-h-[44px]" onClick={() => void handleBuildIndex()}>
+            <Database className="mr-2 h-4 w-4" aria-hidden="true" />
+            建立索引
+          </Button>
+        )}
+      </div>
+    </div>
+  );
+
+  const keyboardHint = navCount > 0 && (
+    <span className="hidden flex-shrink-0 text-[11px] text-[hsl(var(--color-muted-foreground))] md:inline">
+      ↑↓ 选择 · Enter 打开
+    </span>
+  );
 
   return (
     <div className="h-full flex flex-col overflow-hidden">
@@ -763,17 +1258,32 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
               <Input
                 ref={inputRef}
                 value={query}
-                onChange={(e) => setQuery(e.target.value)}
+                onChange={(e) => {
+                  // 词一变，在途的那次搜索就没有意义了：先作废，
+                  // 免得慢半拍的结果回来覆盖掉新词的结果。
+                  if (searchingRef.current) invalidateInFlight();
+                  // 同时松开列表选中：否则用户选了一行又接着改词，
+                  // 这时的回车会去开那一行，而不是搜新词。
+                  setActiveIndex(-1);
+                  setQuery(e.target.value);
+                }}
                 onKeyDown={handleKeyDown}
                 onCompositionStart={() => {
                   composingRef.current = true;
+                  setComposing(true);
                 }}
-                onCompositionEnd={() => {
+                onCompositionEnd={(e) => {
                   composingRef.current = false;
+                  setComposing(false);
+                  // Safari/WKWebView 的 compositionend 在 input 之前触发，
+                  // 光靠 onChange 会漏掉上屏的最后一段，这里补一次。
+                  setQuery(e.currentTarget.value);
                 }}
                 placeholder="搜索剧情名称或内容..."
                 className="pr-12 min-h-[44px]"
                 aria-label="搜索剧情"
+                aria-controls={navCount > 0 ? RESULT_LISTBOX_ID : undefined}
+                aria-activedescendant={activeIndex >= 0 ? optionDomId(activeIndex) : undefined}
                 enterKeyHint="search"
                 autoComplete="off"
                 autoCorrect="off"
@@ -823,7 +1333,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
                     <span className="flex flex-col">
                       <span>调试日志</span>
                       <span className="text-[11px] text-[hsl(var(--color-muted-foreground))]">
-                        显示匹配过程记录
+                        显示匹配过程记录（关闭边打边搜）
                       </span>
                     </span>
                     <input
@@ -1000,9 +1510,22 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
             </div>
           )}
 
-          {/* 搜索中：有真实进度就画百分比，没有就只转 spinner，不编 0%。 */}
+          {/* 计时器已排上但请求还没发：先给一个"收到了"的反馈，
+              这样第一个字打下去不会像卡住。 */}
+          {autoPending && !searching && (
+            <div className="mt-3 flex items-center gap-2 text-[11px] text-[hsl(var(--color-muted-foreground))]">
+              <span
+                className="h-1.5 w-1.5 flex-shrink-0 rounded-full bg-[hsl(var(--color-primary))] motion-safe:animate-pulse"
+                aria-hidden="true"
+              />
+              <span>停下就搜，按回车立即搜索</span>
+            </div>
+          )}
+
+          {/* 搜索中：有真实进度就画百分比，没有就只转 spinner，不编 0%。
+              这块不挂 aria-live——播报统一交给下方那个 sr-only 区域。 */}
           {searching && (
-            <div className="mt-3 space-y-1" aria-live="polite">
+            <div className="mt-3 space-y-1">
               {progress && progress.total > 0 ? (
                 <>
                   <div className="flex items-center justify-between gap-2 text-[11px] text-[hsl(var(--color-muted-foreground))] font-mono">
@@ -1038,7 +1561,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
       </header>
 
       {/* 搜索结果 */}
-      <main className="flex-1 overflow-hidden">
+      <main className="flex-1 overflow-hidden" aria-busy={searching}>
         <CustomScrollArea
           className="h-full"
           viewportClassName="reader-scroll"
@@ -1046,12 +1569,13 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
           trackOffsetBottom="calc(4.5rem + env(safe-area-inset-bottom, 0px))"
         >
           <div className="container py-6 pb-24 motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-700">
-            {searching && !page && !segmentPage && (
-              <div
-                className="flex items-center justify-center gap-2 text-[hsl(var(--color-muted-foreground))]"
-                role="status"
-                aria-live="polite"
-              >
+            {/* 结果落定后只说一句，polite 排队，不打断用户正在听的内容。 */}
+            <div className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+              {announcement}
+            </div>
+
+            {searching && hitCount === 0 && (
+              <div className="flex items-center justify-center gap-2 text-[hsl(var(--color-muted-foreground))]">
                 <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
                 <span>
                   {progress && progress.total > 0
@@ -1061,169 +1585,128 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
               </div>
             )}
 
+            {!searching && searchError && renderSearchError(searchError)}
+
             {/* 段落模式结果 */}
-            {!searching &&
-              mode === "segment" &&
-              segmentPage &&
-              segmentPage.hits.length === 0 &&
-              searched &&
-              emptyHint}
-            {!searching && mode === "segment" && segmentPage && segmentPage.hits.length > 0 && (
-              <div className="space-y-3">
-                <div className="flex items-center justify-between text-sm text-[hsl(var(--color-muted-foreground))]">
-                  <span>共 {segmentPage.totalMatched} 段命中</span>
-                  {segmentPage.truncated && (
-                    <span className="text-xs">
-                      已显示 {segmentPage.hits.length} / {segmentPage.totalMatched}，缩小关键词可获得更精确结果
-                    </span>
-                  )}
-                </div>
-                {segmentPage.hits.map((hit, index) => {
-                  const speakerOnly = hit.matchTarget === "speaker";
-                  const titleOnly = hit.matchTarget === "title";
-                  return (
-                  <button
-                    key={`${hit.storyId}-${hit.segmentIndex}-${index}`}
-                    onClick={() => openSegment(hit)}
-                    disabled={openingStoryId === hit.storyId}
-                    className="w-full p-4 rounded-lg border border-[hsl(var(--color-border))] hover:bg-[hsl(var(--color-accent))] transition-all duration-200 text-left hover:-translate-y-0.5 motion-safe:animate-in motion-safe:fade-in-0 disabled:opacity-60 disabled:cursor-wait"
-                    style={{ animationDelay: `${Math.min(index, 10) * 40}ms` }}
-                  >
-                    <div className="flex items-baseline justify-between gap-2 mb-1">
-                      <div className="font-medium truncate">{highlight(hit.storyName)}</div>
-                      <span className="flex-shrink-0 text-[10px] uppercase tracking-widest text-[hsl(var(--color-muted-foreground))]">
-                        {SEGMENT_TYPE_LABEL[hit.segmentType] ?? hit.segmentType}
-                        {" · #"}
-                        {hit.segmentIndex}
+            {!searchError && mode === "segment" && segmentPage && (
+              segmentHits.length === 0 ? (
+                !searching && searched && renderEmptyState()
+              ) : (
+                <div className={cn("space-y-3", searching && "opacity-60 transition-opacity")}>
+                  <div className="flex items-center justify-between gap-2 text-sm text-[hsl(var(--color-muted-foreground))]">
+                    <span>共 {segmentPage.totalMatched} 段命中</span>
+                    {segmentPage.truncated ? (
+                      <span className="text-xs">
+                        已显示 {segmentHits.length} / {segmentPage.totalMatched}，缩小关键词可获得更精确结果
                       </span>
-                    </div>
-                    <div className="flex flex-wrap items-center gap-2 text-xs text-[hsl(var(--color-muted-foreground))] mb-2">
-                      <span className="truncate">{hit.category}</span>
-                      {hit.characterName && (
-                        <span
-                          className={cn(
-                            "inline-flex items-center rounded-full border px-2 py-0.5 text-[11px]",
-                            speakerOnly
-                              ? "border-[hsl(var(--color-primary)/0.5)] bg-[hsl(var(--color-primary)/0.1)] text-[hsl(var(--color-foreground))]"
-                              : "border-[hsl(var(--color-border))]"
-                          )}
-                        >
-                          {/* When the badge itself already calls out the
-                              speaker as the reason the row matched, skip
-                              the term highlight inside the chip — a double
-                              visual accent muddies the card. */}
-                          {speakerOnly ? hit.characterName : highlight(hit.characterName)}
-                        </span>
-                      )}
-                      {speakerOnly && (
-                        <span className="inline-flex items-center rounded-full bg-[hsl(var(--color-primary)/0.12)] px-2 py-0.5 text-[10px] text-[hsl(var(--color-primary))]">
-                          按说话人命中
-                        </span>
-                      )}
-                      {titleOnly && (
-                        <span className="inline-flex items-center rounded-full bg-[hsl(var(--color-primary)/0.12)] px-2 py-0.5 text-[10px] text-[hsl(var(--color-primary))]">
-                          按剧情标题命中
-                        </span>
-                      )}
-                    </div>
-                    {hit.matchedText && (
-                      <div className="text-sm text-[hsl(var(--color-foreground))] whitespace-pre-wrap leading-relaxed">
-                        {highlight(hit.matchedText)}
-                      </div>
+                    ) : (
+                      keyboardHint
                     )}
-                  </button>
-                  );
-                })}
-              </div>
+                  </div>
+                  <div
+                    id={RESULT_LISTBOX_ID}
+                    role="listbox"
+                    aria-label="段落搜索结果"
+                    className="space-y-3"
+                  >
+                    {segmentHits.map((hit, index) => (
+                      <SegmentResultRow
+                        key={`${hit.storyId}-${hit.segmentIndex}-${index}`}
+                        hit={hit}
+                        index={index}
+                        active={activeIndex === index}
+                        opening={openingStoryId === hit.storyId}
+                        highlight={highlight}
+                        onOpen={handleOpenSegment}
+                        registerRow={registerRow}
+                      />
+                    ))}
+                  </div>
+                </div>
+              )
             )}
 
             {/* 整篇模式结果 */}
-            {!searching && mode === "story" && searched && page && page.results.length === 0 && emptyHint}
-
-            {!searching && mode === "story" && page && page.results.length > 0 && (
-              <div className="space-y-3">
-                {facetEntries.length > 0 && (
-                  <div className="flex flex-wrap gap-2" role="group" aria-label="按分类筛选">
-                    {facetEntries.map(([name, count]) => {
-                      const active = activeFacet === name;
-                      return (
+            {!searchError && mode === "story" && page && (
+              page.results.length === 0 ? (
+                !searching && searched && renderEmptyState()
+              ) : (
+                <div className={cn("space-y-3", searching && "opacity-60 transition-opacity")}>
+                  {facetEntries.length > 0 && (
+                    <div className="flex flex-wrap gap-2" role="group" aria-label="按分类筛选">
+                      {facetEntries.map(([name, count]) => {
+                        const active = activeFacet === name;
+                        return (
+                          <button
+                            key={name}
+                            type="button"
+                            aria-pressed={active}
+                            onClick={() => setActiveFacet(active ? null : name)}
+                            className={cn(
+                              "inline-flex min-h-[44px] items-center rounded-full border px-3 text-xs transition-colors",
+                              active
+                                ? "border-[hsl(var(--color-primary))] bg-[hsl(var(--color-primary)/0.12)] text-[hsl(var(--color-foreground))]"
+                                : "border-[hsl(var(--color-border))] text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-foreground))]"
+                            )}
+                          >
+                            {name} {count}
+                          </button>
+                        );
+                      })}
+                      {activeFacet && (
                         <button
-                          key={name}
                           type="button"
-                          aria-pressed={active}
-                          onClick={() => setActiveFacet(active ? null : name)}
-                          className={cn(
-                            "inline-flex min-h-[44px] items-center rounded-full border px-3 text-xs transition-colors",
-                            active
-                              ? "border-[hsl(var(--color-primary))] bg-[hsl(var(--color-primary)/0.12)] text-[hsl(var(--color-foreground))]"
-                              : "border-[hsl(var(--color-border))] text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-foreground))]"
-                          )}
+                          onClick={() => setActiveFacet(null)}
+                          className="inline-flex min-h-[44px] items-center px-2 text-xs text-[hsl(var(--color-muted-foreground))] underline hover:text-[hsl(var(--color-foreground))]"
                         >
-                          {name} {count}
+                          清除筛选
                         </button>
-                      );
-                    })}
-                    {activeFacet && (
-                      <button
-                        type="button"
-                        onClick={() => setActiveFacet(null)}
-                        className="inline-flex min-h-[44px] items-center px-2 text-xs text-[hsl(var(--color-muted-foreground))] underline hover:text-[hsl(var(--color-foreground))]"
-                      >
-                        清除筛选
-                      </button>
+                      )}
+                    </div>
+                  )}
+                  <div className="flex items-center justify-between gap-2 text-sm text-[hsl(var(--color-muted-foreground))]">
+                    <span>
+                      共 {page.totalMatched} 条匹配
+                      {activeFacet ? ` · ${activeFacet} ${visibleResults.length} 条` : ""}
+                    </span>
+                    {page.truncated ? (
+                      <span className="text-xs">
+                        已显示 {page.results.length} / {page.totalMatched}，缩小关键词可获得更精确结果
+                      </span>
+                    ) : (
+                      keyboardHint
                     )}
                   </div>
-                )}
-                <div
-                  className="flex items-center justify-between text-sm text-[hsl(var(--color-muted-foreground))]"
-                  aria-live="polite"
-                >
-                  <span>
-                    共 {page.totalMatched} 条匹配
-                    {activeFacet ? ` · ${activeFacet} ${visibleResults.length} 条` : ""}
-                  </span>
-                  {page.truncated && (
-                    <span className="text-xs">
-                      已显示 {page.results.length} / {page.totalMatched}，缩小关键词可获得更精确结果
-                    </span>
+                  {visibleResults.length === 0 ? (
+                    <div className="text-center text-sm text-[hsl(var(--color-muted-foreground))]">
+                      该分类下没有结果，换一个分类或清除筛选试试。
+                    </div>
+                  ) : (
+                    <div
+                      id={RESULT_LISTBOX_ID}
+                      role="listbox"
+                      aria-label="剧情搜索结果"
+                      className="space-y-3"
+                    >
+                      {visibleResults.map((result, index) => (
+                        <StoryResultRow
+                          key={`${result.storyId}-${index}`}
+                          result={result}
+                          index={index}
+                          active={activeIndex === index}
+                          opening={openingStoryId === result.storyId}
+                          highlight={highlight}
+                          onOpen={handleOpenResult}
+                          registerRow={registerRow}
+                        />
+                      ))}
+                    </div>
                   )}
                 </div>
-                {visibleResults.length === 0 ? (
-                  <div className="text-center text-sm text-[hsl(var(--color-muted-foreground))]">
-                    该分类下没有结果，换一个分类或清除筛选试试。
-                  </div>
-                ) : (
-                  visibleResults.map((result, index) => (
-                    <button
-                      key={`${result.storyId}-${index}`}
-                      onClick={() => openResult(result)}
-                      disabled={openingStoryId === result.storyId}
-                      className="w-full p-4 rounded-lg border border-[hsl(var(--color-border))] hover:bg-[hsl(var(--color-accent))] transition-all duration-200 text-left hover:-translate-y-0.5 motion-safe:animate-in motion-safe:fade-in-0 disabled:opacity-60 disabled:cursor-wait"
-                      style={{ animationDelay: `${Math.min(index, 10) * 40}ms` }}
-                    >
-                      <div className="font-medium mb-1">
-                        {highlight(result.storyName)}
-                        {openingStoryId === result.storyId && (
-                          <span className="ml-2 text-xs text-[hsl(var(--color-muted-foreground))]">
-                            打开中...
-                          </span>
-                        )}
-                      </div>
-                      <div className="text-xs text-[hsl(var(--color-muted-foreground))] mb-2">
-                        {result.category}
-                      </div>
-                      {result.matchedText && (
-                        <div className="text-sm text-[hsl(var(--color-muted-foreground))] line-clamp-2">
-                          {highlight(result.matchedText)}
-                        </div>
-                      )}
-                    </button>
-                  ))
-                )}
-              </div>
+              )
             )}
 
-            {!searching && !searched && (
+            {!searching && !searchError && !searched && (
               <div className="mx-auto max-w-md">
                 <details className="group rounded-lg border border-[hsl(var(--color-border))] bg-[hsl(var(--color-muted)/0.1)]">
                   <summary className="flex min-h-[44px] cursor-pointer list-none items-center justify-between px-4 py-3 text-sm text-[hsl(var(--color-foreground))]">
@@ -1248,6 +1731,10 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
                     <div>
                       <span className="font-mono text-[hsl(var(--color-foreground))]">"短语"</span>
                       <span className="ml-2">用英文引号匹配精确短语。中文默认按单字 AND，搜「凯尔希」请写成 <code>"凯尔希"</code></span>
+                    </div>
+                    <div>
+                      <span className="font-mono text-[hsl(var(--color-foreground))]">↑ ↓ Enter</span>
+                      <span className="ml-2">出结果后可直接用方向键选中、回车打开</span>
                     </div>
                   </div>
                 </details>
