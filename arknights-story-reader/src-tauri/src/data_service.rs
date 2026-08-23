@@ -5,7 +5,7 @@ use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use reqwest::blocking::Client;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -25,6 +25,13 @@ const REPO_DOWNLOAD_URL: &str = "https://codeload.github.com/Kengxxiao/Arknights
 const DEFAULT_BRANCH: &str = "master";
 const VERSION_FILE: &str = "version.json";
 const SEARCH_RESULT_LIMIT: usize = 500;
+/// 建立 TCP/TLS 连接的上限。连不上就是连不上，多等也不会自己好。
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// 单次 socket 操作的上限。blocking 版 reqwest 的 `timeout` 按「每次
+/// connect/read/write 操作」计时，而不是整个响应的总时限：几百 MB 的数
+/// 据包只要每个 8KB 块能在窗口内到达就不受影响，真正断流的连接则会在
+/// 一分钟内报错，而不是永远挂着。
+const HTTP_OP_TIMEOUT: Duration = Duration::from_secs(60);
 /// Bump when any of: FTS schema, tokenizer rules, `searchable_text` format,
 /// or the set of stories that gets indexed. A bump drops both FTS tables at
 /// open time, so the next `rebuild_story_index_*` starts from scratch.
@@ -1718,6 +1725,8 @@ impl DataService {
     fn create_http_client() -> Result<Client, String> {
         Client::builder()
             .user_agent("arknights-story-reader")
+            .connect_timeout(HTTP_CONNECT_TIMEOUT)
+            .timeout(HTTP_OP_TIMEOUT)
             .build()
             .map_err(|e| format!("Failed to create http client: {}", e))
     }
@@ -1924,23 +1933,98 @@ impl DataService {
         // 是数据集的大头，移动前先剪掉，省磁盘也省一次拷贝。
         Self::prune_unused_dirs(&extracted_root);
 
-        if self.data_dir.exists() {
-            fs::remove_dir_all(&self.data_dir)
-                .map_err(|e| format!("Failed to remove old data: {}", e))?;
-        }
-
-        match fs::rename(&extracted_root, &self.data_dir) {
-            Ok(_) => {}
-            Err(_) => {
-                copy_dir_all(&extracted_root, &self.data_dir)?;
-                fs::remove_dir_all(&extracted_root).ok();
-            }
-        }
+        self.swap_in_extracted(&extracted_root)?;
 
         fs::remove_dir_all(&extract_root).ok();
         // 数据目录已经整个换掉，缓存的剧情目录立刻作废。
         self.invalidate_catalog();
         Ok(())
+    }
+
+    /// 旧数据在换入期间的暂存目录（`<data_dir>_old`）。上一次换入若在
+    /// 「挪开旧目录」和「删掉暂存」之间崩溃会留下残骸：能清就清掉复用
+    /// 固定名字；清不掉就退化成带时间戳的名字，绝不往已有目录上改名。
+    fn old_data_aside_path(&self) -> PathBuf {
+        let mut name = self
+            .data_dir
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_else(|| std::ffi::OsString::from("ArknightsGameData"));
+        name.push("_old");
+        let fixed = self.data_dir.with_file_name(&name);
+        if !fixed.exists() || fs::remove_dir_all(&fixed).is_ok() {
+            return fixed;
+        }
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        name.push(format!("_{}", nanos));
+        self.data_dir.with_file_name(name)
+    }
+
+    /// 把验收完毕的新数据树换到 `data_dir`。
+    ///
+    /// 旧实现是「删旧 → 改名新」：整树删除耗时不短，删除开始到改名完成
+    /// 之间崩溃/断电，旧数据已经没了、新数据还没落位，两头落空。现在：
+    /// 1. 旧目录整体改名挪到旁边（一次系统调用，不碰内容）；
+    /// 2. 新目录改名进 `data_dir`（跨设备改名失败时退回整树拷贝）；
+    /// 3. 新数据确认落位后才删除旧目录。
+    /// 第 2 步失败会把旧目录改回原位。即便恰好在两次改名之间崩溃，旧数
+    /// 据也还完整躺在暂存目录里，不会凭空蒸发。
+    fn swap_in_extracted(&self, extracted_root: &Path) -> Result<(), String> {
+        let old_aside = if self.data_dir.exists() {
+            let aside = self.old_data_aside_path();
+            match fs::rename(&self.data_dir, &aside) {
+                Ok(()) => Some(aside),
+                Err(err) => {
+                    // 挪不开（Windows 上目录被占用等）只能退回原地删除。
+                    // 这条退化路径没有崩溃保护，但也不比旧行为更差。
+                    eprintln!("[SYNC] 旧数据目录改名失败，退回原地替换: {}", err);
+                    fs::remove_dir_all(&self.data_dir)
+                        .map_err(|e| format!("Failed to remove old data: {}", e))?;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let landed = match fs::rename(extracted_root, &self.data_dir) {
+            Ok(()) => Ok(()),
+            // 应用数据目录和解压目录不在同一设备时 rename 不可用。
+            Err(_) => copy_dir_all(extracted_root, &self.data_dir).map(|_| {
+                fs::remove_dir_all(extracted_root).ok();
+            }),
+        };
+
+        match landed {
+            Ok(()) => {
+                if let Some(aside) = old_aside {
+                    // 删不掉只是暂时占点磁盘，留给下一次换入开场清理
+                    //（见 `old_data_aside_path`），不能算安装失败。
+                    if let Err(err) = fs::remove_dir_all(&aside) {
+                        eprintln!("[SYNC] 清理旧数据暂存 {:?} 失败（忽略）: {}", aside, err);
+                    }
+                }
+                Ok(())
+            }
+            Err(err) => {
+                if let Some(aside) = old_aside {
+                    // 清掉可能的半截拷贝，再把旧数据改回原位。
+                    if self.data_dir.exists() {
+                        fs::remove_dir_all(&self.data_dir).ok();
+                    }
+                    if let Err(restore_err) = fs::rename(&aside, &self.data_dir) {
+                        return Err(format!(
+                            "{}；回滚旧数据也失败（数据仍完整保留在 {:?}）: {}",
+                            err, aside, restore_err
+                        ));
+                    }
+                }
+                Err(err)
+            }
+        }
     }
 
     /// 删除阅读器用不到的大目录（存在才删，失败只记日志）。
@@ -2282,6 +2366,10 @@ impl DataService {
         let build_lock = self.index_build_lock();
         let _build_guard = build_lock.lock().unwrap_or_else(|e| e.into_inner());
 
+        // 拿到锁后先给数据集身份拍一张快照，提交前再对一次（见循环之后）。
+        // 锁串行化的是「多个重建」，挡不住重建进行到一半时同步/导入把
+        // data_dir 整个换掉——那样本次读到的就是新旧混合的文件。
+        let dataset_probe = self.catalog_fingerprint();
         let catalog = self.catalog()?;
         let fingerprint = self.index_dataset_fingerprint(catalog.stories.len());
 
@@ -2474,6 +2562,17 @@ impl DataService {
 
         drop(story_insert_stmt);
         drop(segment_insert_stmt);
+
+        // 提交前复核：构建期间数据集被同步/导入换掉的话，上面读到的是新旧
+        // 混合的内容，而此刻的磁盘指纹已经是新数据集的。若照常提交，这份
+        // 杂交索引会被盖上新指纹，刚结束的那次同步随后自动发起的重建（在
+        // `INDEX_BUILD_LOCKS` 上排队）一看指纹相符就直接跳过，坏索引从此
+        // 常驻。回滚本次事务，把重建让给排在后面的那一次。
+        if self.catalog_fingerprint() != dataset_probe {
+            return Err(
+                "数据集在索引重建期间被替换，本次结果已回滚，稍后会自动重建".to_string(),
+            );
+        }
 
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -4935,5 +5034,91 @@ mod tests {
             "the catalog cached before the install must have been dropped"
         );
         assert!(catalog_build_count(&dir) > before);
+    }
+
+    #[test]
+    fn swap_restores_old_data_when_new_tree_cannot_land() {
+        let fx = Fixture::new("swap_rollback");
+        let parent = fx.service.data_dir.parent().unwrap().to_path_buf();
+
+        // 新目录不存在：rename 和整树拷贝都必然失败，逼出回滚路径。
+        let missing = parent.join("does_not_exist");
+        let err = fx
+            .service
+            .swap_in_extracted(&missing)
+            .expect_err("swapping in a missing tree must fail");
+        assert!(!err.is_empty());
+
+        assert!(
+            fx.service.is_installed(),
+            "换入失败后旧数据必须原样回到 data_dir"
+        );
+        assert_eq!(
+            fx.service.get_story_entry("main_00-01").unwrap().story_name,
+            "序章"
+        );
+        assert!(
+            !parent.join("ArknightsGameData_old").exists(),
+            "回滚之后不应留下暂存目录"
+        );
+    }
+
+    #[test]
+    fn extract_cleans_stale_aside_dir_from_previous_crash() {
+        let fx = Fixture::new("zip_stale_aside");
+        let parent = fx.service.data_dir.parent().unwrap().to_path_buf();
+
+        // 模拟上一次换入在「挪开旧目录」之后崩溃留下的残骸。
+        let stale = parent.join("ArknightsGameData_old");
+        Fixture::write_file(&stale.join("marker.txt"), "left by a crash");
+
+        let zip_path = parent.join("good.zip");
+        write_zip(
+            &zip_path,
+            &[(
+                "pkg/zh_CN/gamedata/excel/story_review_table.json",
+                REVIEW_TABLE_JSON,
+            )],
+        );
+
+        fx.service
+            .extract_zip_at(&zip_path, &parent, None)
+            .expect("a valid package installs over a stale aside dir");
+
+        assert!(fx.service.is_installed());
+        assert!(
+            !stale.exists(),
+            "成功换入后不应留下任何 _old 暂存目录（包括崩溃残骸）"
+        );
+    }
+
+    #[test]
+    fn http_client_builds_with_timeouts() {
+        // 冒烟：带超时配置的客户端必须能构建（不发任何请求）。
+        DataService::create_http_client().expect("client with timeouts must build");
+    }
+
+    #[test]
+    fn concurrent_rebuilds_only_build_once() {
+        let fx = Fixture::new("index_concurrent");
+        let db = fx.service.index_db_path.clone();
+        let before = index_build_count(&db);
+
+        let s1 = fx.service.clone();
+        let s2 = fx.service.clone();
+        let t1 = std::thread::spawn(move || s1.rebuild_story_index());
+        let t2 = std::thread::spawn(move || s2.rebuild_story_index());
+        t1.join().unwrap().expect("first concurrent rebuild");
+        t2.join().unwrap().expect("second concurrent rebuild");
+
+        assert_eq!(
+            index_build_count(&db) - before,
+            1,
+            "并发重建应在 INDEX_BUILD_LOCKS 上串行化，后到的一次靠指纹跳过"
+        );
+
+        let status = fx.service.get_story_index_status().unwrap();
+        assert!(status.ready);
+        assert_eq!(status.total, 6);
     }
 }
