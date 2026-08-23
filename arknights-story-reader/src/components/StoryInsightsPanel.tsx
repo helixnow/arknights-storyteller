@@ -138,7 +138,7 @@ export function StoryInsightsPanel({
             aria-pressed={isActive}
             onClick={() => onCharacterSelect(character.name, character.firstIndex)}
             className={cn(
-              "relative w-full min-h-[44px] overflow-hidden text-left transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[hsl(var(--color-ring))]",
+              "relative flex w-full min-h-[44px] overflow-hidden text-left transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[hsl(var(--color-ring))]",
               isActive
                 ? "bg-[hsl(var(--color-primary)/0.12)] text-[hsl(var(--color-primary))]"
                 : "hover:bg-[hsl(var(--color-foreground)/0.04)] active:bg-[hsl(var(--color-foreground)/0.08)]"
@@ -154,7 +154,7 @@ export function StoryInsightsPanel({
               )}
               style={{ width: `${share}%` }}
             />
-            <span className="relative flex items-center gap-3 px-4 py-2.5">
+            <span className="relative flex flex-1 items-center gap-3 px-4 py-2.5">
               <CharacterAvatar name={character.name} size={28} />
               <span className="flex-1 min-w-0 font-medium truncate text-sm">
                 {character.name}
