@@ -260,7 +260,11 @@ function loadCacheMap<T extends { page: unknown; updatedAt: number; version: str
       if (!hasPayload(entry.page)) continue;
       // 旧条目存的是带相对时间的完整版本串，这里归一化成 commit 部分，
       // 让升级前落盘的缓存也能继续命中。
-      out[cacheKey] = { ...entry, version: stableVersionOf(entry.version) } as T;
+      const entryVersion = stableVersionOf(entry.version);
+      // 空版本条目是旧版本在 get_current_version 返回前就落盘的产物：
+      // 它会在下个会话同样的空版本窗口期被误判为有效缓存，直接丢弃。
+      if (!entryVersion) continue;
+      out[cacheKey] = { ...entry, version: entryVersion } as T;
     }
     return out;
   } catch {
@@ -650,7 +654,9 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
 
     try {
       if (activeMode === "segment") {
-        const cached = opts?.forceRefresh ? undefined : segmentCache[raw];
+        // version 还没就绪（getCurrentVersion 未返回或失败）时缓存整体停用：
+        // 空串没法证明缓存对应的是当前这份数据。
+        const cached = opts?.forceRefresh || !version ? undefined : segmentCache[raw];
         if (cached && cached.version === version) {
           setSegmentPage(cached.page);
           setPage(null);
@@ -677,14 +683,18 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
         setSearched(true);
         commitQuery();
 
-        const nextCache = prune({
-          ...segmentCache,
-          [raw]: { page: data, updatedAt: Date.now(), version },
-        });
-        setSegmentCache(nextCache);
-        // 边打边搜的中间结果只进内存：跨会话留着「凯」「凯尔」这种半截查询
-        // 没有意义，而每次落盘都要把整张表 stringify 一遍。
-        if (!auto) persistSegmentCache(nextCache);
+        // version 没就绪前一律不写缓存：记在空版本下的条目在真实版本落地后
+        // 永远不再命中，落盘后还会污染下个会话的空版本窗口期。
+        if (version) {
+          const nextCache = prune({
+            ...segmentCache,
+            [raw]: { page: data, updatedAt: Date.now(), version },
+          });
+          setSegmentCache(nextCache);
+          // 边打边搜的中间结果只进内存：跨会话留着「凯」「凯尔」这种半截查询
+          // 没有意义，而每次落盘都要把整张表 stringify 一遍。
+          if (!auto) persistSegmentCache(nextCache);
+        }
         settle();
 
         if (data.hits.length === 0 && allowFallback) {
@@ -693,7 +703,8 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
         return;
       }
 
-      if (!opts?.forceRefresh && !debugMode) {
+      // 同段落模式：version 为空时缓存既不可读也不可写。
+      if (!opts?.forceRefresh && !debugMode && version) {
         const cached = cache[raw];
         if (cached && cached.version === version) {
           setPage(cached.page);
@@ -727,12 +738,14 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
         setSegmentPage(null);
         setDebugLogs([]);
         setDebugExpanded(false);
-        const nextCache = prune({
-          ...cache,
-          [raw]: { page: data, updatedAt: Date.now(), version },
-        });
-        setCache(nextCache);
-        if (!auto) writeJson(CACHE_KEY, nextCache);
+        if (version) {
+          const nextCache = prune({
+            ...cache,
+            [raw]: { page: data, updatedAt: Date.now(), version },
+          });
+          setCache(nextCache);
+          if (!auto) writeJson(CACHE_KEY, nextCache);
+        }
         setFromCache({ used: false });
       }
       setSearched(true);

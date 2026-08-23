@@ -64,7 +64,27 @@ function todayKey() {
 function readStreak(): StreakInfo {
   try {
     const raw = window.localStorage.getItem(STREAK_KEY);
-    if (raw) return JSON.parse(raw);
+    if (raw) {
+      // JSON.parse 的结果不一定是对象（可能是 null / 数字 / 数组），
+      // 逐字段校验，别让手改过的 localStorage 把 streak 算成 NaN。
+      const parsed: unknown = JSON.parse(raw);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        const p = parsed as Partial<StreakInfo>;
+        if (
+          typeof p.currentStreak === "number" &&
+          Number.isFinite(p.currentStreak) &&
+          typeof p.lastReadOn === "string" &&
+          typeof p.totalDays === "number" &&
+          Number.isFinite(p.totalDays)
+        ) {
+          return {
+            currentStreak: p.currentStreak,
+            lastReadOn: p.lastReadOn,
+            totalDays: p.totalDays,
+          };
+        }
+      }
+    }
   } catch {}
   return { currentStreak: 0, lastReadOn: "", totalDays: 0 };
 }

@@ -756,7 +756,8 @@ mod tests {
         drop(acquire_install_lock("sync_data").expect("panic 后锁必须自动释放"));
     }
 
-    /// DataService::new 只记两条路径、不碰磁盘，所以这里不需要 GameData。
+    /// DataService::new 除记路径外还会尝试接回 `_old` 暂存目录，但对这个
+    /// 不存在的路径它扫不到任何候选、不会动磁盘，所以这里不需要 GameData。
     #[test]
     fn lock_service_recovers_from_poisoned_mutex() {
         let mutex = Arc::new(Mutex::new(DataService::new(PathBuf::from(
