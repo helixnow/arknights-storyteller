@@ -3,6 +3,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { AlertCircle, CheckCircle, Download, Loader2, Upload } from "lucide-react";
 import { useDataSyncManager } from "@/hooks/useDataSyncManager";
+import { safeConfirm } from "@/hooks/useAppUpdater";
 
 interface SyncDialogProps {
   open: boolean;
@@ -142,9 +143,12 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
               关闭
             </Button>
             <Button
-              onClick={() => {
+              onClick={async () => {
                 if (status === "up-to-date") {
-                  const ok = window.confirm("当前已是最新。再次同步会重新下载并覆盖本机数据，确定继续？");
+                  const ok = await safeConfirm(
+                    "当前已是最新。再次同步会重新下载并覆盖本机数据，确定继续？",
+                    { title: "重新同步", kind: "warning" }
+                  );
                   if (!ok) return;
                 }
                 void handleSync();

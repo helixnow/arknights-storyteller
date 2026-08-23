@@ -2255,7 +2255,6 @@ impl DataService {
 
     /// 与 `search_stories_ex` 相同，但沿途 emit `search-progress`，
     /// 让前端在回退线性扫描（可能几秒）时不至于是一片空白。
-    #[allow(dead_code)]
     pub fn search_stories_ex_with_progress(
         &self,
         app: &AppHandle,
@@ -2355,7 +2354,6 @@ impl DataService {
     }
 
     /// 与 `search_segments` 相同，额外 emit `search-progress`。
-    #[allow(dead_code)]
     pub fn search_segments_with_progress(
         &self,
         app: &AppHandle,

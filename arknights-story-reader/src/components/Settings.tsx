@@ -16,6 +16,7 @@ import {
   checkAndroidUpdate,
   installAndroidUpdate,
   openAndroidInstallPermissionSettings,
+  safeConfirm,
   type UpdateAvailability,
 } from "@/hooks/useAppUpdater";
 import { useToast } from "@/components/ui/toast";
@@ -51,6 +52,12 @@ const THEME_COLOR_OPTIONS = [
     darkSwatch: "#ada3ff",
   },
 ];
+
+// 插件未编译（Android）或未在 capability 中授权时，Tauri 会抛出 “not allowed” /
+// “plugin ... not found” 之类的错误，这类情况才需要回退到浏览器文件选择器。
+function isPluginUnavailableError(message: string): boolean {
+  return /not allowed|not found|unknown plugin|plugin/i.test(message);
+}
 
 export function Settings() {
   const { themeColor, setThemeColor } = useTheme();
@@ -99,13 +106,14 @@ export function Settings() {
     void loadVersionInfo();
   };
 
-  const handleSyncClick = () => {
+  const handleSyncClick = async () => {
     setStatusMessage(null);
     setError(null);
-    const confirmed = window.confirm(
+    const confirmed = await safeConfirm(
       status === "not-installed"
         ? "将从 GitHub 下载完整剧情数据包并占用较多存储，确定开始？"
-        : "同步会覆盖本机已有的剧情数据并重建索引，确定继续？"
+        : "同步会覆盖本机已有的剧情数据并重建索引，确定继续？",
+      { title: "同步剧情数据", kind: "warning" }
     );
     if (!confirmed) return;
     void handleSync();
@@ -116,28 +124,53 @@ export function Settings() {
   const handleImportClick = async () => {
     setStatusMessage(null);
     setError(null);
-    const confirmed = window.confirm(
-      "导入 ZIP 会覆盖本机已有的剧情数据。请确保压缩包来自 ArknightsGameData。"
+    const confirmed = await safeConfirm(
+      "导入 ZIP 会覆盖本机已有的剧情数据。请确保压缩包来自 ArknightsGameData。",
+      { title: "导入 ZIP", kind: "warning" }
     );
     if (!confirmed) return;
+
+    // 只有在 dialog 插件确实不可用（移动端未注册 / 未授权）时才退回
+    // <input type="file">，其余错误都要如实反馈，避免又弹一个选择器。
+    let openDialog: typeof import("@tauri-apps/plugin-dialog").open;
     try {
-      const { open } = await import("@tauri-apps/plugin-dialog");
-      const selected = await open({
+      ({ open: openDialog } = await import("@tauri-apps/plugin-dialog"));
+    } catch (err) {
+      console.info("[Settings] 文件对话框插件不可用，回退到文件选择器", err);
+      fileInputRef.current?.click();
+      return;
+    }
+
+    let path: string | null;
+    try {
+      const selected = await openDialog({
         multiple: false,
         filters: [{ name: "ZIP", extensions: ["zip"] }],
       });
-      const path = Array.isArray(selected) ? selected[0] : selected;
-      if (path) {
-        await api.importFromZip(path);
-        window.dispatchEvent(new Event("app:data-updated"));
-        setStatusMessage("数据版本信息已更新");
-        await loadVersionInfo();
-        return;
+      path = (Array.isArray(selected) ? selected[0] : selected) ?? null;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (isPluginUnavailableError(message)) {
+        console.info("[Settings] 文件对话框不可用，回退到文件选择器", err);
+        fileInputRef.current?.click();
+      } else {
+        setError(`选择文件失败：${message}`);
       }
-    } catch {
-      // 移动端或未授权 dialog 时回退到 input。
+      return;
     }
-    fileInputRef.current?.click();
+
+    // 用户取消选择。
+    if (!path) return;
+
+    try {
+      await api.importFromZip(path);
+      window.dispatchEvent(new Event("app:data-updated"));
+      setStatusMessage("数据版本信息已更新");
+      await loadVersionInfo();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setError(`导入 ZIP 失败：${message}`);
+    }
   };
 
   const handleFileSelected = async (event: ChangeEvent<HTMLInputElement>) => {

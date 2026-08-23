@@ -105,19 +105,33 @@ async function fetchAndroidManifest(options: ManifestOptions = {}): Promise<Andr
   }
 }
 
-async function safeConfirm(message: string): Promise<boolean> {
+/**
+ * 确认对话框。macOS / iOS 的 WKWebView 不实现 JS 的 window.confirm（直接静默
+ * 返回 false），所以优先走 plugin-dialog；Android 上该插件未注册，调用会被 ACL
+ * 拒绝，此时再回退到 window.confirm（Android WebView 支持）。
+ */
+export async function safeConfirm(
+  message: string,
+  options: { title?: string; kind?: "info" | "warning" | "error" } = {}
+): Promise<boolean> {
+  const { title = "请确认", kind = "info" } = options;
   try {
     const dialog = await import("@tauri-apps/plugin-dialog");
     if (typeof dialog.confirm === "function") {
-      return await dialog.confirm(message, { title: "发现更新", kind: "info" });
+      return await dialog.confirm(message, { title, kind });
     }
     if (typeof dialog.ask === "function") {
-      return await dialog.ask(message, { title: "发现更新" });
+      return await dialog.ask(message, { title, kind });
     }
   } catch (error) {
-    console.info("[Updater] 对话框插件不可用，回退到 window.confirm", error);
+    console.info("[Dialog] 对话框插件不可用，回退到 window.confirm", error);
   }
-  return window.confirm(message);
+  try {
+    return window.confirm(message);
+  } catch (error) {
+    console.error("[Dialog] window.confirm 不可用", error);
+    return false;
+  }
 }
 
 export async function checkDesktopUpdate(currentVersionOverride?: string): Promise<DesktopUpdateAvailable | null> {
@@ -223,7 +237,8 @@ export function useAppUpdater() {
         if (!updateInfo || isCancelled) return;
 
         const shouldInstall = await safeConfirm(
-          `检测到新版本 ${updateInfo.availableVersion}，是否立即下载并安装更新？`
+          `检测到新版本 ${updateInfo.availableVersion}，是否立即下载并安装更新？`,
+          { title: "发现更新" }
         );
         if (!shouldInstall || isCancelled) {
           console.info("[Updater] 用户取消更新");
@@ -264,7 +279,8 @@ export function useAppUpdater() {
         }
 
         const shouldInstall = await safeConfirm(
-          `检测到新版本 ${manifest.version}，是否立即下载安装？`
+          `检测到新版本 ${manifest.version}，是否立即下载安装？`,
+          { title: "发现更新" }
         );
 
         if (!shouldInstall || isCancelled) {

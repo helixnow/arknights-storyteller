@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "desktop",
+  "description": "Permissions for the plugins that are only compiled on non-Android targets (see the cfg(not(target_os = \"android\")) dependencies in Cargo.toml)",
+  "windows": ["main"],
+  "platforms": ["macOS", "windows", "linux", "iOS"],
+  "permissions": [
+    "dialog:default",
+    "process:default",
+    "updater:default",
+    "opener:default"
+  ]
+}
