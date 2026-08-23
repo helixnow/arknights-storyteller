@@ -267,14 +267,20 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
     // 数据同步换了整个目录，进度快照没变也必须重来一遍。
     const onDataUpdated = () => refresh(true);
     const onRefresh = () => refresh(false);
+    // Android WebView 从后台回前台常常只发 visibilitychange 不发 focus，得靠它兜住跨天刷新。
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") refresh(false);
+    };
 
     window.addEventListener("focus", onRefresh);
     window.addEventListener("app:home-refresh", onRefresh);
     window.addEventListener("app:data-updated", onDataUpdated);
+    document.addEventListener("visibilitychange", onVisibility);
     return () => {
       window.removeEventListener("focus", onRefresh);
       window.removeEventListener("app:home-refresh", onRefresh);
       window.removeEventListener("app:data-updated", onDataUpdated);
+      document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [loadHome]);
 
