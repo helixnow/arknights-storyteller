@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   StoryCategory,
   Chapter,
@@ -16,75 +16,74 @@ import type {
   StoryPreviewToken,
 } from "@/types/story";
 
-export interface SyncProgress {
+/**
+ * `sync-progress` / `search-progress` / `index-progress` 在 Rust 侧是三个
+ * 同形状的结构体，前端共用一个类型即可。`total <= 0` 表示还没有真实刻度，
+ * UI 应该走不确定态。
+ */
+export interface ProgressPayload {
   phase: string;
   current: number;
   total: number;
   message: string;
 }
 
+/** `sync-progress` 的载荷，等价于 {@link ProgressPayload}。 */
+export type SyncProgress = ProgressPayload;
+
+type ProgressEvent = "sync-progress" | "search-progress" | "index-progress";
+
+/** 三个进度事件的订阅逻辑只有事件名不同。 */
+function onProgress(
+  event: ProgressEvent,
+  callback: (progress: ProgressPayload) => void
+): Promise<UnlistenFn> {
+  return listen<ProgressPayload>(event, ({ payload }) => callback(payload));
+}
+
+/**
+ * 同步 / 版本这类生命周期命令一旦失败就是异常路径：留一条 console.error
+ * 方便从用户日志里定位，再把原始错误原样抛回去交给调用方做 UI 提示。
+ * 目录读取那类命令的失败由调用方自行处理（不少是可以静默的），不走这里。
+ */
+async function invokeReporting<T>(command: string): Promise<T> {
+  try {
+    return await invoke<T>(command);
+  } catch (error) {
+    console.error(`[API] ${command} 失败:`, error);
+    throw error;
+  }
+}
+
 export const api = {
   // 是否已安装数据
   isInstalled: async (): Promise<boolean> => {
-    console.log("[API] 调用 is_installed");
     try {
-      const ok = await invoke<boolean>("is_installed");
-      console.log("[API] is_installed:", ok);
-      return ok;
+      return await invoke<boolean>("is_installed");
     } catch (error) {
+      // 读不到安装状态时按「未安装」处理，让首屏去引导同步而不是卡在报错上。
       console.error("[API] is_installed 失败:", error);
       return false;
     }
   },
   // 同步数据
   syncData: async (): Promise<void> => {
-    console.log("[API] 开始调用 sync_data 命令");
-    try {
-      await invoke<void>("sync_data");
-      console.log("[API] sync_data 命令成功完成");
-    } catch (error) {
-      console.error("[API] sync_data 命令失败:", error);
-      throw error;
-    }
+    return invokeReporting<void>("sync_data");
   },
 
   // 获取当前版本
   getCurrentVersion: async (): Promise<string> => {
-    console.log("[API] 调用 get_current_version");
-    try {
-      const version = await invoke<string>("get_current_version");
-      console.log("[API] 当前版本:", version);
-      return version;
-    } catch (error) {
-      console.error("[API] 获取当前版本失败:", error);
-      throw error;
-    }
+    return invokeReporting<string>("get_current_version");
   },
 
   // 获取远程版本
   getRemoteVersion: async (): Promise<string> => {
-    console.log("[API] 调用 get_remote_version");
-    try {
-      const version = await invoke<string>("get_remote_version");
-      console.log("[API] 远程版本:", version);
-      return version;
-    } catch (error) {
-      console.error("[API] 获取远程版本失败:", error);
-      throw error;
-    }
+    return invokeReporting<string>("get_remote_version");
   },
 
   // 检查更新
   checkUpdate: async (): Promise<boolean> => {
-    console.log("[API] 调用 check_update");
-    try {
-      const hasUpdate = await invoke<boolean>("check_update");
-      console.log("[API] 是否有更新:", hasUpdate);
-      return hasUpdate;
-    } catch (error) {
-      console.error("[API] 检查更新失败:", error);
-      throw error;
-    }
+    return invokeReporting<boolean>("check_update");
   },
 
   // 手动导入 ZIP（按路径，避免整包穿过 JS 堆）
@@ -94,17 +93,12 @@ export const api = {
 
   // 手动导入ZIP（字节流，移动端回退）
   importZipFromBytes: async (bytes: Uint8Array): Promise<void> => {
-    console.log("[API] 调用 import_from_zip_bytes, 大小:", bytes.byteLength);
     return invoke<void>("import_from_zip_bytes", { bytes });
   },
 
   // 监听同步进度
-  onSyncProgress: (callback: (progress: SyncProgress) => void) => {
-    console.log("[API] 开始监听 sync-progress 事件");
-    return listen<SyncProgress>("sync-progress", (event) => {
-      console.log("[API] 收到同步进度:", event.payload);
-      callback(event.payload);
-    });
+  onSyncProgress: (callback: (progress: ProgressPayload) => void) => {
+    return onProgress("sync-progress", callback);
   },
 
   // 获取章节列表
@@ -172,19 +166,13 @@ export const api = {
   },
 
   // 监听搜索进度
-  onSearchProgress: (callback: (progress: { phase: string; current: number; total: number; message: string }) => void) => {
-    return listen("search-progress", (event) => {
-      // @ts-expect-error payload shape from Rust
-      callback(event.payload);
-    });
+  onSearchProgress: (callback: (progress: ProgressPayload) => void) => {
+    return onProgress("search-progress", callback);
   },
 
   // 监听索引重建进度
-  onIndexProgress: (callback: (progress: { phase: string; current: number; total: number; message: string }) => void) => {
-    return listen("index-progress", (event) => {
-      // @ts-expect-error payload shape from Rust
-      callback(event.payload);
-    });
+  onIndexProgress: (callback: (progress: ProgressPayload) => void) => {
+    return onProgress("index-progress", callback);
   },
 
   // 调试模式搜索剧情
@@ -194,31 +182,26 @@ export const api = {
 
   // 获取主线剧情（按章节分组）
   getMainStoriesGrouped: async (): Promise<Array<[string, StoryEntry[]]>> => {
-    console.log("[API] 调用 get_main_stories_grouped");
     return invoke("get_main_stories_grouped");
   },
 
   // 获取活动剧情（按活动分组）
   getActivityStoriesGrouped: async (): Promise<Array<[string, StoryEntry[]]>> => {
-    console.log("[API] 调用 get_activity_stories_grouped");
     return invoke("get_activity_stories_grouped");
   },
 
   // 获取支线剧情（按项目分组）
   getSidestoryStoriesGrouped: async (): Promise<Array<[string, StoryEntry[]]>> => {
-    console.log("[API] 调用 get_sidestory_stories_grouped");
     return invoke("get_sidestory_stories_grouped");
   },
 
   // 获取肉鸽剧情（按项目分组）
   getRoguelikeStoriesGrouped: async (): Promise<Array<[string, StoryEntry[]]>> => {
-    console.log("[API] 调用 get_roguelike_stories_grouped");
     return invoke("get_roguelike_stories_grouped");
   },
 
   // 获取干员密录（原追忆集）
   getMemoryStories: async (): Promise<StoryEntry[]> => {
-    console.log("[API] 调用 get_memory_stories");
     return invoke("get_memory_stories");
   },
 
