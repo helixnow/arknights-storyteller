@@ -831,7 +831,12 @@ function renderImage(
 
 function sanitizeFileStem(storyName: string): string {
   const cleaned = storyName.replace(/[\\/:*?"<>|\u0000]+/g, "_").trim();
-  return cleaned ? cleaned.slice(0, 40) : "arknights-story";
+  if (!cleaned) return "arknights-story";
+  // 按码点截断而不是 `slice(0, 40)`：后者数的是 UTF-16 单元，恰好跨在
+  // 边界上的代理对（生僻字/emoji）会被劈成孤立代理项——Android 端
+  // invoke 的 JSON 反序列化会直接拒绝，保存/分享整条路径报错。粒度与
+  // useImageSharer 里 truncateToBytes 的码点截断保持一致。
+  return Array.from(cleaned).slice(0, 40).join("");
 }
 
 /** Quote template canvas dimensions — fixed 4:5 portrait for social feeds. */

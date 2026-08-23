@@ -56,9 +56,29 @@ interface StreakInfo {
   totalDays: number;
 }
 
-function todayKey() {
-  const d = new Date();
+function dayKey(d: Date) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+function todayKey() {
+  return dayKey(new Date());
+}
+
+function yesterdayKey() {
+  const d = new Date();
+  d.setDate(d.getDate() - 1);
+  return dayKey(d);
+}
+
+/**
+ * localStorage 里的 currentStreak 只会在下一次打开剧情时被 bumpReadingStreak
+ * 惰性重算。断签超过一天后回来，存的还是断签前的旧值——直接展示就是在撒谎
+ * （显示「连续 12 天」，一打开剧情立刻跳回 1 天）。展示前按 lastReadOn 校验：
+ * 最后一次阅读在今天或昨天，streak 才还活着。
+ */
+function effectiveStreakDays(streak: StreakInfo): number {
+  const last = streak.lastReadOn;
+  return last === todayKey() || last === yesterdayKey() ? streak.currentStreak : 0;
 }
 
 function readStreak(): StreakInfo {
@@ -129,13 +149,22 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
   const loadSeqRef = useRef(0);
   /** 上一次成功渲染所依据的进度快照，用来判断这次刷新有没有必要。 */
   const loadedFromRef = useRef<ReadingProgressSnapshot | null>(null);
+  /** 上一次成功加载对应的日期。「今日推荐」按天挑选，跨天后哪怕进度快照
+   *  没变也不能跳过刷新，否则挂机过夜的用户会一直看到昨天的「每日随机一章」。 */
+  const loadedDayRef = useRef<string | null>(null);
 
   const loadHome = useCallback(async (options?: { force?: boolean }) => {
-    // 首页的内容只由两样东西决定：剧情目录和阅读进度快照。目录换了会走
-    // `app:data-updated`（force），所以进度快照没变时这次刷新一定得不到
-    // 新结果——直接跳过，桌面端反复切窗口就不会一路打 IPC 出去。
+    // 首页的内容由三样东西决定：剧情目录、阅读进度快照、当天日期（今日
+    // 推荐）。目录换了会走 `app:data-updated`（force），所以快照和日期都
+    // 没变时这次刷新一定得不到新结果——直接跳过，桌面端反复切窗口就不会
+    // 一路打 IPC 出去。
     const snapshot = getReadingProgress();
-    if (!options?.force && loadedFromRef.current === snapshot) return;
+    if (
+      !options?.force &&
+      loadedFromRef.current === snapshot &&
+      loadedDayRef.current === todayKey()
+    )
+      return;
 
     const seq = (loadSeqRef.current += 1);
     const stale = () => seq !== loadSeqRef.current;
@@ -152,6 +181,7 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
         setRecentStories((prev) => (prev.length === 0 ? prev : []));
         setHighlight(null);
         loadedFromRef.current = snapshot;
+        loadedDayRef.current = todayKey();
         return;
       }
 
@@ -200,6 +230,9 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
         .filter((x): x is RecentStory => x !== null);
       setRecentStories((prev) => (sameRecentStories(prev, matched) ? prev : matched));
       loadedFromRef.current = snapshot;
+      // 用挑推荐时的 `t` 而不是现在的 todayKey()：加载恰好跨过零点时两者
+      // 会不同，记 `t` 能让下一次刷新发现日期变了、重挑今天的推荐。
+      loadedDayRef.current = t;
     } catch (err) {
       if (stale()) return;
       console.warn("[Home] load failed", err);
@@ -360,7 +393,7 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
 
             {installed === true && (
               <StreakStrip
-                streak={streak}
+                streakDays={effectiveStreakDays(streak)}
                 favoritesCount={favoriteCount}
                 recentCount={recentStories.length}
                 onGoToRecent={() => onGoToTab("stories")}
@@ -595,13 +628,14 @@ function EmptyContinueCard({ onBrowse }: { onBrowse: () => void }) {
 }
 
 function StreakStrip({
-  streak,
+  streakDays,
   favoritesCount,
   recentCount,
   onGoToRecent,
   onGoToFavorites,
 }: {
-  streak: StreakInfo;
+  /** 已经按 lastReadOn 校验过的有效连续天数（断签即为 0）。 */
+  streakDays: number;
   favoritesCount: number;
   recentCount: number;
   onGoToRecent: () => void;
@@ -614,7 +648,7 @@ function StreakStrip({
     onClick?: () => void;
     hint?: string;
   }> = [
-    { icon: Flame, label: "连续阅读", value: `${streak.currentStreak} 天` },
+    { icon: Flame, label: "连续阅读", value: `${streakDays} 天` },
     {
       icon: BookOpen,
       label: "最近阅读",
@@ -736,10 +770,7 @@ export function bumpReadingStreak() {
     return;
   }
   let next: StreakInfo;
-  const yesterday = new Date();
-  yesterday.setDate(yesterday.getDate() - 1);
-  const y = `${yesterday.getFullYear()}-${String(yesterday.getMonth() + 1).padStart(2, "0")}-${String(yesterday.getDate()).padStart(2, "0")}`;
-  if (current.lastReadOn === y) {
+  if (current.lastReadOn === yesterdayKey()) {
     next = {
       currentStreak: current.currentStreak + 1,
       lastReadOn: t,
