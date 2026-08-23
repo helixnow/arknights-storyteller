@@ -390,6 +390,9 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   // 读者钉回原来那一段，而不是让百分比把人甩到别处。
   const topAnchorRef = useRef<{ index: number; offset: number } | null>(null);
   const scrollRatioRef = useRef(0);
+  // 当前正文的镜像，供 loadStory 判断缓存命中时内容是否真的换了。
+  const contentRef = useRef(content);
+  contentRef.current = content;
 
   const { settings, updateSettings, resetSettings } = useReaderSettings();
   const { showSummaries, minimalMode, inlineImages } = useAppPreferences();
@@ -843,8 +846,15 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
 
     const cached = storyContentCache.get(storyPath);
     if (cached) {
-      setContent(cached);
-      setCurrentPage(0);
+      // 命中预取缓存时 useState 初始化已经带上了同一份正文，且进度恢复的
+      // layout effect 先于本 effect 执行、已把分页页码恢复到存储页。此时
+      // 再无条件 setCurrentPage(0) 会把刚恢复的页码打回第 0 页，随后的
+      // 进度落盘还会把第 0 页写回存储——真实的阅读进度就此丢失。只有
+      // 内容真的变化（错误/空态重试后命中新缓存）才需要重置页码。
+      if (contentRef.current !== cached) {
+        setContent(cached);
+        setCurrentPage(0);
+      }
       setError(null);
       setLoading(false);
       try {

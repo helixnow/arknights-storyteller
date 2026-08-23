@@ -678,6 +678,17 @@ export function StoryList({ onSelectStory }: StoryListProps) {
     void loadSection("main");
   }, [installed, loadSection]);
 
+  // 切分类时清掉上一个分类遗留的错误卡：目标分类若已加载完成，
+  // loadSection 会直接短路返回，永远没有时机清 error，健康的列表上方
+  // 会一直压着一张与它无关的旧错误（例如活动超时后切回主线）。
+  // 新分类真的需要加载且再次失败时，会重新设置一张对应的错误卡。
+  const errorClearCategoryRef = useRef(activeCategory);
+  useEffect(() => {
+    if (errorClearCategoryRef.current === activeCategory) return;
+    errorClearCategoryRef.current = activeCategory;
+    setError(null);
+  }, [activeCategory]);
+
   useEffect(() => {
     if (installed !== true) return;
     void loadCategory(activeCategory);

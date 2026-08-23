@@ -397,8 +397,14 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
     [cancelAutoClear, loadVersionInfo, scheduleAutoClear]
   );
 
+  /**
+   * 浏览器字节流导入（dialog 插件不可用时的回退）。`transferredJob` 与
+   * importFromPath 同义：交接调用方在弹 <input type="file"> 前就持有的
+   * "import" 锁——选完文件必须整把交棒，绝不能先放再抢，否则释放的瞬间
+   * 锁就会被其他等待者截走。
+   */
   const importFromFile = useCallback(
-    async (file: File) => {
+    async (file: File, options: { transferredJob?: () => void } = {}) => {
       await runImport(`正在读取 ${file.name}`, async () => {
         devLog("[useDataSyncManager] 导入 ZIP 字节数:", file.size);
         // 绝不能 file.arrayBuffer() 一口吞：整包会先占满 JS 堆，再被
@@ -439,7 +445,7 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
           });
           throw err;
         }
-      });
+      }, options.transferredJob);
     },
     [runImport]
   );

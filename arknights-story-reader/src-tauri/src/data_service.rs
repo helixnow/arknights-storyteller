@@ -2224,12 +2224,7 @@ impl DataService {
             return Err("ZIP 文件不存在".to_string());
         }
 
-        let parent_dir = self
-            .data_dir
-            .parent()
-            .ok_or_else(|| "Invalid data directory".to_string())?;
-
-        let temp_path = parent_dir.join("ArknightsGameData_import.zip");
+        let temp_path = self.import_temp_zip_path()?;
         emit_progress(&app, "导入", 0, 100, "正在复制 ZIP 文件");
         fs::copy(source_path, &temp_path).map_err(|e| format!("复制 ZIP 文件失败: {}", e))?;
 
@@ -2249,24 +2244,31 @@ impl DataService {
         Ok(parent_dir.join("ArknightsGameData_import_staging.part"))
     }
 
-    /// 把已写完的暂存文件转正并执行导入。与 `import_zip_from_path` 的
-    /// 差别只在第一步：暂存文件本来就是我们自己的临时文件，直接改名成
-    /// 导入临时 ZIP 即可，省掉整包几百 MB 的磁盘复制。之后与其他导入
-    /// 入口走完全相同的 finalize 流程（校验、解压、覆盖、重建索引）。
-    pub fn import_zip_from_staging(&self, app: AppHandle) -> Result<(), String> {
-        let staging = self.import_staging_path()?;
-        if !staging.exists() {
-            return Err("暂存的 ZIP 数据不存在，请重新选择文件导入".to_string());
-        }
+    /// 导入临时 ZIP 的固定路径。`import_zip_from_path` 复制到这里，分块
+    /// 导入的收尾把暂存文件改名到这里。文件名只在本方法出现一次，
+    /// 保证改名的目标与 finalize 读取的来源永远是同一个文件。
+    pub fn import_temp_zip_path(&self) -> Result<PathBuf, String> {
         let parent_dir = self
             .data_dir
             .parent()
             .ok_or_else(|| "Invalid data directory".to_string())?;
+        Ok(parent_dir.join("ArknightsGameData_import.zip"))
+    }
 
-        let temp_path = parent_dir.join("ArknightsGameData_import.zip");
+    /// 对已经转正（暂存改名成导入临时 ZIP）的文件执行导入。与
+    /// `import_zip_from_path` 的差别只在第一步：字节已经躺在导入临时
+    /// ZIP 里，无需整包复制，直接走统一的 finalize 流程（校验、解压、
+    /// 覆盖、重建索引）。
+    ///
+    /// 「确认暂存存在 + 改名转正」必须在调用本方法之前、于
+    /// IMPORT_CHUNK_LOCK 内完成（见 commands.rs 的
+    /// `promote_import_staging`）：若不与追加互斥，滞留在阻塞线程池里
+    /// 的迟到块可能插进 exists 与 rename 之间，把字节写进即将转正的
+    /// 暂存文件，损坏 ZIP。本方法特意不持那把锁——解压可能要跑几分钟，
+    /// 攥着锁会把迟到块本该秒回的「传输中断」快速失败也一起堵住。
+    pub fn import_promoted_zip(&self, app: AppHandle) -> Result<(), String> {
+        let temp_path = self.import_temp_zip_path()?;
         emit_progress(&app, "导入", 30, 100, "正在校验 ZIP 文件");
-        fs::rename(&staging, &temp_path).map_err(|e| format!("写入 ZIP 数据失败: {}", e))?;
-
         self.finalize_manual_import(&temp_path, &app)
     }
 

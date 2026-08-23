@@ -507,7 +507,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
   const searchingRef = useRef(false);
   /** 在途搜索查的词和模式：防抖 effect 靠它识别"同一条已经在路上"。 */
   const inFlightRef = useRef<{ mode: SearchMode; query: string } | null>(null);
-  /** 自动搜索失败过的 `${mode}:${query}`，避免 effect 反复重试同一个错误。 */
+  /** 上一次落定失败的 `${mode}:${query}`（手动/自动都记），避免防抖 effect 反复重试同一个错误。 */
   const autoFailedRef = useRef<string | null>(null);
   const rowRefs = useRef(new Map<number, HTMLButtonElement>());
   /** 本面板发起/承接的重建在途；state 落地前就要能拦住重复触发。 */
@@ -776,9 +776,10 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
       setSegmentPage(null);
       // 结果已经清掉了，上一次成功留下的"已从缓存恢复"横幅不能继续挂着撒谎。
       setFromCache({ used: false });
-      if (auto) {
-        autoFailedRef.current = `${activeMode}:${raw}`;
-      } else {
+      // 手动失败也记同一把钥匙：searchError 可能被别的路径清掉（比如切模式），
+      // 这条 ref 是防抖 effect 不再替用户偷偷重发的最后一道闸。
+      autoFailedRef.current = `${activeMode}:${raw}`;
+      if (!auto) {
         toast.error("搜索失败，请重试");
       }
     } finally {
@@ -1057,6 +1058,9 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     // 已经就是当前展示的结果，或者刚刚自动搜失败过，都别再发一遍。
     if (raw === lastQuery && searched && !searchError) return cancel();
     if (autoFailedRef.current === `${mode}:${raw}`) return cancel();
+    // 当前词已经落定失败（手动回车失败也算）：自动重试只会把失败态冲掉再挂一次。
+    // 用户按回车走 handleSearch，开头就清 searchError，手动重试不受影响。
+    if (searchError?.query === raw) return cancel();
     // 同一个词的搜索已经在路上（回车 / 历史词条 / 切模式触发的手动搜）：
     // 再排一个计时器只会把它作废重发——手动搜的写历史、段落零命中回退
     // 全都会跟着丢，后端还要白挨一次同样的查询。

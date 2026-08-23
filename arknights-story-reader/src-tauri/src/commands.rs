@@ -403,12 +403,21 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// append_import_chunk 的专用互斥：它的「查暂存长度 → 追加写入」是两
-/// 步，若上一轮传输滞留在阻塞线程池里的迟到块恰好在新一轮某块查完长度
-/// 之后落盘，偏移校验就形同虚设，最终悄悄拼出一个损坏的 ZIP。所有追加
-/// 统一串行在这把小锁下（临界区一次 stat 加一次顺序写，与安装互斥无
-/// 嵌套），迟到块要么排在前面被偏移校验拒掉，要么排在后面看到已变化的
-/// 长度同样被拒。
+/// 暂存文件生命周期的专用互斥。三种触碰暂存文件的操作全部串行在这把
+/// 小锁下：追加（append_import_chunk 的「查长度 → 写入」）、收尾转正
+/// （promote_import_staging 的「确认存在 → 改名」）、显式中止的删除
+/// （abort_import_transfer）。它们各自都是「先检查后动作」的两步，
+/// 若不互斥，上一轮传输滞留在阻塞线程池里的迟到块可以插进任意一对
+/// 检查与动作之间：追加会绕过偏移校验拼出损坏的 ZIP，转正会把迟到
+/// 字节一起改名带走（或让迟到块写进已转正的文件），删除会被复活的
+/// 半截文件抵消。串行之后迟到块只剩统一结局——排在前面被偏移校验
+/// 拒掉，或排在后面看到已变化的长度 / 已缺失的暂存而快速失败。
+///
+/// 锁序约定：三个入口都在持有 INSTALL_LOCK（guard）期间才来拿这把锁，
+/// 固定方向是 INSTALL_LOCK → IMPORT_CHUNK_LOCK，禁止反向（持这把锁去
+/// 抢安装互斥，包括在临界区内 Drop InstallLockGuard）。临界区只允许
+/// 纳秒级的 stat / 顺序写 / rename / remove；耗时的校验解压必须放锁后
+/// 进行，否则迟到块的快速失败会被堵成慢失败。
 static IMPORT_CHUNK_LOCK: Mutex<()> = Mutex::new(());
 
 /// 显式中止在途的分块传输：取走寄存的安装互斥持有并清理暂存文件。
@@ -487,6 +496,37 @@ fn append_import_chunk(staging: &std::path::Path, offset: u64, chunk: &[u8]) -> 
     Ok(())
 }
 
+/// 收尾块把写完的暂存文件转正：确认它存在，并原子改名成导入临时 ZIP。
+///
+/// 「exists → rename」全程握着 IMPORT_CHUNK_LOCK，与迟到块的追加互斥。
+/// 若不互斥（旧实现把这两步放在 DataService 里裸跑），迟到块可以在
+/// exists 之后、rename 之前打开暂存文件——rename 只改目录项不换 inode，
+/// 迟到字节会顺着还开着的句柄写进已转正的 ZIP，悄悄写坏它；也可能在
+/// rename 之后才走到追加，得到含糊的 IO 错误而不是明确的「传输中断」。
+/// 串行之后迟到块只有两种结局：排在转正之前，要么被偏移校验拒掉、
+/// 要么完整落盘后才轮到改名（改名带走的永远是一个完整一致的文件，
+/// 绝无写到一半被改名的撕裂）；排在转正之后，看到暂存缺失，秒回
+/// IMPORT_STREAM_BROKEN。
+///
+/// 锁内只有一次 stat 加一次 rename（纳秒级）；耗时的校验解压由调用方在
+/// 放锁之后做（DataService::import_promoted_zip），不会堵住迟到块的
+/// 快速失败。调用时机在收尾块 append 成功之后，此时安装互斥（guard）
+/// 仍在手上，锁序仍是 INSTALL_LOCK → IMPORT_CHUNK_LOCK。
+fn promote_import_staging(
+    staging: &std::path::Path,
+    dest: &std::path::Path,
+) -> Result<(), String> {
+    let _serialized = IMPORT_CHUNK_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // 收尾时暂存缺失只能是这轮传输从未落盘 / 已被显式中止清理，
+    // 沿用原有话术引导用户重选文件，而不是报含糊的改名 IO 错误。
+    if !staging.exists() {
+        return Err("暂存的 ZIP 数据不存在，请重新选择文件导入".to_string());
+    }
+    std::fs::rename(staging, dest).map_err(|e| format!("写入 ZIP 数据失败: {}", e))
+}
+
 /// 分块导入 ZIP。前端把文件切成几 MB 的块，逐块 base64 后调用本命令。
 ///
 /// 为什么不直接传字节：Tauri 2 在 Android 上的 IPC 走 postMessage，
@@ -561,7 +601,11 @@ pub async fn import_from_zip_bytes(
         append_import_chunk(&staging, offset, &chunk)?;
         if last {
             let _guard = guard;
-            service.import_zip_from_staging(app)
+            // 转正（确认存在 + 改名）在 IMPORT_CHUNK_LOCK 内完成，与迟到
+            // 块的追加互斥；随后的校验解压不再持 chunk 锁，迟到块会立刻
+            // 看到暂存缺失、秒拿「传输中断」而不是等解压结束。
+            promote_import_staging(&staging, &service.import_temp_zip_path()?)?;
+            service.import_promoted_zip(app)
         } else {
             stow_transfer_hold(guard);
             Ok(())
@@ -903,6 +947,82 @@ mod tests {
             .expect("追加线程不该 panic")
             .expect("放锁后排队的追加必须成功");
         assert_eq!(std::fs::read(&staging).unwrap(), b"headtail");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 收尾转正的「确认存在 → 改名」必须整体握着 IMPORT_CHUNK_LOCK：
+    /// 持锁期间转正寸步难行，放锁后才允许改名。与
+    /// append_import_chunk_is_serialized_by_dedicated_mutex 合起来构成
+    /// 互斥的两个方向——追加与转正抢同一把锁，迟到块绝不可能插进
+    /// exists 与 rename 之间把字节写进即将转正（或已转正）的文件。
+    #[test]
+    fn promote_import_staging_is_serialized_with_appends() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("askr_import_promote_{nanos}"));
+        let staging = dir.join("staging.part");
+        let dest = dir.join("promoted.zip");
+        append_import_chunk(&staging, 0, b"complete zip bytes").expect("首块必须成功");
+
+        let outer = IMPORT_CHUNK_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let worker_staging = staging.clone();
+        let worker_dest = dest.clone();
+        let worker =
+            std::thread::spawn(move || promote_import_staging(&worker_staging, &worker_dest));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!worker.is_finished(), "持锁期间转正不得完成");
+        assert!(staging.exists(), "持锁期间暂存文件不得被改名走");
+        assert!(!dest.exists(), "持锁期间不得出现转正后的文件");
+        drop(outer);
+        worker
+            .join()
+            .expect("转正线程不该 panic")
+            .expect("放锁后排队的转正必须成功");
+        assert!(!staging.exists(), "转正后暂存文件必须消失");
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"complete zip bytes",
+            "转正必须原封不动地带走全部已落盘字节"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 转正（rename）之后暂存已经不存在：迟到的续传块必须秒拿统一的
+    /// 「传输中断」（IMPORT_STREAM_BROKEN）快速失败——既不能把字节写进
+    /// 已转正的文件，也不能凭空复活一个幽灵 `.part`。收尾自身在暂存
+    /// 缺失时（从未落盘 / 已被中止清理 / 重复收尾）也要报明确的
+    /// 「暂存不存在」，而不是含糊的改名 IO 错误。
+    #[test]
+    fn late_chunk_after_promotion_gets_stream_broken() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("askr_import_late_{nanos}"));
+        let staging = dir.join("staging.part");
+        let dest = dir.join("promoted.zip");
+
+        append_import_chunk(&staging, 0, b"zip payload").expect("首块必须成功");
+        promote_import_staging(&staging, &dest).expect("转正必须成功");
+
+        // 最像真的那种迟到块：偏移恰好等于转正前的长度。
+        let err = append_import_chunk(&staging, 11, b" late bytes").expect_err("迟到块必须失败");
+        assert!(err.contains("不连续"), "迟到块应得到「中断」话术: {err}");
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"zip payload",
+            "已转正的文件不得被迟到块污染"
+        );
+        assert!(!staging.exists(), "迟到块不得复活幽灵 .part");
+
+        let err = promote_import_staging(&staging, &dest).expect_err("暂存缺失时转正必须失败");
+        assert!(err.contains("暂存的 ZIP 数据不存在"), "{err}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

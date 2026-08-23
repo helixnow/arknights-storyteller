@@ -89,6 +89,13 @@ const STATUS_NOTICE_TTL_MS = 4000;
  */
 const INDEX_JOB_WATCHDOG_MS = 30_000;
 
+/**
+ * 回退 <input type="file"> 的取消侦测宽限期：窗口重新获得焦点说明系统选择器
+ * 已经收场，但选中文件的 change 事件可能还在路上（Android 从选择器 activity
+ * 返回时有延迟），等满宽限期仍没有文件才按「用户取消」处理。
+ */
+const FILE_PICKER_CANCEL_GRACE_MS = 1500;
+
 export function Settings() {
   const { themeColor, setThemeColor } = useTheme();
   const { minimalMode, setMinimalMode, inlineImages, setInlineImages } = useAppPreferences();
@@ -187,6 +194,65 @@ export function Settings() {
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
+  /**
+   * 回退到 <input type="file"> 期间寄存的任务锁。系统选择器开着时
+   * handleImportClick 已经 return，绝不能让它的 finally 放锁——释放会同步唤醒
+   * acquireDataJobWhenIdle 的等待者（自动更新安装），锁被截走后用户选完文件
+   * 再导入只会报「导入正在进行」。锁的去向只有两条：选到文件整把交棒给
+   * importFromFile；确认取消后在这里释放。
+   */
+  const pendingImportJobRef = useRef<(() => void) | null>(null);
+  /** 撤掉取消侦听（焦点监听 + 宽限计时器）；寄存的锁本身由调用方另行处置。 */
+  const pendingImportWatchCleanupRef = useRef<(() => void) | null>(null);
+
+  /** 取走寄存的锁并撤掉侦听；之后交棒还是释放由取走的人决定。 */
+  const takePendingImportJob = useCallback(() => {
+    pendingImportWatchCleanupRef.current?.();
+    const job = pendingImportJobRef.current;
+    pendingImportJobRef.current = null;
+    return job;
+  }, []);
+
+  /**
+   * 寄存锁并布防取消侦听。检测手法沿用本仓库刷新数据用的窗口焦点事件
+   * （HomePanel / StoryList 同款）：选择器（Android 上是独立 activity）关掉后
+   * 窗口必然重新获得焦点，此时先等一个宽限期让可能在路上的 change 事件先到；
+   * 等不到就视为用户取消，放锁并清 preparing 态。万一误判（change 姗姗来迟），
+   * importFromFile 会退回自己抢锁，行为和修复前一致，不会更糟。
+   */
+  const armPendingImportWatch = useCallback((releaseJob: () => void) => {
+    pendingImportJobRef.current = releaseJob;
+    let graceTimer: number | null = null;
+    const onFocus = () => {
+      window.removeEventListener("focus", onFocus);
+      graceTimer = window.setTimeout(() => {
+        graceTimer = null;
+        pendingImportWatchCleanupRef.current = null;
+        const job = pendingImportJobRef.current;
+        pendingImportJobRef.current = null;
+        if (job) {
+          job();
+          setPreparingImport(false);
+        }
+      }, FILE_PICKER_CANCEL_GRACE_MS);
+    };
+    pendingImportWatchCleanupRef.current = () => {
+      window.removeEventListener("focus", onFocus);
+      if (graceTimer !== null) window.clearTimeout(graceTimer);
+      pendingImportWatchCleanupRef.current = null;
+    };
+    window.addEventListener("focus", onFocus);
+  }, []);
+
+  // 设置页卸载时选择器可能还开着：侦听要拆，寄存的锁必须放掉，不能跟着组件蒸发。
+  useEffect(() => {
+    return () => {
+      pendingImportWatchCleanupRef.current?.();
+      pendingImportJobRef.current?.();
+      pendingImportJobRef.current = null;
+    };
+  }, []);
+
   const handleImportClick = async () => {
     if (dataActionsDisabled) return;
     showStatus(null);
@@ -199,6 +265,9 @@ export function Settings() {
       return;
     }
     setPreparingImport(true);
+    // 回退到 <input type="file"> 时锁已寄存给选择器流程，本次 finally 必须跳过
+    // 放锁，否则用户还在系统相册/文件器里挑文件，锁就被等待者截走了。
+    let lockParkedForPicker = false;
     try {
       const confirmed = await safeConfirm(
         "导入 ZIP 会覆盖本机已有的剧情数据。请确保压缩包来自 ArknightsGameData。",
@@ -214,6 +283,8 @@ export function Settings() {
         ({ open: openDialog } = await import("@tauri-apps/plugin-dialog"));
       } catch (err) {
         devLog("[Settings] 文件对话框插件不可用，回退到文件选择器", err);
+        armPendingImportWatch(releaseJob);
+        lockParkedForPicker = true;
         fileInputRef.current?.click();
         return;
       }
@@ -229,6 +300,8 @@ export function Settings() {
         const message = err instanceof Error ? err.message : String(err);
         if (isPluginUnavailableError(message)) {
           devLog("[Settings] 文件对话框不可用，回退到文件选择器", err);
+          armPendingImportWatch(releaseJob);
+          lockParkedForPicker = true;
           fileInputRef.current?.click();
         } else {
           setError(localizeBackendError(err, "选择文件失败"));
@@ -245,16 +318,37 @@ export function Settings() {
       // 释放函数幂等，finally 里的兜底调用不会误伤。
       await importFromPath(path, { transferredJob: releaseJob });
     } finally {
-      releaseJob();
-      setPreparingImport(false);
+      // 回退路径的锁与 preparing 态改由选择器流程收尾（选到文件交棒、取消放锁），
+      // 这里再放就把空窗重新开出来了。其余路径（确认取消、原生对话框取消、
+      // 插件报错未回退、导入收尾）照旧兜底；释放函数幂等，重复调用无害。
+      if (!lockParkedForPicker) {
+        releaseJob();
+        setPreparingImport(false);
+      }
     }
   };
 
   const handleFileSelected = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     event.target.value = "";
-    if (!file) return;
-    await importFromFile(file);
+    // 接过回退路径寄存的锁（同时撤掉取消侦听）。
+    const transferredJob = takePendingImportJob();
+    // change 到了却没有文件：一样是取消，放锁并清 preparing 态。
+    if (!file) {
+      transferredJob?.();
+      setPreparingImport(false);
+      return;
+    }
+    try {
+      // 与 path 路径同一句纪律：把手里这把锁整体交棒给 importFromFile，
+      // 绝不能先放再让它重抢——释放会同步唤醒 acquireDataJobWhenIdle 的
+      // 等待者，同一个 tick 里锁就被截走。交棒后由导入流程负责释放。
+      await importFromFile(file, { transferredJob: transferredJob ?? undefined });
+    } finally {
+      // 释放函数幂等，这里兜底再放一次无害（正常已由导入流程释放）。
+      transferredJob?.();
+      setPreparingImport(false);
+    }
   };
 
   const toast = useToast();
