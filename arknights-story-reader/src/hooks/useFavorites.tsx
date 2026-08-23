@@ -166,11 +166,12 @@ export function FavoritesProvider({ children }: { children: ReactNode }) {
 
   // 首帧的值就是刚从 localStorage 读出来的，回写没有意义；更糟的是：如果
   // 读取因数据损坏回落到了空状态，这次回写会立刻用 `{}` 覆盖掉原始数据，
-  // 连恢复的机会都不留。跳过首帧，只有用户真正改动收藏后才落盘。
-  const hydratedRef = useRef(false);
+  // 连恢复的机会都不留。守卫不能用「跳过第一次 effect」计数：StrictMode
+  // 开发模式下挂载期 effect 会连跑两次，第二次就把初始状态写回去了。改为
+  // 与初始 state 做引用比较——用户任何真实改动都会产生新对象，自然落盘。
+  const initialFavoritesRef = useRef(favorites);
   useEffect(() => {
-    if (!hydratedRef.current) {
-      hydratedRef.current = true;
+    if (favorites === initialFavoritesRef.current) {
       return;
     }
     try {
