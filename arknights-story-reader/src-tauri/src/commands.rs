@@ -412,14 +412,22 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
 static IMPORT_CHUNK_LOCK: Mutex<()> = Mutex::new(());
 
 /// 显式中止在途的分块传输：取走寄存的安装互斥持有并清理暂存文件。
-/// 只有真取到持有才删 `.part`——寄存已空说明这轮传输并不占着锁
-/// （某块在后端失败时 guard 已随错误一起 Drop / 收尾块已把持有带进
-/// 导入流程 / 弃单已被收走且锁可能已易主），此时删文件反而可能误伤
-/// 新一轮传输正在写的暂存。清理失败不影响放锁：guard 在返回前无条件
-/// Drop，INSTALL_LOCK 一定回到空闲。
+///
+/// 寄存已空只说明这轮传输不占着锁，半截 `.part` 却未必不在：某块在
+/// 后端失败（解码 / 落盘报错）时 guard 已随错误一起 Drop，暂存文件
+/// 留在盘上，不清理就要躺到下次启动。所以寄存为空时改为当场抢一次
+/// 安装互斥：抢到证明没有任何同步 / 导入 / 收尾在跑，删暂存是安全的
+/// （持锁期间新一轮传输的首块拿不到锁，不存在被误删的活暂存）；
+/// 抢不到说明 sync / 导入收尾正占着这组路径，严格 no-op——此时删
+/// 文件反而可能误伤它们正在处理的暂存。清理失败不影响放锁：guard
+/// 在返回前无条件 Drop，INSTALL_LOCK 一定回到空闲。
 fn abort_import_transfer(staging: &std::path::Path) -> Result<(), String> {
-    let Some(guard) = take_transfer_hold() else {
-        return Ok(());
+    let guard = match take_transfer_hold() {
+        Some(guard) => guard,
+        None => match acquire_install_lock("import_from_zip_bytes") {
+            Ok(guard) => guard,
+            Err(_) => return Ok(()),
+        },
     };
     // 删除与追加共用 IMPORT_CHUNK_LOCK：滞留在阻塞线程池里的迟到块
     // 要么先落盘随后被删，要么在删除后看到暂存缺失报「中断」，
@@ -1007,7 +1015,8 @@ mod tests {
     }
 
     /// 显式中止在途传输：立刻放锁 + 清理暂存，不必等 60 秒弃单超时；
-    /// 寄存已空时必须是严格 no-op——既不删文件也不碰别人持有的锁。
+    /// 寄存已空且锁归别人时必须是严格 no-op——既不删文件也不碰别人
+    /// 持有的锁。
     #[test]
     fn abort_import_transfer_releases_lock_and_cleans_staging() {
         let _serial = serialize_global_lock_tests();
@@ -1046,6 +1055,40 @@ mod tests {
         std::fs::remove_file(&staging).unwrap();
         abort_import_transfer(&staging).expect("暂存缺失时中止必须成功");
         drop(acquire_install_lock("sync_data").expect("锁必须已被释放"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 中途某块在后端失败（解码 / 落盘报错）时 guard 已随 Err 一起
+    /// Drop：寄存为空、INSTALL_LOCK 空闲，但半截 `.part` 还躺在盘上。
+    /// 显式中止必须现抢一把安装互斥把它删掉，而不是 no-op 留给下次
+    /// 启动清理；删完锁必须回到空闲，也不得凭空造出寄存持有。
+    #[test]
+    fn abort_import_transfer_cleans_staging_when_lock_is_free() {
+        let _serial = serialize_global_lock_tests();
+        // 防御：清掉可能的残留寄存，保证从空闲态开始。
+        drop(take_transfer_hold());
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("askr_import_abort_free_{nanos}"));
+        let staging = dir.join("staging.part");
+
+        // 复刻事故现场：首块落盘后，下一块在后端失败——guard 随错误
+        // 一起 Drop（未寄存），锁空闲，半截暂存留在盘上。
+        append_import_chunk(&staging, 0, b"chunk landed, next one failed").expect("首块必须成功");
+        drop(acquire_install_lock("import_from_zip_bytes").expect("空闲时必须拿到锁"));
+
+        abort_import_transfer(&staging).expect("锁空闲时中止必须成功");
+        assert!(!staging.exists(), "锁空闲时中止必须删掉遗留的半截暂存");
+        assert!(take_transfer_hold().is_none(), "中止不得凭空造出寄存持有");
+        drop(acquire_install_lock("sync_data").expect("中止后锁必须回到空闲"));
+
+        // 暂存本就不存在时同样静默成功（幂等），锁照样回到空闲。
+        abort_import_transfer(&staging).expect("暂存缺失且锁空闲时中止必须成功");
+        drop(acquire_install_lock("sync_data").expect("锁必须仍然空闲"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
