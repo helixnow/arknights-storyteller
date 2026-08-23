@@ -1707,7 +1707,15 @@ impl DataService {
                 commit_short,
                 format_timestamp(info.fetched_at)
             ))
+        } else if self.is_installed() {
+            // version.json 读不出来 ≠ 没有数据：断电可能把它截成半截，换入
+            // 成功后写版本文件也可能失败（sync_data 里版本写在换入之后），
+            // 数据集其实还完整躺在 data_dir 里——和 check_update 堵住的是
+            // 同一类撒谎。这里若报「未安装」，设置页会把完整数据当成没装、
+            // 催用户首次下载。文案必须避开「未安装」，前端拿它判定安装状态。
+            Ok("本地数据（版本未知）".to_string())
         } else {
+            // 数据集真的不存在，才是「未安装」。
             Ok("未安装".to_string())
         }
     }
@@ -1729,8 +1737,12 @@ impl DataService {
 
     pub fn check_update(&self) -> Result<bool, String> {
         let Some(current) = self.read_version() else {
-            // 本地根本没有数据，提示用户下载。
-            return Ok(true);
+            // version.json 读不出来 ≠ 没有数据：断电可能把它截成半截，
+            // 换入成功后写版本文件也可能失败（sync_data 里版本写在换入
+            // 之后），数据集其实还完整躺在 data_dir 里。这些状态和
+            // manual- 一样没有可比 commit，报「有更新」会让用户每次启动
+            // 都被催同步；只有数据集真的不存在才提示下载。
+            return Ok(!self.is_installed());
         };
 
         let local_commit = current.commit.trim();
@@ -5129,9 +5141,61 @@ mod tests {
             );
         }
 
-        // 完全没有数据时才提示用户下载。
+        // version.json 被断电截成半截（解析失败）或干脆缺失，但数据集
+        // 还完整：同样没有可比 commit，不能催更。
+        fs::write(fx.service.data_dir.join(VERSION_FILE), "{\"commit\":").unwrap();
+        assert_eq!(
+            fx.service.check_update().unwrap(),
+            false,
+            "a corrupt version file with an intact dataset must not report an update"
+        );
         fs::remove_file(fx.service.data_dir.join(VERSION_FILE)).unwrap();
+        assert_eq!(
+            fx.service.check_update().unwrap(),
+            false,
+            "a missing version file with an intact dataset must not report an update"
+        );
+
+        // 完全没有数据时才提示用户下载。
+        fs::remove_dir_all(&fx.service.data_dir).unwrap();
         assert!(fx.service.check_update().unwrap());
+    }
+
+    /// version.json 缺失/损坏但数据集完整时，设置页不能显示「未安装」催用户
+    /// 首次下载——和 check_update 堵住的是同一类撒谎；数据目录真不在才算未安装。
+    #[test]
+    fn current_version_only_reports_not_installed_when_dataset_is_gone() {
+        let fx = Fixture::new("cur_ver");
+
+        // 正常路径：version.json 可读，展示短 commit + 时间。
+        fx.set_version("abcdef1234567890");
+        assert!(
+            fx.service
+                .get_current_version()
+                .unwrap()
+                .starts_with("abcdef1"),
+            "可读版本文件应展示短 commit"
+        );
+
+        // 损坏（断电截成半截）：数据集还在，不能报「未安装」。
+        fs::write(fx.service.data_dir.join(VERSION_FILE), "{\"commit\":").unwrap();
+        assert_eq!(
+            fx.service.get_current_version().unwrap(),
+            "本地数据（版本未知）",
+            "版本文件损坏但数据完整，不能报「未安装」"
+        );
+
+        // 缺失（换入后写版本失败）：同样不能报「未安装」。
+        fs::remove_file(fx.service.data_dir.join(VERSION_FILE)).unwrap();
+        assert_eq!(
+            fx.service.get_current_version().unwrap(),
+            "本地数据（版本未知）",
+            "版本文件缺失但数据完整，不能报「未安装」"
+        );
+
+        // 数据目录整个不存在，才是真正的「未安装」。
+        fs::remove_dir_all(&fx.service.data_dir).unwrap();
+        assert_eq!(fx.service.get_current_version().unwrap(), "未安装");
     }
 
     // ---- ZIP install safety ------------------------------------------------

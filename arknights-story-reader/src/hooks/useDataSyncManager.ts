@@ -474,7 +474,14 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
   }, [cancelAutoClear]);
 
   const status = useMemo(() => {
-    if (!currentVersion || currentVersion === "未安装") {
+    // 后端约定：只有数据集真的不存在才返回「未安装」；已安装但 version.json
+    // 缺失/损坏时返回「本地数据（版本未知）」。空串意味着还没加载出来或读取
+    // 失败，状态未知，不能顺手当成「未安装」——那会把装好的数据说成没装、
+    // 催用户首次下载（与后端 check_update 堵住的是同一类撒谎）。
+    if (!currentVersion) {
+      return "unknown" as const;
+    }
+    if (currentVersion === "未安装") {
       return "not-installed" as const;
     }
     if (hasUpdate) {
