@@ -622,10 +622,17 @@ impl DataService {
         }
     }
     pub fn new(app_data_dir: PathBuf) -> Self {
-        Self {
+        let service = Self {
             data_dir: app_data_dir.join("ArknightsGameData"),
             index_db_path: app_data_dir.join("story_index.db"),
-        }
+        };
+        // 上一次换入若恰好在两次改名之间崩溃/断电，data_dir 会消失、完整
+        // 的旧数据却还躺在 `_old` 暂存目录里。开机先接回来，否则
+        // is_installed 会误报「未安装」，用户以为数据凭空没了。`new` 只在
+        // setup 里跑一次，任何命令（包括同步换入）都还没机会启动，此时
+        // 动这些目录没有并发之忧。
+        service.restore_data_dir_from_aside();
+        service
     }
 
     fn open_index_connection(&self) -> Result<Connection, String> {
@@ -1918,10 +1925,7 @@ impl DataService {
         // 先验收再动旧数据：如果这个包里没有 story_review_table.json，整个
         // 应用就是空的。此时必须保留已有 data_dir，让用户继续用旧数据。
         // 空文件同样算校验失败——半截下载解出来的壳子比旧数据更没用。
-        let review_ok = fs::metadata(extracted_root.join(REVIEW_TABLE_REL))
-            .map(|meta| meta.is_file() && meta.len() > 0)
-            .unwrap_or(false);
-        if !review_ok {
+        if !Self::holds_valid_dataset(&extracted_root) {
             fs::remove_dir_all(&extract_root).ok();
             return Err(format!(
                 "ZIP 校验失败：缺少或为空 {}，已保留原有数据",
@@ -1961,6 +1965,80 @@ impl DataService {
             .unwrap_or(0);
         name.push(format!("_{}", nanos));
         self.data_dir.with_file_name(name)
+    }
+
+    /// `extract_zip_at` 的验收标准：非空 `story_review_table.json` 才算一份
+    /// 撑得起应用的数据集。换入验收和崩溃恢复用同一把尺子。
+    fn holds_valid_dataset(dir: &Path) -> bool {
+        fs::metadata(dir.join(REVIEW_TABLE_REL))
+            .map(|meta| meta.is_file() && meta.len() > 0)
+            .unwrap_or(false)
+    }
+
+    /// `swap_in_extracted` 若恰好在「旧目录挪开」和「新目录落位」两次改名
+    /// 之间崩溃/断电，`data_dir` 会消失，完整的旧数据却还躺在暂存目录里
+    /// （固定的 `<data_dir>_old`，或它清不掉时退化出的
+    /// `<data_dir>_old_<纳秒>`，见 `old_data_aside_path`）。启动时把这份
+    /// 残骸改名接回 `data_dir`，数据不会因为一次断电就「消失」。
+    ///
+    /// 只认里面有非空 `story_review_table.json` 的暂存目录；半截壳子恢复
+    /// 回去也撑不起应用，一概不碰，留给下一次换入开场清理。同时存在多个
+    /// 候选时取时间戳最大的：带时间戳的名字只在固定名残骸清不掉时才会
+    /// 启用，必然比固定名新。`data_dir` 尚在时什么都不做——成功换入后
+    /// 清理失败留下的 `_old` 是上一份数据，抢着恢复反而会顶掉新数据。
+    fn restore_data_dir_from_aside(&self) {
+        if self.data_dir.exists() {
+            return;
+        }
+        let Some(parent) = self.data_dir.parent() else {
+            return;
+        };
+        let Some(dir_name) = self.data_dir.file_name().and_then(|n| n.to_str()) else {
+            return;
+        };
+        let fixed_name = format!("{}_old", dir_name);
+
+        // (时间戳, 路径)。固定名没有时间戳，记 0，天然排在最旧。
+        let mut candidates: Vec<(u128, PathBuf)> = Vec::new();
+        let fixed = parent.join(&fixed_name);
+        if Self::holds_valid_dataset(&fixed) {
+            candidates.push((0, fixed));
+        }
+        if let Ok(entries) = fs::read_dir(parent) {
+            let stamped_prefix = format!("{}_", fixed_name);
+            for entry in entries.flatten() {
+                let file_name = entry.file_name();
+                let Some(name) = file_name.to_str() else {
+                    continue;
+                };
+                let Some(stamp) = name.strip_prefix(&stamped_prefix) else {
+                    continue;
+                };
+                let Ok(stamp) = stamp.parse::<u128>() else {
+                    continue;
+                };
+                let path = entry.path();
+                if Self::holds_valid_dataset(&path) {
+                    candidates.push((stamp, path));
+                }
+            }
+        }
+        let Some((_, aside)) = candidates.into_iter().max_by_key(|(stamp, _)| *stamp) else {
+            return;
+        };
+
+        match fs::rename(&aside, &self.data_dir) {
+            Ok(()) => {
+                eprintln!("[RECOVER] 上次数据换入中断，已从 {:?} 恢复数据目录", aside);
+            }
+            Err(err) => {
+                // 恢复失败不致命：数据仍完整躺在暂存目录里，下次启动重试。
+                eprintln!(
+                    "[RECOVER] 发现换入中断残留 {:?}，但恢复失败（数据仍完整保留）: {}",
+                    aside, err
+                );
+            }
+        }
     }
 
     /// 把验收完毕的新数据树换到 `data_dir`。
@@ -2051,6 +2129,20 @@ impl DataService {
         }
     }
 
+    /// 解压手动导入的临时 ZIP，无论成败都删掉临时文件：这个 ZIP 和数据集
+    /// 一个量级，解压失败后留着只会白占几百 MB 磁盘，下次导入也会原样
+    /// 重写一份。
+    fn extract_import_zip(
+        &self,
+        temp_path: &Path,
+        parent_dir: &Path,
+        app: Option<&AppHandle>,
+    ) -> Result<(), String> {
+        let extracted = self.extract_zip_at(temp_path, parent_dir, app);
+        fs::remove_file(temp_path).ok();
+        extracted
+    }
+
     fn finalize_manual_import(&self, temp_path: &Path, app: &AppHandle) -> Result<(), String> {
         let parent_dir = self
             .data_dir
@@ -2058,8 +2150,7 @@ impl DataService {
             .ok_or_else(|| "Invalid data directory".to_string())?;
 
         emit_progress(app, "导入", 40, 100, "正在解压 ZIP 文件");
-        self.extract_zip_at(temp_path, parent_dir, Some(app))?;
-        fs::remove_file(temp_path).ok();
+        self.extract_import_zip(temp_path, parent_dir, Some(app))?;
 
         if let Err(err) = self.clear_story_index() {
             eprintln!("[IMPORT] Failed to reset story index: {}", err);
@@ -5090,6 +5181,112 @@ mod tests {
             !stale.exists(),
             "成功换入后不应留下任何 _old 暂存目录（包括崩溃残骸）"
         );
+    }
+
+    // ---- Crash recovery on startup ------------------------------------------
+
+    /// 模拟换入恰好在两次改名之间崩溃：data_dir 已挪到 `_old`、新目录还没
+    /// 落位。下一次启动（DataService::new）必须把数据接回来，而不是让
+    /// is_installed 误报「未安装」。
+    #[test]
+    fn new_restores_aside_left_by_crash_between_renames() {
+        let fx = Fixture::new("recover_fixed");
+        let parent = fx.service.data_dir.parent().unwrap().to_path_buf();
+        let aside = parent.join("ArknightsGameData_old");
+        fs::rename(&fx.service.data_dir, &aside).unwrap();
+        assert!(!fx.service.is_installed(), "崩溃现场：数据目录已消失");
+
+        let relaunched = DataService::new(fx.root.clone());
+        assert!(
+            relaunched.is_installed(),
+            "重启后必须从 _old 暂存目录恢复数据"
+        );
+        assert!(!aside.exists(), "恢复即改名回 data_dir，不留副本");
+        assert_eq!(
+            relaunched.get_story_entry("main_00-01").unwrap().story_name,
+            "序章"
+        );
+    }
+
+    /// 固定名 `_old` 清不掉时换入会退化成带时间戳的暂存名。恢复必须选
+    /// 时间戳最大的那份——它来自最近一次换入，固定名残骸是更早的数据集。
+    #[test]
+    fn new_restores_newest_timestamped_aside() {
+        let fx = Fixture::new("recover_stamped");
+        let parent = fx.service.data_dir.parent().unwrap().to_path_buf();
+
+        // 更早的残骸：数据有效，但不是最近一次换入挪出去的。
+        let stale = parent.join("ArknightsGameData_old");
+        Fixture::write_file(&stale.join(REVIEW_TABLE_REL), REVIEW_TABLE_JSON);
+        Fixture::write_file(&stale.join("stale_marker.txt"), "older dataset");
+
+        // 最近一次换入挪出去的现场（带时间戳的退化名字）。
+        let fresh = parent.join("ArknightsGameData_old_1700000000000000000");
+        fs::rename(&fx.service.data_dir, &fresh).unwrap();
+
+        let relaunched = DataService::new(fx.root.clone());
+        assert!(relaunched.is_installed());
+        assert!(
+            !relaunched.data_dir.join("stale_marker.txt").exists(),
+            "必须恢复时间戳最大的暂存目录，而不是更早的固定名残骸"
+        );
+        assert!(!fresh.exists());
+        assert!(stale.exists(), "没被选中的残骸原样留给下一次换入清理");
+    }
+
+    /// 只认包含非空 story_review_table.json 的暂存目录：空壳恢复回去也
+    /// 撑不起应用，反而会挡住之后正常的下载安装。
+    #[test]
+    fn new_ignores_aside_without_valid_review_table() {
+        let fx = Fixture::new("recover_invalid");
+        let parent = fx.service.data_dir.parent().unwrap().to_path_buf();
+        fs::remove_dir_all(&fx.service.data_dir).unwrap();
+
+        let shell = parent.join("ArknightsGameData_old");
+        Fixture::write_file(&shell.join(REVIEW_TABLE_REL), ""); // 空表 = 无效
+        Fixture::write_file(&shell.join("marker.txt"), "crash shell");
+
+        let relaunched = DataService::new(fx.root.clone());
+        assert!(!relaunched.is_installed(), "空壳残骸不该被当成数据恢复");
+        assert!(!relaunched.data_dir.exists());
+        assert!(shell.exists(), "无效残骸原样保留，等下一次换入开场清理");
+    }
+
+    /// data_dir 还健在时绝不能动：成功换入后清理失败留下的 `_old` 是上
+    /// 一份数据，抢着恢复反而会把新数据顶掉。
+    #[test]
+    fn new_leaves_existing_data_dir_alone() {
+        let fx = Fixture::new("recover_noop");
+        let parent = fx.service.data_dir.parent().unwrap().to_path_buf();
+        let leftover = parent.join("ArknightsGameData_old");
+        Fixture::write_file(&leftover.join(REVIEW_TABLE_REL), REVIEW_TABLE_JSON);
+        Fixture::write_file(&leftover.join("marker.txt"), "previous dataset");
+
+        let relaunched = DataService::new(fx.root.clone());
+        assert!(relaunched.is_installed());
+        assert!(
+            !relaunched.data_dir.join("marker.txt").exists(),
+            "现有数据目录不该被残骸覆盖"
+        );
+        assert!(leftover.exists());
+    }
+
+    /// 手动导入的临时 ZIP 在解压失败后也必须删掉——它和数据集一个量级，
+    /// 留着只会白占磁盘。
+    #[test]
+    fn manual_import_temp_zip_is_removed_even_on_failure() {
+        let fx = Fixture::new("import_zip_cleanup");
+        let parent = fx.service.data_dir.parent().unwrap().to_path_buf();
+        let temp_path = parent.join("ArknightsGameData_import.zip");
+        write_zip(&temp_path, &[("pkg/README.md", "no review table")]);
+
+        let err = fx
+            .service
+            .extract_import_zip(&temp_path, &parent, None)
+            .expect_err("无效包必须被拒绝");
+        assert!(err.contains("ZIP 校验失败"), "{}", err);
+        assert!(!temp_path.exists(), "解压失败后临时导入 ZIP 必须被清理");
+        assert!(fx.service.is_installed(), "拒绝无效包不能伤及现有数据");
     }
 
     #[test]

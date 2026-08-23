@@ -82,7 +82,11 @@ interface StatusNotice {
 
 const STATUS_NOTICE_TTL_MS = 4000;
 
-/** 这么久收不到任何索引进度，就认为那次重建已经结束（或压根没起来），放锁。 */
+/**
+ * 兜底看门狗：正常路径是搜索面板重建收场时广播 `app:story-index-updated`，
+ * 收到就立刻放锁。只有那条广播丢了（面板异常卸载之类）才靠这个超时救锁，
+ * 保证任何情况下都不会死锁。
+ */
 const INDEX_JOB_WATCHDOG_MS = 30_000;
 
 export function Settings() {
@@ -256,8 +260,12 @@ export function Settings() {
 
   /**
    * 索引重建实际跑在搜索面板里（它常驻挂载，监听 `app:rebuild-story-index`），
-   * 这边只是发起方，所以只能靠后端的 index-progress 判断它是否还在跑：
-   * 收到终态就放锁，长时间没有任何进度就认定那次重建已经结束，兜底放锁。
+   * 这边只是发起方。放锁一主两备：
+   *   1. 面板重建收场（成功或失败）广播 `app:story-index-updated`
+   *      （reason: rebuilt / rebuild-failed），收到立刻放锁——失败秒放，
+   *      不用再吊满 30s 看门狗；
+   *   2. 后端 index-progress 到终态也放锁，广播万一丢了还有它；
+   *   3. 长时间一点动静都没有，看门狗兜底放锁，保证不死锁。
    */
   const indexJobReleaseRef = useRef<(() => void) | null>(null);
   const indexWatchdogRef = useRef<number | null>(null);
@@ -299,6 +307,20 @@ export function Settings() {
       releaseIndexJob();
     };
   }, [armIndexWatchdog, releaseIndexJob]);
+
+  // 主放锁路径：搜索面板的 runBuildIndex 无论成败都会在收场时广播
+  // `app:story-index-updated`，reason 标出成败。只认这两个终态 reason——
+  // useAutoIndex 的常规状态广播（startup / data-updated）可能恰好赶在
+  // 我们发起的重建中途到达，那时放锁会让同步 / 导入趁虚而入。
+  useEffect(() => {
+    const handler = (event: Event) => {
+      if (!indexJobReleaseRef.current) return;
+      const reason = (event as CustomEvent<{ reason?: string } | null>).detail?.reason;
+      if (reason === "rebuilt" || reason === "rebuild-failed") releaseIndexJob();
+    };
+    window.addEventListener("app:story-index-updated", handler);
+    return () => window.removeEventListener("app:story-index-updated", handler);
+  }, [releaseIndexJob]);
 
   const handleRebuildIndex = useCallback(() => {
     setError(null);

@@ -119,6 +119,29 @@ function describeSearchError(err: unknown): string {
 }
 
 /**
+ * 重建收场广播。事件名复用 useAutoIndex 已有的 `app:story-index-updated`，
+ * detail 形状也保持一致，只是 reason 标出成败（rebuilt / rebuild-failed）。
+ * 设置页发起的重建（`app:rebuild-story-index` 路径）由设置页拿着 "index"
+ * 任务锁：它靠这条广播在重建结束的瞬间放锁，而不是干等 30s 看门狗——
+ * 尤其是重建一启动就失败、后端一条 index-progress 都没发的情况。
+ */
+function dispatchIndexRebuildFinished(succeeded: boolean, status: StoryIndexStatus | null) {
+  try {
+    window.dispatchEvent(
+      new CustomEvent("app:story-index-updated", {
+        detail: {
+          ready: status?.ready ?? false,
+          total: status?.total ?? 0,
+          reason: succeeded ? "rebuilt" : "rebuild-failed",
+        },
+      })
+    );
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
  * 半截的查询串先别发出去：引号还没配对、或者停在 `-` / `OR` 上时，
  * 后端只会返回一堆噪音，用户每敲一个符号就闪一次"没有结果"。
  */
@@ -883,14 +906,16 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     void handleSearch();
   };
 
-  const refreshIndexStatus = useCallback(async () => {
+  const refreshIndexStatus = useCallback(async (): Promise<StoryIndexStatus | null> => {
     try {
       const status = await api.getStoryIndexStatus();
       setIndexStatus(status);
       setIndexError(null);
+      return status;
     } catch (err) {
       devLog("获取索引状态失败", err);
       setIndexError("获取索引状态失败");
+      return null;
     }
   }, []);
 
@@ -898,6 +923,8 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
    * 重建主体，不负责抢锁：`app:rebuild-story-index` 事件路径的锁由派发方
    * （设置页先 acquireDataJob("index") 再派发）持有，这里再抢一次必然失败；
    * 面板内按钮走下面的 handleBuildIndex，由它抢锁后再进来。
+   * 无论成败，收场时都会广播 `app:story-index-updated`（reason 标出成败），
+   * 设置页靠它在重建结束的第一时间释放 "index" 任务锁。
    */
   const runBuildIndex = useCallback(async () => {
     // 已经在建（比如设置页刚派发过事件）：重复跑只会让两次写库互相拖慢。
@@ -907,10 +934,13 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     setIndexMessage(null);
     // 同样先给不确定态；真实进度由挂载时注册的 index-progress 监听填。
     setIndexProgress({ phase: "准备", current: 0, total: 0, message: "" });
+    let succeeded = false;
+    let finalStatus: StoryIndexStatus | null = null;
     try {
       setBuildingIndex(true);
       await api.buildStoryIndex();
-      await refreshIndexStatus();
+      succeeded = true;
+      finalStatus = await refreshIndexStatus();
       setIndexMessage("全文索引建立完成");
       toast.success("全文索引建立完成");
     } catch (err) {
@@ -921,6 +951,9 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
       buildingIndexRef.current = false;
       setBuildingIndex(false);
       setIndexProgress(null);
+      // 失败也要广播：设置页那头正拿着锁等结果，收不到终态就只能吊到
+      // 看门狗超时，期间同步 / 导入 / 更新的入口全被白白锁住。
+      dispatchIndexRebuildFinished(succeeded, finalStatus);
     }
   }, [refreshIndexStatus, toast]);
 
@@ -1084,8 +1117,8 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     };
   }, []);
 
-  // 自动索引 hook 重建完成后会派发 `app:story-index-updated`；这里监听
-  // 一下把状态条刷成"已就绪"，不用再等用户手动切页。
+  // 自动索引 hook 和本面板的重建收场都会派发 `app:story-index-updated`；
+  // 这里监听一下把状态条刷成最新，不用再等用户手动切页。
   useEffect(() => {
     const handler = () => {
       void refreshIndexStatus();
