@@ -183,12 +183,14 @@ export const CustomScrollArea = forwardRef<HTMLDivElement, CustomScrollAreaProps
           offsetY: event.clientY - thumbRect.top,
         };
 
-        if (thumb.setPointerCapture) {
-          try {
-            thumb.setPointerCapture(event.pointerId);
-          } catch (error) {
-            console.warn("[ScrollArea] setPointerCapture failed", error);
-          }
+        /* 捕获失败不影响功能：拖动本来就是靠 window 上的 pointermove /
+           pointerup 跟的，捕获只是让指针移出滑块后事件仍打在滑块上。
+           指针在同一帧里被取消（触摸被滚动手势接管、鼠标被拔掉）时抛
+           NotFoundError 是常态，为此往控制台刷一行警告纯属噪音。 */
+        try {
+          thumb.setPointerCapture?.(event.pointerId);
+        } catch {
+          /* 忽略：走 window 监听的兜底路径。 */
         }
       },
       [clearHideTimer, showTrack]
@@ -228,12 +230,11 @@ export const CustomScrollArea = forwardRef<HTMLDivElement, CustomScrollAreaProps
         if (!drag) return;
 
         draggingRef.current = null;
-        if (thumbRef.current?.releasePointerCapture) {
-          try {
-            thumbRef.current.releasePointerCapture(event.pointerId);
-          } catch (error) {
-            console.warn("[ScrollArea] releasePointerCapture failed", error);
-          }
+        // 先问 hasPointerCapture 再释放：没捕获时直接调 release 会抛，
+        // 而「没捕获」在 pointercancel 路径上是正常情况。
+        const thumb = thumbRef.current;
+        if (thumb?.hasPointerCapture?.(event.pointerId)) {
+          thumb.releasePointerCapture(event.pointerId);
         }
         scheduleHide();
       };

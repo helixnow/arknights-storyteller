@@ -1,4 +1,4 @@
-import { type KeyboardEvent, useCallback, useRef } from "react";
+import { type KeyboardEvent, useCallback, useEffect, useRef } from "react";
 import { Book, Home, Search, Settings, Users2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -27,8 +27,55 @@ export function tabPanelId(tab: Tab) {
   return `tab-panel-${tab}`;
 }
 
+/* 打开阅读器时导航会被卸载，关闭时重新挂载。入场动画只在本次会话第一次
+   挂载时播：否则每次退出阅读器，底栏都要再从屏幕外滑上来一遍，看着像页面
+   在抖。用模块级变量而不是 state——它要跨组件实例存活。 */
+let hasPlayedEntrance = false;
+
+/** 其它浮层（toast 等）避让底栏用的 CSS 变量名，定义见 index.css。 */
+const INSET_VAR = "--bottom-nav-inset";
+
 export function BottomNav({ activeTab, onTabChange }: BottomNavProps) {
   const buttonsRef = useRef<Array<HTMLButtonElement | null>>([]);
+  const navRef = useRef<HTMLElement | null>(null);
+  const playEntranceRef = useRef(!hasPlayedEntrance);
+
+  /* 把「屏幕底边到导航上沿」的实测距离发布成 CSS 变量。高度受字号/换行影响
+     算不准，所以只能量；量到之后交给 CSS，浮层就不用各自去 querySelector。
+     卸载时删掉变量而不是写 0：读的一方 `var(--bottom-nav-inset, …)` 才能
+     落到「没有底栏」的兜底值上。 */
+  useEffect(() => {
+    hasPlayedEntrance = true;
+    const nav = navRef.current;
+    if (!nav) return;
+    const root = document.documentElement;
+
+    const sync = () => {
+      // 用 offsetHeight + 计算后的 bottom，而不是 getBoundingClientRect：
+      // 入场动画期间导航还带着 translateY，量矩形会得到一个偏小的值，而动画
+      // 结束不触发任何观察器，那个错值就会一直留着。这两个量都只看布局，
+      // 不受 transform 影响；`bottom` 还顺带把 max()/env() 解析成了 px。
+      const bottom = Number.parseFloat(window.getComputedStyle(nav).bottom);
+      const inset = nav.offsetHeight + (Number.isFinite(bottom) ? bottom : 0);
+      root.style.setProperty(INSET_VAR, `${Math.round(inset)}px`);
+    };
+
+    sync();
+
+    // 导航自身高度变化（字号、换行）用 ResizeObserver；视口高度变化时导航
+    // 尺寸没变、但它离底边的距离变了，得靠 resize/旋转事件兜住。
+    const observer = new ResizeObserver(sync);
+    observer.observe(nav);
+    window.addEventListener("resize", sync);
+    window.addEventListener("orientationchange", sync);
+
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", sync);
+      window.removeEventListener("orientationchange", sync);
+      root.style.removeProperty(INSET_VAR);
+    };
+  }, []);
 
   // tablist 的键盘规范：方向键在 tab 之间移动焦点并切换，Home/End 跳首尾。
   // 配合 roving tabindex（只有当前 tab 参与 Tab 键序列）。
@@ -72,8 +119,13 @@ export function BottomNav({ activeTab, onTabChange }: BottomNavProps) {
 
   return (
     <nav
+      ref={navRef}
       aria-label="主导航"
-      className="bottom-nav-glass motion-safe:animate-in motion-safe:slide-in-from-bottom-8 motion-safe:duration-500"
+      className={cn(
+        "bottom-nav-glass",
+        playEntranceRef.current &&
+          "motion-safe:animate-in motion-safe:slide-in-from-bottom-8 motion-safe:duration-500"
+      )}
     >
       <div
         role="tablist"
@@ -93,12 +145,16 @@ export function BottomNav({ activeTab, onTabChange }: BottomNavProps) {
               type="button"
               role="tab"
               aria-selected={active}
+              /* aria-selected 说的是「这个 tab 被选中」，aria-current="page"
+                 说的是「你现在就在这一页」。屏幕阅读器的地标/导航速览里读的是
+                 后者，缺了它用户在导航里跳来跳去时不知道自己站在哪。 */
+              aria-current={active ? "page" : undefined}
               aria-controls={tabPanelId(id)}
               tabIndex={active ? 0 : -1}
               onClick={() => onTabChange(id)}
               onKeyDown={(event) => handleKeyDown(event, index)}
               className={cn(
-                "bottom-nav-pill relative flex flex-col items-center justify-center gap-0.5 flex-1 min-h-[52px] rounded-3xl px-2 pt-1.5 pb-2.5 select-none",
+                "bottom-nav-pill relative flex flex-col items-center justify-center gap-0.5 flex-1 min-h-[52px] min-w-[44px] rounded-3xl px-2 pt-1.5 pb-2.5 select-none",
                 active
                   ? "font-semibold text-[hsl(var(--color-primary))]"
                   : "text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-foreground))]"

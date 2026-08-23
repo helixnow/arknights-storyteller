@@ -152,6 +152,11 @@
      reserved for short, delightful motions like button press rebound. */
   --ease-spring: cubic-bezier(0.32, 0.72, 0, 1);
   --ease-spring-snappy: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  /* 焦点环的唯一尺寸来源。组件里手写的 `ring-2` 与下面的 outline 基线都按
+     这两个值走，键盘用户在任何控件上看到的环宽/环距才是一致的。 */
+  --focus-ring-width: 2px;
+  --focus-ring-offset: 2px;
 }
 
 :root[data-theme-color="book"] {
@@ -338,6 +343,10 @@
 }
 html, body {
   overflow: hidden;
+  /* 文档本身不滚动，纵向的橡皮筋/下拉刷新只会和阅读器的手势抢触摸序列：
+     滚动区已经用 `overscroll-behavior: contain` 挡住了链式滚动，这里再把
+     文档层的回弹关掉。横轴不动，保留浏览器的左缘返回手势。 */
+  overscroll-behavior-y: none;
 }
 
 html, body, #root {
@@ -359,6 +368,42 @@ body {
      避免退回到 text-shadow 这类 hack。实际 macOS/iOS/Windows 上通常还会
      再落回到系统的 PingFang / 微软雅黑 的真粗体。 */
   font-synthesis: weight;
+}
+
+/* ===== 焦点环基线 =====
+ * 组件如果自己画环（Tailwind 的 `focus-visible:outline-none` + `ring-*`），
+ * 类选择器会盖掉这条规则，不会出现「outline + ring」两层环；剩下那些从没写过
+ * 焦点样式的元素（底部导航的 tab、卡片上的行按钮……）则落到这条基线上，拿到
+ * 与 ring 同宽同色的环，而不是各浏览器各画一套默认虚线。
+ * 用 `:where()` 保持 0 特异性，任何组件级样式都能覆盖。
+ */
+:where(:focus-visible) {
+  outline: var(--focus-ring-width) solid hsl(var(--color-ring));
+  outline-offset: var(--focus-ring-offset);
+}
+
+/* iOS/Android WebView 点击时那块半透明灰色方块会盖住圆角、并且比我们自己的
+   按下反馈晚半拍。控件本身都有 hover/active 态，这里统一关掉系统高亮；
+   `touch-action: manipulation` 顺带去掉 300ms 双击缩放延迟。
+   注意不要扩到整个 `*`：正文文本的长按选择高亮要保留。 */
+:where(
+  a[href],
+  button,
+  summary,
+  label,
+  select,
+  [role="button"],
+  [role="tab"],
+  [role="switch"],
+  [role="option"],
+  [role="menuitem"]
+) {
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+:where(input, textarea) {
+  -webkit-tap-highlight-color: transparent;
 }
 
 /* 页面统一左右留白与最大宽度 */
@@ -755,7 +800,11 @@ body {
   height: 100%;
   overflow-y: auto;
   overflow-x: hidden;
-  overscroll-behavior: contain;
+  /* contain 而不是 auto：滚到顶/底继续拖时不把滚动链传给文档，否则整页跟着
+     橡皮筋位移，阅读器的左缘返回/翻页手势会在回弹动画里被打断。
+     横轴保持默认（auto）：这里 overflow-x 是 hidden，本来就不会产生横向
+     overscroll，写死 none 反而会连带禁掉浏览器自带的左缘返回导航。 */
+  overscroll-behavior-y: contain;
   scrollbar-width: none;
 }
 
@@ -942,16 +991,47 @@ input[type="range"]::-moz-range-thumb {
   );
 }
 
-/* ===== 尊重 prefers-reduced-motion ===== */
+/* ===== 尊重 prefers-reduced-motion =====
+ *
+ * 收口原则：
+ *  - 只改 duration / delay / iteration-count，绝不动 transform、opacity 这类
+ *    「最终态」属性。滚动条滑块的 translateY、卡片背景的 scale、玻璃导航靠
+ *    translateZ(0) 提层都在用 transform，`transform: none !important` 会直接
+ *    把布局和合成层打坏。
+ *  - 用 0.01ms 而不是 0s：时长为 0 的动画/过渡不会派发 animationend /
+ *    transitionend，靠这些事件收尾的组件会永远停在中间态。
+ */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
-    animation-duration: 0.001ms !important;
+    animation-duration: 0.01ms !important;
+    animation-delay: 0s !important;
     animation-iteration-count: 1 !important;
-    transition-duration: 0.001ms !important;
+    transition-duration: 0.01ms !important;
+    transition-delay: 0s !important;
     scroll-behavior: auto !important;
   }
+
+  /* 「还在转/还在加载」是状态信息而不是装饰。上面那条会把 spinner 冻结成一个
+     歪着的静止图标，看起来像卡死，所以这两类循环动画保留，只放慢到不刺眼的
+     速度（旋转≈1.5 倍慢，骨架屏呼吸≈3 倍慢）。 */
+  .animate-spin {
+    animation-duration: 1.5s !important;
+    animation-iteration-count: infinite !important;
+  }
+  .animate-pulse {
+    animation-duration: 3s !important;
+    animation-iteration-count: infinite !important;
+  }
+
   .reader-scroll {
     scroll-behavior: auto;
+  }
+
+  /* 悬停时的位移是纯装饰，留着只会变成「瞬移」，不如直接取消。
+     （底部导航按下的回弹在 `.bottom-nav-pill` 那一节就近处理，
+     写在这里会被后面的规则按源码顺序盖掉。） */
+  .reader-highlight-toggle:hover {
+    transform: none;
   }
 }
 
@@ -1164,6 +1244,13 @@ input[type="range"]::-moz-range-thumb {
  *   - isolation: isolate：隔绝上层 stacking context 的影响，避免某些
  *     Safari 版本在祖先含 filter/transform 时把 backdrop-filter 当成无效
  */
+/*
+ * 浮岛离屏幕底边的距离由 `bottom` 决定，高度由内容决定，两者相加才是「其它
+ * 悬浮层需要避开的净空」。BottomNav 挂载后会把实测值写进
+ * `--bottom-nav-inset`（见 BottomNav.tsx），卸载时删掉；toast 之类的浮层直接
+ * `var(--bottom-nav-inset, 0px)` 读，读不到就退回只避开 home indicator 的
+ * 安全间距——阅读器里没有底栏，正好是这条兜底路径。
+ */
 .bottom-nav-glass {
   position: fixed;
   left: max(0.75rem, env(safe-area-inset-left, 0px));
@@ -1186,12 +1273,64 @@ input[type="range"]::-moz-range-thumb {
     background: hsl(var(--color-background) / 0.96);
   }
 }
+/* 最小点击区（≥44×44）写在组件的 Tailwind 类里：这里的规则不在
+   `@layer utilities` 中，会无条件盖过 `min-h-*`，放在这反而会把目标改小。 */
 .bottom-nav-pill {
   transition: background-color 0.2s ease, color 0.2s ease, transform 0.15s ease;
+}
+/* 关掉了系统的灰色点按高亮，就得自己给一个按下反馈。 */
+.bottom-nav-pill:active {
+  transform: scale(0.96);
+}
+/* 浮岛是贴边的，焦点环画在外侧会被圆角裁掉，所以往里收。 */
+.bottom-nav-pill:focus-visible {
+  outline: var(--focus-ring-width) solid hsl(var(--color-ring));
+  outline-offset: calc(-1 * var(--focus-ring-width));
+}
+@media (prefers-reduced-motion: reduce) {
+  .bottom-nav-pill:active {
+    transform: none;
+  }
 }
 .bottom-nav-pill[aria-selected="true"] {
   background: hsl(var(--color-primary) / 0.14);
   color: hsl(var(--color-primary));
+}
+
+/* ===== Toast 浮层 ===== */
+/*
+ * 位置完全交给 CSS：底栏在就贴着它上沿浮，不在（阅读器全屏）就只避开
+ * home indicator，两者取大值。这样底栏出现/消失、旋转屏幕、字号变化时
+ * 浏览器自己重算，不需要 toast 每次弹出都读一遍布局。
+ */
+.toast-viewport {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: max(
+    calc(var(--bottom-nav-inset, 0px) + 12px),
+    calc(env(safe-area-inset-bottom, 0px) + 1.25rem)
+  );
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+  padding-left: max(1rem, env(safe-area-inset-left, 0px));
+  padding-right: max(1rem, env(safe-area-inset-right, 0px));
+  pointer-events: none;
+}
+
+/* ===== KeepAlive 面板 =====
+ * 面板常驻挂载、只切可见性（见 KeepAlive.tsx）。隐藏面板里的循环动画仍然
+ * 会一帧一帧合成——四个面板的骨架屏/spinner 同时转，等于白烧一半合成预算。
+ * 暂停而不是取消：切回来时接着播，不会出现「进度条从头开始」的突兀感。
+ */
+[data-keepalive-active="false"],
+[data-keepalive-active="false"] *,
+[data-keepalive-active="false"] *::before,
+[data-keepalive-active="false"] *::after {
+  animation-play-state: paused;
 }
 
 /* 人物统计网格：视口外的卡片跳过绘制/布局。400+ 行的面板，

@@ -3,7 +3,6 @@ import {
   useCallback,
   useContext,
   useEffect,
-  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -67,24 +66,8 @@ const ICON_CLASSES: Record<ToastKind, string> = {
   error: "text-[hsl(var(--color-status-error))]",
 };
 
-/* 阅读器里没有底部导航岛，按 5rem 抬起来会让提示悬在半空。改成实测：
-   底栏存在就贴着它上沿放，不存在就退回一个只避开 home indicator 的
-   安全间距。 */
-const FALLBACK_BOTTOM = "calc(env(safe-area-inset-bottom, 0px) + 1.25rem)";
-const NAV_GAP_PX = 12;
-
-function measureBottomInset(): string {
-  if (typeof document === "undefined") return FALLBACK_BOTTOM;
-  const nav = document.querySelector<HTMLElement>(".bottom-nav-glass");
-  if (!nav) return FALLBACK_BOTTOM;
-  const rect = nav.getBoundingClientRect();
-  const inset = Math.round(window.innerHeight - rect.top) + NAV_GAP_PX;
-  return inset > 0 ? `${inset}px` : FALLBACK_BOTTOM;
-}
-
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [toasts, setToasts] = useState<ToastPayload[]>([]);
-  const [bottomInset, setBottomInset] = useState(FALLBACK_BOTTOM);
   const nextId = useRef(1);
 
   const remove = useCallback((id: number) => {
@@ -105,20 +88,6 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     []
   );
 
-  // 只在有提示时才测量/监听窗口变化，平时不挂任何监听器。
-  const hasToasts = toasts.length > 0;
-  useLayoutEffect(() => {
-    if (!hasToasts) return;
-    const sync = () => setBottomInset(measureBottomInset());
-    sync();
-    window.addEventListener("resize", sync);
-    window.addEventListener("orientationchange", sync);
-    return () => {
-      window.removeEventListener("resize", sync);
-      window.removeEventListener("orientationchange", sync);
-    };
-  }, [hasToasts]);
-
   const value = useMemo<ToastContextValue>(
     () => ({
       show,
@@ -132,10 +101,10 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   return (
     <ToastContext.Provider value={value}>
       {children}
-      <div
-        className="pointer-events-none fixed inset-x-0 z-[100] flex flex-col items-center gap-2 px-4"
-        style={{ bottom: bottomInset }}
-      >
+      {/* 抬升高度由 `.toast-viewport` 读 BottomNav 发布的 --bottom-nav-inset
+          决定：底栏在就贴着它上沿，阅读器全屏时自动落回只避开 home indicator
+          的安全间距，不需要在这里测量布局。 */}
+      <div className="toast-viewport">
         {toasts.map((t) => (
           <ToastItem key={t.id} toast={t} onDismiss={remove} />
         ))}
