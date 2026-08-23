@@ -229,6 +229,15 @@ function loadCacheMap<T extends { page: unknown; updatedAt: number; version: str
   }
 }
 
+function writeJson(key: string, value: unknown) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch (err) {
+    // 配额满 / 隐私模式：缓存只是加速手段，丢了不影响功能。
+    devLog(`写入缓存 ${key} 失败`, err);
+  }
+}
+
 /**
  * 段级缓存落盘。零命中的条目一律不写：下次搜索会直接命中空结果，
  * 从而永久绕开"段落搜不到就自动改搜整篇"的兜底。
@@ -238,15 +247,6 @@ function persistSegmentCache(map: Record<string, CachedSegmentPage>) {
     SEGMENT_CACHE_KEY,
     Object.fromEntries(Object.entries(map).filter(([, entry]) => entry.page.hits.length > 0))
   );
-}
-
-function writeJson(key: string, value: unknown) {
-  try {
-    localStorage.setItem(key, JSON.stringify(value));
-  } catch (err) {
-    // 配额满 / 隐私模式：缓存只是加速手段，丢了不影响功能。
-    devLog(`写入缓存 ${key} 失败`, err);
-  }
 }
 
 // ─────────────────────────────────────────────────────────
