@@ -79,6 +79,35 @@ pub fn run() {
         builder = builder.plugin(crate::image_sharer::init());
     }
 
+    let context = tauri::generate_context!();
+
+    // Android 端两个内联移动插件（apk-updater / image-sharer）由 lib.rs 里的
+    // `tauri::plugin::Builder` 直接构建，build.rs 没有对应的 InlinedPlugin
+    // 权限清单，capabilities/*.json 也因此无法引用它们的权限（引用不存在的
+    // 权限会让构建直接失败）。而 Tauri 2 对所有 `plugin:` 前缀的 invoke 都
+    // 强制走 ACL：不补授权的话，前端 invoke("plugin:apk-updater|…") /
+    // ("plugin:image-sharer|…") 会被一律拒绝——应用内更新、保存到相册、
+    // 系统分享在 Android 上整个失效。这里在运行时把这五条命令按最小范围
+    // 放行：仅 Android 编译、仅本地（Local）来源，窗口约束与
+    // capabilities/default.json 的 main 主窗口一致（本应用只有这一个窗口）。
+    #[cfg(target_os = "android")]
+    let context = {
+        use tauri::utils::acl::ExecutionContext;
+
+        let mut context = context;
+        let authority = context.runtime_authority_mut();
+        for cmd in [
+            "plugin:apk-updater|download_and_install",
+            "plugin:apk-updater|open_install_permission_settings",
+            "plugin:image-sharer|save_image",
+            "plugin:image-sharer|share_image",
+            "plugin:image-sharer|open_storage_permission_settings",
+        ] {
+            authority.__allow_command(cmd.to_string(), ExecutionContext::Local);
+        }
+        context
+    };
+
     builder
         .setup(|app| {
             // 解析不出数据目录属于致命配置错误，交给 Tauri 的 setup 错误
@@ -139,6 +168,6 @@ pub fn run() {
             commands::get_story_neighbors,
             commands::get_story_category_name,
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running tauri application");
 }
