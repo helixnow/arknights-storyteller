@@ -77,10 +77,21 @@ class ApkUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
         }
 
         runOnMain {
-          promptInstall(apkFile)
-          val result = JSObject()
-          result.put("status", "install-intent-launched")
-          invoke.resolve(result)
+          // 这里已经离开协程的 try/catch：个别 ROM / TV 盒子上没有能处理
+          // APK 安装 intent 的组件，startActivity 会抛 ActivityNotFoundException，
+          // 主线程未捕获异常会直接闪退。必须就地兜住并转成可读的 reject。
+          try {
+            promptInstall(apkFile)
+            val result = JSObject()
+            result.put("status", "install-intent-launched")
+            invoke.resolve(result)
+          } catch (error: Exception) {
+            val detail = error.message?.trim().orEmpty()
+            invoke.reject(
+              if (detail.isEmpty()) "无法启动系统安装界面"
+              else "无法启动系统安装界面：$detail"
+            )
+          }
         }
       } catch (cancelled: CancellationException) {
         // Plugin destroyed mid-download; nobody is listening for the result.
@@ -94,12 +105,26 @@ class ApkUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
   @Command
   fun openInstallPermissionSettings(invoke: Invoke) {
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-      val intent = Intent(
-        Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-        Uri.parse("package:${activity.packageName}")
-      )
-      intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-      activity.startActivity(intent)
+      // 部分 ROM / TV 盒子不认带 package: URI 的形式（抛
+      // ActivityNotFoundException），退化到全局"安装未知应用"列表；
+      // 两者都失败时给出可读错误，避免用户困在"需要权限"却无处授权。
+      try {
+        val intent = Intent(
+          Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+          Uri.parse("package:${activity.packageName}")
+        )
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        activity.startActivity(intent)
+      } catch (specific: Exception) {
+        try {
+          val fallback = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES)
+          fallback.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+          activity.startActivity(fallback)
+        } catch (generic: Exception) {
+          invoke.reject("无法打开安装权限设置，请在系统设置中手动允许本应用安装未知应用")
+          return
+        }
+      }
     }
     invoke.resolve()
   }
@@ -165,7 +190,10 @@ class ApkUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
   private fun sanitizeApkFileName(input: String?): String? {
     val trimmed = input?.trim().orEmpty()
     if (trimmed.isEmpty()) return null
-    val cleaned = trimmed.replace(Regex("[\\\\/:*?\"<>|\\u0000]+"), "_").take(128)
+    // Linux 文件名上限是 255 字节而非字符：Rust 侧对长度没有兜底，中文
+    // 每字占 3 字节，按 80 个 UTF-16 单元截断（≤240 字节，加 .apk 后缀
+    // 仍 ≤244 字节）才能保证落盘不因 ENAMETOOLONG 失败。
+    val cleaned = trimmed.replace(Regex("[\\\\/:*?\"<>|\\u0000]+"), "_").take(80)
     if (cleaned.all { it == '.' }) return null
     return if (cleaned.endsWith(".apk", ignoreCase = true)) cleaned else "$cleaned.apk"
   }

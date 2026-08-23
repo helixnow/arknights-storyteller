@@ -176,7 +176,10 @@ class ImageSharerPlugin(private val activity: Activity) : Plugin(activity) {
     if (trimmed.isEmpty()) return null
     // Strip path separators / null bytes to keep MediaStore happy and rule
     // out traversal; cap the length so the filesystem never rejects the name.
-    val cleaned = trimmed.replace(Regex("[\\\\/:*?\"<>|\\u0000]+"), "_").take(120)
+    // 注意上限按字节算：Linux 文件名最长 255 字节，中文每字 3 字节，Rust
+    // 侧截到 80 字符（可达 244 字节）后再叠加分享缓存的时间戳前缀（14 字
+    // 节）就会超限。76 个 UTF-16 单元 ≤228 字节，加 .png 与前缀 ≤246 字节。
+    val cleaned = trimmed.replace(Regex("[\\\\/:*?\"<>|\\u0000]+"), "_").take(76)
     if (cleaned.all { it == '.' }) return null
     return if (cleaned.endsWith(".png", ignoreCase = true)) cleaned else "$cleaned.png"
   }
