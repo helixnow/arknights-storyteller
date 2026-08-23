@@ -84,6 +84,10 @@ struct Case<'a> {
 /// - story_code lookup
 /// - character nicknames
 /// - corner cases (empty-ish, pure punctuation)
+///
+/// Note: CJK is tokenized one character at a time (no jieba / user dictionary
+/// any more), so a multi-char name is an AND over its characters rather than a
+/// single dictionary word. Expectations below are stated in those terms.
 const QUERIES: &[Case<'static>] = &[
     Case { query: "凯尔希", min_story_hits: 100, min_segment_hits: 500, expected_story_id: None, note: "core operator name, very common" },
     Case { query: "阿米娅", min_story_hits: 100, min_segment_hits: 500, expected_story_id: None, note: "primary protagonist" },
@@ -91,18 +95,18 @@ const QUERIES: &[Case<'static>] = &[
     Case { query: "罗德岛", min_story_hits: 150, min_segment_hits: 800, expected_story_id: None, note: "faction name" },
     Case { query: "整合运动", min_story_hits: 50, min_segment_hits: 200, expected_story_id: None, note: "antagonist faction" },
     Case { query: "源石", min_story_hits: 100, min_segment_hits: 400, expected_story_id: None, note: "lore term" },
-    Case { query: "源石技艺", min_story_hits: 20, min_segment_hits: 80, expected_story_id: None, note: "compound lore term must be recognized whole" },
+    Case { query: "源石技艺", min_story_hits: 20, min_segment_hits: 80, expected_story_id: None, note: "compound lore term, matched as an AND over its characters" },
     Case { query: "感染者", min_story_hits: 50, min_segment_hits: 200, expected_story_id: None, note: "lore term" },
     Case { query: "PRTS", min_story_hits: 30, min_segment_hits: 150, expected_story_id: None, note: "ASCII acronym with prefix matching" },
     Case { query: "prts", min_story_hits: 30, min_segment_hits: 150, expected_story_id: None, note: "ASCII is case-insensitive" },
     Case { query: "凯尔希 阿米娅", min_story_hits: 30, min_segment_hits: 50, expected_story_id: None, note: "AND over two operator names" },
-    Case { query: "凯尔希阿米娅", min_story_hits: 30, min_segment_hits: 50, expected_story_id: None, note: "must jieba-split to two names" },
+    Case { query: "凯尔希阿米娅", min_story_hits: 30, min_segment_hits: 50, expected_story_id: None, note: "no whitespace — char-level AND still recovers both names" },
     Case { query: "阿米娅 or 凯尔希", min_story_hits: 200, min_segment_hits: 800, expected_story_id: None, note: "OR union must match each name" },
     Case { query: "-凯尔希 博士", min_story_hits: 50, min_segment_hits: 300, expected_story_id: None, note: "NOT exclusion with implicit AND on second term" },
     Case { query: "\"凯尔希\"", min_story_hits: 100, min_segment_hits: 500, expected_story_id: None, note: "quoted phrase = exact name" },
-    Case { query: "德克萨斯", min_story_hits: 30, min_segment_hits: 100, expected_story_id: None, note: "user-dict operator" },
-    Case { query: "能天使", min_story_hits: 20, min_segment_hits: 60, expected_story_id: None, note: "user-dict operator" },
-    Case { query: "特蕾西娅", min_story_hits: 10, min_segment_hits: 30, expected_story_id: None, note: "4-char user-dict name" },
+    Case { query: "德克萨斯", min_story_hits: 30, min_segment_hits: 100, expected_story_id: None, note: "operator name" },
+    Case { query: "能天使", min_story_hits: 20, min_segment_hits: 60, expected_story_id: None, note: "operator name" },
+    Case { query: "特蕾西娅", min_story_hits: 10, min_segment_hits: 30, expected_story_id: None, note: "4-char operator name" },
     Case { query: "Rhodes Island", min_story_hits: 0, min_segment_hits: 0, expected_story_id: None, note: "Latin name — may not be common, but must not crash" },
     Case { query: "你好吗", min_story_hits: 5, min_segment_hits: 10, expected_story_id: None, note: "short common phrase" },
     Case { query: "大地惊雷", min_story_hits: 1, min_segment_hits: 1, expected_story_id: Some("1stact_level_a001_ex01_end"), note: "exact story name lookup must rank first" },
@@ -112,7 +116,7 @@ const QUERIES: &[Case<'static>] = &[
     Case { query: "***", min_story_hits: 0, min_segment_hits: 0, expected_story_id: None, note: "pure FTS specials → no results, must not error" },
     Case { query: "阿", min_story_hits: 100, min_segment_hits: 500, expected_story_id: None, note: "single CJK char fallback must still match via per-char tokens" },
     Case { query: "希", min_story_hits: 100, min_segment_hits: 500, expected_story_id: None, note: "single CJK char" },
-    Case { query: "莱茵生命", min_story_hits: 20, min_segment_hits: 60, expected_story_id: None, note: "user-dict org name" },
+    Case { query: "莱茵生命", min_story_hits: 20, min_segment_hits: 60, expected_story_id: None, note: "org name" },
     Case { query: "炎国", min_story_hits: 5, min_segment_hits: 10, expected_story_id: None, note: "two-char faction name" },
     Case { query: "abcdxyz", min_story_hits: 0, min_segment_hits: 0, expected_story_id: None, note: "nonsense ASCII — no matches" },
 ];

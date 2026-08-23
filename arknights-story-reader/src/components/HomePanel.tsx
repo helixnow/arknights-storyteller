@@ -12,6 +12,8 @@ type Tab = "home" | "stories" | "characters" | "search" | "settings";
 interface HomePanelProps {
   onSelectStory: (story: StoryEntry) => void;
   onGoToTab: (tab: Tab) => void;
+  /** 可选：直接跳到剧情页的「收藏」分类。不传时走 `app:open-favorites` 事件。 */
+  onGoToFavorites?: () => void;
 }
 
 interface RecentItem {
@@ -22,6 +24,10 @@ interface RecentItem {
 
 const STREAK_KEY = "arknights-reading-streak-v1";
 const PROGRESS_KEY = "reading-progress";
+/** 扫描最近进度的上限：够算「最近阅读 N 章」，又不会把整个 map 都解析成卡片。 */
+const RECENT_SCAN_LIMIT = 60;
+/** 首页最多渲染几张最近阅读卡片（含「继续阅读」大卡）。 */
+const RECENT_RENDER_LIMIT = 5;
 
 interface StreakInfo {
   currentStreak: number;
@@ -63,12 +69,13 @@ function readRecentProgress(): RecentItem[] {
   }
 }
 
-export function HomePanel({ onSelectStory, onGoToTab }: HomePanelProps) {
-  const { favoriteStories } = useFavorites();
+export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePanelProps) {
+  const { favoriteStories, favoriteGroups } = useFavorites();
   const [recentStories, setRecentStories] = useState<Array<{ entry: StoryEntry; meta: RecentItem }>>([]);
   const [highlight, setHighlight] = useState<StoryEntry | null>(null);
   const [loading, setLoading] = useState(true);
-  const [installed, setInstalled] = useState(true);
+  // null = 还没问过后端。先渲染骨架，避免闪一下「已安装」再跳回未同步。
+  const [installed, setInstalled] = useState<boolean | null>(null);
   const [streak, setStreak] = useState<StreakInfo>(() => readStreak());
 
   const loadHome = useCallback(async () => {
@@ -77,11 +84,13 @@ export function HomePanel({ onSelectStory, onGoToTab }: HomePanelProps) {
       const ok = await api.isInstalled();
       setInstalled(ok);
       if (!ok) {
+        setRecentStories([]);
+        setHighlight(null);
         setLoading(false);
         return;
       }
       // 1) 最近阅读 (从 localStorage 读 progress，storyPath 就是 storyTxt)
-      const entries = readRecentProgress().slice(0, 12);
+      const entries = readRecentProgress().slice(0, RECENT_SCAN_LIMIT);
       // 2) 主线随机一章作为"今日推荐"
       const main = await api.getMainStoriesGrouped();
       const allMain: StoryEntry[] = main.flatMap(([, stories]) => stories);
@@ -107,16 +116,17 @@ export function HomePanel({ onSelectStory, onGoToTab }: HomePanelProps) {
       (rogues as Array<[string, StoryEntry[]]>).forEach(([, ss]) => ss.forEach((s) => byPath.set(s.storyTxt, s)));
       (mems as StoryEntry[]).forEach((s) => byPath.set(s.storyTxt, s));
 
+      // 保留完整命中列表：渲染只取前几张，但「最近阅读 N 章」要用真实数量。
       const matched = entries
         .map((e) => {
           const entry = byPath.get(e.storyPath);
           return entry ? { entry, meta: e } : null;
         })
-        .filter((x): x is { entry: StoryEntry; meta: RecentItem } => x !== null)
-        .slice(0, 5);
+        .filter((x): x is { entry: StoryEntry; meta: RecentItem } => x !== null);
       setRecentStories(matched);
     } catch (err) {
       console.warn("[Home] load failed", err);
+      setInstalled((prev) => prev ?? false);
     } finally {
       setLoading(false);
     }
@@ -127,26 +137,46 @@ export function HomePanel({ onSelectStory, onGoToTab }: HomePanelProps) {
   }, [loadHome]);
 
   useEffect(() => {
-    // Refresh when user returns from reader (approx via visibility or listen
-    // to custom event from reader). We'll refetch each time tab becomes home.
+    // 首页需要在这些时机重新读一遍：从阅读器返回（app:home-refresh）、
+    // 剧情数据刚同步完（app:data-updated）、窗口重新获得焦点。
     const handler = () => {
       void loadHome();
       setStreak(readStreak());
     };
     window.addEventListener("focus", handler);
     window.addEventListener("app:home-refresh", handler);
+    window.addEventListener("app:data-updated", handler);
     return () => {
       window.removeEventListener("focus", handler);
       window.removeEventListener("app:home-refresh", handler);
+      window.removeEventListener("app:data-updated", handler);
     };
   }, [loadHome]);
 
-  const favoritesCount = useMemo(() => Object.keys(favoriteStories).length, [favoriteStories]);
+  // 与剧情页「收藏」分类同口径：单章收藏 + 收藏分组展开后的去重总数。
+  const favoritesCount = useMemo(() => {
+    const ids = new Set<string>(Object.keys(favoriteStories));
+    Object.values(favoriteGroups).forEach((group) => {
+      group.storyIds.forEach((id) => ids.add(id));
+    });
+    return ids.size;
+  }, [favoriteGroups, favoriteStories]);
+
   const continueItem = recentStories[0] ?? null;
+  const showSkeleton = installed === null;
+
+  const handleGoToFavorites = useCallback(() => {
+    if (onGoToFavorites) {
+      onGoToFavorites();
+      return;
+    }
+    window.dispatchEvent(new Event("app:open-favorites"));
+    onGoToTab("stories");
+  }, [onGoToFavorites, onGoToTab]);
 
   return (
     <div className="h-full flex flex-col overflow-hidden">
-      <header className="flex-shrink-0 px-5 pt-6 pb-2 motion-safe:animate-in motion-safe:fade-in-0">
+      <header className="flex-shrink-0 pl-[max(1.25rem,env(safe-area-inset-left,0px))] pr-[max(1.25rem,env(safe-area-inset-right,0px))] pt-6 pb-2 motion-safe:animate-in motion-safe:fade-in-0">
         <div className="text-[11px] uppercase tracking-[0.18em] text-[hsl(var(--color-muted-foreground))]">
           Welcome, Doctor
         </div>
@@ -159,39 +189,46 @@ export function HomePanel({ onSelectStory, onGoToTab }: HomePanelProps) {
           viewportClassName="reader-scroll"
           trackOffsetBottom="calc(5rem + env(safe-area-inset-bottom, 0px))"
         >
-          <div className="px-5 pb-32 space-y-6">
-            {!installed && (
+          <div className="pl-[max(1.25rem,env(safe-area-inset-left,0px))] pr-[max(1.25rem,env(safe-area-inset-right,0px))] pb-32 space-y-6">
+            {showSkeleton && <HomeSkeleton />}
+
+            {installed === false && (
               <div className="rounded-2xl border border-dashed border-[hsl(var(--color-border))] p-5 text-sm text-[hsl(var(--color-muted-foreground))]">
-                剧情数据尚未同步。请先去
-                <button
-                  className="mx-1 underline text-[hsl(var(--color-primary))]"
+                <div>剧情数据尚未同步，先去设置里同步一次再回来。</div>
+                <Button
+                  className="mt-3 min-h-[44px]"
                   onClick={() => onGoToTab("settings")}
                 >
-                  设置
-                </button>
-                同步数据。
+                  去设置同步
+                </Button>
               </div>
             )}
 
-            {installed && continueItem ? (
+            {installed === true && continueItem ? (
               <ContinueReadingCard
                 entry={continueItem.entry}
                 percentage={continueItem.meta.percentage}
                 onOpen={() => onSelectStory(continueItem.entry)}
               />
-            ) : installed ? (
+            ) : installed === true ? (
               <EmptyContinueCard onBrowse={() => onGoToTab("stories")} />
             ) : null}
 
-            {installed && (
-              <StreakStrip streak={streak} favoritesCount={favoritesCount} recentCount={recentStories.length} />
+            {installed === true && (
+              <StreakStrip
+                streak={streak}
+                favoritesCount={favoritesCount}
+                recentCount={recentStories.length}
+                onGoToRecent={() => onGoToTab("stories")}
+                onGoToFavorites={handleGoToFavorites}
+              />
             )}
 
-            {installed && recentStories.length > 1 && (
+            {installed === true && recentStories.length > 1 && (
               <section className="space-y-3">
                 <SectionTitle icon={BookOpen} title="最近阅读" />
                 <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                  {recentStories.slice(1, 5).map(({ entry, meta }) => (
+                  {recentStories.slice(1, RECENT_RENDER_LIMIT).map(({ entry, meta }) => (
                     <RecentCard
                       key={entry.storyId}
                       entry={entry}
@@ -203,7 +240,7 @@ export function HomePanel({ onSelectStory, onGoToTab }: HomePanelProps) {
               </section>
             )}
 
-            {installed && highlight && (
+            {installed === true && highlight && (
               <section className="space-y-3">
                 <SectionTitle icon={Sparkles} title="今日推荐" />
                 <RecentCard
@@ -215,14 +252,39 @@ export function HomePanel({ onSelectStory, onGoToTab }: HomePanelProps) {
               </section>
             )}
 
-            {loading && (
+            {!showSkeleton && loading && (
               <div className="text-center text-sm text-[hsl(var(--color-muted-foreground))]">
-                正在准备首页…
+                正在刷新…
               </div>
             )}
           </div>
         </CustomScrollArea>
       </main>
+    </div>
+  );
+}
+
+function HomeSkeleton() {
+  return (
+    <div className="space-y-4" aria-hidden="true">
+      <div className="story-card h-44 w-full motion-safe:animate-pulse bg-[hsl(var(--color-secondary)/0.5)]" />
+      <div className="grid grid-cols-3 gap-2">
+        {[0, 1, 2].map((i) => (
+          <div
+            key={i}
+            className="h-[86px] rounded-2xl border border-[hsl(var(--color-border))] bg-[hsl(var(--color-secondary)/0.4)] motion-safe:animate-pulse"
+          />
+        ))}
+      </div>
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+        {[0, 1].map((i) => (
+          <div
+            key={i}
+            className="h-[88px] rounded-2xl border border-[hsl(var(--color-border))] bg-[hsl(var(--color-secondary)/0.4)] motion-safe:animate-pulse"
+          />
+        ))}
+      </div>
+      <div className="sr-only">首页加载中</div>
     </div>
   );
 }
@@ -293,7 +355,7 @@ function EmptyContinueCard({ onBrowse }: { onBrowse: () => void }) {
         欢迎回到罗德岛。打开任意一章剧情，这里会记住你读到哪里。
       </div>
       <div className="mt-3">
-        <Button size="sm" onClick={onBrowse}>
+        <Button className="min-h-[44px]" onClick={onBrowse}>
           浏览剧情
         </Button>
       </div>
@@ -305,28 +367,71 @@ function StreakStrip({
   streak,
   favoritesCount,
   recentCount,
+  onGoToRecent,
+  onGoToFavorites,
 }: {
   streak: StreakInfo;
   favoritesCount: number;
   recentCount: number;
+  onGoToRecent: () => void;
+  onGoToFavorites: () => void;
 }) {
-  const items = [
+  const items: Array<{
+    icon: typeof BookOpen;
+    label: string;
+    value: string;
+    onClick?: () => void;
+    hint?: string;
+  }> = [
     { icon: Flame, label: "连续阅读", value: `${streak.currentStreak} 天` },
-    { icon: BookOpen, label: "最近阅读", value: `${recentCount} 章` },
-    { icon: Sparkles, label: "收藏剧情", value: `${favoritesCount}` },
+    {
+      icon: BookOpen,
+      label: "最近阅读",
+      value: `${recentCount} 章`,
+      onClick: onGoToRecent,
+      hint: "查看剧情列表",
+    },
+    {
+      icon: Sparkles,
+      label: "收藏剧情",
+      value: `${favoritesCount}`,
+      onClick: onGoToFavorites,
+      hint: "查看收藏",
+    },
   ];
   return (
     <div className="grid grid-cols-3 gap-2">
-      {items.map(({ icon: Icon, label, value }) => (
-        <div
-          key={label}
-          className="flex flex-col items-center gap-1 rounded-2xl border border-[hsl(var(--color-border))] bg-[hsl(var(--color-card))] px-3 py-3 text-center"
-        >
-          <Icon className="h-4 w-4 text-[hsl(var(--color-primary))]" />
-          <div className="text-[11px] text-[hsl(var(--color-muted-foreground))]">{label}</div>
-          <div className="text-sm font-semibold tabular-nums">{value}</div>
-        </div>
-      ))}
+      {items.map(({ icon: Icon, label, value, onClick, hint }) => {
+        const content = (
+          <>
+            <Icon className="h-4 w-4 text-[hsl(var(--color-primary))]" />
+            <div className="text-[11px] text-[hsl(var(--color-muted-foreground))]">{label}</div>
+            <div className="text-sm font-semibold tabular-nums">{value}</div>
+          </>
+        );
+        const shared =
+          "flex min-h-[76px] flex-col items-center justify-center gap-1 rounded-2xl border border-[hsl(var(--color-border))] bg-[hsl(var(--color-card))] px-3 py-3 text-center";
+
+        if (!onClick) {
+          return (
+            <div key={label} className={shared}>
+              {content}
+            </div>
+          );
+        }
+
+        return (
+          <button
+            key={label}
+            type="button"
+            onClick={onClick}
+            aria-label={`${label} ${value}，${hint ?? ""}`}
+            className={`${shared} transition-colors active:scale-[0.98] hover:border-[hsl(var(--color-primary)/0.5)] hover:bg-[hsl(var(--color-accent))]`}
+          >
+            {content}
+          </button>
+        );
+      })}
     </div>
   );
 }
@@ -376,13 +481,26 @@ function RecentCard({
   );
 }
 
+/** 通知首页重新拉取数据（阅读器返回、进度变化等场景）。 */
+export function notifyHomeRefresh() {
+  try {
+    window.dispatchEvent(new Event("app:home-refresh"));
+  } catch {}
+}
+
 /**
  * 供阅读器在打开剧情时调用，更新 streak。
+ *
+ * 无论 streak 本身有没有变化都要广播刷新：当天第二次阅读不会改 streak，
+ * 但阅读进度变了，首页仍然需要重新读一遍。
  */
 export function bumpReadingStreak() {
   const t = todayKey();
   const current = readStreak();
-  if (current.lastReadOn === t) return;
+  if (current.lastReadOn === t) {
+    notifyHomeRefresh();
+    return;
+  }
   let next: StreakInfo;
   const yesterday = new Date();
   yesterday.setDate(yesterday.getDate() - 1);
@@ -398,6 +516,6 @@ export function bumpReadingStreak() {
   }
   try {
     window.localStorage.setItem(STREAK_KEY, JSON.stringify(next));
-    window.dispatchEvent(new Event("app:home-refresh"));
   } catch {}
+  notifyHomeRefresh();
 }

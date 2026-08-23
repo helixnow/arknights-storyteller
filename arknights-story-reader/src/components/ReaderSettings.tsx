@@ -13,8 +13,16 @@ import { cn } from "@/lib/utils";
 
 const READING_MODES: Array<{ value: Settings["readingMode"]; label: string; description: string }> =
   [
-    { value: "scroll", label: "连续滚动", description: "纵向滚动阅读，接近小说体验" },
-    { value: "paged", label: "章节分页", description: "按页分段，便于快速定位" },
+    {
+      value: "scroll",
+      label: "连续滚动",
+      description: "纵向滚动阅读，向下滑动时自动收起顶栏",
+    },
+    {
+      value: "paged",
+      label: "章节分页",
+      description: "按页分段，点击正文左右两侧即可翻页",
+    },
   ];
 
 const READER_THEMES: Array<{ value: Settings["theme"]; label: string; swatch: string }> = [
@@ -47,7 +55,8 @@ interface ReaderSettingsProps {
  */
 function pickerChipClass(active: boolean, extra?: string) {
   return cn(
-    "glass glass-pane text-left transition-[background-color,color,box-shadow,transform] duration-200 ease-spring",
+    // 触控目标至少 44px 高，手机上不至于点不中。
+    "glass glass-pane min-h-[44px] text-left transition-[background-color,color,box-shadow,transform] duration-200 ease-spring",
     "active:scale-[0.98] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--color-ring))]",
     active
       ? "glass-thick ring-1 ring-[hsl(var(--color-primary)/0.45)] text-[hsl(var(--color-foreground))]"
@@ -76,6 +85,7 @@ export function ReaderSettingsPanel({
             <Button
               variant="ghost"
               size="icon-pill"
+              className="h-11 w-11"
               onClick={onReset}
               aria-label="恢复默认"
               title="恢复默认"
@@ -85,6 +95,7 @@ export function ReaderSettingsPanel({
             <Button
               variant="ghost"
               size="icon-pill"
+              className="h-11 w-11"
               onClick={onClose}
               aria-label="关闭"
               title="关闭"

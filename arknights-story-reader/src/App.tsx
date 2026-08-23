@@ -1,10 +1,10 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { ThemeProvider } from "@/components/theme-provider";
 import { StoryList } from "@/components/StoryList";
 import { StoryReader } from "@/components/StoryReader";
 import { SearchPanel } from "@/components/SearchPanel";
 import { Settings } from "@/components/Settings";
-import { BottomNav } from "@/components/BottomNav";
+import { BottomNav, tabPanelId } from "@/components/BottomNav";
 import { HomePanel } from "@/components/HomePanel";
 import type { StoryEntry } from "@/types/story";
 import { FavoritesProvider } from "@/hooks/useFavorites";
@@ -15,6 +15,7 @@ import { CharactersPanel } from "@/components/CharactersPanel";
 import { useAppUpdater } from "@/hooks/useAppUpdater";
 import { useBackHandler } from "@/hooks/useBackHandler";
 import { useAutoIndex } from "@/hooks/useAutoIndex";
+import { useLegacyStorageCleanup } from "@/hooks/useLegacyStorageCleanup";
 import { ToastProvider } from "@/components/ui/toast";
 
 type Tab = "home" | "stories" | "characters" | "search" | "settings";
@@ -29,6 +30,7 @@ interface ReaderFocus {
 function App() {
   useAppUpdater();
   useAutoIndex();
+  useLegacyStorageCleanup();
   const [activeTab, setActiveTab] = useState<Tab>("home");
   const [readerVisible, setReaderVisible] = useState(false);
   const [readerStory, setReaderStory] = useState<StoryEntry | null>(null);
@@ -40,11 +42,9 @@ function App() {
     preview?: string;
     issuedAt: number;
   } | null>(null);
-
   const readerActive = readerVisible && readerStory !== null;
 
   const handleSelectStory = useCallback((story: StoryEntry) => {
-    console.log("[App] 选择剧情:", story.storyName);
     setReaderStory(story);
     setReaderFocus(null);
     setReaderInitialCharacter(null);
@@ -53,13 +53,12 @@ function App() {
   }, []);
 
   const handleBackToList = useCallback(() => {
-    console.log("[App] 返回剧情列表");
     setReaderVisible(false);
+    window.dispatchEvent(new Event("app:home-refresh"));
   }, []);
 
   const handleSearchResult = useCallback(
     (story: StoryEntry, focus: { query: string; snippet?: string | null }) => {
-      console.log("[App] 搜索结果选择，storyId:", story.storyId);
       setReaderStory(story);
       setReaderFocus({
         storyId: story.storyId,
@@ -76,7 +75,6 @@ function App() {
 
   const handleOpenStoryWithCharacter = useCallback(
     (story: StoryEntry, character: string) => {
-      console.log("[App] 从人物面板打开剧情:", story.storyName, "角色:", character);
       setReaderStory(story);
       setReaderFocus(null);
       setReaderInitialCharacter(character);
@@ -97,33 +95,40 @@ function App() {
         preview: jump.preview,
         issuedAt: Date.now(),
       });
-      setActiveTab("stories");
       setReaderVisible(true);
     },
     []
   );
 
-  const handleTabChange = useCallback(
-    (tab: Tab) => {
-      if (readerActive) {
-        setReaderVisible(false);
-      }
-      setActiveTab(tab);
-    },
-    [readerActive]
-  );
+  const handleTabChange = useCallback((tab: Tab) => {
+    setActiveTab(tab);
+  }, []);
 
   const handleGoToTab = useCallback((tab: Tab) => {
     setActiveTab(tab);
     setReaderVisible(false);
   }, []);
 
-  // Android/Browser back-button: close open full-screen layers before falling
-  // back to the system default.
+  useEffect(() => {
+    const onGoTab = (event: Event) => {
+      const detail = (event as CustomEvent<Tab>).detail;
+      if (detail) handleGoToTab(detail);
+    };
+    window.addEventListener("app:go-tab", onGoTab as EventListener);
+    return () => window.removeEventListener("app:go-tab", onGoTab as EventListener);
+  }, [handleGoToTab]);
+
   useBackHandler(readerActive, () => {
-    setReaderVisible(false);
+    handleBackToList();
     return true;
   });
+
+  useBackHandler(!readerActive && activeTab !== "home", () => {
+    setActiveTab("home");
+    return true;
+  });
+
+  useBackHandler(!readerActive && activeTab === "home", () => false);
 
   const homeView = useMemo(
     () => (
@@ -167,11 +172,12 @@ function App() {
         readerFocus && readerFocus.storyId === readerStory.storyId ? readerFocus : null
       }
       initialJump={
-        readerInitialJump && readerInitialJump.storyId === readerStory.storyId ? readerInitialJump : null
+        readerInitialJump && readerInitialJump.storyId === readerStory.storyId
+          ? readerInitialJump
+          : null
       }
       onBack={handleBackToList}
       onNavigateStory={(next) => {
-        // When prev/next tapped inside reader, just swap stories in-place.
         setReaderStory(next);
         setReaderFocus(null);
         setReaderInitialCharacter(null);
@@ -180,38 +186,52 @@ function App() {
     />
   ) : null;
 
-  console.log(
-    "[App] 当前状态 - activeTab:",
-    activeTab,
-    "readerVisible:",
-    readerVisible,
-    "readerStory:",
-    readerStory?.storyName ?? null
-  );
-
   const appContent = (
-    <div className="h-full flex flex-col overflow-hidden pt-[calc(env(safe-area-inset-top,0px)+20px)]">
+    <div className="h-full flex flex-col overflow-hidden pt-[max(env(safe-area-inset-top,0px),12px)]">
       <div className="relative flex-1 overflow-hidden">
-        <KeepAlive active={!readerActive && activeTab === "home"} className="absolute inset-0">
-          {homeView}
+        <KeepAlive
+          active={!readerActive && activeTab === "home"}
+          className="absolute inset-0"
+        >
+          <div id={tabPanelId("home")} role="tabpanel" className="h-full">
+            {homeView}
+          </div>
         </KeepAlive>
-        <KeepAlive active={!readerActive && activeTab === "stories"} className="absolute inset-0">
-          {storyListView}
+        <KeepAlive
+          active={!readerActive && activeTab === "stories"}
+          className="absolute inset-0"
+        >
+          <div id={tabPanelId("stories")} role="tabpanel" className="h-full">
+            {storyListView}
+          </div>
         </KeepAlive>
         <KeepAlive
           active={!readerActive && activeTab === "characters"}
           className="absolute inset-0"
         >
-          <CharactersPanel
-            onOpenStory={handleOpenStoryWithCharacter}
-            onOpenStoryJump={(story, jump) => handleOpenStoryJump(story, jump)}
-          />
+          <div id={tabPanelId("characters")} role="tabpanel" className="h-full">
+            <CharactersPanel
+              active={!readerActive && activeTab === "characters"}
+              onOpenStory={handleOpenStoryWithCharacter}
+              onOpenStoryJump={(story, jump) => handleOpenStoryJump(story, jump)}
+            />
+          </div>
         </KeepAlive>
-        <KeepAlive active={!readerActive && activeTab === "search"} className="absolute inset-0">
-          {searchView}
+        <KeepAlive
+          active={!readerActive && activeTab === "search"}
+          className="absolute inset-0"
+        >
+          <div id={tabPanelId("search")} role="tabpanel" className="h-full">
+            {searchView}
+          </div>
         </KeepAlive>
-        <KeepAlive active={!readerActive && activeTab === "settings"} className="absolute inset-0">
-          {settingsView}
+        <KeepAlive
+          active={!readerActive && activeTab === "settings"}
+          className="absolute inset-0"
+        >
+          <div id={tabPanelId("settings")} role="tabpanel" className="h-full">
+            {settingsView}
+          </div>
         </KeepAlive>
         {readerStory && (
           <KeepAlive active={readerActive} className="absolute inset-0">

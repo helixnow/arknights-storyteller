@@ -19,13 +19,11 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
   const loadVersionInfo = useCallback(async () => {
     setLoadingInfo(true);
     try {
-      const [current, remote, needUpdate] = await Promise.all([
-        api.getCurrentVersion(),
-        api.getRemoteVersion(),
-        api.checkUpdate(),
-      ]);
+      const current = await api.getCurrentVersion().catch(() => "");
       setCurrentVersion(current);
+      const remote = await api.getRemoteVersion().catch(() => "未知");
       setRemoteVersion(remote);
+      const needUpdate = await api.checkUpdate().catch(() => false);
       setHasUpdate(needUpdate);
     } catch (err) {
       console.error("[useDataSyncManager] 加载版本信息失败:", err);
@@ -58,8 +56,10 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
       setError(null);
       setProgress({ phase: "准备", current: 0, total: 1, message: "准备开始..." });
       await api.syncData();
+      window.dispatchEvent(new Event("app:data-updated"));
       onSuccess?.();
       await loadVersionInfo();
+      setProgress({ phase: "完成", current: 1, total: 1, message: "同步完成" });
     } catch (err) {
       const message = err instanceof Error ? err.message : "同步失败";
       console.error("[useDataSyncManager] 同步失败:", message, err);
@@ -95,12 +95,13 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
         await api.importZipFromBytes(bytes);
 
         setProgress({
-          phase: "导入",
-          current: 40,
+          phase: "完成",
+          current: 100,
           total: 100,
-          message: "正在校验 ZIP 文件…",
+          message: "导入完成",
         });
 
+        window.dispatchEvent(new Event("app:data-updated"));
         onSuccess?.();
         await loadVersionInfo();
       } catch (err) {

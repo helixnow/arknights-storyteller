@@ -113,45 +113,73 @@ function backgroundCandidates(token: string): string[] {
   ];
 }
 
-function stripActPrefix(token: string): string {
+/**
+ * 从活动 id 里猜 KV 素材名的核心部分：`act17side` → `side` 之类。
+ * 猜错（削成空串，或压根没削掉东西）时返回 null，调用方就只用原始 token。
+ */
+function stripActPrefix(token: string): string | null {
   let core = token;
   if (core.startsWith("act_")) core = core.slice(4);
   else if (core.startsWith("act")) core = core.slice(3);
   core = core.replace(/^\d+/, "");
   if (core.endsWith("side")) core = core.slice(0, -4);
   if (core.endsWith("mini")) core = core.slice(0, -4);
+  if (!core || core === token) return null;
   return core;
 }
 
 function activityKvCandidates(token: string): string[] {
-  const core = stripActPrefix(token);
-  return [
-    `${FEXLI}/kvimg/default_kv_${core}.png`,
-    `${FEXLI}/kvimg/kv_${core}1.png`,
-    `${FEXLI}/kvimg/kv_${core}.png`,
+  // token 可能已经是 story_review_table 给的图片名（`storyPic` /
+  // `storyEntryPicId`，形如 `act17side_entrypic` / `xxx_storyMainPic`），
+  // 这种情况下再去剥 `act` 前缀只会把它削坏，所以原始 token 永远排在最前。
+  const base = token.replace(/\.(png|jpg|jpeg|webp)$/i, "");
+  const urls = [
+    `${FEXLI}/kvimg/${base}.png`,
+    `${FEXLI}/kvimg/default_kv_${base}.png`,
+    `${FEXLI}/kvimg/kv_${base}.png`,
   ];
+  // 旧的启发式猜测保留作兜底。
+  const core = stripActPrefix(base);
+  if (core) {
+    urls.push(
+      `${FEXLI}/kvimg/default_kv_${core}.png`,
+      `${FEXLI}/kvimg/kv_${core}1.png`,
+      `${FEXLI}/kvimg/kv_${core}.png`
+    );
+  }
+  return Array.from(new Set(urls));
 }
 
 function activityLogoCandidates(token: string): string[] {
-  const core = stripActPrefix(token);
-  return [
-    `${FEXLI}/kvimg/brand_${core}.png`,
-    `${FEXLI}/camplogo/logo_${core}.png`,
+  const base = token.replace(/\.(png|jpg|jpeg|webp)$/i, "");
+  const urls = [
+    `${FEXLI}/kvimg/brand_${base}.png`,
+    `${FEXLI}/camplogo/logo_${base}.png`,
   ];
+  const core = stripActPrefix(base);
+  if (core) {
+    urls.push(
+      `${FEXLI}/kvimg/brand_${core}.png`,
+      `${FEXLI}/camplogo/logo_${core}.png`
+    );
+  }
+  return Array.from(new Set(urls));
 }
 
 function chapterCoverCandidates(token: string): string[] {
   // `token` 通常是 `main_0`、`main_8`、`main_13`。
   const raw = token.replace(/^main_/, "").trim();
   const nn = /^\d+$/.test(raw) ? raw.padStart(2, "0") : raw;
-  return [
-    // 内置章节封面（打包在 public/bundled/mapreview/）
-    `/bundled/mapreview/main_${nn}-01.png`,
-    `${FEXLI}/mapreview/main_${nn}-01.png`,
-    `${FEXLI}/avgs/bg_main_${raw}.png`,
-    `${FEXLI}/avgs/${raw}_i01.png`,
-    `${FEXLI}/avgs/${raw}_I01.png`,
-  ];
+  return Array.from(
+    new Set([
+      // 内置章节封面（打包在 public/bundled/mapreview/）
+      `/bundled/mapreview/main_${nn}-01.png`,
+      `${FEXLI}/mapreview/main_${nn}-01.png`,
+      `${FEXLI}/avgs/bg_main_${raw}.png`,
+      `${FEXLI}/avgs/${raw}_i01.png`,
+      `${FEXLI}/avgs/${raw}_I01.png`,
+    ])
+  );
 }
 
 export function resolveAssetCandidatesLocal(

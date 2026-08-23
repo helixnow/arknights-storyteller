@@ -19,6 +19,7 @@ import {
   type UpdateAvailability,
 } from "@/hooks/useAppUpdater";
 import { useToast } from "@/components/ui/toast";
+import { api } from "@/services/api";
 
 const THEME_COLOR_OPTIONS = [
   {
@@ -87,7 +88,7 @@ export function Settings() {
   } = useDataSyncManager({
     active: true,
     onSuccess: () => {
-          setStatusMessage("数据版本信息已更新");
+      setStatusMessage("数据版本信息已更新");
     },
   });
 
@@ -101,14 +102,41 @@ export function Settings() {
   const handleSyncClick = () => {
     setStatusMessage(null);
     setError(null);
+    const confirmed = window.confirm(
+      status === "not-installed"
+        ? "将从 GitHub 下载完整剧情数据包并占用较多存储，确定开始？"
+        : "同步会覆盖本机已有的剧情数据并重建索引，确定继续？"
+    );
+    if (!confirmed) return;
     void handleSync();
   };
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  const handleImportClick = () => {
+  const handleImportClick = async () => {
     setStatusMessage(null);
     setError(null);
+    const confirmed = window.confirm(
+      "导入 ZIP 会覆盖本机已有的剧情数据。请确保压缩包来自 ArknightsGameData。"
+    );
+    if (!confirmed) return;
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const selected = await open({
+        multiple: false,
+        filters: [{ name: "ZIP", extensions: ["zip"] }],
+      });
+      const path = Array.isArray(selected) ? selected[0] : selected;
+      if (path) {
+        await api.importFromZip(path);
+        window.dispatchEvent(new Event("app:data-updated"));
+        setStatusMessage("数据版本信息已更新");
+        await loadVersionInfo();
+        return;
+      }
+    } catch {
+      // 移动端或未授权 dialog 时回退到 input。
+    }
     fileInputRef.current?.click();
   };
 
@@ -561,7 +589,7 @@ export function Settings() {
               </CardContent>
             </Card>
 
-          <Card className="motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-500" style={{ animationDelay: "70ms" }}>
+          <Card className="motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-500" style={{ animationDelay: "180ms" }}>
             <CardHeader>
               <CardTitle>素材与外观</CardTitle>
               <CardDescription>控制封面、头像、插画等装饰性素材</CardDescription>
@@ -617,7 +645,7 @@ export function Settings() {
             </CardContent>
           </Card>
 
-          <Card className="motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-500" style={{ animationDelay: "90ms" }}>
+          <Card className="motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-500" style={{ animationDelay: "240ms" }}>
             <CardHeader>
               <CardTitle>缓存与索引</CardTitle>
               <CardDescription>统一管理本地索引与人物统计</CardDescription>
@@ -645,7 +673,7 @@ export function Settings() {
             </CardContent>
           </Card>
 
-            <Card className="motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-500" style={{ animationDelay: "120ms" }}>
+            <Card className="motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-500" style={{ animationDelay: "300ms" }}>
               <CardHeader>
                 <CardTitle>关于</CardTitle>
                 <CardDescription>应用信息</CardDescription>

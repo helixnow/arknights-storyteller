@@ -8,8 +8,10 @@ import { Collapsible } from "@/components/ui/collapsible";
 import { ArrowLeft, Loader2, Shuffle } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { CharacterAvatar } from "@/components/CharacterAvatar";
+import { postProcessSegments } from "@/components/StoryReader";
 
 interface CharactersPanelProps {
+  active?: boolean;
   onOpenStory: (story: StoryEntry, character: string) => void;
   onOpenStoryJump?: (
     story: StoryEntry,
@@ -55,7 +57,11 @@ function countCharactersInStory(content: ParsedStoryContent): Map<string, number
   return map;
 }
 
-export function CharactersPanel({ onOpenStory, onOpenStoryJump }: CharactersPanelProps) {
+export function CharactersPanel({
+  active = true,
+  onOpenStory,
+  onOpenStoryJump,
+}: CharactersPanelProps) {
   const [loading, setLoading] = useState(true);
   const [progress, setProgress] = useState({ current: 0, total: 0 });
   const [error, setError] = useState<string | null>(null);
@@ -93,11 +99,14 @@ export function CharactersPanel({ onOpenStory, onOpenStoryJump }: CharactersPane
       setVersion(ver);
 
       // 使用主页同样的分组与排序数据源
-      const [mainGrouped, activityGrouped, memoryStories] = await Promise.all([
-        api.getMainStoriesGrouped(),
-        api.getActivityStoriesGrouped(),
-        api.getMemoryStories(),
-      ]);
+      const [mainGrouped, activityGrouped, sidestoryGrouped, roguelikeGrouped, memoryStories] =
+        await Promise.all([
+          api.getMainStoriesGrouped(),
+          api.getActivityStoriesGrouped(),
+          api.getSidestoryStoriesGrouped().catch(() => []),
+          api.getRoguelikeStoriesGrouped().catch(() => []),
+          api.getMemoryStories(),
+        ]);
 
       // 生成 groupInfoByStoryId
       const groupInfo = new Map<string, GroupInfo>();
@@ -128,15 +137,40 @@ export function CharactersPanel({ onOpenStory, onOpenStoryJump }: CharactersPane
         groupInfo.set(s.storyId, {
           category: "memory",
           groupName: "干员密录",
-          groupOrder: idx, // 干员密录整体作为一组，这里顺序意义不大
+          groupOrder: idx,
           storyOrder: s.storySort,
         });
       });
 
-      // 收集所有剧情条目并去重
+      sidestoryGrouped.forEach(([name, stories], groupOrder) => {
+        stories.forEach((s) => {
+          if (!groupInfo.has(s.storyId)) {
+            groupInfo.set(s.storyId, {
+              category: "activity",
+              groupName: name,
+              groupOrder,
+              storyOrder: s.storySort,
+            });
+          }
+        });
+      });
+
+      roguelikeGrouped.forEach(([name, stories], groupOrder) => {
+        stories.forEach((s) => {
+          groupInfo.set(s.storyId, {
+            category: "other",
+            groupName: name,
+            groupOrder,
+            storyOrder: s.storySort,
+          });
+        });
+      });
+
       const storiesMap = new Map<string, StoryEntry>();
       mainGrouped.forEach(([, stories]) => stories.forEach((s) => storiesMap.set(s.storyId, s)));
       activityGrouped.forEach(([, stories]) => stories.forEach((s) => storiesMap.set(s.storyId, s)));
+      sidestoryGrouped.forEach(([, stories]) => stories.forEach((s) => storiesMap.set(s.storyId, s)));
+      roguelikeGrouped.forEach(([, stories]) => stories.forEach((s) => storiesMap.set(s.storyId, s)));
       memoryStories.forEach((s) => storiesMap.set(s.storyId, s));
 
       const stories = Array.from(storiesMap.values());
@@ -264,7 +298,12 @@ export function CharactersPanel({ onOpenStory, onOpenStoryJump }: CharactersPane
         }
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "加载失败");
+      const raw = err instanceof Error ? err.message : String(err);
+      setError(
+        /NOT_INSTALLED|未安装/i.test(raw)
+          ? "尚未同步剧情数据。请先到设置页下载或导入 ArknightsGameData。"
+          : raw || "加载失败"
+      );
     } finally {
       setLoading(false);
       loadingRef.current = false;
@@ -272,8 +311,9 @@ export function CharactersPanel({ onOpenStory, onOpenStoryJump }: CharactersPane
   }, [getCacheKey]);
 
   useEffect(() => {
+    if (!active) return;
     loadAll();
-  }, [loadAll]);
+  }, [active, loadAll]);
 
   useEffect(() => {
     const handler = () => {
@@ -282,7 +322,11 @@ export function CharactersPanel({ onOpenStory, onOpenStoryJump }: CharactersPane
       );
     };
     window.addEventListener("app:refresh-character-stats", handler);
-    return () => window.removeEventListener("app:refresh-character-stats", handler);
+    window.addEventListener("app:data-updated", handler);
+    return () => {
+      window.removeEventListener("app:refresh-character-stats", handler);
+      window.removeEventListener("app:data-updated", handler);
+    };
   }, [loadAll]);
 
   const allCharacters = useMemo(() => {
@@ -338,10 +382,9 @@ export function CharactersPanel({ onOpenStory, onOpenStoryJump }: CharactersPane
         try {
           const content = await api.getStoryContent(story.storyTxt);
           const hits: CharacterQuote[] = [];
-          content.segments.forEach((seg, segmentIndex) => {
+          postProcessSegments(content.segments).forEach((seg, segmentIndex) => {
             if (seg.type === "dialogue" && seg.characterName === selected) {
               const text = seg.text.trim();
-              // 过滤过短（通常无信息量）与过长（不适合当金句展示）的句子
               if (text.length >= 10 && text.length <= 160) {
                 hits.push({ text, storyName: story.storyName, story, segmentIndex });
               }

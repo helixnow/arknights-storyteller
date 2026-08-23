@@ -20,6 +20,7 @@ import {
   ChevronRight,
   ListTree,
   MoreHorizontal,
+  RefreshCw,
   Settings as SettingsIcon,
   Share2,
   Star,
@@ -82,6 +83,75 @@ function isSegmentHighlightable(segment: StorySegment): boolean {
   }
 }
 
+/**
+ * 阅读器使用的段落后处理：丢弃 music 段、规整空白、合并连续同角色对话。
+ *
+ * 导出为纯函数，是为了让其它面板（例如人物金句列表）能用同一套下标口径
+ * 计算 `segmentIndex`——直接对 `content.segments` 取下标会和阅读器里的
+ * 段号错位。
+ */
+export function postProcessSegments(segments: readonly StorySegment[]): StorySegment[] {
+  const cleaned = segments.flatMap<StorySegment>((segment) => {
+    // Drop music segments here — inline music UI is out of scope (BGM
+    // playback will be opt-in later).
+    if (segment.type === "music") return [];
+
+    if (segment.type === "dialogue" || segment.type === "narration") {
+      const normalizedText = segment.text
+        .replace(/\r\n/g, "\n")
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .join("\n");
+      if (!normalizedText) {
+        return [];
+      }
+      if (normalizedText === segment.text) {
+        return [segment];
+      }
+      return [{ ...segment, text: normalizedText }];
+    }
+
+    if (segment.type === "decision") {
+      const options = segment.options.map((option) => option.trim()).filter(Boolean);
+      if (options.length === 0) {
+        return [];
+      }
+      if (options.length === segment.options.length) {
+        return [segment];
+      }
+      return [{ ...segment, options }];
+    }
+
+    return [segment];
+  });
+
+  const merged: StorySegment[] = [];
+  cleaned.forEach((segment) => {
+    // De-dup consecutive Image segments with the same token (common in
+    // scripts that set the same background twice in a row).
+    if (segment.type === "image") {
+      const last = merged[merged.length - 1];
+      if (last && last.type === "image" && last.token === segment.token) {
+        return;
+      }
+    }
+    if (segment.type === "dialogue") {
+      const last = merged[merged.length - 1];
+      if (last && last.type === "dialogue" && last.characterName === segment.characterName) {
+        merged[merged.length - 1] = {
+          ...last,
+          text: `${last.text}\n${segment.text}`.replace(/\n{2,}/g, "\n"),
+        };
+        return;
+      }
+    }
+    merged.push(segment);
+  });
+
+  return merged;
+}
+
 function approximateSegmentLength(segment: StorySegment): number {
   switch (segment.type) {
     case "dialogue":
@@ -121,13 +191,20 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
   const [activeCharacter, setActiveCharacter] = useState<string | null>(null);
   const [storyEntry, setStoryEntry] = useState<StoryEntry | null>(null);
   const [storyInfoText, setStoryInfoText] = useState<string | null>(null);
+  // 沉浸阅读：连续滚动模式下向下滚动收起顶栏，向上滚动/回到顶部再展开。
+  const [headerHidden, setHeaderHidden] = useState(false);
+  const [headerHeight, setHeaderHeight] = useState(56);
 
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const readerRootRef = useRef<HTMLDivElement | null>(null);
+  const headerRef = useRef<HTMLElement | null>(null);
   const focusAppliedRef = useRef<number | null>(null);
   const characterAppliedRef = useRef<string | null>(null);
   const pendingScrollIndexRef = useRef<number | null>(null);
   const jumpAppliedRef = useRef<number | null>(null);
+  const lastScrollTopRef = useRef(0);
+  // 已恢复过阅读进度的 `storyPath::readingMode`，避免"滚动→写进度→再恢复"回路。
+  const restoredKeyRef = useRef<string | null>(null);
 
   const { settings, updateSettings, resetSettings } = useReaderSettings();
   const { showSummaries, minimalMode, inlineImages } = useAppPreferences();
@@ -144,6 +221,17 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
   const [shareDialogOpen, setShareDialogOpen] = useState(false);
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
   const moreMenuRef = useRef<HTMLDivElement | null>(null);
+
+  // 抽屉 / 选段工具栏是否占据了界面。滚动监听里用 ref 读取，避免因为这些
+  // 状态变化而反复重建 scroll listener。
+  const overlayOpenRef = useRef(false);
+  overlayOpenRef.current =
+    settingsOpen || insightsOpen || shareDialogOpen || selectMode || moreMenuOpen;
+
+  // 最近一次持久化的阅读进度。恢复逻辑只在换篇 / 换模式时读取它，所以用
+  // ref 兜住，避免把持续变化的 `progress` 写进 effect 依赖。
+  const progressRef = useRef(progress);
+  progressRef.current = progress;
 
   // Back-button stack. `useBackHandler` is LIFO — the most recently mounted
   // handler that returns `true` wins, so the effective priority is "最近
@@ -203,69 +291,10 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
     onBack,
   });
 
-  const processedSegments = useMemo<StorySegment[]>(() => {
-    if (!content) return [];
-
-    const cleaned = content.segments.flatMap<StorySegment>((segment) => {
-      // Drop music segments here — inline music UI is out of scope (BGM
-      // playback will be opt-in later).
-      if (segment.type === "music") return [];
-
-      if (segment.type === "dialogue" || segment.type === "narration") {
-        const normalizedText = segment.text
-          .replace(/\r\n/g, "\n")
-          .split("\n")
-          .map((line) => line.trim())
-          .filter(Boolean)
-          .join("\n");
-        if (!normalizedText) {
-          return [];
-        }
-        if (normalizedText === segment.text) {
-          return [segment];
-        }
-        return [{ ...segment, text: normalizedText }];
-      }
-
-      if (segment.type === "decision") {
-        const options = segment.options.map((option) => option.trim()).filter(Boolean);
-        if (options.length === 0) {
-          return [];
-        }
-        if (options.length === segment.options.length) {
-          return [segment];
-        }
-        return [{ ...segment, options }];
-      }
-
-      return [segment];
-    });
-
-    const merged: StorySegment[] = [];
-    cleaned.forEach((segment) => {
-      // De-dup consecutive Image segments with the same token (common in
-      // scripts that set the same background twice in a row).
-      if (segment.type === "image") {
-        const last = merged[merged.length - 1];
-        if (last && last.type === "image" && last.token === segment.token) {
-          return;
-        }
-      }
-      if (segment.type === "dialogue") {
-        const last = merged[merged.length - 1];
-        if (last && last.type === "dialogue" && last.characterName === segment.characterName) {
-          merged[merged.length - 1] = {
-            ...last,
-            text: `${last.text}\n${segment.text}`.replace(/\n{2,}/g, "\n"),
-          };
-          return;
-        }
-      }
-      merged.push(segment);
-    });
-
-    return merged;
-  }, [content]);
+  const processedSegments = useMemo<StorySegment[]>(
+    () => (content ? postProcessSegments(content.segments) : []),
+    [content]
+  );
 
   /**
    * Content fingerprint for every segment. Fed to `useHighlights` so stored
@@ -701,8 +730,18 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
     setActiveCharacter(null);
   }, [storyId, storyPath]);
 
+  /**
+   * 恢复上次阅读位置。
+   *
+   * 只在"换一篇剧情"或"切换阅读模式"时执行一次（用 `restoredKeyRef` 记住
+   * 已恢复过的 key）。之前这个 effect 依赖 `progress`，而滚动时又会不断写
+   * 进度，于是形成 滚动 → 写进度 → 重新恢复 的回路，表现为滚动被拽回去。
+   */
   useLayoutEffect(() => {
     if (!processedSegments.length) return;
+
+    const restoreKey = `${storyPath}::${settings.readingMode}`;
+    if (restoredKeyRef.current === restoreKey) return;
 
     // 若正在处理搜索跳转或初始定位，避免恢复旧的阅读进度，以免覆盖滚动
     const shouldSkipRestore =
@@ -710,14 +749,24 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
       (initialFocus && initialFocus.storyId === storyId) ||
       (initialJump && initialJump.storyId === storyId);
     if (shouldSkipRestore) {
+      restoredKeyRef.current = restoreKey;
       return;
     }
 
+    const stored = progressRef.current;
+
+    // 上次是另一种阅读模式时，用百分比近似换算，别一路弹回开头。
+    const storedPercentage =
+      typeof stored?.percentage === "number" && Number.isFinite(stored.percentage)
+        ? Math.max(0, Math.min(1, stored.percentage))
+        : 0;
+
     if (settings.readingMode === "paged") {
+      const lastPage = Math.max(totalPages - 1, 0);
       const storedPage =
-        progress?.readingMode === "paged" && typeof progress.currentPage === "number"
-          ? Math.min(progress.currentPage, Math.max(totalPages - 1, 0))
-          : 0;
+        stored?.readingMode === "paged" && typeof stored.currentPage === "number"
+          ? Math.min(stored.currentPage, lastPage)
+          : Math.round(storedPercentage * lastPage);
       setCurrentPage(storedPage);
       const ratio = totalPages <= 1 ? 1 : (storedPage + 1) / totalPages;
       setProgressValue(Number.isFinite(ratio) ? ratio : 0);
@@ -725,39 +774,27 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
       const container = scrollContainerRef.current;
       if (!container) return;
       const storedTop =
-        progress?.readingMode === "scroll" && typeof progress.scrollTop === "number"
-          ? progress.scrollTop
-          : 0;
+        stored?.readingMode === "scroll" && typeof stored.scrollTop === "number"
+          ? stored.scrollTop
+          : storedPercentage * Math.max(container.scrollHeight - container.clientHeight, 0);
       container.scrollTo({ top: storedTop });
+      lastScrollTopRef.current = storedTop;
       const { scrollHeight, clientHeight } = container;
       const denominator = scrollHeight - clientHeight;
       const ratio = denominator <= 0 ? 1 : storedTop / denominator;
       setProgressValue(Number.isFinite(ratio) ? ratio : 0);
     }
-  }, [processedSegments, settings.readingMode, progress, totalPages, initialFocus, initialJump, storyId]);
 
-  // 初始角色高亮与定位
-  useEffect(() => {
-    if (!processedSegments.length) return;
-    if (!initialCharacter) return;
-    if (characterAppliedRef.current === initialCharacter && activeCharacter === initialCharacter) return;
-
-    // 查找该角色的第一条对话段落
-    let firstIndex: number | null = null;
-    for (let i = 0; i < processedSegments.length; i += 1) {
-      const seg = processedSegments[i];
-      if (seg.type === "dialogue" && seg.characterName === initialCharacter) {
-        firstIndex = i;
-        break;
-      }
-    }
-    setActiveCharacter(initialCharacter);
-    characterAppliedRef.current = initialCharacter;
-    if (firstIndex !== null) {
-      // 平滑滚动至第一条出现位置
-      scrollToSegment(firstIndex, "auto");
-    }
-  }, [processedSegments, initialCharacter, activeCharacter, scrollToSegment]);
+    restoredKeyRef.current = restoreKey;
+  }, [
+    processedSegments,
+    settings.readingMode,
+    storyPath,
+    totalPages,
+    initialFocus,
+    initialJump,
+    storyId,
+  ]);
 
   useEffect(() => {
     if (!processedSegments.length || settings.readingMode !== "scroll") return;
@@ -779,6 +816,19 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
           percentage: clamped,
           updatedAt: Date.now(),
         });
+
+        // 沉浸阅读：向下滚动收起顶栏腾出屏幕，向上滚动或靠近顶部时复原。
+        // 抽屉/选段工具栏打开时保持顶栏可见，避免操作路径消失。
+        const delta = scrollTop - lastScrollTopRef.current;
+        if (Math.abs(delta) >= 6) {
+          lastScrollTopRef.current = scrollTop;
+          if (!overlayOpenRef.current) {
+            setHeaderHidden(delta > 0 && scrollTop > 96);
+          }
+        }
+        if (scrollTop <= 24) {
+          setHeaderHidden(false);
+        }
       });
     };
 
@@ -804,27 +854,157 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
     });
   }, [processedSegments, currentPage, settings.readingMode, totalPages, updateProgress]);
 
+  // 顶栏实际高度（带关卡编号/标签时会比 3.5rem 高），收起时按这个值上移。
+  useLayoutEffect(() => {
+    const element = headerRef.current;
+    if (!element) return;
+    const measure = () => setHeaderHeight(element.offsetHeight || 56);
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [content, storyEntry]);
+
+  // 任一抽屉/选段工具栏打开、切到分页模式或换篇时，顶栏一律复位为可见。
   useEffect(() => {
-    const handleKey = (event: KeyboardEvent) => {
+    if (
+      settings.readingMode !== "scroll" ||
+      settingsOpen ||
+      insightsOpen ||
+      shareDialogOpen ||
+      selectMode ||
+      moreMenuOpen
+    ) {
+      setHeaderHidden(false);
+    }
+  }, [
+    settings.readingMode,
+    settingsOpen,
+    insightsOpen,
+    shareDialogOpen,
+    selectMode,
+    moreMenuOpen,
+  ]);
+
+  useEffect(() => {
+    setHeaderHidden(false);
+    lastScrollTopRef.current = 0;
+  }, [storyPath]);
+
+  const goToPrevPage = useCallback(() => {
+    setCurrentPage((prev) => Math.max(0, prev - 1));
+  }, []);
+
+  const goToNextPage = useCallback(() => {
+    setCurrentPage((prev) => Math.min(Math.max(totalPages - 1, 0), prev + 1));
+  }, [totalPages]);
+
+  // 分页模式的触控翻页：点正文左侧 20% 上一页、右侧 20% 下一页。
+  // 选段模式和任何抽屉打开时都关掉，避免抢走点击。
+  const pageTapEnabled =
+    settings.readingMode === "paged" &&
+    !selectMode &&
+    !settingsOpen &&
+    !insightsOpen &&
+    !shareDialogOpen &&
+    !moreMenuOpen;
+
+  const handleReaderTap = useCallback(
+    (event: ReactMouseEvent<HTMLElement>) => {
+      if (!pageTapEnabled) return;
+
+      // 书签按钮、上一话/下一话、插图里的链接以及滚动条本身优先。
       const target = event.target as HTMLElement | null;
-      if (target?.tagName && ["INPUT", "TEXTAREA"].includes(target.tagName)) {
+      if (
+        target?.closest(
+          "button, a, input, textarea, select, [role='button'], [contenteditable='true'], .scroll-area__track"
+        )
+      ) {
         return;
       }
 
+      // 正在划词选择文本时不翻页。
+      const selection = typeof window !== "undefined" ? window.getSelection() : null;
+      if (selection && !selection.isCollapsed && selection.toString().trim()) return;
+
+      const rect = event.currentTarget.getBoundingClientRect();
+      if (rect.width <= 0) return;
+      const ratio = (event.clientX - rect.left) / rect.width;
+      if (ratio <= 0.2) {
+        goToPrevPage();
+      } else if (ratio >= 0.8) {
+        goToNextPage();
+      }
+    },
+    [pageTapEnabled, goToPrevPage, goToNextPage]
+  );
+
+  useEffect(() => {
+    const handleKey = (event: KeyboardEvent) => {
+      // 段落自己已经消费掉的按键（选段模式的空格/回车）不再重复处理。
+      if (event.defaultPrevented) return;
+      const target = event.target as HTMLElement | null;
+      if (target?.tagName && ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName)) {
+        return;
+      }
+      if (target?.isContentEditable) return;
+      // 抽屉打开时把按键留给抽屉本身（Esc 关闭等）。
+      if (settingsOpen || insightsOpen || shareDialogOpen) return;
+
+      const isSpace = event.key === " " || event.key === "Spacebar";
+      // 焦点落在按钮/链接上时空格属于该控件本身，别把"打开设置"变成翻页；
+      // 方向键仍然可以翻页，避免点过一次"下一页"后键盘就失灵。
+      if (isSpace && target?.closest("button, a, [role='menuitem']")) return;
+
       if (settings.readingMode === "paged") {
-        if (event.key === "ArrowLeft") {
+        if (event.key === "ArrowLeft" || event.key === "PageUp" || (isSpace && event.shiftKey)) {
           event.preventDefault();
-          setCurrentPage((prev) => Math.max(0, prev - 1));
-        } else if (event.key === "ArrowRight") {
+          goToPrevPage();
+        } else if (event.key === "ArrowRight" || event.key === "PageDown" || isSpace) {
           event.preventDefault();
-          setCurrentPage((prev) => Math.min(totalPages - 1, prev + 1));
+          goToNextPage();
+        } else if (event.key === "Home") {
+          event.preventDefault();
+          setCurrentPage(0);
+        } else if (event.key === "End") {
+          event.preventDefault();
+          setCurrentPage(Math.max(totalPages - 1, 0));
         }
+        return;
+      }
+
+      const container = scrollContainerRef.current;
+      if (!container) return;
+      // 翻屏留一点重叠行，避免正好把一行切在屏幕边界上。
+      const step = Math.max(container.clientHeight - 64, 120);
+
+      if (event.key === "PageDown" || (isSpace && !event.shiftKey)) {
+        event.preventDefault();
+        container.scrollBy({ top: step, behavior: "smooth" });
+      } else if (event.key === "PageUp" || (isSpace && event.shiftKey)) {
+        event.preventDefault();
+        container.scrollBy({ top: -step, behavior: "smooth" });
+      } else if (event.key === "Home") {
+        event.preventDefault();
+        container.scrollTo({ top: 0, behavior: "smooth" });
+      } else if (event.key === "End") {
+        event.preventDefault();
+        container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
       }
     };
 
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
-  }, [settings.readingMode, totalPages]);
+  }, [
+    settings.readingMode,
+    totalPages,
+    settingsOpen,
+    insightsOpen,
+    shareDialogOpen,
+    goToPrevPage,
+    goToNextPage,
+  ]);
 
   const jumpToSegment = useCallback(
     (index: number, options?: { highlightSearch?: boolean }) => {
@@ -866,11 +1046,14 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
     if (jumpAppliedRef.current === token) return;
 
     let target = initialJump.segmentIndex;
+    const preview = initialJump.preview?.trim();
 
-    // 如果段号落在合理范围外，或者附带了预览文本，先用 preview 精确定位
-    // 作为更稳妥的兜底（避免因数据更新后段号整体偏移而跳错位置）。
-    if ((target < 0 || target >= processedSegments.length) && initialJump.preview) {
-      const idx = findFocusSegmentIndex({ storyId, query: "", snippet: initialJump.preview });
+    // 只要带了预览文本就以文本匹配为准：调用方（人物金句列表等）拿到的
+    // 段号可能是基于原始 `content.segments` 的下标，和阅读器后处理过的
+    // 段号并不是同一套；数据同步后整体偏移也会跳错位置。文本匹配失败时
+    // 再退回原段号。
+    if (preview) {
+      const idx = findFocusSegmentIndex({ storyId, query: "", snippet: preview });
       if (idx !== null) target = idx;
     }
 
@@ -886,6 +1069,29 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
     jumpToSegment,
     storyId,
   ]);
+
+  // 初始角色高亮与定位（人物面板点击"在剧情中查看"）。使用 jumpToSegment，
+  // 这样分页模式也会翻到该角色首次出场的那一页，而不是只在当前页滚动。
+  useEffect(() => {
+    if (!processedSegments.length) return;
+    if (!initialCharacter) return;
+    if (characterAppliedRef.current === initialCharacter && activeCharacter === initialCharacter) return;
+
+    // 查找该角色的第一条对话段落
+    let firstIndex: number | null = null;
+    for (let i = 0; i < processedSegments.length; i += 1) {
+      const seg = processedSegments[i];
+      if (seg.type === "dialogue" && seg.characterName === initialCharacter) {
+        firstIndex = i;
+        break;
+      }
+    }
+    setActiveCharacter(initialCharacter);
+    characterAppliedRef.current = initialCharacter;
+    if (firstIndex !== null) {
+      jumpToSegment(firstIndex, { highlightSearch: false });
+    }
+  }, [processedSegments, initialCharacter, activeCharacter, jumpToSegment]);
 
   // 当页面或段落渲染完成后，执行挂起的滚动请求（最多尝试几次）
   useLayoutEffect(() => {
@@ -1069,7 +1275,8 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
       const selectable = selectMode && segment.type !== "decision"; // selecting a decision block is awkward; skip
 
       const segmentStyle: CSSProperties = { marginBottom: spacing };
-      segmentStyle.paddingRight = "1.25rem";
+      // 给右上角的收藏按钮留位，否则长句会被角标压住。
+      segmentStyle.paddingRight = "clamp(2.75rem, 6vw, 3.25rem)";
 
       const handleSegmentClick = (event: ReactMouseEvent<HTMLDivElement>) => {
         if (!selectable) return;
@@ -1111,17 +1318,65 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
           )
         : "";
 
-      // 展示用的"已收藏"小角标：阅读时可以一眼看到这一段是否被收藏。
-      // 进入选段模式时隐藏，避免与选中态 ring 视觉冲突。
-      const highlightButton = annotationHighlight && !selectMode ? (
-        <span
-          className="reader-highlight-toggle is-active"
-          aria-label="此段已收藏"
-          title="此段已收藏"
-        >
-          <BookmarkCheck className="h-4 w-4" />
-        </span>
-      ) : null;
+      // 右上角的收藏开关：阅读时既能一眼看到这一段是否已收藏，也能直接点
+      // 一下切换划线，不必先进选段模式。触控区固定 44×44，视觉上仍是那颗
+      // 小圆角标（内层 span 负责外观，外层按钮只负责命中区域）。
+      // 选段模式下隐藏，避免和选中态 ring 打架、也避免抢走选段点击。
+      const highlightButton =
+        highlightable && !selectMode ? (
+          <button
+            type="button"
+            className="reader-highlight-toggle"
+            aria-pressed={annotationHighlight}
+            aria-label={annotationHighlight ? "取消收藏此段" : "收藏此段"}
+            title={annotationHighlight ? "取消收藏此段" : "收藏此段"}
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              toggleHighlight(index);
+            }}
+            style={{
+              top: "0.15rem",
+              right: "0.15rem",
+              width: "2.75rem",
+              height: "2.75rem",
+              padding: 0,
+              border: "none",
+              background: "transparent",
+              boxShadow: "none",
+              opacity: annotationHighlight ? 1 : 0.45,
+              touchAction: "manipulation",
+              cursor: "pointer",
+            }}
+          >
+            <span
+              aria-hidden="true"
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                width: "1.75rem",
+                height: "1.75rem",
+                borderRadius: "9999px",
+                border: `1px solid hsl(var(--color-${
+                  annotationHighlight ? "primary" : "border"
+                }) / ${annotationHighlight ? "0.45" : "1"})`,
+                background: annotationHighlight
+                  ? "hsl(var(--color-primary) / 0.18)"
+                  : "hsl(var(--color-card) / 0.92)",
+                color: annotationHighlight
+                  ? "hsl(var(--color-primary))"
+                  : "hsl(var(--color-muted-foreground))",
+              }}
+            >
+              {annotationHighlight ? (
+                <BookmarkCheck className="h-4 w-4" />
+              ) : (
+                <BookmarkPlus className="h-4 w-4" />
+              )}
+            </span>
+          </button>
+        ) : null;
 
       if (segment.type === "dialogue") {
         const showAvatar = !minimalMode && !selectMode;
@@ -1141,6 +1396,9 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
           data-search-pulse={searchPulseActive ? "true" : undefined}
           style={{
             ...segmentStyle,
+            // 头像被隐藏（选段模式 / 极简模式）时同步收掉给头像预留的左内边距，
+            // 否则对话段左侧会空出一条明显的空档。
+            ...(showAvatar ? null : { paddingLeft: 0 }),
             textAlign: segment.position === "right" ? ("right" as CSSProperties["textAlign"]) : undefined,
           }}
         >
@@ -1194,7 +1452,10 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
             data-search-pulse={searchPulseActive ? "true" : undefined}
             style={{ marginBottom: spacing }}
           >
-            <div className="reader-decision-title">选择：</div>
+            {/* 抉择块内的字号一律用 em，跟随阅读器字号一起缩放。 */}
+            <div className="reader-decision-title" style={{ fontSize: "0.85em" }}>
+              选择：
+            </div>
             {segment.options.map((option, optionIndex) => {
               const tag = values[optionIndex];
               return (
@@ -1203,10 +1464,18 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
                   className="reader-decision-option"
                   style={{ animationDelay: `${optionIndex * 60}ms` }}
                 >
-                  <span className="reader-decision-bullet">{optionIndex + 1}</span>
+                  <span
+                    className="reader-decision-bullet"
+                    style={{ width: "1.6em", height: "1.6em", fontSize: "0.78em" }}
+                  >
+                    {optionIndex + 1}
+                  </span>
                   <span className="flex-1">{option}</span>
                   {tag ? (
-                    <span className="text-[10px] uppercase tracking-wider text-[hsl(var(--color-muted-foreground))]">
+                    <span
+                      className="uppercase tracking-wider text-[hsl(var(--color-muted-foreground))]"
+                      style={{ fontSize: "0.62em" }}
+                    >
                       {tag}
                     </span>
                   ) : null}
@@ -1235,7 +1504,9 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
           >
             {highlightButton}
             {segment.speaker ? (
-              <div className="reader-system-speaker">{segment.speaker}</div>
+              <div className="reader-system-speaker" style={{ fontSize: "0.8em" }}>
+                {segment.speaker}
+              </div>
             ) : null}
             <div className="reader-text">{renderLines(segment.text)}</div>
           </div>
@@ -1311,7 +1582,7 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
             onClick={handleSegmentClick}
             {...segmentA11yProps}
             data-search-pulse={searchPulseActive ? "true" : undefined}
-            style={{ marginBottom: spacing }}
+            style={{ marginBottom: spacing, fontSize: "1.35em" }}
           >
             {segment.title}
           </div>
@@ -1350,38 +1621,69 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
       searchPulseToken,
       selectMode,
       selectedSegments,
+      toggleHighlight,
       toggleSegmentSelection,
     ]
   );
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center h-full">
-        <div className="text-[hsl(var(--color-muted-foreground))]">加载中...</div>
+      <div
+        className="h-full flex flex-col overflow-hidden reader-surface"
+        data-reader-theme={settings.theme}
+        aria-busy="true"
+        aria-live="polite"
+      >
+        <header className="flex-shrink-0 z-20 bg-[hsl(var(--color-background)/0.95)] backdrop-blur border-b">
+          <div className="container flex items-center gap-2 h-14">
+            <Button variant="ghost" size="icon" onClick={onBack} aria-label="返回剧情列表">
+              <ArrowLeft className="h-5 w-5" />
+            </Button>
+            <h1 className="flex-1 min-w-0 text-base font-semibold truncate">{storyName}</h1>
+          </div>
+        </header>
+        <div className="flex-1 overflow-hidden">
+          <div className="container py-8">
+            <ReaderSkeleton />
+          </div>
+        </div>
+        <span className="sr-only">正在加载剧情内容</span>
       </div>
     );
   }
 
   if (error) {
     return (
-      <div className="flex flex-col items-center justify-center h-full gap-4">
+      <div className="flex flex-col items-center justify-center h-full gap-4 px-6 text-center">
         <div className="text-[hsl(var(--color-destructive))]">加载失败: {error}</div>
-        <Button onClick={onBack} variant="outline">
-          <ArrowLeft className="mr-2 h-4 w-4" />
-          返回
-        </Button>
+        <div className="flex flex-wrap items-center justify-center gap-2">
+          <Button onClick={() => void loadStory()} className="min-h-[44px]">
+            <RefreshCw className="mr-2 h-4 w-4" />
+            重试
+          </Button>
+          <Button onClick={onBack} variant="outline" className="min-h-[44px]">
+            <ArrowLeft className="mr-2 h-4 w-4" />
+            返回
+          </Button>
+        </div>
       </div>
     );
   }
 
   if (!content || processedSegments.length === 0) {
     return (
-      <div className="flex flex-col items-center justify-center h-full gap-4">
+      <div className="flex flex-col items-center justify-center h-full gap-4 px-6 text-center">
         <div className="text-[hsl(var(--color-muted-foreground))]">暂无内容</div>
-        <Button onClick={onBack} variant="outline">
-          <ArrowLeft className="mr-2 h-4 w-4" />
-          返回
-        </Button>
+        <div className="flex flex-wrap items-center justify-center gap-2">
+          <Button onClick={() => void loadStory()} variant="outline" className="min-h-[44px]">
+            <RefreshCw className="mr-2 h-4 w-4" />
+            重新加载
+          </Button>
+          <Button onClick={onBack} variant="outline" className="min-h-[44px]">
+            <ArrowLeft className="mr-2 h-4 w-4" />
+            返回
+          </Button>
+        </div>
       </div>
     );
   }
@@ -1392,7 +1694,16 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
       className="h-full flex flex-col overflow-hidden reader-surface"
       data-reader-theme={settings.theme}
     >
-      <header className="flex-shrink-0 z-20 bg-[hsl(var(--color-background)/0.95)] backdrop-blur border-b">
+      <header
+        ref={headerRef}
+        className="flex-shrink-0 z-20 bg-[hsl(var(--color-background)/0.95)] backdrop-blur border-b motion-safe:transition-[margin-top,opacity] motion-safe:duration-200"
+        style={{
+          marginTop: headerHidden ? `-${headerHeight}px` : 0,
+          opacity: headerHidden ? 0 : 1,
+          pointerEvents: headerHidden ? "none" : undefined,
+        }}
+        aria-hidden={headerHidden}
+      >
         <div className="container flex items-center gap-2 h-14">
           <Button variant="ghost" size="icon" onClick={onBack} aria-label="返回剧情列表">
             <ArrowLeft className="h-5 w-5" />
@@ -1479,7 +1790,27 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
         </div>
       </header>
 
-      <main className="flex-1 overflow-hidden">
+      <main className="relative flex-1 overflow-hidden" onClick={handleReaderTap}>
+        {pageTapEnabled && (
+          <>
+            {currentPage > 0 && (
+              <div
+                aria-hidden="true"
+                className="pointer-events-none absolute left-0.5 top-1/2 z-10 -translate-y-1/2 opacity-20 text-[hsl(var(--color-foreground))]"
+              >
+                <ChevronLeft className="h-6 w-6" />
+              </div>
+            )}
+            {currentPage < totalPages - 1 && (
+              <div
+                aria-hidden="true"
+                className="pointer-events-none absolute right-0.5 top-1/2 z-10 -translate-y-1/2 opacity-20 text-[hsl(var(--color-foreground))]"
+              >
+                <ChevronRight className="h-6 w-6" />
+              </div>
+            )}
+          </>
+        )}
         <CustomScrollArea
           className="h-full"
           viewportClassName={cn(
@@ -1498,8 +1829,13 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
             <div className="reader-content motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-700" style={readerContentStyles}>
               {showSummaries && storyInfoText && (
                 <div className="reader-summary motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-700">
-                  <div className="reader-summary-label">剧情概述</div>
-                  <div className="reader-summary-body">{renderLines(storyInfoText)}</div>
+                  {/* 概述块的字号同样用 em，随阅读器字号一起缩放。 */}
+                  <div className="reader-summary-label" style={{ fontSize: "0.75em" }}>
+                    剧情概述
+                  </div>
+                  <div className="reader-summary-body" style={{ fontSize: "0.95em" }}>
+                    {renderLines(storyInfoText)}
+                  </div>
                 </div>
               )}
               {renderableSegments.map((segment, idx) =>
@@ -1530,25 +1866,29 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
       )}
 
       {settings.readingMode === "paged" && !selectMode && (
-        <footer className="flex-shrink-0 bg-[hsl(var(--color-background)/0.95)] backdrop-blur border-t p-4">
+        <footer
+          className="flex-shrink-0 bg-[hsl(var(--color-background)/0.95)] backdrop-blur border-t px-4 pt-4 pb-4"
+          style={{ paddingBottom: "calc(env(safe-area-inset-bottom, 0px) + 1rem)" }}
+        >
           <div className="container flex items-center justify-between gap-3">
             <Button
               variant="outline"
-              onClick={() => setCurrentPage((prev) => Math.max(0, prev - 1))}
+              onClick={goToPrevPage}
               disabled={currentPage === 0}
-              className="flex-1"
+              className="flex-1 min-h-[44px]"
             >
               <ChevronLeft className="mr-2 h-4 w-4" />
               上一页
             </Button>
-            <div className="text-xs text-[hsl(var(--color-muted-foreground))] min-w-[4rem] text-center">
-              {progressPercentage}%
+            <div className="text-xs tabular-nums text-[hsl(var(--color-muted-foreground))] min-w-[5.5rem] text-center">
+              {currentPage + 1} / {totalPages}
+              <span className="block text-[10px] opacity-75">{progressPercentage}%</span>
             </div>
             <Button
               variant="outline"
-              onClick={() => setCurrentPage((prev) => Math.min(totalPages - 1, prev + 1))}
+              onClick={goToNextPage}
               disabled={currentPage >= totalPages - 1}
-              className="flex-1"
+              className="flex-1 min-h-[44px]"
             >
               下一页
               <ChevronRight className="ml-2 h-4 w-4" />
@@ -1610,9 +1950,9 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => setCurrentPage((prev) => Math.max(0, prev - 1))}
+                onClick={goToPrevPage}
                 disabled={currentPage === 0}
-                className="flex-1"
+                className="flex-1 min-h-[44px]"
               >
                 <ChevronLeft className="mr-2 h-4 w-4" />
                 上一页
@@ -1623,9 +1963,9 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => setCurrentPage((prev) => Math.min(totalPages - 1, prev + 1))}
+                onClick={goToNextPage}
                 disabled={currentPage >= totalPages - 1}
-                className="flex-1"
+                className="flex-1 min-h-[44px]"
               >
                 下一页
                 <ChevronRight className="ml-2 h-4 w-4" />
@@ -1713,6 +2053,41 @@ export function StoryReader({ storyId, storyPath, storyName, onBack, initialFocu
   );
 }
 
+
+/**
+ * 加载态骨架屏：用几条灰条模拟"头像 + 角色名 + 正文"的节奏，比一行
+ * "加载中..." 更接近最终版式，切换时不会整屏跳动。
+ */
+function ReaderSkeleton() {
+  const rows = [
+    { width: "38%", lines: 2 },
+    { width: "46%", lines: 3 },
+    { width: "32%", lines: 2 },
+    { width: "42%", lines: 3 },
+  ];
+  return (
+    <div className="mx-auto w-full max-w-[48rem] px-6 space-y-7 motion-safe:animate-pulse">
+      {rows.map((row, rowIndex) => (
+        <div key={rowIndex} className="flex gap-3">
+          <div className="h-9 w-9 flex-shrink-0 rounded-full bg-[hsl(var(--color-muted)/0.45)]" />
+          <div className="flex-1 space-y-2">
+            <div
+              className="h-3.5 rounded bg-[hsl(var(--color-muted)/0.55)]"
+              style={{ width: row.width }}
+            />
+            {Array.from({ length: row.lines }).map((_, lineIndex) => (
+              <div
+                key={lineIndex}
+                className="h-3 rounded bg-[hsl(var(--color-muted)/0.32)]"
+                style={{ width: lineIndex === row.lines - 1 ? "72%" : "100%" }}
+              />
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
 
 interface ReaderImageSegmentProps {
   index: number;

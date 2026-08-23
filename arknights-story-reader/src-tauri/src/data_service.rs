@@ -1,9 +1,8 @@
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use reqwest::blocking::Client;
@@ -15,7 +14,7 @@ use zip::ZipArchive;
 
 use crate::models::{
     Activity, Chapter, SearchDebugResponse, SearchResult, SearchResultsPage, SegmentHit,
-    SegmentSearchPage, StoryCategory, StoryEntry, StoryIndexStatus, StorySegment,
+    SegmentSearchPage, StoryCategory, StoryEntry, StoryIndexStatus, StoryPreviewToken, StorySegment,
 };
 use crate::parser::parse_story_text;
 
@@ -24,12 +23,16 @@ const REPO_DOWNLOAD_URL: &str = "https://codeload.github.com/Kengxxiao/Arknights
 const DEFAULT_BRANCH: &str = "master";
 const VERSION_FILE: &str = "version.json";
 const SEARCH_RESULT_LIMIT: usize = 500;
-/// Bump when any of: FTS schema, tokenizer rules, flatten_segments format.
+/// Bump when any of: FTS schema, tokenizer rules, flatten_segments format,
+/// or the set of stories that gets indexed.
+/// v7 = segment post-processing de-dupes consecutive same-token Image
+///      segments (matching the reader) and roguelike stories join the index;
+///      both shift stored segment indices, so a full rebuild is required.
 /// v6 = removed jieba, switched to char-level CJK tokenization (lighter binary).
 /// v4 = added segment-level FTS table `story_segment_index` (2025-05).
 /// v5 = parser recognises [Image]/[Background]/[PlayMusic]; dialogue carries
 ///      characterId; requires full rebuild.
-const INDEX_VERSION: i32 = 6;
+const INDEX_VERSION: i32 = 7;
 
 #[derive(Clone, serde::Serialize)]
 struct SyncProgress {
@@ -196,74 +199,118 @@ fn normalize_for_fuzzy(text: &str) -> String {
         .collect()
 }
 
-/// Split a raw user query into logical terms for AND matching in the fallback
-/// scanner. Quoted phrases are kept intact; the leading `-` marks NOT (ignored
-/// in fallback — fallback is advisory, not exhaustive). Returns already
+/// A user query broken down for the linear-scan fallback, mirroring the
+/// boolean semantics of `build_fts_query_advanced`: AND between groups, OR
+/// inside a group, and `-term` excludes.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct QueryTerms {
+    /// Positive terms. Every group must be satisfied (AND); within a group
+    /// any single alternative suffices (OR).
+    positive: Vec<Vec<String>>,
+    /// Terms introduced with a leading `-`; a document matching any of them
+    /// is rejected.
+    negative: Vec<String>,
+}
+
+impl QueryTerms {
+    /// The first positive term, used to centre the preview snippet.
+    fn primary(&self) -> Option<&str> {
+        self.positive
+            .first()
+            .and_then(|group| group.first())
+            .map(String::as_str)
+    }
+
+    /// Are all positive groups satisfied by at least one of `haystacks`?
+    /// Callers must check `excluded_by` separately — a title-only fast path
+    /// cannot see the body text a `-term` might live in.
+    fn positives_match(&self, haystacks: &[&str]) -> bool {
+        if self.positive.is_empty() {
+            return false;
+        }
+        self.positive.iter().all(|group| {
+            group
+                .iter()
+                .any(|term| haystacks.iter().any(|hay| hay.contains(term.as_str())))
+        })
+    }
+
+    fn excluded_by(&self, haystacks: &[&str]) -> bool {
+        self.negative
+            .iter()
+            .any(|term| haystacks.iter().any(|hay| hay.contains(term.as_str())))
+    }
+}
+
+/// Split a raw user query into logical terms for the fallback scanner.
+/// Quoted phrases are kept intact, a literal `or` joins the surrounding terms
+/// into one OR group, and a leading `-` marks an exclusion. Returns already
 /// fuzzy-normalized terms.
-fn split_query_terms(query: &str) -> Vec<String> {
-    let mut terms = Vec::new();
+fn split_query_terms(query: &str) -> QueryTerms {
+    let mut raw_terms: Vec<String> = Vec::new();
     let mut buf = String::new();
     let mut in_quotes = false;
+
+    // Quoted segments are pushed pre-normalized; the `-` of a NOT term is
+    // preserved here and interpreted below.
+    let flush = |buf: &mut String, terms: &mut Vec<String>| {
+        if buf.is_empty() {
+            return;
+        }
+        let raw = std::mem::take(buf);
+        let negated = raw.starts_with('-');
+        let normalized = normalize_for_fuzzy(&raw);
+        if normalized.is_empty() {
+            return;
+        }
+        if negated {
+            terms.push(format!("-{}", normalized));
+        } else {
+            terms.push(normalized);
+        }
+    };
+
     for ch in query.chars() {
         match ch {
             '"' => {
-                if in_quotes {
-                    if !buf.is_empty() {
-                        let normalized = normalize_for_fuzzy(&buf);
-                        if !normalized.is_empty() {
-                            terms.push(normalized);
-                        }
-                        buf.clear();
-                    }
-                    in_quotes = false;
-                } else {
-                    if !buf.is_empty() {
-                        let normalized = normalize_for_fuzzy(&buf);
-                        if !normalized.is_empty() {
-                            terms.push(normalized);
-                        }
-                        buf.clear();
-                    }
-                    in_quotes = true;
-                }
+                flush(&mut buf, &mut raw_terms);
+                in_quotes = !in_quotes;
             }
             c if c.is_whitespace() && !in_quotes => {
-                if !buf.is_empty() {
-                    let normalized = normalize_for_fuzzy(&buf);
-                    if !normalized.is_empty() {
-                        terms.push(normalized);
-                    }
-                    buf.clear();
-                }
+                flush(&mut buf, &mut raw_terms);
             }
             _ => buf.push(ch),
         }
     }
-    if !buf.is_empty() {
-        let normalized = normalize_for_fuzzy(&buf);
-        if !normalized.is_empty() {
-            terms.push(normalized);
+    flush(&mut buf, &mut raw_terms);
+
+    let mut out = QueryTerms::default();
+    let mut pending_or = false;
+    for term in raw_terms {
+        if term == "or" {
+            // `or` only connects when there is something on the left to
+            // connect to; a leading `or` is just noise.
+            pending_or = !out.positive.is_empty();
+            continue;
         }
+        if let Some(rest) = term.strip_prefix('-') {
+            if !rest.is_empty() {
+                out.negative.push(rest.to_string());
+            }
+            continue;
+        }
+        if pending_or {
+            if let Some(group) = out.positive.last_mut() {
+                group.push(term);
+                pending_or = false;
+                continue;
+            }
+        }
+        pending_or = false;
+        out.positive.push(vec![term]);
     }
 
-    // Drop OR/NOT keywords and NOT prefixes — fallback only matches positive terms.
-    terms
-        .into_iter()
-        .filter_map(|t| {
-            if t == "or" {
-                None
-            } else if let Some(rest) = t.strip_prefix('-') {
-                if rest.is_empty() {
-                    None
-                } else {
-                    // Preserve as a positive term — NOT semantics handled only by FTS path.
-                    Some(rest.to_string())
-                }
-            } else {
-                Some(t)
-            }
-        })
-        .collect()
+    out
 }
 
 fn extract_numeric_parts(text: &str) -> Vec<i32> {
@@ -464,9 +511,16 @@ impl DataService {
     }
 
     fn clear_story_index(&self) -> Result<(), String> {
-        if self.index_db_path.exists() {
-            fs::remove_file(&self.index_db_path)
-                .map_err(|e| format!("Failed to remove story index: {}", e))?;
+        // WAL 模式下 `-wal` / `-shm` 是数据库的一部分：只删主文件会让 SQLite
+        // 用残留的 WAL 复活旧索引。
+        for suffix in ["", "-wal", "-shm"] {
+            let mut path = self.index_db_path.clone().into_os_string();
+            path.push(suffix);
+            let path = PathBuf::from(path);
+            if path.exists() {
+                fs::remove_file(&path)
+                    .map_err(|e| format!("Failed to remove story index {:?}: {}", path, e))?;
+            }
         }
         Ok(())
     }
@@ -510,6 +564,48 @@ impl DataService {
         }
     }
 
+    /// Group-level cover token from `story_review_table.json`. Entries often
+    /// carry a null `storyPic`, in which case the活动/章节 level art is the
+    /// only thing we can hand the frontend.
+    fn group_story_pic(value: &Value) -> Option<String> {
+        ["storyPic", "storyEntryPicId", "storyPicId", "storyMainPicId"]
+            .iter()
+            .find_map(|key| {
+                value
+                    .get(key)
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+            })
+    }
+
+    /// Deserialize a group's `infoUnlockDatas`, backfilling the cover token
+    /// from the group when the entry itself has none.
+    fn parse_group_entries(value: &Value) -> Vec<StoryEntry> {
+        let Some(unlock_datas) = value.get("infoUnlockDatas").and_then(|v| v.as_array()) else {
+            return Vec::new();
+        };
+        let group_pic = Self::group_story_pic(value);
+        unlock_datas
+            .iter()
+            .filter_map(|unlock_data| {
+                serde_json::from_value::<StoryEntry>(unlock_data.clone()).ok()
+            })
+            .map(|mut story| {
+                if story
+                    .story_pic
+                    .as_ref()
+                    .map(|p| p.trim().is_empty())
+                    .unwrap_or(true)
+                {
+                    story.story_pic = group_pic.clone();
+                }
+                story
+            })
+            .collect()
+    }
+
     fn collect_stories_for_index(&self) -> Result<Vec<IndexedStory>, String> {
         if !self.is_installed() {
             return Err("NOT_INSTALLED".to_string());
@@ -534,24 +630,36 @@ impl DataService {
                 .and_then(|v| v.as_str())
                 .unwrap_or("UNKNOWN");
 
-            let Some(unlock_datas) = value.get("infoUnlockDatas").and_then(|v| v.as_array()) else {
-                continue;
-            };
-
             let category_name = Self::resolve_category_name(entry_type, entry_id, value);
 
-            for unlock_data in unlock_datas {
-                if let Ok(story) = serde_json::from_value::<StoryEntry>(unlock_data.clone()) {
-                    if story.story_txt.trim().is_empty() {
-                        continue;
-                    }
-                    if seen_ids.insert(story.story_id.clone()) {
-                        stories.push(IndexedStory {
-                            category_name: category_name.clone(),
-                            entry_type: entry_type.to_string(),
-                            story,
-                        });
-                    }
+            for story in Self::parse_group_entries(value) {
+                if story.story_txt.trim().is_empty() {
+                    continue;
+                }
+                if seen_ids.insert(story.story_id.clone()) {
+                    stories.push(IndexedStory {
+                        category_name: category_name.clone(),
+                        entry_type: entry_type.to_string(),
+                        story,
+                    });
+                }
+            }
+        }
+
+        // Roguelike scripts live in `story_table.json`, not in the review
+        // table. Without them 肉鸽 is unsearchable and `get_story_entry` /
+        // `get_story_neighbors` fail for every roguelike reader session.
+        for (group_key, group_stories) in self.collect_roguelike_groups().unwrap_or_default() {
+            for story in group_stories {
+                if story.story_txt.trim().is_empty() {
+                    continue;
+                }
+                if seen_ids.insert(story.story_id.clone()) {
+                    stories.push(IndexedStory {
+                        category_name: group_key.clone(),
+                        entry_type: "ROGUELIKE".to_string(),
+                        story,
+                    });
                 }
             }
         }
@@ -672,6 +780,19 @@ impl DataService {
 
         let mut merged: Vec<StorySegment> = Vec::with_capacity(cleaned.len());
         for seg in cleaned {
+            // Scripts routinely set the same illustration twice in a row; the
+            // reader collapses those, so the index has to as well or every
+            // later segment index drifts.
+            if let StorySegment::Image { token, .. } = &seg {
+                if let Some(StorySegment::Image {
+                    token: prev_token, ..
+                }) = merged.last()
+                {
+                    if prev_token == token {
+                        continue;
+                    }
+                }
+            }
             if let StorySegment::Dialogue {
                 character_name,
                 text,
@@ -1084,21 +1205,29 @@ impl DataService {
     }
 
     pub fn check_update(&self) -> Result<bool, String> {
-        let current = self.read_version();
-        if current.is_none() {
+        let Some(current) = self.read_version() else {
+            // 本地根本没有数据，提示用户下载。
             return Ok(true);
+        };
+
+        let local_commit = current.commit.trim();
+        if local_commit.is_empty()
+            || local_commit == "unknown"
+            || local_commit.starts_with("manual-")
+        {
+            // 手动导入 / 版本未知的包没有可比较的 commit，无法判断新旧；
+            // 报"有更新"会让用户每次启动都被催同步。
+            return Ok(false);
         }
 
         let client = Self::create_http_client()?;
         match self.fetch_latest_commit(&client) {
-            Ok(remote) => {
-                if let Some(cur) = current {
-                    Ok(cur.commit != remote)
-                } else {
-                    Ok(true)
-                }
+            Ok(remote) => Ok(!local_commit.eq_ignore_ascii_case(remote.trim())),
+            Err(err) => {
+                // 网络/API 失败说明的是"查不到"，不是"有新版本"。
+                eprintln!("[UPDATE] 检查更新失败，视为无更新: {}", err);
+                Ok(false)
             }
-            Err(_) => Ok(true),
         }
     }
 
@@ -1265,7 +1394,27 @@ impl DataService {
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path())
             .find(|path| path.is_dir())
-            .ok_or_else(|| "解压后的文件结构不正确".to_string())?;
+            .ok_or_else(|| {
+                fs::remove_dir_all(&extract_root).ok();
+                "解压后的文件结构不正确".to_string()
+            })?;
+
+        // 先验收再动旧数据：如果这个包里没有 story_review_table.json，整个
+        // 应用就是空的。此时必须保留已有 data_dir，让用户继续用旧数据。
+        if !extracted_root
+            .join("zh_CN/gamedata/excel/story_review_table.json")
+            .exists()
+        {
+            fs::remove_dir_all(&extract_root).ok();
+            return Err(
+                "ZIP 校验失败：缺少 zh_CN/gamedata/excel/story_review_table.json，已保留原有数据"
+                    .to_string(),
+            );
+        }
+
+        // 阅读器只需要 story / excel 数据；关卡、战斗、美术等目录加起来
+        // 是数据集的大头，移动前先剪掉，省磁盘也省一次拷贝。
+        Self::prune_unused_dirs(&extracted_root);
 
         if self.data_dir.exists() {
             fs::remove_dir_all(&self.data_dir)
@@ -1282,6 +1431,30 @@ impl DataService {
 
         fs::remove_dir_all(&extract_root).ok();
         Ok(())
+    }
+
+    /// 删除阅读器用不到的大目录（存在才删，失败只记日志）。
+    fn prune_unused_dirs(root: &Path) {
+        const UNUSED: &[&str] = &[
+            "zh_CN/gamedata/levels",
+            "zh_CN/gamedata/bakemuzzledata",
+            "zh_CN/gamedata/battle",
+            "zh_CN/gamedata/building",
+            "zh_CN/gamedata/art",
+            "zh_CN/gamedata/[uc]lua",
+            "zh_CN/gamedata/levelscripts",
+            "zh_CN/gamedata/story/[uc]lua",
+            "zh_CN/gamedata/story/levelscripts",
+        ];
+        for rel in UNUSED {
+            let path = root.join(rel);
+            if !path.is_dir() {
+                continue;
+            }
+            if let Err(err) = fs::remove_dir_all(&path) {
+                eprintln!("[SYNC] 剪枝 {:?} 失败（忽略）: {}", path, err);
+            }
+        }
     }
 
     fn finalize_manual_import(&self, temp_path: &Path, app: &AppHandle) -> Result<(), String> {
@@ -1512,17 +1685,7 @@ impl DataService {
         for (_id, value) in data.iter() {
             if let Some(et) = value.get("entryType").and_then(|v| v.as_str()) {
                 if et == entry_type {
-                    if let Some(unlock_datas) =
-                        value.get("infoUnlockDatas").and_then(|v| v.as_array())
-                    {
-                        for unlock_data in unlock_datas {
-                            if let Ok(story) =
-                                serde_json::from_value::<StoryEntry>(unlock_data.clone())
-                            {
-                                stories.push(story);
-                            }
-                        }
-                    }
+                    stories.extend(Self::parse_group_entries(value));
                 }
             }
         }
@@ -1549,17 +1712,7 @@ impl DataService {
         for (_id, value) in data.iter() {
             if let Some(entry_type) = value.get("entryType").and_then(|v| v.as_str()) {
                 if entry_type == "MAINLINE" {
-                    if let Some(unlock_datas) =
-                        value.get("infoUnlockDatas").and_then(|v| v.as_array())
-                    {
-                        for unlock_data in unlock_datas {
-                            if let Ok(story) =
-                                serde_json::from_value::<StoryEntry>(unlock_data.clone())
-                            {
-                                stories.push(story);
-                            }
-                        }
-                    }
+                    stories.extend(Self::parse_group_entries(value));
                 }
             }
         }
@@ -1983,11 +2136,12 @@ impl DataService {
     fn search_stories_fallback(&self, query: &str) -> Result<Vec<SearchResult>, String> {
         let mut results = Vec::new();
         let terms = split_query_terms(query);
-        if terms.is_empty() {
+        if terms.positive.is_empty() {
+            // Purely-negative (or empty) queries have no meaningful answer.
             return Ok(results);
         }
         // Primary term for context extraction + raw query for display fallback.
-        let primary_term = terms[0].clone();
+        let primary_term = terms.primary().unwrap_or_default().to_string();
 
         let stories = self.collect_stories_for_index()?;
 
@@ -2002,12 +2156,13 @@ impl DataService {
                 .as_ref()
                 .map(|s| normalize_for_fuzzy(s))
                 .unwrap_or_default();
+            let title_hits =
+                terms.positives_match(&[story_name_norm.as_str(), code_norm.as_str()]);
 
-            // Fast path: title/code AND-hit.
-            let title_hits = terms
-                .iter()
-                .all(|t| story_name_norm.contains(t) || (!code_norm.is_empty() && code_norm.contains(t)));
-            if title_hits {
+            // Fast path: title/code hit and nothing to exclude. With NOT terms
+            // in play we still have to read the body, since an exclusion may
+            // only appear there.
+            if title_hits && terms.negative.is_empty() {
                 results.push(SearchResult {
                     story_id: story.story_id.clone(),
                     story_name: story.story_name.clone(),
@@ -2024,9 +2179,19 @@ impl DataService {
                 // Normalize the content with the same rules used for terms so that
                 // `{@nickname}` → `博士`, whitespace and punctuation differences are neutralized.
                 let content_norm = normalize_for_fuzzy(&content);
-                let body_hits = terms.iter().all(|t| content_norm.contains(t));
-                if body_hits {
-                    let matched_text = self.extract_context(&content, &primary_term);
+                if terms.excluded_by(&[
+                    content_norm.as_str(),
+                    story_name_norm.as_str(),
+                    code_norm.as_str(),
+                ]) {
+                    continue;
+                }
+                if title_hits || terms.positives_match(&[content_norm.as_str()]) {
+                    let matched_text = if title_hits {
+                        story.story_name.clone()
+                    } else {
+                        self.extract_context(&content, &primary_term)
+                    };
                     results.push(SearchResult {
                         story_id: story.story_id.clone(),
                         story_name: story.story_name.clone(),
@@ -2059,7 +2224,7 @@ impl DataService {
 
         match self.search_stories_with_index(trimmed) {
             // Index returned authoritative results — don't waste time on
-            // linear scan. FTS5 with jieba is a superset of plain contains()
+            // linear scan. Char-level FTS5 is a superset of plain contains()
             // matching at this point.
             Ok(Some(results)) => Ok(results),
             // Index not ready (never built, was cleared, or empty table).
@@ -2085,8 +2250,34 @@ impl DataService {
     /// `search_stories` (FTS + linear scan, deduped), but it also runs a
     /// separate `COUNT(*)` on the FTS side for accurate totals.
     pub fn search_stories_ex(&self, query: &str) -> Result<SearchResultsPage, String> {
+        self.search_stories_ex_inner(query, None)
+    }
+
+    /// 与 `search_stories_ex` 相同，但沿途 emit `search-progress`，
+    /// 让前端在回退线性扫描（可能几秒）时不至于是一片空白。
+    #[allow(dead_code)]
+    pub fn search_stories_ex_with_progress(
+        &self,
+        app: &AppHandle,
+        query: &str,
+    ) -> Result<SearchResultsPage, String> {
+        self.search_stories_ex_inner(query, Some(app))
+    }
+
+    fn search_stories_ex_inner(
+        &self,
+        query: &str,
+        app: Option<&AppHandle>,
+    ) -> Result<SearchResultsPage, String> {
+        let progress = |phase: &str, cur: usize, total: usize, msg: String| {
+            if let Some(app) = app {
+                emit_search_progress(app, phase, cur, total, msg);
+            }
+        };
+
         let trimmed = query.trim();
         if trimmed.is_empty() {
+            progress("完成", 1, 1, "查询为空".to_string());
             return Ok(SearchResultsPage {
                 results: Vec::new(),
                 total_matched: 0,
@@ -2095,7 +2286,12 @@ impl DataService {
             });
         }
 
-        let results = self.search_stories(trimmed)?;
+        progress("检索", 0, 3, format!("搜索「{}」", trimmed));
+        let results = match app {
+            Some(app) => self.search_stories_with_progress(app, trimmed)?,
+            None => self.search_stories(trimmed)?,
+        };
+        progress("检索", 1, 3, format!("命中 {} 篇", results.len()));
 
         // Compute total via FTS (best effort — if the index is unavailable we
         // fall back to `results.len()` which is at least a lower bound).
@@ -2103,6 +2299,7 @@ impl DataService {
             .count_fts_matches(trimmed)
             .unwrap_or_else(|_| results.len());
         let total_matched = total_matched.max(results.len());
+        progress("统计", 2, 3, format!("共 {} 条匹配", total_matched));
 
         // Build facets from the returned subset. Categories are formatted as
         // `<Type> | <Specific Name>` (see `format_category_label`); aggregating
@@ -2154,8 +2351,33 @@ impl DataService {
     /// first-run before sync completes), this returns an empty page and the
     /// caller should fall back to `search_stories_ex`.
     pub fn search_segments(&self, query: &str) -> Result<SegmentSearchPage, String> {
+        self.search_segments_inner(query, None)
+    }
+
+    /// 与 `search_segments` 相同，额外 emit `search-progress`。
+    #[allow(dead_code)]
+    pub fn search_segments_with_progress(
+        &self,
+        app: &AppHandle,
+        query: &str,
+    ) -> Result<SegmentSearchPage, String> {
+        self.search_segments_inner(query, Some(app))
+    }
+
+    fn search_segments_inner(
+        &self,
+        query: &str,
+        app: Option<&AppHandle>,
+    ) -> Result<SegmentSearchPage, String> {
+        let progress = |phase: &str, cur: usize, total: usize, msg: String| {
+            if let Some(app) = app {
+                emit_search_progress(app, phase, cur, total, msg);
+            }
+        };
+
         let trimmed = query.trim();
         if trimmed.is_empty() {
+            progress("完成", 1, 1, "查询为空".to_string());
             return Ok(SegmentSearchPage {
                 hits: Vec::new(),
                 total_matched: 0,
@@ -2163,7 +2385,10 @@ impl DataService {
             });
         }
 
+        progress("段落检索", 0, 2, format!("搜索「{}」", trimmed));
+
         let Some(conn) = self.try_open_index_connection()? else {
+            progress("完成", 1, 1, "段落索引尚未建立".to_string());
             return Ok(SegmentSearchPage {
                 hits: Vec::new(),
                 total_matched: 0,
@@ -2180,6 +2405,7 @@ impl DataService {
             })
             .unwrap_or(0);
         if seg_total == 0 {
+            progress("完成", 1, 1, "段落索引为空".to_string());
             return Ok(SegmentSearchPage {
                 hits: Vec::new(),
                 total_matched: 0,
@@ -2260,9 +2486,9 @@ impl DataService {
             };
             // Did the query actually hit the segment body / speaker? Used
             // for the UI's "按说话人命中" badge. "mixed" is our honest
-            // fallback when jieba tokenised the query and neither the body
-            // nor the speaker contain the full probe verbatim — in that
-            // case we show no badge rather than falsely accusing one
+            // fallback when the char-level tokens matched but neither the
+            // body nor the speaker contain the full probe verbatim — in
+            // that case we show no badge rather than falsely accusing one
             // column of being the culprit.
             let body_norm = normalize_for_fuzzy(&raw_text);
             let speaker_norm = normalize_for_fuzzy(&character_norm);
@@ -2347,6 +2573,8 @@ impl DataService {
         } else {
             hits.len()
         };
+
+        progress("完成", 2, 2, format!("命中 {} 段", total_matched));
 
         Ok(SegmentSearchPage {
             hits,
@@ -2580,10 +2808,11 @@ impl DataService {
 
         let mut results = Vec::new();
         let terms = split_query_terms(trimmed);
-        if terms.is_empty() {
+        if terms.positive.is_empty() {
+            emit_search_progress(app, "完成", 1, 1, "查询没有可用的正向词");
             return Ok(Vec::new());
         }
-        let primary_term = terms[0].clone();
+        let primary_term = terms.primary().unwrap_or_default().to_string();
         for (idx, indexed) in stories.iter().enumerate() {
             let story = &indexed.story;
             let category_label =
@@ -2595,10 +2824,9 @@ impl DataService {
                 .as_ref()
                 .map(|s| normalize_for_fuzzy(s))
                 .unwrap_or_default();
-            let title_hits = terms
-                .iter()
-                .all(|t| story_name_norm.contains(t) || (!code_norm.is_empty() && code_norm.contains(t)));
-            if title_hits {
+            let title_hits =
+                terms.positives_match(&[story_name_norm.as_str(), code_norm.as_str()]);
+            if title_hits && terms.negative.is_empty() {
                 results.push(SearchResult {
                     story_id: story.story_id.clone(),
                     story_name: story.story_name.clone(),
@@ -2607,8 +2835,17 @@ impl DataService {
                 });
             } else if let Ok(content) = self.read_story_text(&story.story_txt) {
                 let content_norm = normalize_for_fuzzy(&content);
-                if terms.iter().all(|t| content_norm.contains(t)) {
-                    let matched_text = self.extract_context(&content, &primary_term);
+                let excluded = terms.excluded_by(&[
+                    content_norm.as_str(),
+                    story_name_norm.as_str(),
+                    code_norm.as_str(),
+                ]);
+                if !excluded && (title_hits || terms.positives_match(&[content_norm.as_str()])) {
+                    let matched_text = if title_hits {
+                        story.story_name.clone()
+                    } else {
+                        self.extract_context(&content, &primary_term)
+                    };
                     results.push(SearchResult {
                         story_id: story.story_id.clone(),
                         story_name: story.story_name.clone(),
@@ -2843,17 +3080,8 @@ impl DataService {
                         .and_then(|v| v.as_str())
                         .unwrap_or("未知章节");
 
-                    if let Some(unlock_datas) =
-                        value.get("infoUnlockDatas").and_then(|v| v.as_array())
-                    {
-                        let mut stories = Vec::new();
-                        for unlock_data in unlock_datas {
-                            if let Ok(story) =
-                                serde_json::from_value::<StoryEntry>(unlock_data.clone())
-                            {
-                                stories.push(story);
-                            }
-                        }
+                    let mut stories = Self::parse_group_entries(value);
+                    if !stories.is_empty() {
                         stories.sort_by_key(|s| s.story_sort);
                         groups.push((id.clone(), group_name.to_string(), stories));
                     }
@@ -2894,41 +3122,29 @@ impl DataService {
                         .and_then(|v| v.as_str())
                         .unwrap_or("未知活动");
 
-                    if let Some(unlock_datas) =
-                        value.get("infoUnlockDatas").and_then(|v| v.as_array())
-                    {
-                        let mut stories = Vec::new();
-                        for unlock_data in unlock_datas {
-                            if let Ok(story) =
-                                serde_json::from_value::<StoryEntry>(unlock_data.clone())
-                            {
-                                stories.push(story);
-                            }
-                        }
+                    let mut stories = Self::parse_group_entries(value);
+                    if !stories.is_empty() {
+                        stories.sort_by_key(|s| s.story_sort);
+                        let start_time = value
+                            .get("startTime")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(i64::MAX);
+                        let normalized_start = if start_time <= 0 {
+                            i64::MAX
+                        } else {
+                            start_time
+                        };
+                        let sort_id = value
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_else(|| _id.as_str());
 
-                        if !stories.is_empty() {
-                            stories.sort_by_key(|s| s.story_sort);
-                            let start_time = value
-                                .get("startTime")
-                                .and_then(|v| v.as_i64())
-                                .unwrap_or(i64::MAX);
-                            let normalized_start = if start_time <= 0 {
-                                i64::MAX
-                            } else {
-                                start_time
-                            };
-                            let sort_id = value
-                                .get("id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_else(|| _id.as_str());
-
-                            groups.push((
-                                activity_name.to_string(),
-                                stories,
-                                normalized_start,
-                                sort_id.to_string(),
-                            ));
-                        }
+                        groups.push((
+                            activity_name.to_string(),
+                            stories,
+                            normalized_start,
+                            sort_id.to_string(),
+                        ));
                     }
                 }
             }
@@ -2975,19 +3191,10 @@ impl DataService {
                     .and_then(|v| v.as_str())
                     .unwrap_or("支线剧情");
 
-                if let Some(unlock_datas) = value.get("infoUnlockDatas").and_then(|v| v.as_array())
-                {
-                    let mut stories = Vec::new();
-                    for unlock_data in unlock_datas {
-                        if let Ok(story) = serde_json::from_value::<StoryEntry>(unlock_data.clone())
-                        {
-                            stories.push(story);
-                        }
-                    }
-                    if !stories.is_empty() {
-                        stories.sort_by_key(|s| s.story_sort);
-                        groups.push((group_name.to_string(), stories, id.clone()));
-                    }
+                let mut stories = Self::parse_group_entries(value);
+                if !stories.is_empty() {
+                    stories.sort_by_key(|s| s.story_sort);
+                    groups.push((group_name.to_string(), stories, id.clone()));
                 }
             }
         }
@@ -3003,7 +3210,13 @@ impl DataService {
         if !self.is_installed() {
             return Err("NOT_INSTALLED".to_string());
         }
+        self.collect_roguelike_groups()
+    }
 
+    /// 枚举 `story_table.json` 里的所有 `Obt/Roguelike/...` 剧情，按主题分组。
+    /// 既服务于「肉鸽」列表页，也被 `collect_stories_for_index` 复用，
+    /// 保证肉鸽剧情同样可搜索、可取上下篇。
+    fn collect_roguelike_groups(&self) -> Result<Vec<(String, Vec<StoryEntry>)>, String> {
         // 首先读取 meta，提取 contentPath -> desc 映射（用于更友好的命名）
         let meta_file = self
             .data_dir
@@ -3055,14 +3268,19 @@ impl DataService {
         let table_obj: HashMap<String, Value> = serde_json::from_str(&story_table_content)
             .map_err(|e| format!("Failed to parse story table: {}", e))?;
 
-        let mut grouped: HashMap<String, Vec<StoryEntry>> = HashMap::new();
-        let mut counters: HashMap<String, i32> = HashMap::new();
+        // `story_table` 是 HashMap，迭代顺序随机；先把命中的 key 排好序再
+        // 分配 storySort，否则每次启动的编号（以及索引里的顺序）都不一样。
+        let mut keys: Vec<String> = table_obj
+            .into_keys()
+            .filter(|key| key.to_ascii_lowercase().starts_with("obt/roguelike/"))
+            .collect();
+        keys.sort_by(|a, b| compare_story_group_ids(a, b));
 
-        for (key, _v) in table_obj.into_iter() {
+        let mut grouped: BTreeMap<String, Vec<StoryEntry>> = BTreeMap::new();
+        let mut counters: BTreeMap<String, i32> = BTreeMap::new();
+
+        for key in keys {
             let lower = key.to_ascii_lowercase();
-            if !lower.starts_with("obt/roguelike/") {
-                continue;
-            }
             let group_key = lower
                 .split('/')
                 .nth(2)
@@ -3086,6 +3304,7 @@ impl DataService {
                 avg_tag: None,
                 story_txt: lower.clone(),
                 story_info: None,
+                story_pic: None,
                 story_review_type: "ROGUELIKE".to_string(),
                 unlock_type: "NONE".to_string(),
                 story_dependence: None,
@@ -3127,9 +3346,88 @@ impl DataService {
         let data: HashMap<String, Value> = serde_json::from_str(&content)
             .map_err(|e| format!("Failed to parse story review data: {}", e))?;
 
-        let stories = self.parse_stories_by_entry_type(&data, "NONE")?;
+        let mut stories = self.parse_stories_by_entry_type(&data, "NONE")?;
+
+        // 干员密录的 storySort 在原始数据里几乎全是 0，直接按它排等于
+        // 保留 HashMap 的随机顺序。改为按「干员 char token → 篇内序号 →
+        // storyId」排，同一位干员的密录始终连在一起且顺序稳定。
+        stories.sort_by(|a, b| {
+            let a_char = extract_char_token(&a.story_txt).unwrap_or_else(|| a.story_name.clone());
+            let b_char = extract_char_token(&b.story_txt).unwrap_or_else(|| b.story_name.clone());
+            a_char
+                .cmp(&b_char)
+                .then_with(|| extract_numeric_parts(&a.story_txt).cmp(&extract_numeric_parts(&b.story_txt)))
+                .then_with(|| a.story_name.cmp(&b.story_name))
+                .then_with(|| a.story_id.cmp(&b.story_id))
+        });
         Ok(stories)
     }
+
+    /// 读取剧情脚本，返回第一张可用作缩略图的素材 token。
+    /// 优先 `[Image]`（真正的剧情插画），没有时退化到脚本里第一条
+    /// `[Background]`——解析器有意丢弃 Background 段，所以这里直接扫原文。
+    pub fn get_story_preview_token(
+        &self,
+        story_path: &str,
+    ) -> Result<Option<StoryPreviewToken>, String> {
+        let raw = self.read_story_text(story_path)?;
+
+        let parsed = parse_story_text(&raw);
+        for segment in &parsed.segments {
+            if let StorySegment::Image { token, .. } = segment {
+                let token = token.trim().trim_start_matches('$');
+                if !token.is_empty() {
+                    return Ok(Some(StoryPreviewToken {
+                        kind: "image".to_string(),
+                        token: token.to_string(),
+                    }));
+                }
+            }
+        }
+
+        Ok(first_background_token(&raw).map(|token| StoryPreviewToken {
+            kind: "background".to_string(),
+            token,
+        }))
+    }
+}
+
+/// 从 `obt/memory/char_002_amiya/...` 这类路径里抓出 `char_002_amiya`。
+fn extract_char_token(story_txt: &str) -> Option<String> {
+    story_txt
+        .split(|c| c == '/' || c == '\\')
+        .find(|seg| seg.starts_with("char_"))
+        .map(|seg| seg.to_ascii_lowercase())
+}
+
+/// 扫描原始脚本里第一条 `[Background(image="bg_xxx"...)]` 的 image token。
+fn first_background_token(raw: &str) -> Option<String> {
+    for line in raw.lines() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with('[') {
+            continue;
+        }
+        // `to_ascii_lowercase` 不改变字节长度，偏移量可以直接用回原串。
+        let lowered = trimmed.to_ascii_lowercase();
+        if !lowered.starts_with("[background") {
+            continue;
+        }
+        let Some(image_at) = lowered.find("image=") else {
+            continue;
+        };
+        // 用原始大小写切片取值，token 本身可能含大写（如 `bg_Rhodes`）。
+        let value = trimmed[image_at + "image=".len()..]
+            .trim_start()
+            .trim_start_matches('"');
+        let end = value
+            .find(|c: char| c == '"' || c == ',' || c == ')')
+            .unwrap_or(value.len());
+        let token = value[..end].trim().trim_start_matches('$').trim();
+        if !token.is_empty() {
+            return Some(token.to_string());
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -3162,6 +3460,94 @@ mod tests {
     }
 
     #[test]
+    fn preview_token_prefers_image_then_background() {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_root = std::env::temp_dir().join(format!("story_preview_test_{}", timestamp));
+        let data_dir = temp_root.join("ArknightsGameData");
+        let story_dir = data_dir.join("zh_CN/gamedata/story/demo");
+        fs::create_dir_all(&story_dir).unwrap();
+        fs::write(
+            story_dir.join("with_image.txt"),
+            "[Background(image=\"bg_rhodes\",screenadapt=\"coverall\")]\n\
+             [Image(image=\"avg_8_34\",fadetime=2)]\n\
+             [name=\"凯尔希\"]测试\n",
+        )
+        .unwrap();
+        fs::write(
+            story_dir.join("bg_only.txt"),
+            "[Delay(time=1)]\n[Background(image=\"bg_Rhodes_1\",fadetime=2)]\n旁白\n",
+        )
+        .unwrap();
+        fs::write(story_dir.join("plain.txt"), "[name=\"博士\"]没有插画\n").unwrap();
+
+        let service = DataService {
+            data_dir: data_dir.clone(),
+            index_db_path: temp_root.join("story_index.db"),
+        };
+
+        let image = service
+            .get_story_preview_token("demo/with_image")
+            .unwrap()
+            .expect("image segment wins over background");
+        assert_eq!(image.kind, "image");
+        assert_eq!(image.token, "avg_8_34");
+
+        let background = service
+            .get_story_preview_token("demo/bg_only")
+            .unwrap()
+            .expect("falls back to the first Background");
+        assert_eq!(background.kind, "background");
+        assert_eq!(background.token, "bg_Rhodes_1");
+
+        assert!(service.get_story_preview_token("demo/plain").unwrap().is_none());
+
+        let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn post_process_dedupes_consecutive_same_image() {
+        let segments = vec![
+            StorySegment::Image {
+                token: "avg_1".to_string(),
+                caption: None,
+            },
+            StorySegment::Image {
+                token: "avg_1".to_string(),
+                caption: None,
+            },
+            StorySegment::Image {
+                token: "avg_2".to_string(),
+                caption: None,
+            },
+            StorySegment::Image {
+                token: "avg_1".to_string(),
+                caption: None,
+            },
+        ];
+        let processed = DataService::post_process_segments_for_index(&segments);
+        let tokens: Vec<&str> = processed
+            .iter()
+            .filter_map(|s| match s {
+                StorySegment::Image { token, .. } => Some(token.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tokens, vec!["avg_1", "avg_2", "avg_1"]);
+    }
+
+    #[test]
+    fn extract_char_token_from_memory_path() {
+        assert_eq!(
+            extract_char_token("obt/memory/char_002_amiya/char_002_amiya_1"),
+            Some("char_002_amiya".to_string())
+        );
+        assert_eq!(extract_char_token("obt/main/level_main_01-01_beg"), None);
+    }
+
+    #[test]
     fn normalize_for_fuzzy_strips_whitespace_and_punctuation() {
         assert_eq!(normalize_for_fuzzy("凯尔希 阿米娅"), "凯尔希阿米娅");
         assert_eq!(normalize_for_fuzzy("凯尔希，阿米娅！"), "凯尔希阿米娅");
@@ -3181,46 +3567,73 @@ mod tests {
     #[test]
     fn split_query_terms_basic() {
         let terms = split_query_terms("凯尔希 阿米娅");
-        assert_eq!(terms, vec!["凯尔希", "阿米娅"]);
+        assert_eq!(terms.positive, vec![vec!["凯尔希"], vec!["阿米娅"]]);
+        assert!(terms.negative.is_empty());
     }
 
     #[test]
     fn split_query_terms_quoted_phrase() {
         let terms = split_query_terms("\"凯尔希 阿米娅\"");
         // Quoted phrase collapses internal whitespace because of fuzzy normalization.
-        assert_eq!(terms, vec!["凯尔希阿米娅"]);
+        assert_eq!(terms.positive, vec![vec!["凯尔希阿米娅"]]);
     }
 
     #[test]
-    fn split_query_terms_drops_or_and_not_prefix() {
+    fn split_query_terms_keeps_or_group_and_negation() {
         let terms = split_query_terms("凯尔希 or 阿米娅 -博士");
-        // `or` is dropped and NOT prefix becomes a positive term in fallback.
-        assert_eq!(terms, vec!["凯尔希", "阿米娅", "博士"]);
+        // `or` merges the two names into one alternative group; `-博士` is an
+        // exclusion, never a positive term.
+        assert_eq!(terms.positive, vec![vec!["凯尔希", "阿米娅"]]);
+        assert_eq!(terms.negative, vec!["博士"]);
+    }
+
+    #[test]
+    fn split_query_terms_not_is_not_inverted() {
+        let terms = split_query_terms("-凯尔希 博士");
+        assert_eq!(terms.positive, vec![vec!["博士"]]);
+        assert_eq!(terms.negative, vec!["凯尔希"]);
+        assert!(terms.positives_match(&["博士说过的话"]));
+        assert!(terms.excluded_by(&["凯尔希说过的话"]));
+        assert!(!terms.excluded_by(&["博士说过的话"]));
+    }
+
+    #[test]
+    fn split_query_terms_or_group_matches_either_alternative() {
+        let terms = split_query_terms("凯尔希 or 阿米娅");
+        assert!(terms.positives_match(&["只提到凯尔希"]));
+        assert!(terms.positives_match(&["只提到阿米娅"]));
+        assert!(!terms.positives_match(&["只提到博士"]));
     }
 
     #[test]
     fn fts_query_escapes_specials_and_is_nonempty() {
         let q = DataService::build_fts_query_advanced("凯尔希*").expect("non-empty");
-        assert!(!q.contains('*') || q.ends_with('*'));
-        // The phrase must still contain the CJK word token.
-        assert!(q.contains("凯尔希"));
+        // `*` is a FTS special and gets sanitized away for CJK terms.
+        assert!(!q.contains('*'));
+        // Every char of the term must still be present as its own token.
+        for ch in ["凯", "尔", "希"] {
+            assert!(q.contains(ch), "missing {} in {}", ch, q);
+        }
     }
 
     #[test]
-    fn fts_query_long_cjk_uses_jieba_words() {
+    fn fts_query_long_cjk_is_char_level_and() {
         let q = DataService::build_fts_query_advanced("凯尔希阿米娅").expect("non-empty");
-        // jieba splits `凯尔希阿米娅` into two names → AND of two phrases.
-        assert!(q.contains("AND"));
-        assert!(q.contains("凯尔希") || q.contains("凯"));
-        assert!(q.contains("阿米娅") || q.contains("阿"));
+        // Char-level tokenization: every CJK char becomes its own phrase,
+        // AND-joined inside one parenthesized clause.
+        assert_eq!(q, "(\"凯\" AND \"尔\" AND \"希\" AND \"阿\" AND \"米\" AND \"娅\")");
     }
 
     #[test]
-    fn fts_query_short_cjk_word_is_phrase() {
+    fn fts_query_short_cjk_word_is_char_level_and() {
         let q = DataService::build_fts_query_advanced("凯尔希").expect("non-empty");
-        // Should emit a single phrase clause (no connector).
-        assert!(q.contains("凯尔希"));
-        assert!(!q.contains("AND"));
+        assert_eq!(q, "(\"凯\" AND \"尔\" AND \"希\")");
+    }
+
+    #[test]
+    fn fts_query_single_cjk_char_has_no_connector() {
+        let q = DataService::build_fts_query_advanced("希").expect("non-empty");
+        assert_eq!(q, "\"希\"");
     }
 
     #[test]
@@ -3247,7 +3660,7 @@ mod tests {
         // The positive term must come BEFORE the NOT clause — otherwise FTS5
         // rejects the query with "unable to use function MATCH".
         let not_idx = q.find("NOT").unwrap();
-        let bodhi_idx = q.find("博士").unwrap();
+        let bodhi_idx = q.find('博').unwrap();
         assert!(
             bodhi_idx < not_idx,
             "positive term must precede NOT; got: {}",
@@ -3274,11 +3687,10 @@ mod tests {
     }
 
     #[test]
-    fn tokenize_for_fts_emits_word_and_chars() {
+    fn tokenize_for_fts_emits_single_cjk_chars() {
+        // No word segmentation any more: CJK is indexed one char at a time.
         let tokens = DataService::tokenize_for_fts("凯尔希 博士");
-        assert!(tokens.iter().any(|t| t == "凯尔希"));
-        assert!(tokens.iter().any(|t| t == "凯"));
-        assert!(tokens.iter().any(|t| t == "博士"));
+        assert_eq!(tokens, vec!["凯", "尔", "希", "博", "士"]);
     }
 
     #[test]

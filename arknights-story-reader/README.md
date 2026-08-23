@@ -1,6 +1,6 @@
 # 明日方舟剧情阅读器 (Arknights Story Reader)
 
-一个基于 Tauri 2 + React 19 + TypeScript + Rust 的本地剧情阅读与搜索应用，支持桌面与移动平台，提供舒适的“小说式”阅读体验、全文检索、人物统计、收藏与线索集分享等功能。
+一个基于 Tauri 2 + React 19 + TypeScript + Rust 的本地剧情阅读与搜索应用，支持桌面与移动平台，提供舒适的“小说式”阅读体验、全文检索、人物统计、收藏划线与分享图等功能。
 
 > 数据来自社区项目 ArknightsGameData。应用不包含或分发任何商业素材，仅提供本地阅读与管理能力。
 
@@ -20,8 +20,8 @@
   - 无索引时自动回退逐条扫描；显示实时搜索进度；结果上限 500 条
 - 人物统计
   - 自动统计每章/每活动的人物发言次数；按人物聚合并可一键跳转到该人物首次出现
-- 收藏与线索集（分享码 AKC1-…）
-  - 阅读器段落“划线收藏”，汇总为线索集；支持导入/导出分享码并跨设备复现定位
+- 收藏与划线
+  - 阅读器段落“划线收藏”（内容指纹对齐，数据更新后不丢）；剧情/分组收藏汇总在列表页
 - 多平台与更新
   - 桌面（Windows/macOS/Linux）：Tauri 2；内置自动更新
   - Android：支持在线更新（APK 下载+安装），iOS 可本地构建安装
@@ -29,8 +29,8 @@
 ## 🧱 技术架构
 
 - 前端：Vite + React 19 + TypeScript + Tailwind 4
-  - 组件与页面：`StoryList`（主线/活动/支线/肉鸽/密录）、`StoryReader`、`SearchPanel`、`CharactersPanel`、`Settings`、`ClueSetsPanel`
-  - 状态与能力：收藏、划线高亮、阅读进度、主题与偏好、线索集导入导出
+  - 组件与页面：`StoryList`（主线/活动/支线/肉鸽/密录）、`StoryReader`、`SearchPanel`、`CharactersPanel`、`Settings`
+  - 状态与能力：收藏、划线高亮、阅读进度、主题与偏好、分享图
 - 后端（Tauri + Rust）：
   - 同步与导入（`DataService::sync_data/import_zip_*`）：下载 GitHub ZIP 或本地 ZIP 并解压；维护 `version.json`
   - 全文索引（`rusqlite` FTS5）：构建/查询/状态；tokenize 与 CJK 处理
@@ -42,10 +42,10 @@
 
 ```
 src/                     # 前端 (React + TS)
-  components/            # 视图组件（阅读器/列表/搜索/设置/人物/线索集等）
-  hooks/                 # 业务 hooks（进度、偏好、收藏、线索集、更新等）
+  components/            # 视图组件（阅读器/列表/搜索/设置/人物等）
+  hooks/                 # 业务 hooks（进度、偏好、收藏、更新等）
   services/api.ts        # 调用 Tauri 后端命令 + 事件监听
-  lib/                   # 工具与编解码（线索集分享码等）
+  lib/                   # 工具（素材 URL、段落摘要等）
   types/                 # TS 类型
 
 src-tauri/               # 后端 (Rust + Tauri)

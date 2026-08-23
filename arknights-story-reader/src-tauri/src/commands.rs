@@ -1,7 +1,7 @@
 use crate::data_service::DataService;
 use crate::models::{
     Chapter, ParsedStoryContent, SearchDebugResponse, SearchResult, SearchResultsPage,
-    SegmentSearchPage, StoryCategory, StoryEntry, StoryIndexStatus,
+    SegmentSearchPage, StoryCategory, StoryEntry, StoryIndexStatus, StoryPreviewToken,
 };
 use crate::parser::parse_story_text;
 use std::sync::{Arc, Mutex};
@@ -100,8 +100,21 @@ pub async fn get_story_entry(
     state: State<'_, AppState>,
     story_id: String,
 ) -> Result<StoryEntry, String> {
-    let service = lock_service(&state.data_service);
-    service.get_story_entry(&story_id)
+    let service = clone_service(&state);
+    tauri::async_runtime::spawn_blocking(move || service.get_story_entry(&story_id))
+        .await
+        .map_err(|err| format!("Failed to join get_story_entry task: {}", err))?
+}
+
+#[tauri::command]
+pub async fn get_story_preview_token(
+    state: State<'_, AppState>,
+    story_path: String,
+) -> Result<Option<StoryPreviewToken>, String> {
+    let service = clone_service(&state);
+    tauri::async_runtime::spawn_blocking(move || service.get_story_preview_token(&story_path))
+        .await
+        .map_err(|err| format!("Failed to join preview token task: {}", err))?
 }
 
 #[tauri::command]
@@ -131,24 +144,30 @@ pub async fn search_stories(
 
 #[tauri::command]
 pub async fn search_stories_ex(
+    app: AppHandle,
     state: State<'_, AppState>,
     query: String,
 ) -> Result<SearchResultsPage, String> {
     let service = clone_service(&state);
-    tauri::async_runtime::spawn_blocking(move || service.search_stories_ex(&query))
-        .await
-        .map_err(|err| format!("Failed to join search_ex task: {}", err))?
+    tauri::async_runtime::spawn_blocking(move || {
+        service.search_stories_ex_with_progress(&app, &query)
+    })
+    .await
+    .map_err(|err| format!("Failed to join search_ex task: {}", err))?
 }
 
 #[tauri::command]
 pub async fn search_segments(
+    app: AppHandle,
     state: State<'_, AppState>,
     query: String,
 ) -> Result<SegmentSearchPage, String> {
     let service = clone_service(&state);
-    tauri::async_runtime::spawn_blocking(move || service.search_segments(&query))
-        .await
-        .map_err(|err| format!("Failed to join search_segments task: {}", err))?
+    tauri::async_runtime::spawn_blocking(move || {
+        service.search_segments_with_progress(&app, &query)
+    })
+    .await
+    .map_err(|err| format!("Failed to join search_segments task: {}", err))?
 }
 
 #[tauri::command]
