@@ -49,11 +49,58 @@ const candidateCache = new Map<string, string[]>();
 const CANDIDATE_CACHE_LIMIT = 4000;
 const CANDIDATE_CACHE_EVICT = 1000;
 
+// ─────────────────────────────────────────────────────────────
+// 死模板修正
+//
+// assetUrls.ts 有两处模板与镜像仓库的真实文件布局不符，拼出的 URL 是
+// 全库 404（用仓库目录清单核实过）：
+//   1. fexli 的 `charpor/{cid}.png` —— 该目录下所有文件都带精英化后缀，
+//      绝大多数干员有 `{cid}_1.png`，个别（近卫阿米娅等）只有 `{cid}_2.png`，
+//      裸 `{cid}.png` 一个都不存在；
+//   2. Puppiiz 的 `storyline/images/` 与 `storyline/backgrounds/` ——
+//      仓库里没有这两个子目录（storyline/ 下只有一批 abbr 图标）。
+// 必失败的候选不只是浪费一次请求：每次 onerror 都会给所属 host 的熔断
+// 计数记一笔账，一屏头像/插画攒够 8 次就把整个 host 熔断，连坐该源上
+// 明明存在的素材。所有候选解析（useAsset / peekAssetCandidates）都经过
+// 本文件这一个出口，在进缓存前统一修正；Rust 侧 asset_service.rs 的模板
+// 已同步改成修正后的形态。
+// ─────────────────────────────────────────────────────────────
+const FEXLI_CHARPOR_PREFIX =
+  "https://raw.githubusercontent.com/fexli/ArknightsResource/main/charpor/";
+const PUPPIIZ_STORYLINE_PREFIX =
+  "https://raw.githubusercontent.com/PuppiizSunniiz/Arknight-Images/main/storyline/";
+
+function repairDeadTemplates(urls: string[]): string[] {
+  const out: string[] = [];
+  for (const url of urls) {
+    if (
+      url.startsWith(`${PUPPIIZ_STORYLINE_PREFIX}images/`) ||
+      url.startsWith(`${PUPPIIZ_STORYLINE_PREFIX}backgrounds/`)
+    ) {
+      continue;
+    }
+    if (
+      url.startsWith(FEXLI_CHARPOR_PREFIX) &&
+      url.endsWith(".png") &&
+      // 已带精英后缀的（假想的未来形态）不再重复加工。
+      !/_\d+\.png$/.test(url)
+    ) {
+      const stem = url.slice(0, -".png".length);
+      out.push(`${stem}_1.png`, `${stem}_2.png`);
+      continue;
+    }
+    out.push(url);
+  }
+  return out;
+}
+
 function resolveCandidatesCached(kind: AssetKind, token: string): string[] {
   const key = `${kind}|${token}`;
   const hit = candidateCache.get(key);
   if (hit) return hit;
-  const next = resolveAssetCandidatesLocal(kind, token, globalCharIndex);
+  const next = repairDeadTemplates(
+    resolveAssetCandidatesLocal(kind, token, globalCharIndex)
+  );
   if (candidateCache.size >= CANDIDATE_CACHE_LIMIT) {
     // 整表清空会让还挂在屏幕上的组件拿到全新数组引用、白白重挂 `<img>`；
     // 按插入顺序淘汰最老的一批，正在渲染的那些通常刚被访问过。

@@ -170,17 +170,43 @@ export function FavoritesProvider({ children }: { children: ReactNode }) {
   // 开发模式下挂载期 effect 会连跑两次，第二次就把初始状态写回去了。改为
   // 与初始 state 做引用比较——用户任何真实改动都会产生新对象，自然落盘。
   const initialFavoritesRef = useRef(favorites);
+  // 「当前 state 对应的存储串」。storage 事件把别的窗口写的状态灌进来时，
+  // 存储里已经是这份内容了，据此跳过回写，免得两个窗口互相触发写入。
+  const lastRawRef = useRef<string | null>(null);
   useEffect(() => {
     if (favorites === initialFavoritesRef.current) {
       return;
     }
     try {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(favorites));
+      const raw = JSON.stringify(favorites);
+      if (raw === lastRawRef.current) {
+        return;
+      }
+      window.localStorage.setItem(STORAGE_KEY, raw);
+      lastRawRef.current = raw;
     } catch (error) {
       // setItem 失败是原子的：旧数据原样保留，本次改动只在会话内生效。
       console.warn("[Favorites] 写入本地收藏失败:", error);
     }
   }, [favorites]);
+
+  // 多窗口（桌面端可以开多个）时跟随其它窗口的修改。收藏是「整表读进
+  // 内存 → 任意改动整表回写」，不同步的话：A 窗口刚收藏的条目会在 B 窗口
+  // 的下一次回写里被 B 的旧内存状态整体覆盖，星标无声丢失（偏好 hook 已
+  // 有同样的监听，这里是同一个坑）。
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onStorage = (event: StorageEvent) => {
+      // key 为 null 表示外部 storage.clear()，也要跟随。
+      if (event.key !== null && event.key !== STORAGE_KEY) return;
+      const raw = event.key === STORAGE_KEY ? event.newValue : null;
+      if (event.key === STORAGE_KEY && raw === lastRawRef.current) return;
+      lastRawRef.current = raw;
+      setFavorites(readFromStorage());
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, []);
 
   const isFavorite = useCallback(
     (storyId: string) => Boolean(favorites.stories[storyId]) || groupedStoryIds.has(storyId),

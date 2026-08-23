@@ -612,8 +612,16 @@ pub struct DataService {
 }
 
 impl DataService {
+    /// 安装判定与 `holds_valid_dataset` 同一把尺子：非空 review 表才算装了。
+    /// 只看 `exists()` 会把 0 字节的 review 表当成「已安装」——首次安装走
+    /// `swap_in_extracted` 的跨设备拷贝回退时断电，正好会留下这么一个刚
+    /// 创建还没写入的空表，且首次安装没有 `_old` 可恢复，壳子会一直占着
+    /// data_dir。误报的后果全是用户可见的死局：check_update 不催下载、
+    /// 前端拿到 true 不弹同步引导、设置页说「本地数据」，而目录加载却因
+    /// 解析空 JSON 直接报错，用户没有任何出路。判成「未安装」后一切归位：
+    /// 读类命令报 NOT_INSTALLED，前端走首次下载/导入引导。
     pub fn is_installed(&self) -> bool {
-        self.data_dir.join(REVIEW_TABLE_REL).exists()
+        Self::holds_valid_dataset(&self.data_dir)
     }
 
     /// 返回运行时 character_table.json 路径（若已同步），供 character_table
@@ -5690,8 +5698,8 @@ mod tests {
         );
     }
 
-    /// 空的 review 表同样是壳子（holds_valid_dataset 要求非空）：
-    /// is_installed 只看文件存在会误报「已安装」，恢复判定不能跟着错。
+    /// 空的 review 表同样是壳子（holds_valid_dataset 要求非空，
+    /// is_installed 同尺）：恢复判定不能把它当有效数据留在原地。
     #[test]
     fn new_replaces_husk_with_empty_review_table() {
         let fx = Fixture::new("recover_husk_empty");
@@ -5726,6 +5734,38 @@ mod tests {
             relaunched.data_dir.join(REVIEW_TABLE_REL).exists(),
             "壳子里的文件一个都不该动"
         );
+    }
+
+    /// 上一场景的用户可见面：首次安装的跨设备拷贝断电后，data_dir 里
+    /// 只剩一张 0 字节 review 表，没有 version.json，也没有 `_old` 可
+    /// 恢复。安装判定必须与 holds_valid_dataset 同尺——只看 exists()
+    /// 会误报「已安装」：check_update 不催下载、前端不弹同步引导、
+    /// 设置页说「本地数据」，目录加载却因解析空 JSON 报错，用户卡死
+    /// 在坏数据上没有出路。
+    #[test]
+    fn husk_with_empty_review_table_does_not_count_as_installed() {
+        let fx = Fixture::new("husk_not_installed");
+        fs::write(fx.service.data_dir.join(REVIEW_TABLE_REL), "").unwrap();
+        fs::remove_file(fx.service.data_dir.join(VERSION_FILE)).unwrap();
+
+        assert!(
+            !fx.service.is_installed(),
+            "0 字节 review 表撑不起应用，不能算「已安装」"
+        );
+        assert!(
+            fx.service.check_update().unwrap(),
+            "壳子等于没装，必须提示用户下载数据"
+        );
+        assert_eq!(
+            fx.service.get_current_version().unwrap(),
+            "未安装",
+            "设置页不能把壳子说成有本地数据"
+        );
+        let err = fx
+            .service
+            .get_story_categories()
+            .expect_err("壳子上读目录必须走统一的未安装错误");
+        assert!(err.contains("NOT_INSTALLED"), "{}", err);
     }
 
     /// data_dir 还健在时绝不能动：成功换入后清理失败留下的 `_old` 是上

@@ -27,11 +27,16 @@ function CharacterAvatarImpl({
 }: CharacterAvatarProps) {
   const resolver = useCharacterResolver();
   // 既支持真正的 charId（char_xxx），也支持名字 / 内部 alias（如
-  // 干员密录路径里的 `kroos`、`amgoat`）。两侧都经过 resolver，失败时
-  // 保留原值作为 monogram 兜底 token。
+  // 干员密录路径里的 `kroos`、`amgoat`）。charId 解析失败时必须再用
+  // name 解析一次——密录路径里的 alias 与 charId 尾段对不上时，卡片
+  // 标题里的干员名还能把头像救回来；之前 `resolveCharId(charId) ?? charId`
+  // 把解析不出的原始 alias 当结果返回，name 这条救援路径永远走不到。
+  // 两侧都失败才保留原始 charId 作为 monogram 兜底 token。
   const resolvedId =
-    (charId ? resolver.resolveCharId(charId) ?? charId : null) ??
-    resolver.resolveCharId(name);
+    (charId ? resolver.resolveCharId(charId) : null) ??
+    resolver.resolveCharId(name) ??
+    charId ??
+    null;
   const resolvedName = name ?? (resolvedId ? resolver.resolveName(resolvedId) : null);
 
   const token = resolvedId ?? name ?? null;

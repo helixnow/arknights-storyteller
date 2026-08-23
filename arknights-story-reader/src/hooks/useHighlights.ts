@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useToast } from "@/components/ui/toast";
 
 /**
  * Shape of each persisted highlight. `segmentIndex` is the index at the time
@@ -46,12 +47,19 @@ function readStorage(): HighlightStore {
   return {};
 }
 
-function persistStore(store: HighlightStore): void {
+/** 失败提示的会话级闩锁：同一轮连续失败只打扰用户一次，写成功后复位。 */
+let persistFailureNotified = false;
+
+function persistStore(store: HighlightStore): boolean {
   try {
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
+    persistFailureNotified = false;
+    return true;
   } catch {
     // Quota / private mode: the write fails atomically, the previously
-    // stored value stays intact. Never write partial data.
+    // stored value stays intact. Never write partial data. 成败必须让调用方
+    // 知道——书签在界面上已经点亮，写失败还不吭声等于骗用户「已保存」。
+    return false;
   }
 }
 
@@ -104,6 +112,32 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
   const persistTimerRef = useRef<number | null>(null);
   // Latest store snapshot awaiting the debounced write; null when clean.
   const pendingStoreRef = useRef<HighlightStore | null>(null);
+
+  // 冲刷跑在 setTimeout 回调和卸载清理里，通过 ref 取最新的 toast 句柄。
+  const toast = useToast();
+  const toastRef = useRef(toast);
+  useEffect(() => {
+    toastRef.current = toast;
+  }, [toast]);
+
+  /**
+   * 把待写快照冲刷进 localStorage。写失败（quota 满 / 隐私模式）以前是
+   * 静默吞掉的——书签照常点亮、导览面板照常列出，用户以为收藏成功，
+   * 重启后却全没了。改为明确提示一次；且失败时保留 pending（与阅读进度
+   * hook 的 flushPending 一致），后续改动 / 卸载冲刷会带着它重试，配额
+   * 腾出来后还能救回。只有真正写成功才清空 pending。
+   */
+  const flushPendingStore = useCallback(() => {
+    if (pendingStoreRef.current === null) return;
+    if (persistStore(pendingStoreRef.current)) {
+      pendingStoreRef.current = null;
+      return;
+    }
+    if (!persistFailureNotified) {
+      persistFailureNotified = true;
+      toastRef.current.error("划线未能保存到本地存储（空间可能已满），将自动重试");
+    }
+  }, []);
   // 首帧的 store 就是刚从 localStorage 读出来的，回写没有意义；更糟的是：
   // 如果读取因数据损坏回落到了 {}，这次回写会立刻用空对象覆盖掉原始数据，
   // 连恢复的机会都不留。守卫不能用「跳过第一次 effect」的布尔标记：
@@ -122,10 +156,7 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
     }
     persistTimerRef.current = window.setTimeout(() => {
       persistTimerRef.current = null;
-      if (pendingStoreRef.current !== null) {
-        persistStore(pendingStoreRef.current);
-        pendingStoreRef.current = null;
-      }
+      flushPendingStore();
     }, 0);
     return () => {
       // Deps-change cleanup only disarms the timer — the next effect run
@@ -135,20 +166,12 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
         persistTimerRef.current = null;
       }
     };
-  }, [store]);
+  }, [store, flushPendingStore]);
 
   // Unmount flush: if a debounced write is still pending when the reader
   // unmounts (toggle a highlight, immediately navigate back), write it now
   // instead of silently dropping the annotation.
-  useEffect(
-    () => () => {
-      if (pendingStoreRef.current !== null) {
-        persistStore(pendingStoreRef.current);
-        pendingStoreRef.current = null;
-      }
-    },
-    []
-  );
+  useEffect(() => () => flushPendingStore(), [flushPendingStore]);
 
   // The raw entries as persisted. Always an array of (upgraded) objects.
   const entries = useMemo<HighlightEntry[]>(

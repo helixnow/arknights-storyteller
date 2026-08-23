@@ -474,11 +474,20 @@ function wrapLatin(ctx: CanvasRenderingContext2D, text: string, maxWidth: number
     }
     if (current) {
       lines.push(current);
-      current = token.trim().length > 0 ? token : "";
-    } else {
-      lines.push(token);
       current = "";
     }
+    // 换行后行首不保留纯空白 token。
+    if (token.trim().length === 0) continue;
+    if (ctx.measureText(token).width <= maxWidth) {
+      current = token;
+      continue;
+    }
+    // 单个 token 比整行还宽（长 URL / 无空格的英文串）：按字符硬折行。
+    // 以前直接把它原样 push 成一行，导出图上这一整行会越过右侧留白、
+    // 在画布边缘被硬生生裁掉。末段留在 current 里，后续短词还能接上。
+    const pieces = wrapCjk(ctx, token, maxWidth);
+    current = pieces.pop() ?? "";
+    lines.push(...pieces);
   }
   if (current) lines.push(current);
   return lines;
@@ -944,12 +953,32 @@ function renderQuoteImage(
   // piece without dominating the quote body.
   const storyLabel = [subtitle?.trim(), storyName].filter(Boolean).join(" · ");
   const attribution = `—— ${dialogue.characterName} · ${storyLabel}`;
-  ctx.fillStyle = palette.text;
+  // 署名和左下角水印同在一条基线上：署名的可用宽度先扣掉水印再留一段
+  // 间隙，否则长标题的署名会一路顶到左缘、和水印叠成一团。
+  const watermark = "明日方舟剧情阅读器";
+  ctx.font = `400 ${QUOTE_WATERMARK_FONT_SIZE}px ${TITLE_FONT_FAMILY}`;
+  const watermarkWidth = ctx.measureText(watermark).width;
+  const attrMaxWidth = contentWidth - watermarkWidth - 32;
   ctx.font = `700 ${QUOTE_ATTR_FONT_SIZE}px ${CONTENT_FONT_FAMILY}`;
+  let attrText = attribution;
+  if (ctx.measureText(attrText).width > attrMaxWidth) {
+    // 超宽时按码点截断补省略号。以前不做任何截断就右对齐硬画：
+    // `x = 宽度 - 边距 - 实测宽度` 在长标题下会算成负数，导出的图上
+    // 署名从左缘被裁掉半截。码点粒度与正文 clamp 逻辑保持一致。
+    const glyphs = Array.from(attribution);
+    while (
+      glyphs.length > 1 &&
+      ctx.measureText(glyphs.join("") + "…").width > attrMaxWidth
+    ) {
+      glyphs.pop();
+    }
+    attrText = glyphs.join("") + "…";
+  }
+  ctx.fillStyle = palette.text;
   ctx.textBaseline = "bottom";
-  const attrWidth = ctx.measureText(attribution).width;
+  const attrWidth = ctx.measureText(attrText).width;
   ctx.fillText(
-    attribution,
+    attrText,
     width - QUOTE_HORIZONTAL_PADDING - attrWidth,
     height - QUOTE_VERTICAL_PADDING
   );
@@ -959,11 +988,7 @@ function renderQuoteImage(
   ctx.fillStyle = palette.muted;
   ctx.font = `400 ${QUOTE_WATERMARK_FONT_SIZE}px ${TITLE_FONT_FAMILY}`;
   ctx.textBaseline = "bottom";
-  ctx.fillText(
-    "明日方舟剧情阅读器",
-    QUOTE_HORIZONTAL_PADDING,
-    height - QUOTE_VERTICAL_PADDING
-  );
+  ctx.fillText(watermark, QUOTE_HORIZONTAL_PADDING, height - QUOTE_VERTICAL_PADDING);
 
   return exportCanvas(canvas, width, height);
 }

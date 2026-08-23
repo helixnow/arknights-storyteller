@@ -18,6 +18,11 @@
 //! 「Rust 说的候选」和「浏览器实际请求的候选」会各走各的。本文件末尾的
 //! 单测钉住了几个容易漂移的点：内置 `/bundled/` 前缀、精二立绘顺序、
 //! 活动 KV 的「原 token 优先」。
+//!
+//! 例外：assetUrls.ts 仍会拼出两处与镜像仓库真实布局不符的历史死模板
+//! （fexli `charpor/{cid}.png`、Puppiiz `storyline/images|backgrounds/`），
+//! 前端在 `src/hooks/useAsset.ts` 的解析出口统一修正成本文件的形态——
+//! 对齐的是「浏览器最终请求的候选」，那边的修正规则变了这里也要跟。
 
 use serde::{Deserialize, Serialize};
 
@@ -97,8 +102,11 @@ fn avatar_candidates(token: &str) -> Vec<String> {
         out.push(format!("/bundled/avatar/{}.png", cid));
         // yuanyan3060 的 avatar 是 char_xxx.png
         out.push(format!("{}/avatar/{}.png", YUANYAN, cid));
-        // fexli 也有 charpor（半身），同路径也可用作备胎
-        out.push(format!("{}/charpor/{}.png", FEXLI, cid));
+        // fexli 的 charpor（半身像）可用作备胎，但该目录所有文件都带
+        // 精英化后缀：绝大多数干员有 `{cid}_1.png`，个别没有精一素材的
+        // （近卫阿米娅等）只有 `{cid}_2.png`；裸 `{cid}.png` 全库不存在。
+        out.push(format!("{}/charpor/{}_1.png", FEXLI, cid));
+        out.push(format!("{}/charpor/{}_2.png", FEXLI, cid));
         // PuppiizSunniiz avatars
         out.push(format!("{}/avatars/{}.png", PUPPIIZ, cid));
     }
@@ -134,21 +142,23 @@ fn strip_dollar(token: &str) -> &str {
 
 fn avg_candidates(token: &str) -> Vec<String> {
     let t = strip_dollar(token);
+    // Puppiiz 仓库没有 `storyline/images/` 目录（storyline/ 下只有一批
+    // abbr 图标），历史上的第三候选是全库 404，只会白吃一次请求并给
+    // 该 host 的熔断计数记账，已删除。
     vec![
         format!("{}/avgs/{}.png", FEXLI, t),
         format!("{}/avgs/bg/{}.png", FEXLI, t),
-        format!("{}/storyline/images/{}.png", PUPPIIZ, t),
     ]
 }
 
 fn background_candidates(token: &str) -> Vec<String> {
     let t = strip_dollar(token);
     // fexli 仓库里大多数背景在 `avgs/bg/<token>.png` 子目录，少部分老的在
-    // `avgs/<token>.png` 根目录。按命中率排序。
+    // `avgs/<token>.png` 根目录。按命中率排序。Puppiiz 没有
+    // `storyline/backgrounds/` 目录，历史上的第三候选与 avg 同理已删除。
     vec![
         format!("{}/avgs/bg/{}.png", FEXLI, t),
         format!("{}/avgs/{}.png", FEXLI, t),
-        format!("{}/storyline/backgrounds/{}.png", PUPPIIZ, t),
     ]
 }
 
@@ -267,6 +277,38 @@ mod tests {
         let first_e2 = out.iter().position(|u| u.contains("_2.png")).unwrap();
         let first_e1 = out.iter().position(|u| u.contains("_1.png")).unwrap();
         assert!(first_e2 < first_e1, "精二立绘必须排在精一之前: {out:?}");
+    }
+
+    #[test]
+    fn fexli_avatar_backup_carries_elite_suffixes() {
+        // fexli charpor 目录下没有裸 `{cid}.png`（全库皆为 `_1` / `_2` 等
+        // 精英化后缀）。裸模板进候选链只会白吃一次 404，并给 fexli host 的
+        // 熔断计数记一笔账——一屏头像攒够阈值就把整个 host 熔断，连坐
+        // 插画/封面/KV。
+        let out = avatar_candidates("char_002_amiya");
+        let e1 = format!("{FEXLI}/charpor/char_002_amiya_1.png");
+        let e2 = format!("{FEXLI}/charpor/char_002_amiya_2.png");
+        let bare = format!("{FEXLI}/charpor/char_002_amiya.png");
+        assert!(out.contains(&e1), "缺精一半身像备胎: {out:?}");
+        assert!(out.contains(&e2), "缺精二半身像备胎（近卫阿米娅等无精一素材）: {out:?}");
+        assert!(!out.contains(&bare), "裸 charpor 模板是全库 404，不得回归: {out:?}");
+        // `_1` 几乎全员都有，排在 `_2` 前面少吃一次 404。
+        let p1 = out.iter().position(|u| u == &e1).unwrap();
+        let p2 = out.iter().position(|u| u == &e2).unwrap();
+        assert!(p1 < p2);
+    }
+
+    #[test]
+    fn story_art_chains_skip_missing_puppiiz_directories() {
+        // Puppiiz 仓库没有 storyline/images 与 storyline/backgrounds 目录，
+        // 这两条历史候选是全库 404，不得回归。
+        for out in [avg_candidates("32_i06"), background_candidates("bg_courtyard")] {
+            assert!(
+                out.iter().all(|u| !u.contains("/storyline/")),
+                "storyline 死模板不得回归: {out:?}"
+            );
+            assert!(!out.is_empty());
+        }
     }
 
     #[test]

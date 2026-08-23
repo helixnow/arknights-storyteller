@@ -9,6 +9,7 @@ import {
 } from "@/components/ui/sheet-shell";
 import { FONT_FAMILIES, ReaderSettings as Settings } from "@/hooks/useReaderSettings";
 import { useSidePanel } from "@/hooks/useSidePanel";
+import { safeConfirm } from "@/hooks/useAppUpdater";
 import { Minus, Plus, RotateCcw, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -106,11 +107,21 @@ export const ReaderSettingsPanel = memo(function ReaderSettingsPanel({
         description="调整排版与布局，找到最舒适的阅读方式"
         actions={
           <>
+            {/* 恢复默认紧挨着关闭键，一次误触就会不可撤销地清掉全部排版
+                调整——和「清空划线」一样先确认再动手。 */}
             <Button
               variant="ghost"
               size="icon-pill"
               className="h-11 w-11"
-              onClick={onReset}
+              onClick={() => {
+                void (async () => {
+                  const ok = await safeConfirm(
+                    "确定要把所有阅读设置恢复为默认值吗？当前的排版调整将被覆盖。",
+                    { title: "恢复默认", kind: "warning" }
+                  );
+                  if (ok) onReset();
+                })();
+              }}
               aria-label="恢复默认"
               title="恢复默认"
             >

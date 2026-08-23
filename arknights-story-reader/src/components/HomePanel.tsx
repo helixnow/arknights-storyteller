@@ -70,15 +70,28 @@ function yesterdayKey() {
   return dayKey(d);
 }
 
+/** 把 YYYY-MM-DD 平移 N 天。Date 构造器会自动处理跨月/跨年。 */
+function shiftDayKey(key: string, deltaDays: number): string {
+  const [y, m, d] = key.split("-").map((n) => Number.parseInt(n, 10));
+  return dayKey(new Date(y, m - 1, d + deltaDays));
+}
+
 /**
  * localStorage 里的 currentStreak 只会在下一次打开剧情时被 bumpReadingStreak
  * 惰性重算。断签超过一天后回来，存的还是断签前的旧值——直接展示就是在撒谎
  * （显示「连续 12 天」，一打开剧情立刻跳回 1 天）。展示前按 lastReadOn 校验：
  * 最后一次阅读在今天或昨天，streak 才还活着。
+ *
+ * `today` 由调用方传入（组件里是跟着零点定时器/聚焦刷新走的 state），
+ * 这样跨天后一定会带着新日期重算，而不是停在挂载那一刻的日期上。
  */
-function effectiveStreakDays(streak: StreakInfo): number {
+function effectiveStreakDays(streak: StreakInfo, today: string): number {
   const last = streak.lastReadOn;
-  return last === todayKey() || last === yesterdayKey() ? streak.currentStreak : 0;
+  if (!last) return 0;
+  // 时钟回拨（向西跨时区旅行 / 手动改时间）后 lastReadOn 会落在「未来」。
+  // 这不是断签，按仍然存活处理，别把连续天数清成 0。
+  if (last > today) return streak.currentStreak;
+  return last === today || last === shiftDayKey(today, -1) ? streak.currentStreak : 0;
 }
 
 function readStreak(): StreakInfo {
@@ -143,6 +156,8 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
   /** 读目录本身失败了（IPC 异常 / 数据损坏），和「没装数据」是两码事。 */
   const [loadFailed, setLoadFailed] = useState(false);
   const [streak, setStreak] = useState<StreakInfo>(() => readStreak());
+  /** 当前本地日期。跨零点由定时器/聚焦刷新推进，连签展示随之重算。 */
+  const [today, setToday] = useState<string>(() => todayKey());
   const online = useOnlineStatus();
   // 聚焦、返回列表、数据同步都会触发刷新，可能叠在一起。用递增序号
   // 保证只有最后一次的结果能写进 state。
@@ -263,6 +278,9 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
         const next = readStreak();
         return sameStreak(prev, next) ? prev : next;
       });
+      // 同一天内是 no-op（同字符串 setState 直接 bail out）；跨天后推动
+      // 连签展示用新日期重算。
+      setToday(todayKey());
     };
     // 数据同步换了整个目录，进度快照没变也必须重来一遍。
     const onDataUpdated = () => refresh(true);
@@ -272,11 +290,33 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
       if (document.visibilityState === "visible") refresh(false);
     };
 
+    // 窗口一直保持焦点、也从不切后台的场景（桌面端挂机过夜）不会触发
+    // 上面任何一个事件：零点之后「今日推荐」还是昨天那条、连签也停在
+    // 昨天的口径。补一个对准下一个本地零点的定时器，跨天即刷新并顺延。
+    let dayTimer = 0;
+    const scheduleDayRollover = () => {
+      const now = new Date();
+      const nextMidnight = new Date(
+        now.getFullYear(),
+        now.getMonth(),
+        now.getDate() + 1,
+        0,
+        0,
+        1
+      );
+      dayTimer = window.setTimeout(() => {
+        refresh(false);
+        scheduleDayRollover();
+      }, Math.max(nextMidnight.getTime() - now.getTime(), 1000));
+    };
+    scheduleDayRollover();
+
     window.addEventListener("focus", onRefresh);
     window.addEventListener("app:home-refresh", onRefresh);
     window.addEventListener("app:data-updated", onDataUpdated);
     document.addEventListener("visibilitychange", onVisibility);
     return () => {
+      window.clearTimeout(dayTimer);
       window.removeEventListener("focus", onRefresh);
       window.removeEventListener("app:home-refresh", onRefresh);
       window.removeEventListener("app:data-updated", onDataUpdated);
@@ -399,7 +439,7 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
 
             {installed === true && (
               <StreakStrip
-                streakDays={effectiveStreakDays(streak)}
+                streakDays={effectiveStreakDays(streak, today)}
                 favoritesCount={favoriteCount}
                 recentCount={recentStories.length}
                 onGoToRecent={() => onGoToTab("stories")}
@@ -772,6 +812,19 @@ export function bumpReadingStreak() {
   const t = todayKey();
   const current = readStreak();
   if (current.lastReadOn === t) {
+    notifyHomeRefresh();
+    return;
+  }
+  // 时钟回拨（向西跨时区旅行 / 手动调时间）后 lastReadOn 落在未来：既不是
+  // 断签也不是新的一天。原逻辑会走到最下面的 else 把连签清成 1、totalDays
+  // 再 +1。这里只把日期拉回今天，连续天数与总天数原样保留。
+  if (current.lastReadOn > t) {
+    try {
+      window.localStorage.setItem(
+        STREAK_KEY,
+        JSON.stringify({ ...current, lastReadOn: t } satisfies StreakInfo)
+      );
+    } catch {}
     notifyHomeRefresh();
     return;
   }

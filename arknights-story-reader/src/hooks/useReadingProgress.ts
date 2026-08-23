@@ -63,15 +63,18 @@ function prune(map: ProgressMap): ProgressMap {
   return next;
 }
 
-function writeProgressMap(map: ProgressMap) {
-  if (!isBrowser) return;
+/** @returns 是否真的写进了 localStorage（quota 满等失败时返回 false）。 */
+function writeProgressMap(map: ProgressMap): boolean {
+  if (!isBrowser) return true;
   try {
     const pruned = prune(map);
     const raw = JSON.stringify(pruned);
     window.localStorage.setItem(STORAGE_KEY, raw);
     parsedCache = { raw, map: pruned };
+    return true;
   } catch {
-    // ignore quota errors
+    // setItem 失败是原子的：盘上还是旧数据。让调用方决定要不要留着重试。
+    return false;
   }
 }
 
@@ -175,11 +178,18 @@ export function useReadingProgress(
         // 留着 pending：真正离开页面时还会以 force 冲刷一次。
         return;
       }
-      pendingRef.current = null;
-      lastPersistedRef.current = pending;
+      // 成败都推进节流窗口：quota 满时不能退化成「每次滚动都重写整张表」。
       lastWriteRef.current = Date.now();
       const map = readProgressMap();
-      writeProgressMap({ ...map, [pending.storyPath]: pending });
+      if (!writeProgressMap({ ...map, [pending.storyPath]: pending })) {
+        // 写失败（quota 满 / 隐私模式）时必须留着 pending，且不能把
+        // lastPersistedRef 推进到一个从没上过盘的值——否则这份进度就被
+        // 无声丢弃：closeReader / pagehide / 切篇的强制冲刷全都会 no-op，
+        // 哪怕之后配额被清理腾出来（启动期就会清历史搜索缓存）也救不回。
+        return;
+      }
+      pendingRef.current = null;
+      lastPersistedRef.current = pending;
       if (trackStateRef.current) setProgress(pending);
     },
     [clearTimer]
