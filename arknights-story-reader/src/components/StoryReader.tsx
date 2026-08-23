@@ -636,18 +636,30 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
 
     const boundaries: number[] = [0];
     let acc = 0;
+    // 当前页里是否已有会渲染出内容的段。预算断点开页时 acc ≥ budget，页里
+    // 必然有可渲染段；唯独 header 断点是无条件开页——若它面前这一页全是
+    // 隐藏插画（长对话触发预算断点 → 背景图 → 章节标题的常见结构），直接
+    // 把上一个边界推进到 header 处并成一页，否则中间会夹一页空白页。
+    let pageHasRenderable = false;
     processedSegments.forEach((seg, idx) => {
       const len = lengthOf(seg);
       // Always break before a Header — chapters/sections open a new page.
       const isHeader = seg.type === "header";
       if (idx > 0 && isHeader && boundaries[boundaries.length - 1] !== idx) {
-        boundaries.push(idx);
+        if (pageHasRenderable) {
+          boundaries.push(idx);
+        } else {
+          boundaries[boundaries.length - 1] = idx;
+        }
         acc = 0;
+        pageHasRenderable = false;
       }
+      if (!(seg.type === "image" && !imagesVisible)) pageHasRenderable = true;
       acc += len;
       if (acc >= budget && idx + 1 <= lastRenderableIndex) {
         boundaries.push(idx + 1);
         acc = 0;
+        pageHasRenderable = false;
       }
     });
     return boundaries;
@@ -1463,7 +1475,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       if (target?.isContentEditable) return;
       // 带系统 / 浏览器级修饰键的组合不属于阅读器：Alt+← 是历史后退、
       // Cmd/Ctrl+方向键是系统快捷键，之前会被当成普通方向键拦下来翻页，
-      // 用户的后退手势就此失效。Shift 保留——Shift+Space 是往回翻。
+      // 用户的后退手势就此失效。Shift 不在此列，下面单独按键位放行。
       if (event.altKey || event.ctrlKey || event.metaKey) return;
       // 抽屉 / 浮层菜单打开时把按键留给它们自己（Esc 关闭等）。
       if (settingsOpen || insightsOpen || shareDialogOpen || moreMenuOpen) return;
@@ -1477,6 +1489,11 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       }
 
       const isSpace = event.key === " " || event.key === "Spacebar";
+      // Shift 的豁免只给 Shift+Space（往回翻）：Shift+方向键 / PageUp/
+      // PageDown / Home / End 是「扩展文本选区」的浏览器手势——划词分享时
+      // 按到会被当成翻页，选区随页面一换就没了（handleReaderTap 对划词
+      // 已有同样的让位，键盘路径不该更粗暴）。
+      if (event.shiftKey && !isSpace) return;
       // 焦点落在按钮/链接上时空格属于该控件本身，别把"打开设置"变成翻页；
       // 方向键仍然可以翻页，避免点过一次"下一页"后键盘就失灵。
       if (isSpace && target?.closest("button, a, [role='menuitem']")) return;

@@ -29,7 +29,8 @@ import {
   type ShareImagePayload,
 } from "@/hooks/useImageSharer";
 import { peekAssetCandidates } from "@/hooks/useAsset";
-import { isAssetUrlDead, markAssetUrlAlive } from "@/lib/assetUrls";
+import { getAssetHealthVersion, isAssetUrlDead, markAssetUrlAlive } from "@/lib/assetUrls";
+import { isBrowserOffline } from "@/components/AssetImage";
 import type { DialogueSegment, StorySegment } from "@/types/story";
 import { Download, Loader2, RotateCcw, Share2, X } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -286,6 +287,30 @@ function rememberAvatar(key: string, img: HTMLImageElement | null): void {
   avatarCache.set(key, img);
 }
 
+/**
+ * 上次清理否定性缓存时看到的健康度版本号。断网 / 源被熔断期间攒下的
+ * 「null 头像」和失败 URL 与真 404 无法区分，判决并不可靠——展示路径
+ * （AssetImage / StoryThumbnail）已经会在健康事件里撤销这类记录，这里的
+ * 私有缓存必须跟着放行：否则离线时开过一次分享弹窗，网络恢复后全应用的
+ * 头像都回来了，唯独分享图会一直缺头像，直到重启应用。
+ */
+let seenAssetHealthVersion = getAssetHealthVersion();
+
+/** 丢掉否定性缓存（失败 URL 与 null 头像）；已成功的位图仍然保留。 */
+function purgeNegativeAvatarCaches(): void {
+  canvasFailedUrls.clear();
+  for (const [key, img] of avatarCache) {
+    if (img === null) avatarCache.delete(key);
+  }
+}
+
+// 网络恢复时也要主动放行一次：此时各 host 多半早已 proven，
+// markAssetUrlAlive 不会再发健康事件，单靠版本号对不出断网期间记的账。
+// 与 AssetImage 的在线恢复订阅同一纪律：整个模块只挂这一个 listener。
+if (typeof window !== "undefined") {
+  window.addEventListener("online", purgeNegativeAvatarCaches);
+}
+
 function loadImage(url: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -309,6 +334,13 @@ async function loadAvatarImage(
   name: string | null | undefined,
   charId: string | null | undefined
 ): Promise<HTMLImageElement | null> {
+  // 健康度版本变过（某个源首次被证明可达 / 熔断窗口到期）说明之前的
+  // 否定判决可能已失效，先放行再查缓存。
+  const healthVersion = getAssetHealthVersion();
+  if (healthVersion !== seenAssetHealthVersion) {
+    seenAssetHealthVersion = healthVersion;
+    purgeNegativeAvatarCaches();
+  }
   const key = avatarCacheKey(name, charId);
   if (avatarCache.has(key)) return avatarCache.get(key) ?? null;
 
@@ -329,7 +361,10 @@ async function loadAvatarImage(
     }
   }
   if (candidates.length === 0) {
-    rememberAvatar(key, null);
+    // seen 为空 = 这个角色本来就解析不出任何头像 URL，null 是稳定事实；
+    // 否则只是候选全被失败记录 / 熔断挡住，一张图都没真正试过——这种
+    // 判决会随健康度变化失效，缓存它等于把一次断网固化成「永远没头像」。
+    if (seen.size === 0) rememberAvatar(key, null);
     return null;
   }
 
@@ -340,6 +375,9 @@ async function loadAvatarImage(
       rememberAvatar(key, img);
       return img;
     }
+    // 离线时的失败与真 404 无法区分，不能记进任何一本永久账；本次直接
+    // 放弃，网络恢复后重试（与 AssetImage 展示路径的离线纪律一致）。
+    if (isBrowserOffline()) return null;
     canvasFailedUrls.add(url);
   }
   rememberAvatar(key, null);
