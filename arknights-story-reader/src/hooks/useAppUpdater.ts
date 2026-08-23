@@ -90,18 +90,61 @@ const enum CompareResult {
 }
 
 export function compareVersions(a: string, b: string): CompareResult {
-  const normalize = (input: string) => input.trim().replace(/^v/i, "");
-  const partsA = normalize(a).split(".");
-  const partsB = normalize(b).split(".");
-  const length = Math.max(partsA.length, partsB.length);
+  // 预发布段（-beta.1）必须单独切出来：直接按「.」切段再 parseInt 会把
+  // 「1.2.3-beta.1」拆成 [1,2,3,1]，排到正式版 1.2.3 前面——更新源一发
+  // 预发布包，正式版用户就会被误提示"新版本"，预发布用户反而永远等不到
+  // 转正提示。构建元数据（+xxx）按 semver 不参与排序。
+  const parse = (input: string) => {
+    const cleaned = input.trim().replace(/^v/i, "").split("+")[0];
+    const dashIndex = cleaned.indexOf("-");
+    return {
+      core: (dashIndex === -1 ? cleaned : cleaned.slice(0, dashIndex)).split("."),
+      prerelease: dashIndex === -1 ? null : cleaned.slice(dashIndex + 1),
+    };
+  };
+  const versionA = parse(a);
+  const versionB = parse(b);
+
+  const length = Math.max(versionA.core.length, versionB.core.length);
   for (let i = 0; i < length; i += 1) {
-    const segmentA = parseInt(partsA[i] ?? "0", 10);
-    const segmentB = parseInt(partsB[i] ?? "0", 10);
+    const segmentA = parseInt(versionA.core[i] ?? "0", 10);
+    const segmentB = parseInt(versionB.core[i] ?? "0", 10);
     if (Number.isNaN(segmentA) || Number.isNaN(segmentB)) {
       return CompareResult.Equals;
     }
     if (segmentA > segmentB) return CompareResult.Greater;
     if (segmentA < segmentB) return CompareResult.Less;
+  }
+
+  // 核心版本相同时，带预发布段的一方更旧（1.2.3-beta < 1.2.3）。
+  if (versionA.prerelease === null && versionB.prerelease === null) return CompareResult.Equals;
+  if (versionA.prerelease === null) return CompareResult.Greater;
+  if (versionB.prerelease === null) return CompareResult.Less;
+  return comparePrereleaseIdentifiers(versionA.prerelease, versionB.prerelease);
+}
+
+/** semver 预发布段排序：数字标识符按数值比且低于字母标识符，标识符少的更旧。 */
+function comparePrereleaseIdentifiers(a: string, b: string): CompareResult {
+  const idsA = a.split(".");
+  const idsB = b.split(".");
+  const length = Math.max(idsA.length, idsB.length);
+  for (let i = 0; i < length; i += 1) {
+    const idA = idsA[i];
+    const idB = idsB[i];
+    if (idA === undefined) return CompareResult.Less;
+    if (idB === undefined) return CompareResult.Greater;
+    const numA = /^\d+$/.test(idA) ? parseInt(idA, 10) : null;
+    const numB = /^\d+$/.test(idB) ? parseInt(idB, 10) : null;
+    if (numA !== null && numB !== null) {
+      if (numA > numB) return CompareResult.Greater;
+      if (numA < numB) return CompareResult.Less;
+    } else if (numA !== null) {
+      return CompareResult.Less;
+    } else if (numB !== null) {
+      return CompareResult.Greater;
+    } else if (idA !== idB) {
+      return idA > idB ? CompareResult.Greater : CompareResult.Less;
+    }
   }
   return CompareResult.Equals;
 }
@@ -285,6 +328,32 @@ export async function safeConfirm(
   }
 }
 
+/**
+ * 提示对话框，回退策略与 safeConfirm 相同（WKWebView 不实现 window.alert，
+ * 优先 plugin-dialog；Android 上插件被 ACL 拒绝时回退 window.alert）。
+ * 它本身就是兜底反馈，展示失败只记日志，绝不能再抛错打断调用方。
+ */
+export async function safeMessage(
+  text: string,
+  options: { title?: string; kind?: "info" | "warning" | "error" } = {}
+): Promise<void> {
+  const { title = "提示", kind = "info" } = options;
+  try {
+    const dialog = await import("@tauri-apps/plugin-dialog");
+    if (typeof dialog.message === "function") {
+      await dialog.message(text, { title, kind });
+      return;
+    }
+  } catch (error) {
+    devLog("[Dialog] 对话框插件不可用，回退到 window.alert", error);
+  }
+  try {
+    window.alert(text);
+  } catch (error) {
+    devWarn("[Dialog] window.alert 不可用", error);
+  }
+}
+
 export async function checkDesktopUpdate(currentVersionOverride?: string): Promise<DesktopUpdateAvailable | null> {
   const platform = detectRuntimePlatform();
   if (platform !== "desktop") {
@@ -405,6 +474,9 @@ export function useAppUpdater() {
     const isCancelled = () => cancelled;
 
     const runDesktopUpdateFlow = async () => {
+      // 用户点过「安装」之后的失败必须弹出来说清楚——否则确认框一关就没有任何
+      // 下文，用户会以为更新已经在装了。确认前的检查失败仍然只记日志。
+      let userConfirmedInstall = false;
       try {
         const updateInfo = await checkDesktopUpdate();
         if (!updateInfo || isCancelled()) return;
@@ -417,12 +489,19 @@ export function useAppUpdater() {
           devLog("[Updater] 用户取消更新");
           return;
         }
+        userConfirmedInstall = true;
 
         // 安装完会立刻重启进程：这时候若正在同步/导入，数据目录会写到一半被砍。
         // 锁被占时等一会儿再装，而不是把用户刚点的确认静默丢掉。
         const releaseJob = await acquireDataJobWhenIdle("update", INSTALL_LOCK_WAIT_MS);
         if (!releaseJob) {
           devLog("[Updater] 数据任务长时间未结束，跳过本次自动安装");
+          if (!isCancelled()) {
+            await safeMessage("后台数据任务较久未结束，本次自动更新已跳过，可稍后在设置页手动安装。", {
+              title: "更新未安装",
+              kind: "warning",
+            });
+          }
           return;
         }
         if (isCancelled()) {
@@ -442,11 +521,20 @@ export function useAppUpdater() {
         if (isCancelled()) return;
         // 缺少 `updater:allow-check` 权限、未配置更新源之类都是打包配置问题，
         // 启动期没必要在控制台刷红。
-        logUpdateIssue("[Updater] 桌面更新未完成：", describeUpdateError(error), error);
+        const issue = describeUpdateError(error);
+        logUpdateIssue("[Updater] 桌面更新未完成：", issue, error);
+        // 用户自己取消（含 Windows UAC 拒绝）不用再提醒一遍。
+        if (userConfirmedInstall && issue.kind !== "cancelled") {
+          await safeMessage(issue.message, {
+            title: "更新未完成",
+            kind: issue.tone === "error" ? "error" : "warning",
+          });
+        }
       }
     };
 
     const runAndroidUpdateFlow = async () => {
+      let userConfirmedInstall = false;
       try {
         const manifest = await fetchAndroidManifest({ suppressErrors: true });
         if (!manifest || isCancelled()) return;
@@ -468,10 +556,17 @@ export function useAppUpdater() {
           devLog("[Updater] 用户取消安卓更新");
           return;
         }
+        userConfirmedInstall = true;
 
         const releaseJob = await acquireDataJobWhenIdle("update", INSTALL_LOCK_WAIT_MS);
         if (!releaseJob) {
           devLog("[Updater] 数据任务长时间未结束，跳过本次自动安装");
+          if (!isCancelled()) {
+            await safeMessage("后台数据任务较久未结束，本次自动更新已跳过，可稍后在设置页手动安装。", {
+              title: "更新未安装",
+              kind: "warning",
+            });
+          }
           return;
         }
         if (isCancelled()) {
@@ -493,13 +588,26 @@ export function useAppUpdater() {
 
         if (response?.needsPermission) {
           devLog("[Updater] 需要开启未知来源安装权限");
+          // 不解释就直接跳系统设置，用户只会一头雾水；而且启动期自动流程本次
+          // 会话不会再跑，授权后必须指回设置页手动装。
+          await safeMessage("需要先允许本应用安装未知来源应用。即将打开系统授权界面，授权后请在设置页重新点击安装更新。", {
+            title: "需要安装权限",
+            kind: "warning",
+          });
           await openAndroidInstallPermissionSettings();
         } else {
           devLog("[Updater] 已触发 APK 安装流程", response?.status);
         }
       } catch (error) {
         if (isCancelled()) return;
-        logUpdateIssue("[Updater] 安卓更新未完成：", describeUpdateError(error), error);
+        const issue = describeUpdateError(error);
+        logUpdateIssue("[Updater] 安卓更新未完成：", issue, error);
+        if (userConfirmedInstall && issue.kind !== "cancelled") {
+          await safeMessage(issue.message, {
+            title: "更新未完成",
+            kind: issue.tone === "error" ? "error" : "warning",
+          });
+        }
       }
     };
 

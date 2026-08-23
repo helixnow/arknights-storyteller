@@ -2,7 +2,12 @@ import { ChangeEvent, useCallback, useEffect, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { AlertCircle, CheckCircle, Download, Loader2, Upload } from "lucide-react";
-import { describeDataJob, useDataSyncManager } from "@/hooks/useDataSyncManager";
+import {
+  acquireDataJob,
+  dataJobConflictMessage,
+  describeDataJob,
+  useDataSyncManager,
+} from "@/hooks/useDataSyncManager";
 import { safeConfirm } from "@/hooks/useAppUpdater";
 
 interface SyncDialogProps {
@@ -14,6 +19,20 @@ interface SyncDialogProps {
 /** 焦点圈进对话框用的选择器；隐藏的 <input type="file"> 会在下面按可见性筛掉。 */
 const FOCUSABLE_SELECTOR =
   'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
+
+/**
+ * 文件选择器取消侦测的宽限期：窗口回焦说明系统选择器已收场，但选中文件的
+ * change 事件可能还在路上（Android 从选择器 activity 返回有延迟），等满
+ * 宽限期仍没有 change 才按「用户取消」处理。取值与 Settings 的回退导入一致。
+ */
+const FILE_PICKER_CANCEL_GRACE_MS = 1500;
+
+/**
+ * 兜底超时：个别平台打开文件选择器不夺窗口焦点，「先失焦再回焦」的取消
+ * 侦测永远布防不了，寄存的锁会一直占着。等这么久仍没有 change 就按取消
+ * 放锁，保证不死锁；取 5 分钟而不是几秒，避免误伤慢慢挑文件的用户。
+ */
+const FILE_PICKER_STUCK_RELEASE_MS = 5 * 60_000;
 
 export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
   const {
@@ -30,6 +49,7 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
     status,
     handleSync,
     importFromFile,
+    loadVersionInfo,
     resetProgress,
   } = useDataSyncManager({ active: open, onSuccess });
 
@@ -39,6 +59,17 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
       setError(null);
     }
   }, [open, resetProgress, setError]);
+
+  // 数据可能在别处被换掉（设置页的同步/导入）：本对话框在数据未安装时会
+  // 自动弹出并跨 tab 常开，用户切去设置页装完数据再切回来，这里若不跟着
+  // 刷新，就会顶着「当前版本 未安装 / 需要首次安装」的过期状态继续催用户
+  // 重新下载。版本信息只在 open 变化时加载过一次，所以要单独听数据更新。
+  useEffect(() => {
+    if (!open) return;
+    const handler = () => void loadVersionInfo({ silent: true });
+    window.addEventListener("app:data-updated", handler);
+    return () => window.removeEventListener("app:data-updated", handler);
+  }, [open, loadVersionInfo]);
 
   const handleClose = useCallback(() => {
     if (busy) return;
@@ -120,17 +151,144 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
   /** 点击是否始于遮罩本身：从卡片里拖选文字松手落在遮罩上不该关掉对话框。 */
   const overlayPressRef = useRef(false);
 
+  /**
+   * 文件选择器开着期间寄存的 "import" 任务锁（与 Settings 的回退导入同一套
+   * 纪律）。系统选择器可能开很久，这段时间锁必须占着：否则自动索引 / 自动
+   * 更新安装会以为没人干活趁虚抢锁——更新装完直接重启进程，用户选完文件
+   * 回来，导入也只会被「正在××」驳回。锁的去向只有两条：选到文件且用户
+   * 确认，整把交棒给 importFromFile；其余情况（取消侦测命中、确认框点否、
+   * 对话框被关掉）就地释放。
+   */
+  const pendingImportJobRef = useRef<(() => void) | null>(null);
+  /** 撤掉取消侦测（blur / focus / visibility 监听 + 各计时器）；锁本身由调用方另行处置。 */
+  const pendingImportWatchCleanupRef = useRef<(() => void) | null>(null);
+
+  /** 取走寄存的锁并撤掉侦听；之后交棒还是释放由取走的人决定。 */
+  const takePendingImportJob = useCallback(() => {
+    pendingImportWatchCleanupRef.current?.();
+    const job = pendingImportJobRef.current;
+    pendingImportJobRef.current = null;
+    return job;
+  }, []);
+
+  /**
+   * 寄存锁并布防取消侦测（做法与 Settings 的 armPendingImportWatch 一致）：
+   * 先等窗口失焦 / 页面隐藏，确认「选择器真的打开了」，之后的回焦才可信；
+   * 回焦后等一个宽限期让可能在路上的 change 先到，等不到才按「用户取消」
+   * 放锁。用户在选择器里泡多久都安全——期间窗口始终失焦，倒计时无从开始。
+   * 个别平台打开选择器不夺焦点，由 5 分钟兜底超时保证最终放锁、不死锁。
+   * 万一误判（change 姗姗来迟），importFromFile 会退回自己抢锁，行为与
+   * 修复前一致，不会更糟。
+   */
+  const armPendingImportWatch = useCallback((releaseJob: () => void) => {
+    pendingImportJobRef.current = releaseJob;
+    /** 已确认选择器真正打开过（窗口失焦 / 页面隐藏），回焦事件才可信。 */
+    let pickerSeen = false;
+    let graceTimer: number | null = null;
+    let stuckTimer: number | null = null;
+
+    const settleAsCancelled = () => {
+      pendingImportWatchCleanupRef.current?.();
+      const job = pendingImportJobRef.current;
+      pendingImportJobRef.current = null;
+      job?.();
+    };
+
+    const startGrace = () => {
+      if (graceTimer !== null) return;
+      graceTimer = window.setTimeout(() => {
+        graceTimer = null;
+        settleAsCancelled();
+      }, FILE_PICKER_CANCEL_GRACE_MS);
+    };
+    const stopGrace = () => {
+      if (graceTimer !== null) {
+        window.clearTimeout(graceTimer);
+        graceTimer = null;
+      }
+    };
+
+    const onLostFocus = () => {
+      pickerSeen = true;
+      // 又失焦了（还在选择器里，或过渡动画抖出的假回焦）：撤掉可能误开的
+      // 倒计时，绝不在用户看不见页面时放锁。
+      stopGrace();
+    };
+    const onGotFocus = () => {
+      if (!pickerSeen) return;
+      startGrace();
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "hidden") onLostFocus();
+      else onGotFocus();
+    };
+
+    pendingImportWatchCleanupRef.current = () => {
+      window.removeEventListener("blur", onLostFocus);
+      window.removeEventListener("focus", onGotFocus);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      stopGrace();
+      if (stuckTimer !== null) {
+        window.clearTimeout(stuckTimer);
+        stuckTimer = null;
+      }
+      pendingImportWatchCleanupRef.current = null;
+    };
+    window.addEventListener("blur", onLostFocus);
+    window.addEventListener("focus", onGotFocus);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    stuckTimer = window.setTimeout(() => {
+      stuckTimer = null;
+      settleAsCancelled();
+    }, FILE_PICKER_STUCK_RELEASE_MS);
+  }, []);
+
+  /** 收尾：撤掉侦听并释放仍寄存的锁（释放函数幂等，重复调用无害）。 */
+  const settleParkedImport = useCallback(() => {
+    pendingImportWatchCleanupRef.current?.();
+    pendingImportJobRef.current?.();
+    pendingImportJobRef.current = null;
+  }, []);
+
+  // 对话框关掉后 <input type="file"> 随之卸载，change 再也不会来：寄存中的
+  // 锁必须就地释放，否则得干等 5 分钟兜底，期间设置页的同步/导入入口全被
+  // 这把幽灵锁禁用。（寄存期间 busy 为 false，handleClose 不拦关闭——比如
+  // Android 返回键的 Escape 兜底，所以这条路真的走得到。）组件卸载同理。
+  useEffect(() => {
+    if (!open) settleParkedImport();
+  }, [open, settleParkedImport]);
+  useEffect(() => () => settleParkedImport(), [settleParkedImport]);
+
   const handleFileSelected = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     event.target.value = "";
-    if (!file) return;
+    // 同步取走寄存的锁并撤掉取消侦测：选择器收场的回焦宽限可能已经在倒
+    // 计时，晚一个 await 锁就会被当成「用户取消」放掉。
+    const transferredJob = takePendingImportJob();
+    if (!file) {
+      transferredJob?.();
+      return;
+    }
     // 选完再确认：先弹确认框会丢掉用户手势，部分 WebView 就打不开文件选择器了。
+    // 确认期间锁仍握在手里，排队等锁的自动更新安装抢不进来。
     const confirmed = await safeConfirm(
       `导入 ${file.name} 会覆盖本机已有的剧情数据，确定继续？`,
       { title: "导入 ZIP", kind: "warning" }
     );
-    if (!confirmed) return;
-    await importFromFile(file);
+    if (!confirmed) {
+      transferredJob?.();
+      return;
+    }
+    try {
+      // 把锁整把交棒给 importFromFile，绝不能先放再让它重抢：释放会同步
+      // 唤醒 acquireDataJobWhenIdle 的等待者（自动更新安装），同一个 tick
+      // 里锁就被截走。侦测误判提前放了锁时 transferredJob 为 null，
+      // importFromFile 退回自己抢锁，行为与修复前一致。
+      await importFromFile(file, { transferredJob: transferredJob ?? undefined });
+    } finally {
+      // 释放函数幂等，这里兜底再放一次无害（正常已由导入流程释放）。
+      transferredJob?.();
+    }
   };
 
   if (!open) return null;
@@ -140,6 +298,22 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
     progress && progress.total > 0
       ? Math.min(Math.round((progress.current / progress.total) * 100), 100)
       : null;
+
+  const handleImportClick = () => {
+    // 连点第二下可能赶在重渲染禁用按钮之前：锁已寄存说明选择器正在打开，
+    // 直接忽略，别对着用户自己的操作报「导入正在进行」。
+    if (actionsDisabled || pendingImportJobRef.current) return;
+    // 系统选择器可能开很久，先抢下 "import" 锁寄存给选择器流程，堵住这段
+    // 时间自动索引 / 自动更新安装的空窗（后者拿到锁会直接重启进程）。
+    const releaseJob = acquireDataJob("import");
+    if (!releaseJob) {
+      setError(dataJobConflictMessage("导入"));
+      return;
+    }
+    setError(null);
+    armPendingImportWatch(releaseJob);
+    fileInputRef.current?.click();
+  };
 
   return (
     <div
@@ -182,7 +356,11 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
             </div>
             <div className="flex justify-between items-center">
               <span className="text-sm text-[hsl(var(--color-muted-foreground))]">最新版本</span>
-              <span className="text-sm font-mono">{remoteVersion || "未知"}</span>
+              {/* 与「当前版本」同一纪律：请求还在途时不能抢答「未知」——
+                  远程版本要走网络，是这几项里挂得最久的。 */}
+              <span className="text-sm font-mono">
+                {remoteVersion || (loadingInfo ? "读取中..." : "未知")}
+              </span>
             </div>
             {status === "not-installed" && (
               <div className="flex items-center gap-2 text-sm text-[hsl(var(--color-primary))]">
@@ -308,7 +486,7 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
             </Button>
             <Button
               variant="outline"
-              onClick={() => fileInputRef.current?.click()}
+              onClick={handleImportClick}
               disabled={actionsDisabled}
               className="flex-1 min-h-[44px]"
             >

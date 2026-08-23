@@ -39,14 +39,31 @@ interface SheetShellProps {
 const FOCUSABLE =
   'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
-/** Esc 要放过正在输入的控件：那里 Esc 的语义是「撤销这次输入」。 */
+/*
+ * Esc 要放过正在输入的控件：那里 Esc 的语义是「撤销这次输入」。
+ * 但 input 不全是文本框——滑杆 / 复选 / 单选没有「取消输入」一说，焦点停在
+ * 上面时 Esc 应当照常关掉 sheet（拖完字号滑杆、勾完分享选项就是这个状态），
+ * 否则键盘用户只能 Tab 一整圈去找关闭键。
+ */
+const NON_TEXT_INPUT_TYPES = new Set([
+  "button",
+  "checkbox",
+  "color",
+  "file",
+  "image",
+  "radio",
+  "range",
+  "reset",
+  "submit",
+]);
+
 function isTextEntry(node: EventTarget | null): boolean {
   const el = node as HTMLElement | null;
   if (!el) return false;
+  if (el.tagName === "TEXTAREA" || el.isContentEditable === true) return true;
   return (
-    el.tagName === "INPUT" ||
-    el.tagName === "TEXTAREA" ||
-    el.isContentEditable === true
+    el.tagName === "INPUT" &&
+    !NON_TEXT_INPUT_TYPES.has((el as HTMLInputElement).type)
   );
 }
 

@@ -86,10 +86,16 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       setToasts((prev) => {
         if (prev.length < MAX_VISIBLE) return [...prev, payload];
         // 满员时优先挤掉最旧的普通/成功提示：错误和警告承载着「操作失败」
-        // 这类必须被读到的信息，不能被连发的成功提示无声顶掉；只有整屏都
-        // 是紧急提示时才挤最旧那条。刚弹出的新提示永远保留。
+        // 这类必须被读到的信息，不能被连发的成功提示无声顶掉。
         const evict = prev.findIndex((t) => t.kind !== "error" && t.kind !== "warning");
-        return [...prev.filter((_, i) => i !== (evict === -1 ? 0 : evict)), payload];
+        if (evict !== -1) return [...prev.filter((_, i) => i !== evict), payload];
+        // 整屏都是错误/警告：新来的紧急提示挤掉最旧那条；普通提示则临时
+        // 多占一个位置——为一句「已复制」牺牲一条没读完的错误得不偿失，
+        // 紧急提示停留 4–6s 会自己过期腾位。超出 +1 的极端连发才挤最旧。
+        if (kind === "error" || kind === "warning" || prev.length > MAX_VISIBLE) {
+          return [...prev.slice(1), payload];
+        }
+        return [...prev, payload];
       });
     },
     []
@@ -127,7 +133,12 @@ function ToastItem({
   toast: ToastPayload;
   onDismiss: (id: number) => void;
 }) {
-  const [paused, setPaused] = useState(false);
+  // 悬停与聚焦分开记账：鼠标划过再移开时，如果关闭键仍持有键盘焦点，
+  // 倒计时必须继续暂停——否则 toast 会在键盘用户按下 Enter 前消失，
+  // 焦点跌落到 body，用户彻底迷失位置。
+  const [hovered, setHovered] = useState(false);
+  const [focused, setFocused] = useState(false);
+  const paused = hovered || focused;
   const remainingRef = useRef(toast.duration);
 
   const dismiss = useCallback(() => onDismiss(toast.id), [onDismiss, toast.id]);
@@ -158,11 +169,24 @@ function ToastItem({
         "motion-safe:animate-in motion-safe:fade-in-0 motion-safe:slide-in-from-bottom-4 motion-safe:duration-200",
         KIND_CLASSES[toast.kind]
       )}
-      onPointerEnter={() => setPaused(true)}
-      onPointerLeave={() => setPaused(false)}
-      onFocusCapture={() => setPaused(true)}
-      onBlurCapture={() => setPaused(false)}
-      onClick={dismiss}
+      onPointerEnter={() => setHovered(true)}
+      onPointerLeave={() => setHovered(false)}
+      onFocusCapture={() => setFocused(true)}
+      onBlurCapture={() => setFocused(false)}
+      onClick={(event) => {
+        // 划选正文松手也会触发 click：用户是在复制长错误信息，不是点击
+        // 关闭，别把他刚选中的文字连着 toast 一起收走。
+        const selection = window.getSelection();
+        if (
+          selection &&
+          !selection.isCollapsed &&
+          selection.anchorNode &&
+          event.currentTarget.contains(selection.anchorNode)
+        ) {
+          return;
+        }
+        dismiss();
+      }}
     >
       <div className="flex items-start gap-3">
         <Icon

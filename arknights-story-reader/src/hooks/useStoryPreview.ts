@@ -360,6 +360,16 @@ if (typeof window !== "undefined") {
   window.addEventListener("app:data-updated", invalidateAll);
 }
 
+function initialStateFor(storyPath: string | null | undefined): {
+  token: StoryPreviewToken | null;
+  loading: boolean;
+} {
+  if (!storyPath) return { token: null, loading: false };
+  const cached = readCached(storyPath);
+  if (cached) return { token: cached.token, loading: false };
+  return { token: null, loading: true };
+}
+
 /**
  * 返回给定剧情的缩略图 token；首次请求会异步取，结果会填入 React state。
  * 当 `storyPath` 为空/未就绪时返回 `{ token: null, loading: false }`。
@@ -371,15 +381,17 @@ export function useStoryPreview(
   loading: boolean;
 } {
   const [version, setVersion] = useState(dataVersion);
-  const [state, setState] = useState<{
-    token: StoryPreviewToken | null;
-    loading: boolean;
-  }>(() => {
-    if (!storyPath) return { token: null, loading: false };
-    const cached = readCached(storyPath);
-    if (cached) return { token: cached.token, loading: false };
-    return { token: null, loading: true };
-  });
+  const [state, setState] = useState(() => initialStateFor(storyPath));
+
+  // storyPath 原地切换（列表复用行、首页卡片换目标）的那一帧不能把上一篇
+  // 的 token 渲染出去——下游会把旧插画当命中候选继续展示，等 useEffect
+  // （paint 之后）才纠正，用户能看到串篇闪帧。与 <AssetImage> 同一套
+  // 渲染期同步重置的模式。
+  const [renderedPath, setRenderedPath] = useState(storyPath);
+  if (renderedPath !== storyPath) {
+    setRenderedPath(storyPath);
+    setState(initialStateFor(storyPath));
+  }
 
   useEffect(() => {
     const notify = () => setVersion(dataVersion);
