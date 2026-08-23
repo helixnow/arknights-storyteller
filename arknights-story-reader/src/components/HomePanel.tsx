@@ -10,6 +10,7 @@ import {
   toReadPercent,
   useOnlineStatus,
   type ReadingProgressEntry,
+  type ReadingProgressSnapshot,
 } from "@/components/StoryList";
 import { useFavorites } from "@/hooks/useFavorites";
 import {
@@ -106,8 +107,16 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
   // 聚焦、返回列表、数据同步都会触发刷新，可能叠在一起。用递增序号
   // 保证只有最后一次的结果能写进 state。
   const loadSeqRef = useRef(0);
+  /** 上一次成功渲染所依据的进度快照，用来判断这次刷新有没有必要。 */
+  const loadedFromRef = useRef<ReadingProgressSnapshot | null>(null);
 
-  const loadHome = useCallback(async () => {
+  const loadHome = useCallback(async (options?: { force?: boolean }) => {
+    // 首页的内容只由两样东西决定：剧情目录和阅读进度快照。目录换了会走
+    // `app:data-updated`（force），所以进度快照没变时这次刷新一定得不到
+    // 新结果——直接跳过，桌面端反复切窗口就不会一路打 IPC 出去。
+    const snapshot = getReadingProgress();
+    if (!options?.force && loadedFromRef.current === snapshot) return;
+
     const seq = (loadSeqRef.current += 1);
     const stale = () => seq !== loadSeqRef.current;
     const hintTimer = window.setTimeout(() => {
@@ -122,6 +131,7 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
       if (!ok) {
         setRecentStories((prev) => (prev.length === 0 ? prev : []));
         setHighlight(null);
+        loadedFromRef.current = snapshot;
         return;
       }
 
@@ -139,7 +149,7 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
 
       // 2) 最近阅读：progress 的 key 就是 storyTxt，反查成 StoryEntry。
       // 快照和剧情列表的进度徽标同源，两边不可能显示成不一样的百分比。
-      const entries = getReadingProgress().recent.slice(0, RECENT_SCAN_LIMIT);
+      const entries = snapshot.recent.slice(0, RECENT_SCAN_LIMIT);
       const byPath = new Map<string, StoryEntry>();
       allMain.forEach((story) => byPath.set(story.storyTxt, story));
 
@@ -169,6 +179,7 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
         })
         .filter((x): x is RecentStory => x !== null);
       setRecentStories((prev) => (sameRecentStories(prev, matched) ? prev : matched));
+      loadedFromRef.current = snapshot;
     } catch (err) {
       if (stale()) return;
       console.warn("[Home] load failed", err);
@@ -188,21 +199,25 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
   useEffect(() => {
     // 首页需要在这些时机重新读一遍：从阅读器返回（app:home-refresh）、
     // 剧情数据刚同步完（app:data-updated）、窗口重新获得焦点。
-    const handler = () => {
-      void loadHome();
+    const refresh = (force: boolean) => {
+      void loadHome({ force });
       // 同上：连续阅读天数没变时保持同一个对象，避免整页跟着重渲染。
       setStreak((prev) => {
         const next = readStreak();
         return sameStreak(prev, next) ? prev : next;
       });
     };
-    window.addEventListener("focus", handler);
-    window.addEventListener("app:home-refresh", handler);
-    window.addEventListener("app:data-updated", handler);
+    // 数据同步换了整个目录，进度快照没变也必须重来一遍。
+    const onDataUpdated = () => refresh(true);
+    const onRefresh = () => refresh(false);
+
+    window.addEventListener("focus", onRefresh);
+    window.addEventListener("app:home-refresh", onRefresh);
+    window.addEventListener("app:data-updated", onDataUpdated);
     return () => {
-      window.removeEventListener("focus", handler);
-      window.removeEventListener("app:home-refresh", handler);
-      window.removeEventListener("app:data-updated", handler);
+      window.removeEventListener("focus", onRefresh);
+      window.removeEventListener("app:home-refresh", onRefresh);
+      window.removeEventListener("app:data-updated", onDataUpdated);
     };
   }, [loadHome]);
 
@@ -229,7 +244,7 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
   const goToSettings = useCallback(() => onGoToTab("settings"), [onGoToTab]);
   const retryLoad = useCallback(() => {
     setLoadFailed(false);
-    void loadHome();
+    void loadHome({ force: true });
   }, [loadHome]);
 
   const handleGoToFavorites = useCallback(() => {
