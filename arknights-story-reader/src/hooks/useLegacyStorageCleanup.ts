@@ -37,6 +37,16 @@ const CLEANUP_STEPS: Array<{ version: number; keys: string[] }> = [
       "arknights-story-segment-cache-v1",
     ],
   },
+  {
+    version: 3,
+    keys: [
+      // 2026-08：INDEX_VERSION 8→9 修复了索引语料（行尾 `\` 续行拼接、全角
+      // 标点残渣），同理数据 commit 不变、旧缓存察觉不到，SearchPanel 把键
+      // 换成了 v4/v3。旧键自此无人读写，在这里删掉。
+      "arknights-story-search-cache-v3",
+      "arknights-story-segment-cache-v2",
+    ],
+  },
 ];
 
 const CLEANUP_VERSION = CLEANUP_STEPS[CLEANUP_STEPS.length - 1]?.version ?? 0;

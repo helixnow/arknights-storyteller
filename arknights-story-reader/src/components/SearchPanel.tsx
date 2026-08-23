@@ -65,12 +65,12 @@ interface CachedSegmentPage {
 const HISTORY_KEY = "arknights-story-search-history";
 /**
  * 缓存键与后端 `INDEX_VERSION` 同步升级：缓存按数据 commit（stableVersionOf）命中，
- * 但 parser/索引语料变了而 commit 没变时（如 INDEX_VERSION 7→8 修复引号内 `]`、
- * 单引号说话人、状态残渣），旧缓存仍会命中脏结果。此时必须换 key 让旧条目
+ * 但 parser/索引语料变了而 commit 没变时（如 INDEX_VERSION 8→9 修复行尾 `\`
+ * 续行拼接、全角标点残渣），旧缓存仍会命中脏结果。此时必须换 key 让旧条目
  * 自然失效（不再读取即被遗弃），否则用户要清站点数据才能看到正确结果。
  */
-const CACHE_KEY = "arknights-story-search-cache-v3";
-const SEGMENT_CACHE_KEY = "arknights-story-segment-cache-v2";
+const CACHE_KEY = "arknights-story-search-cache-v4";
+const SEGMENT_CACHE_KEY = "arknights-story-segment-cache-v3";
 const DEBUG_STATE_KEY = "arknights-story-search-debug";
 const SEARCH_MODE_KEY = "arknights-story-search-mode";
 

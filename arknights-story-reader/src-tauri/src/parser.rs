@@ -60,6 +60,51 @@ fn normalize_char_id(raw: &str) -> String {
     base.to_string()
 }
 
+/// 教程/训练/沙盒脚本会用行尾 `\` 把一条指令折成好几行（training_8_b.txt：
+/// `[PopupDialog(focusX=..., \` + `animStyle="Highlight", \` + `...)] \` + 正文）。
+/// 逐物理行解析会把属性续行整行漏成旁白、把孤零零的 `\` 当正文，还把教程
+/// 文字跟 dialogHead 说话人拆散——先拼回逻辑行再解析。
+///
+/// 语料里续行的第一行必然以 `[` 开头（正文行从不以 `\` 结尾），所以只认
+/// 指令行，防止误吞真的以反斜杠收尾的台词。空行终止续行：纯手势教程
+/// （`[Tutorial(...)] \` 后面直接空行）没有正文，不能把下一条指令吞进来。
+fn logical_lines(content: &str) -> Vec<std::borrow::Cow<'_, str>> {
+    use std::borrow::Cow;
+    let mut out: Vec<Cow<'_, str>> = Vec::new();
+    let mut buf: Option<String> = None;
+    for raw in content.lines() {
+        let end_trimmed = raw.trim_end();
+        match buf.as_mut() {
+            None => match end_trimmed.strip_suffix('\\') {
+                Some(head) if head.trim_start().starts_with('[') => {
+                    buf = Some(head.to_string());
+                }
+                _ => out.push(Cow::Borrowed(raw)),
+            },
+            Some(joined) => {
+                if end_trimmed.trim_start().is_empty() {
+                    out.push(Cow::Owned(std::mem::take(joined)));
+                    buf = None;
+                    continue;
+                }
+                joined.push(' ');
+                match end_trimmed.strip_suffix('\\') {
+                    Some(more) => joined.push_str(more),
+                    None => {
+                        joined.push_str(end_trimmed);
+                        out.push(Cow::Owned(std::mem::take(joined)));
+                        buf = None;
+                    }
+                }
+            }
+        }
+    }
+    if let Some(joined) = buf {
+        out.push(Cow::Owned(joined));
+    }
+    out
+}
+
 pub fn parse_story_text(content: &str) -> ParsedStoryContent {
     let mut segments = Vec::new();
     // Tracks the most recent [Character(name="char_xxx")] declaration so
@@ -67,7 +112,7 @@ pub fn parse_story_text(content: &str) -> ParsedStoryContent {
     // scripts always declare speaker *before* the dialogue line.
     let mut current_char_id: Option<String> = None;
 
-    for raw_line in content.lines() {
+    for raw_line in logical_lines(content) {
         let mut line = raw_line.trim();
 
         // Update the current speaker's charId without emitting a segment.
@@ -592,9 +637,14 @@ fn has_meaningful_content(text: &str) -> bool {
         return false;
     }
 
-    if trimmed.len() == 1 {
+    if trimmed.chars().count() == 1 {
         let ch = trimmed.chars().next().unwrap();
         if ch.is_ascii_alphanumeric() && ch.is_ascii() {
+            return false;
+        }
+        // 单个全角标点（`[Character(...)]。`、`[delay(time=1)]：` 的手滑残渣）
+        // 跟单个 ASCII 标点一样是渣。单个 CJK 字（"咦"）仍算正文。
+        if !ch.is_alphanumeric() {
             return false;
         }
     }
@@ -1295,6 +1345,73 @@ mod tests {
         let result = parse_story_text("......\n...");
         assert_eq!(kinds(&result), vec!["narration", "narration"]);
         assert_eq!(texts(&result), vec!["......", "..."]);
+    }
+
+    /// 全角标点残渣同样不能漏成孤立段落：act18d3/act3d0 等 6 个文件有
+    /// `[Character(...)]。`，story_malist_1_1 有 `[delay(time=1)]：`。
+    /// act21side task 文本的 `[dialog(...)]......` 是有意的沉默对白，必须保留。
+    #[test]
+    fn test_fullwidth_punctuation_junk_does_not_leak() {
+        assert!(parse_story_text(r#"[Character(name="avg_npc_182#2")]。"#)
+            .segments
+            .is_empty());
+        assert!(
+            parse_story_text(r#"[charslot(slot = "m", name = "avg_4140_lasher_1#1$1")]。"#)
+                .segments
+                .is_empty()
+        );
+        assert!(parse_story_text("[delay(time=1)]：").segments.is_empty());
+
+        let segment = only(r#"[dialog(head="npc_698_1",delay=1,style="other")]......"#);
+        assert_eq!(segment.kind(), "dialogue");
+        assert_eq!(segment.text(), Some("......"));
+
+        // 有名字的纯标点台词（`[name="斯卡蒂"]！！`）是有意写的。
+        let segment = only(r#"[name="斯卡蒂"]！！"#);
+        assert_eq!(segment.text(), Some("！！"));
+    }
+
+    /// 教程/训练脚本把一条指令用行尾 `\` 折成多行（真实数据 training_8_b.txt、
+    /// 316 个文件共 1975 行）。不拼回逻辑行的话：属性续行漏成旁白、孤 `\`
+    /// 变成正文、教程文字跟 dialogHead 说话人拆散。
+    #[test]
+    fn test_backslash_continuation_joins_multiline_commands() {
+        let content = r#"[PopupDialog(focusX=362, focusY=-147, focusWidth=116, focusHeight=130, \
+          animStyle="Highlight", focusStyle="HighlightCircle", black="$f_tut_black", \
+          protectTime=0.5, dialogHead="$avatar_doberm")] \
+敌人似乎已经发现了我方人手不足的弱点，准备兵分两路发动进攻。"#;
+        let segment = only(content);
+        assert_eq!(segment.kind(), "system");
+        assert_eq!(segment.speaker(), Some("Doberm"));
+        assert_eq!(
+            segment.text(),
+            Some("敌人似乎已经发现了我方人手不足的弱点，准备兵分两路发动进攻。")
+        );
+
+        // 单行指令 + `\` + 下一行正文（training_8_b.txt 的常见形态）。
+        let content = r#"[PopupDialog(dialogHead="$avatar_jesica")] \
+啊对了！这些障碍物可以封锁敌人的前进道路。"#;
+        let segment = only(content);
+        assert_eq!(segment.kind(), "system");
+        assert_eq!(segment.speaker(), Some("Jesica"));
+        assert_eq!(segment.text(), Some("啊对了！这些障碍物可以封锁敌人的前进道路。"));
+    }
+
+    /// 手势教程（training_28_f.txt）`[Tutorial(...)] \` 后面直接空行：没有
+    /// 正文，续行必须在空行终止，不能把下一条指令吞成教程文字。
+    #[test]
+    fn test_backslash_continuation_stops_at_blank_line() {
+        let content = "[Tutorial(waitForSignal=\"select_direction\", animStyle=\"Drag\", startTileX=6, startTileY=3, endTileX=6, endTileY=1)] \\\n\n[battle.unlockfunction(mask=\"SYSTEM_MENU_INTERACT\")]";
+        let result = parse_story_text(content);
+        assert!(
+            result.segments.is_empty(),
+            "gesture tutorial leaked: {:?}",
+            result.segments
+        );
+
+        // 正文行以 `\` 收尾不是续行（只有指令行才认续行），原样保留。
+        let result = parse_story_text("路牌上写着：出口 \\\n下一行是别的旁白。");
+        assert_eq!(kinds(&result), vec!["narration", "narration"]);
     }
 
     /// 端到端跑一段贴近真实脚本的片段：段落种类和顺序都要稳。

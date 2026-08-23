@@ -53,7 +53,13 @@ const HTTP_OP_TIMEOUT: Duration = Duration::from_secs(60);
 ///      dropped or mangled), single-quoted attributes are parsed (speaker
 ///      names lose stray quotes, e.g. Magallan), and leftover junk after
 ///      speaker-state commands is no longer indexed as narration.
-const INDEX_VERSION: i32 = 8;
+/// v9 = parser joins trailing-`\` continuation lines back into one logical
+///      command before parsing (tutorial/training scripts no longer leak
+///      attribute lines as narration, and their text regains its dialogHead
+///      speaker), and a lone full-width punctuation mark left after a command
+///      (`[Character(...)]。`) is dropped like its ASCII counterpart; both
+///      change stored text and shift stored segment indices.
+const INDEX_VERSION: i32 = 9;
 
 const META_TOTAL_COUNT: &str = "total_count";
 const META_SEGMENT_TOTAL: &str = "segment_total";
