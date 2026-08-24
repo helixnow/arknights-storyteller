@@ -50,6 +50,16 @@ const RECENT_SCAN_LIMIT = 60;
 const RECENT_RENDER_LIMIT = 5;
 /** 刷新超过这个时长才提示「正在刷新」，命中缓存时不闪。 */
 const REFRESH_HINT_DELAY_MS = 400;
+/**
+ * 次级目录（活动 / 支线 / 肉鸽 / 密录）读失败被吞成空结果（partial）后，
+ * 自动重试的间隔与次数上限。这种失败多半是刚同步完、索引还在重建的短暂
+ * 状态；只靠「下一次聚焦再试」的话，焦点一直停在首页的用户（手机端尤其
+ * 常见）等不来任何聚焦/可见性事件，缺掉的「最近阅读」会挂整个会话。
+ * 设上限是防持久性失败退化成每两秒打一轮 IPC 的死循环——超限后仍有聚焦 /
+ * 可见性 / 数据同步刷新兜底；完整加载成功或强制刷新时额度重新给满。
+ */
+const PARTIAL_RETRY_DELAY_MS = 2500;
+const PARTIAL_RETRY_MAX = 2;
 
 interface StreakInfo {
   currentStreak: number;
@@ -180,6 +190,10 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
   /** 上一次成功加载对应的日期。「今日推荐」按天挑选，跨天后哪怕进度快照
    *  没变也不能跳过刷新，否则挂机过夜的用户会一直看到昨天的「每日随机一章」。 */
   const loadedDayRef = useRef<string | null>(null);
+  /** partial（次级目录读失败）后已自动重试的次数；完整加载或强制刷新归零。 */
+  const partialRetryCountRef = useRef(0);
+  /** partial 自动重试的定时器。新一轮加载启动或组件卸载时作废。 */
+  const partialRetryTimerRef = useRef(0);
 
   const loadHome = useCallback(async (options?: { force?: boolean }) => {
     // 首页的内容由三样东西决定：剧情目录、阅读进度快照、当天日期（今日
@@ -196,6 +210,10 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
 
     const seq = (loadSeqRef.current += 1);
     const stale = () => seq !== loadSeqRef.current;
+    // 这一轮会得出自己的结论，上一轮 partial 挂着的自动重试作废；强制刷新
+    // （数据同步 / 错误卡重试）意味着换了代际，自动重试的额度也重新给满。
+    window.clearTimeout(partialRetryTimerRef.current);
+    if (options?.force) partialRetryCountRef.current = 0;
     const hintTimer = window.setTimeout(() => {
       if (!stale()) setRefreshing(true);
     }, REFRESH_HINT_DELAY_MS);
@@ -270,14 +288,6 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
         mems.forEach((story) => byPath.set(story.storyTxt, story));
       }
 
-      // 保留完整命中列表：渲染只取前几张，但「最近阅读 N 章」要用真实数量。
-      const matched = entries
-        .map((item) => {
-          const entry = byPath.get(item.storyPath);
-          return entry ? { entry, meta: item } : null;
-        })
-        .filter((x): x is RecentStory => x !== null);
-
       // 到这里已无 await，下面这批 setState 会合并成一次渲染、一次亮相。
       // 以前 isInstalled 一返回就把 installed 翻成 true：骨架屏提前退场，
       // 冷启动（目录 IPC 要几十到几百毫秒才回来）会先闪出「打开任意一章
@@ -290,7 +300,26 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
       // 相同就保留旧对象，同步后推荐卡会一直显示旧目录里的书名，点开走的
       // 也是旧路径。
       setHighlight(pick);
-      setRecentStories((prev) => (sameRecentStories(prev, matched) ? prev : matched));
+      setRecentStories((prev) => {
+        // 次级目录这轮读失败（partial）时，byPath 缺的路径先拿上一轮已经
+        // 解析出的 StoryEntry 顶住，进度数字仍用最新快照——否则只读活动 /
+        // 支线的用户会在索引重建的几秒里看到「最近阅读」整段消失、大卡退
+        // 化成「打开任意一章剧情」的空状态（loadFailed 那段注释说过：对有
+        // 阅读记录的用户这就是在撒谎，partial 路径同理）。完整加载时不走
+        // 回退：目录里真不存在的条目（换包被移除）就该消失。
+        const prevByPath = partial
+          ? new Map(prev.map((item) => [item.meta.storyPath, item]))
+          : null;
+        // 保留完整命中列表：渲染只取前几张，但「最近阅读 N 章」要用真实数量。
+        const matched = entries
+          .map((item) => {
+            const entry =
+              byPath.get(item.storyPath) ?? prevByPath?.get(item.storyPath)?.entry;
+            return entry ? { entry, meta: item } : null;
+          })
+          .filter((x): x is RecentStory => x !== null);
+        return sameRecentStories(prev, matched) ? prev : matched;
+      });
       // 有次级目录读失败时结果不完整，不能记成「已按此快照加载」——否则
       // 进度快照没变的话，后续聚焦刷新全被顶部跳过逻辑拦下，瞬时失败里
       // 缺掉的「最近阅读」卡片要等到用户再读点什么才会回来。留空让下一次
@@ -299,6 +328,19 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
       // 用挑推荐时的 `t` 而不是现在的 todayKey()：加载恰好跨过零点时两者
       // 会不同，记 `t` 能让下一次刷新发现日期变了、重挑今天的推荐。
       loadedDayRef.current = t;
+      if (!partial) {
+        partialRetryCountRef.current = 0;
+      } else if (partialRetryCountRef.current < PARTIAL_RETRY_MAX) {
+        // 焦点一直停在首页时不会再有聚焦/可见性事件，缺掉的「最近阅读」
+        // 只能靠这里自动补试。走 app:home-refresh 事件而不是直接递归调
+        // loadHome：组件已卸载时事件自然无人接收，不会往卸载后的组件上灌
+        // setState。失败的请求不进共享缓存，这次重试是真重试。
+        partialRetryCountRef.current += 1;
+        partialRetryTimerRef.current = window.setTimeout(
+          notifyHomeRefresh,
+          PARTIAL_RETRY_DELAY_MS
+        );
+      }
     } catch (err) {
       if (stale()) return;
       console.warn("[Home] load failed", err);
@@ -388,6 +430,9 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
     document.addEventListener("visibilitychange", onVisibility);
     return () => {
       window.clearTimeout(dayTimer);
+      // partial 自动重试的定时器也在这里作废：卸载后即使有在途加载晚一步
+      // 又排了一个，事件派发出去也没有监听者，不会造成任何可见影响。
+      window.clearTimeout(partialRetryTimerRef.current);
       window.removeEventListener("focus", onRefresh);
       window.removeEventListener("app:home-refresh", onRefresh);
       window.removeEventListener("app:data-updated", onDataUpdated);
