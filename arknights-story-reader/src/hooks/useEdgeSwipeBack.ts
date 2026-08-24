@@ -10,6 +10,12 @@ interface Options {
   maxDeviation?: number;
   /** Only active when `true`. */
   enabled: boolean;
+  /**
+   * 宿主视图是否在前台。`enabled=false` 也可能只是因为阅读器里开着菜单：
+   * 那种情况下 pointerdown 采样器必须保留，才能识别“同一根手指先关菜单”
+   * 的竞态；KeepAlive 真正退到后台时则连采样器都必须摘掉。
+   */
+  active?: boolean;
   /** Callback invoked when a back gesture is confirmed. */
   onBack: () => void;
   /**
@@ -27,6 +33,47 @@ const MAX_GESTURE_MS = 1200;
 /** 从这些东西上起手时不接管手势：滑杆要横向拖，浮层有自己的关闭方式。 */
 const IGNORED_ORIGINS =
   "input[type='range'], [data-no-edge-swipe], [role='dialog'], [role='menu'], [role='listbox']";
+
+export type EdgeSwipeDecision = "track" | "cancel" | "trigger";
+
+/**
+ * 边缘返回的纯判定器。事件层只负责取坐标；阈值、反向移动、垂直漂移和长按
+ * 取消都在这里统一，便于用 node:test 锁住临界值。
+ */
+export function evaluateEdgeSwipe(
+  dx: number,
+  dy: number,
+  elapsedMs: number,
+  threshold: number,
+  maxDeviation: number
+): EdgeSwipeDecision {
+  if (!Number.isFinite(dx) || !Number.isFinite(dy) || !Number.isFinite(elapsedMs)) {
+    return "cancel";
+  }
+  if (Math.abs(dy) > maxDeviation || dx < -8 || elapsedMs > MAX_GESTURE_MS) {
+    return "cancel";
+  }
+  if (dx >= threshold && Math.abs(dx) > Math.abs(dy)) return "trigger";
+  return "track";
+}
+
+/**
+ * 分页触控只接受一根手指、且位移不超过阈值的轻点。双指捏合即使最终合成
+ * 一个 click，也会因 maxTouchCount > 1 被拒绝；纵向滚动后的 click 同理。
+ */
+export function isUnambiguousPageTap(
+  maxTouchCount: number,
+  deltaX: number,
+  deltaY: number,
+  maxTravel = 12
+): boolean {
+  return (
+    maxTouchCount === 1 &&
+    Number.isFinite(deltaX) &&
+    Number.isFinite(deltaY) &&
+    Math.hypot(deltaX, deltaY) <= maxTravel
+  );
+}
 
 /**
  * iOS-style edge swipe back for any scrollable container. Pass a ref to the
@@ -47,6 +94,7 @@ export function useEdgeSwipeBack(
     threshold = 60,
     maxDeviation = 40,
     enabled,
+    active = true,
     onBack,
     deferToOverlays = true,
   }: Options
@@ -86,6 +134,10 @@ export function useEdgeSwipeBack(
    * 常驻的代价只是往 ref 写一次数字，禁用期间可以忽略。
    */
   useEffect(() => {
+    if (!active) {
+      pressSampleRef.current = null;
+      return;
+    }
     const onPointerDown = (ev: PointerEvent) => {
       if (!ev.isPrimary || ev.pointerType !== "touch") return;
       if (ev.clientX > edgeWidth) return;
@@ -98,10 +150,10 @@ export function useEdgeSwipeBack(
       pressSampleRef.current = null;
       document.removeEventListener("pointerdown", onPointerDown, opts);
     };
-  }, [edgeWidth]);
+  }, [active, edgeWidth]);
 
   useEffect(() => {
-    if (!enabled) return;
+    if (!active || !enabled) return;
 
     const onTouchStart = (ev: TouchEvent) => {
       // 同一次触点的 pointerdown 紧贴在 touchstart 之前，样本一次性领用；
@@ -141,11 +193,16 @@ export function useEdgeSwipeBack(
       const touch = ev.touches[0];
       const dx = touch.clientX - state.startX;
       const dy = touch.clientY - state.startY;
-      if (Math.abs(dy) > maxDeviation || dx < -8) {
+      const decision = evaluateEdgeSwipe(
+        dx,
+        dy,
+        Date.now() - state.startedAt,
+        threshold,
+        maxDeviation
+      );
+      if (decision === "cancel") {
         state.tracking = false;
-      } else if (Date.now() - state.startedAt > MAX_GESTURE_MS) {
-        state.tracking = false;
-      } else if (dx >= threshold && Math.abs(dx) > Math.abs(dy)) {
+      } else if (decision === "trigger") {
         state.tracking = false;
         if (deferToOverlays) {
           if (requestBack({ minPriority: BACK_PRIORITY.overlay })) return;
@@ -182,5 +239,5 @@ export function useEdgeSwipeBack(
       document.removeEventListener("touchend", onTouchEnd, opts);
       document.removeEventListener("touchcancel", onTouchEnd, opts);
     };
-  }, [enabled, edgeWidth, threshold, maxDeviation, targetRef, deferToOverlays]);
+  }, [active, enabled, edgeWidth, threshold, maxDeviation, targetRef, deferToOverlays]);
 }

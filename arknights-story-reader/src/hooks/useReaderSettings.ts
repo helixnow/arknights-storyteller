@@ -40,7 +40,7 @@ export interface ReaderSettings {
   paragraphIndent: boolean;
 }
 
-const DEFAULT_SETTINGS: ReaderSettings = {
+export const DEFAULT_READER_SETTINGS: ReaderSettings = {
   fontFamily:
     "'Arknights Noto Serif SC', 'Noto Serif SC', 'Source Han Serif SC', 'Songti SC', 'SimSun', serif",
   fontSize: 19,
@@ -99,51 +99,80 @@ function clampNumber(value: unknown, [min, max]: [number, number], fallback: num
  * 把任意来源（localStorage、老版本、外部写入）的设置收敛成合法值。
  * 之前只校验了字体，一份被改坏的 `fontSize: 0` 就能让正文整块塌掉。
  */
-function sanitizeSettings(input: Partial<ReaderSettings> | null | undefined): ReaderSettings {
+export function sanitizeReaderSettings(
+  input: Partial<ReaderSettings> | null | undefined
+): ReaderSettings {
   const source = input ?? {};
   const fontFamily =
     typeof source.fontFamily === "string" && FONT_FAMILY_VALUES.has(source.fontFamily)
       ? source.fontFamily
-      : DEFAULT_SETTINGS.fontFamily;
+      : DEFAULT_READER_SETTINGS.fontFamily;
   return {
     fontFamily,
-    fontSize: clampNumber(source.fontSize, NUMERIC_RANGES.fontSize, DEFAULT_SETTINGS.fontSize),
-    lineHeight: clampNumber(source.lineHeight, NUMERIC_RANGES.lineHeight, DEFAULT_SETTINGS.lineHeight),
+    fontSize: clampNumber(
+      source.fontSize,
+      NUMERIC_RANGES.fontSize,
+      DEFAULT_READER_SETTINGS.fontSize
+    ),
+    lineHeight: clampNumber(
+      source.lineHeight,
+      NUMERIC_RANGES.lineHeight,
+      DEFAULT_READER_SETTINGS.lineHeight
+    ),
     letterSpacing: clampNumber(
       source.letterSpacing,
       NUMERIC_RANGES.letterSpacing,
-      DEFAULT_SETTINGS.letterSpacing
+      DEFAULT_READER_SETTINGS.letterSpacing
     ),
     paragraphSpacing: clampNumber(
       source.paragraphSpacing,
       NUMERIC_RANGES.paragraphSpacing,
-      DEFAULT_SETTINGS.paragraphSpacing
+      DEFAULT_READER_SETTINGS.paragraphSpacing
     ),
-    pageWidth: clampNumber(source.pageWidth, NUMERIC_RANGES.pageWidth, DEFAULT_SETTINGS.pageWidth),
+    pageWidth: clampNumber(
+      source.pageWidth,
+      NUMERIC_RANGES.pageWidth,
+      DEFAULT_READER_SETTINGS.pageWidth
+    ),
     textAlign: TEXT_ALIGNS.has(source.textAlign as ReaderSettings["textAlign"])
       ? (source.textAlign as ReaderSettings["textAlign"])
-      : DEFAULT_SETTINGS.textAlign,
+      : DEFAULT_READER_SETTINGS.textAlign,
     theme: THEMES.has(source.theme as ReaderSettings["theme"])
       ? (source.theme as ReaderSettings["theme"])
-      : DEFAULT_SETTINGS.theme,
+      : DEFAULT_READER_SETTINGS.theme,
     readingMode: READING_MODES.has(source.readingMode as ReaderSettings["readingMode"])
       ? (source.readingMode as ReaderSettings["readingMode"])
-      : DEFAULT_SETTINGS.readingMode,
+      : DEFAULT_READER_SETTINGS.readingMode,
     paragraphIndent:
       typeof source.paragraphIndent === "boolean"
         ? source.paragraphIndent
-        : DEFAULT_SETTINGS.paragraphIndent,
+        : DEFAULT_READER_SETTINGS.paragraphIndent,
   };
 }
 
+/** 合并局部设置并统一做范围 / 枚举校验，UI、storage 与测试共用同一入口。 */
+export function mergeReaderSettings(
+  base: ReaderSettings,
+  partial: Partial<ReaderSettings>
+): ReaderSettings {
+  return sanitizeReaderSettings({ ...base, ...partial });
+}
+
+/** 字段级比较，避免滑杆重复 input 触发整篇正文重排。 */
+export function readerSettingsEqual(a: ReaderSettings, b: ReaderSettings): boolean {
+  return (Object.keys(DEFAULT_READER_SETTINGS) as Array<keyof ReaderSettings>).every(
+    (key) => a[key] === b[key]
+  );
+}
+
 function loadSettings(): ReaderSettings {
-  if (typeof window === "undefined") return DEFAULT_SETTINGS;
+  if (typeof window === "undefined") return DEFAULT_READER_SETTINGS;
   try {
     const stored = window.localStorage.getItem(STORAGE_KEY);
-    if (!stored) return DEFAULT_SETTINGS;
-    return sanitizeSettings(JSON.parse(stored) as Partial<ReaderSettings>);
+    if (!stored) return DEFAULT_READER_SETTINGS;
+    return sanitizeReaderSettings(JSON.parse(stored) as Partial<ReaderSettings>);
   } catch {
-    return DEFAULT_SETTINGS;
+    return DEFAULT_READER_SETTINGS;
   }
 }
 
@@ -167,6 +196,9 @@ function loadLatestSettings(): ReaderSettings {
 
 export function useReaderSettings() {
   const [settings, setSettings] = useState<ReaderSettings>(loadLatestSettings);
+  // 事件回调同步维护的最新快照。pending 不能只等 layout effect：更新设置的
+  // 同一个任务末尾若立刻 pagehide，最终值必须已经有可冲刷的凭据。
+  const settingsRef = useRef(settings);
 
   // Persist on change, but coalesce bursts from slider drags so we don't
   // hit localStorage 18 times while the user is pulling the font-size
@@ -235,6 +267,7 @@ export function useReaderSettings() {
   // 上一版），界面上的最终值便没有任何持久化凭据。
   const initialSettingsRef = useRef(settings);
   useLayoutEffect(() => {
+    settingsRef.current = settings;
     if (typeof window === "undefined") return;
     if (settings === initialSettingsRef.current) {
       return;
@@ -327,24 +360,25 @@ export function useReaderSettings() {
   }, []);
 
   const updateSettings = useCallback((partial: Partial<ReaderSettings>) => {
-    setSettings((prev) => {
-      const next = sanitizeSettings({ ...prev, ...partial });
-      // 滑杆按住不动也会持续派发 input 事件；值没变就别制造新对象，
-      // 否则上千段的正文会跟着白白重排一次。
-      const changed = (Object.keys(next) as Array<keyof ReaderSettings>).some(
-        (key) => next[key] !== prev[key]
-      );
-      return changed ? next : prev;
-    });
+    const prev = settingsRef.current;
+    const next = mergeReaderSettings(prev, partial);
+    // 滑杆按住不动也会持续派发 input 事件；值没变就别制造新对象，
+    // 否则上千段的正文会跟着白白重排一次。
+    if (readerSettingsEqual(next, prev)) return;
+    // 先物化、后交给 React：即便 pagehide 抢在 commit/layout effect 前，
+    // flushPendingSettings 也能拿到用户刚刚操作的最终快照。
+    settingsRef.current = next;
+    pendingSettingsRef.current = next;
+    setSettings(next);
   }, []);
 
   const resetSettings = useCallback(() => {
-    setSettings((prev) => {
-      const changed = (Object.keys(DEFAULT_SETTINGS) as Array<keyof ReaderSettings>).some(
-        (key) => DEFAULT_SETTINGS[key] !== prev[key]
-      );
-      return changed ? { ...DEFAULT_SETTINGS } : prev;
-    });
+    const prev = settingsRef.current;
+    if (readerSettingsEqual(prev, DEFAULT_READER_SETTINGS)) return;
+    const next = { ...DEFAULT_READER_SETTINGS };
+    settingsRef.current = next;
+    pendingSettingsRef.current = next;
+    setSettings(next);
   }, []);
 
   return useMemo(
