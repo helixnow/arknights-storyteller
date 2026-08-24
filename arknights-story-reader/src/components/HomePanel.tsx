@@ -156,6 +156,15 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
   const [refreshing, setRefreshing] = useState(false);
   // null = 还没问过后端。先渲染骨架，避免闪一下「已安装」再跳回未同步。
   const [installed, setInstalled] = useState<boolean | null>(null);
+  /**
+   * 内容区（继续阅读 / 统计条 / 最近阅读 / 今日推荐）是否来自一次成功加载。
+   * 不能只看 installed：失败路径会把 isInstalled 的答案落进 installed 供
+   * 错误卡选文案，若内容区也拿它当门槛，冷启动目录读失败时 recentStories
+   * 还是空的，错误卡下面会凭空亮出「打开任意一章剧情」的空状态和
+   * 「最近阅读 0 章」——对有阅读记录、只是这轮没读出来的用户就是在撒谎。
+   * 之前成功加载过的内容则继续保留，瞬时失败只叠加错误卡、不闪没页面。
+   */
+  const [contentReady, setContentReady] = useState(false);
   /** 读目录本身失败了（IPC 异常 / 数据损坏），和「没装数据」是两码事。 */
   const [loadFailed, setLoadFailed] = useState(false);
   const [streak, setStreak] = useState<StreakInfo>(() => readStreak());
@@ -198,6 +207,7 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
       if (stale()) return;
       if (!installedNow) {
         setInstalled(false);
+        setContentReady(false);
         setLoadFailed(false);
         setRecentStories((prev) => (prev.length === 0 ? prev : []));
         setHighlight(null);
@@ -262,6 +272,7 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
       // 冷启动（目录 IPC 要几十到几百毫秒才回来）会先闪出「打开任意一章
       // 剧情」的空占位卡和「最近阅读 0 章」，目录到了才换成真实内容。
       setInstalled(true);
+      setContentReady(true);
       setLoadFailed(false);
       // highlight 直接 set：缓存命中时 pick 与上一次是同一个对象，React
       // 自动 bail out；数据重新同步后是新对象，才应该重渲染。以前按 storyId
@@ -376,6 +387,8 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
   );
 
   const showSkeleton = installed === null && !loadFailed;
+  /** 内容板块的统一门槛：数据已装 && 手上的内容确实来自成功加载。 */
+  const contentVisible = installed === true && contentReady;
   const goToSettings = useCallback(() => onGoToTab("settings"), [onGoToTab]);
   const retryLoad = useCallback(() => {
     setLoadFailed(false);
@@ -459,17 +472,17 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
               />
             )}
 
-            {installed === true && continueItem ? (
+            {contentVisible && continueItem ? (
               <ContinueReadingCard
                 entry={continueItem.entry}
                 percentage={continueItem.meta.percentage}
                 onOpen={() => onSelectStory(continueItem.entry)}
               />
-            ) : installed === true ? (
+            ) : contentVisible ? (
               <EmptyContinueCard onBrowse={() => onGoToTab("stories")} />
             ) : null}
 
-            {installed === true && (
+            {contentVisible && (
               <StreakStrip
                 streakDays={effectiveStreakDays(streak, today)}
                 favoritesCount={favoriteCount}
@@ -479,7 +492,7 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
               />
             )}
 
-            {installed === true && otherRecentStories.length > 0 && (
+            {contentVisible && otherRecentStories.length > 0 && (
               <section className="space-y-3">
                 <SectionTitle icon={BookOpen} title="最近阅读" />
                 <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
@@ -495,7 +508,7 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
               </section>
             )}
 
-            {installed === true && highlight && (
+            {contentVisible && highlight && (
               <section className="space-y-3">
                 <SectionTitle icon={Sparkles} title="今日推荐" />
                 <RecentCard

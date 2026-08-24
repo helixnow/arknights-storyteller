@@ -730,6 +730,12 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
       }
 
       if (activeMode === "segment") {
+        // 段级搜索没有调试输出，但调试记录的渲染条件只看 debugLogs 非空、
+        // 不看模式：从整篇切到段落时，上一轮整篇搜索的调试记录会挂在段落
+        // 结果（乃至请求在途的等待期）上冒充本次日志。进分支就清、且在
+        // 任何 await 之前，段搜一发起旧日志立刻消失，不给它任何展示窗口。
+        setDebugLogs([]);
+        setDebugExpanded(false);
         // version 还没就绪（getCurrentVersion 未返回或失败）时缓存整体停用：
         // 空串没法证明缓存对应的是当前这份数据。
         const cached = opts?.forceRefresh || !activeVersion ? undefined : segmentCache[raw];
