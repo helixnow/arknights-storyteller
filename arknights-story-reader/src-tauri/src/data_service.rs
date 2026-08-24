@@ -391,15 +391,28 @@ struct Term {
 }
 
 impl Term {
-    /// `text` 必须已经过 `normalize_for_fuzzy`。返回 `None` 表示这个词在
-    /// 索引侧同样产生不了任何子句，两边一起当它不存在。
-    fn word(text: String) -> Option<Self> {
-        let atoms = split_match_atoms(&text);
+    /// `source` 是归一化（NFKC + 小写 + 去组合符）后、但**保留**标点和空白
+    /// 边界的原词；`text` 已过 `normalize_for_fuzzy`，只用于预览定位。
+    ///
+    /// 原子必须切在 `source` 上：FTS 侧 `term_to_clause` 在标点处断词，
+    /// `0-1` 生成 `(0* AND 1*)` 两个独立 token。先去标点再切的话，ASCII
+    /// 段会隔着标点粘成一个原子（`01`），凭空要求两段连续出现——「0」和
+    /// 「1」分居标题与正文的剧情在索引路径能命中、扫描回退却漏掉，索引
+    /// 建好前后同一查询的结果集就分叉了。
+    ///
+    /// 返回 `None` 表示这个词在索引侧同样产生不了任何子句（假名、纯标点
+    /// 等），两边一起当它不存在。
+    fn word(source: &str, text: String) -> Option<Self> {
+        let atoms = split_match_atoms(source);
         (!atoms.is_empty()).then(|| Self { text, atoms })
     }
 
-    fn phrase(text: String) -> Option<Self> {
-        let atoms = split_match_atoms(&text);
+    /// 短语只有一个原子 = 各原子拼接：`normalize_for_fuzzy` 已把 haystack
+    /// 里的空白和标点去掉，`contains` 恰好等价于 FTS 短语要求的「token
+    /// 连续」。原子来源与 `word` 同理取 `source`，拼接后与旧行为一致，但
+    /// `{@nickname}` 之类只在 fuzzy 侧被改写的串不会再偏离 FTS 子句。
+    fn phrase(source: &str, text: String) -> Option<Self> {
+        let atoms = split_match_atoms(source);
         if atoms.is_empty() {
             return None;
         }
@@ -417,11 +430,6 @@ impl Term {
             .iter()
             .all(|atom| haystacks.iter().any(|hay| hay.contains(atom.as_str())))
     }
-
-    /// 取上下文片段时依次尝试的探针：先整词，再退回单个原子。
-    fn snippet_probes(&self) -> impl Iterator<Item = &str> {
-        std::iter::once(self.text.as_str()).chain(self.atoms.iter().map(String::as_str))
-    }
 }
 
 /// A user query broken down for the linear-scan fallback, mirroring the
@@ -438,9 +446,24 @@ struct QueryTerms {
 }
 
 impl QueryTerms {
-    /// The first positive term, used to centre the preview snippet.
-    fn primary(&self) -> Option<&Term> {
-        self.positive.first().and_then(|group| group.first())
+    /// 预览定位的探针序列：先试**每个**正向词的整词，再退回单个原子。
+    ///
+    /// 只探首个正向词的话，OR 组命中的是第二个备选（`凯尔希 or 阿米娅`
+    /// 搜到只提阿米娅的剧情）时探针全部落空，预览退化成开头片段；整词
+    /// 优先跨越所有词，是因为单字原子切出的片段远不如别的词的整词命中
+    /// 可读——预览碎字多半就是这么来的。
+    fn preview_probes(&self) -> impl Iterator<Item = &str> {
+        let whole = self
+            .positive
+            .iter()
+            .flatten()
+            .map(|term| term.text.as_str());
+        let atoms = self
+            .positive
+            .iter()
+            .flatten()
+            .flat_map(|term| term.atoms.iter().map(String::as_str));
+        whole.chain(atoms)
     }
 
     /// Are all positive groups satisfied by at least one of `haystacks`?
@@ -473,7 +496,10 @@ impl QueryTerms {
 /// 同一查询的语义会分叉甚至反转。
 fn split_query_terms(query: &str) -> QueryTerms {
     struct Raw {
+        /// `normalize_for_fuzzy` 后的整词，预览定位用。
         text: String,
+        /// 归一化但保留标点/空白边界的原词，切原子用（见 `Term::word`）。
+        source: String,
         is_not: bool,
         is_quoted: bool,
         /// 整个 token 恰好是裸词 `or`：连接词占位，第二遍改写分组用。
@@ -490,6 +516,7 @@ fn split_query_terms(query: &str) -> QueryTerms {
         if t == "or" {
             terms.push(Raw {
                 text: String::new(),
+                source: String::new(),
                 is_not: false,
                 is_quoted: false,
                 is_or: true,
@@ -522,6 +549,7 @@ fn split_query_terms(query: &str) -> QueryTerms {
         let not_prefix = std::mem::take(pending_not);
         terms.push(Raw {
             text: normalize_for_fuzzy(content),
+            source: content.to_string(),
             is_not: is_not || not_prefix,
             is_quoted: false,
             is_or: false,
@@ -537,6 +565,7 @@ fn split_query_terms(query: &str) -> QueryTerms {
         }
         terms.push(Raw {
             text: normalize_for_fuzzy(&phrase),
+            source: phrase,
             is_not,
             is_quoted: true,
             is_or: false,
@@ -603,9 +632,9 @@ fn split_query_terms(query: &str) -> QueryTerms {
         // 集就分叉了。
         let is_or_before = std::mem::take(&mut pending_or);
         let term = if raw.is_quoted {
-            Term::phrase(raw.text)
+            Term::phrase(&raw.source, raw.text)
         } else {
-            Term::word(raw.text)
+            Term::word(&raw.source, raw.text)
         };
         let Some(term) = term else { continue };
         if raw.is_not {
@@ -3053,7 +3082,7 @@ impl DataService {
         // Fuzzy-normalized query for context extraction.
         let context_probe = normalize_for_fuzzy(query);
         // 兜底定位用：整串探针把空白/标点全部压掉，只有词与词恰好相邻时
-        // 才命中；多词 AND、`or`、排除词都会落空，得退回首个正向词。
+        // 才命中；多词 AND、`or`、排除词都会落空，得退回正向词探针。
         let terms = split_query_terms(query);
         let mut results = Vec::new();
         for row in rows {
@@ -3065,7 +3094,7 @@ impl DataService {
                     // 每个汉字之间都有空格、标点全丢，展示出来是碎的。改走
                     // 线性扫描同一套预览：先整词、再单原子定位，最后给正文
                     // 开头的干净预览，两条路径的片段观感保持一致。
-                    matched_text = self.preview_for(&raw_content, terms.primary());
+                    matched_text = self.preview_for(&raw_content, &terms);
                 }
                 results.push(SearchResult {
                     story_id,
@@ -3144,7 +3173,7 @@ impl DataService {
                         Some(if title_hits {
                             story.story_name.clone()
                         } else {
-                            self.preview_for(&content, terms.primary())
+                            self.preview_for(&content, &terms)
                         })
                     })
             };
@@ -3168,14 +3197,13 @@ impl DataService {
         Ok(results)
     }
 
-    /// 命中片段：先按整词定位，不行再退回单个原子，最后给一段开头预览。
+    /// 命中片段：先按正向词的整词定位（所有词都试——OR 组命中的可能是
+    /// 第二个备选），不行再退回单个原子，最后给一段开头预览。
     /// 空字符串对用户毫无意义，任何情况下都要给点上下文。
-    fn preview_for(&self, content: &str, term: Option<&Term>) -> String {
-        if let Some(term) = term {
-            let snippet = self.extract_context_any(content, term.snippet_probes());
-            if !snippet.trim().is_empty() {
-                return snippet;
-            }
+    fn preview_for(&self, content: &str, terms: &QueryTerms) -> String {
+        let snippet = self.extract_context_any(content, terms.preview_probes());
+        if !snippet.trim().is_empty() {
+            return snippet;
         }
         // 兜底预览只需要开头这点字，别为了截 120 个字符把整篇正文压平两遍。
         let head: String = content.chars().take(400).collect();
@@ -3271,10 +3299,18 @@ impl DataService {
         // Compute total via FTS (best effort — if the index is unavailable we
         // fall back to `results.len()` which is at least a lower bound).
         progress("统计", 0, 0, format!("命中 {} 篇，正在统计", results.len()));
-        let total_matched = self
-            .count_fts_matches(trimmed)
-            .unwrap_or_else(|_| results.len());
-        let total_matched = total_matched.max(results.len());
+        let counted = self.count_fts_matches(trimmed).unwrap_or(None);
+        let (total_matched, truncated) = match counted {
+            // 索引给出了权威总数：截断与否就看有没有没返回的命中。
+            Some(count) => {
+                let total = count.max(results.len());
+                (total, total > results.len())
+            }
+            // 只有线性扫描的结果可依据。扫描在攒满 SEARCH_RESULT_LIMIT 条时
+            // 提前收针，此时真实总数未知但至少等于上限——必须承认截断，
+            // 而不是把「已返回条数」当成总数宣称一条不少。
+            None => (results.len(), results.len() >= SEARCH_RESULT_LIMIT),
+        };
         progress("完成", 1, 1, format!("共 {} 条匹配", total_matched));
 
         // Build facets from the returned subset. Categories are formatted as
@@ -3297,26 +3333,43 @@ impl DataService {
         Ok(SearchResultsPage {
             results,
             total_matched,
-            truncated: total_matched > SEARCH_RESULT_LIMIT,
+            truncated,
             facets,
         })
     }
 
-    fn count_fts_matches(&self, query: &str) -> Result<usize, String> {
+    /// FTS 侧的命中总数。`Ok(None)` 表示索引给不出权威数字——没建好、表还
+    /// 是空的、或 MATCH 本身报错。这些情形下检索走的都是线性扫描，把 0 当
+    /// 总数上报会被 `max(results.len())` 悄悄抹平成「恰好等于已返回条数」，
+    /// 扫描在命中上限提前收针时就谎报成「没截断」。
+    fn count_fts_matches(&self, query: &str) -> Result<Option<usize>, String> {
         let Some(conn) = self.try_open_index_connection()? else {
-            return Ok(0);
+            return Ok(None);
         };
-        let Some(fts_query) = Self::build_fts_query_advanced(query) else {
-            return Ok(0);
-        };
-        let total: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM story_index WHERE story_index MATCH ?1",
-                params![fts_query],
-                |row| row.get(0),
-            )
+        // 与 `search_stories_with_index` 同一把尺子：表为空（版本升级后重建
+        // 还没跑完）时检索走的是扫描，这里的 0 不代表「0 条匹配」。
+        let indexed: i64 = conn
+            .query_row("SELECT COUNT(*) FROM story_index", [], |row| row.get(0))
             .unwrap_or(0);
-        Ok(total.max(0) as usize)
+        if indexed == 0 {
+            return Ok(None);
+        }
+        let Some(fts_query) = Self::build_fts_query_advanced(query) else {
+            // 纯否定/纯标点查询：索引路径同样明确返回空集，0 是权威的。
+            return Ok(Some(0));
+        };
+        match conn.query_row(
+            "SELECT COUNT(*) FROM story_index WHERE story_index MATCH ?1",
+            params![fts_query],
+            |row| row.get::<_, i64>(0),
+        ) {
+            Ok(total) => Ok(Some(total.max(0) as usize)),
+            Err(err) => {
+                // MATCH 报错时检索路径也已回退扫描，别把错误伪装成 0。
+                eprintln!("[INDEX] count failed for '{}': {}", fts_query, err);
+                Ok(None)
+            }
+        }
     }
 
     /// Segment-level search: returns precise `(story_id, segment_index)`
@@ -3403,14 +3456,15 @@ impl DataService {
         // segment_type(UNINDEXED)=0, character_name=6, tokenized_text=1,
         // raw_text(UNINDEXED)=0. Boost character name matches so searching an
         // operator floats dialogue hits featuring that operator to the top.
+        // 不取 snippet()：那一列是逐字分词文本（汉字间全是空格、标点全丢），
+        // 切出来的片段是碎的，预览早已改走 raw_text；留着它每行都白算一次。
         let query_sql = format!(
             "
             SELECT s.story_id,
                    s.segment_index,
                    s.segment_type,
                    s.character_name,
-                   s.raw_text,
-                   snippet(story_segment_index, 4, '', '', '...', 16) AS snip
+                   s.raw_text
             FROM story_segment_index AS s
             WHERE story_segment_index MATCH ?1
             ORDER BY bm25(story_segment_index, 0.0, 0.0, 0.0, 6.0, 1.0, 0.0)
@@ -3442,8 +3496,7 @@ impl DataService {
             let segment_type: String = row.get(2)?;
             let character_name: String = row.get(3).unwrap_or_default();
             let raw_text: String = row.get(4).unwrap_or_default();
-            let snip: String = row.get(5).unwrap_or_default();
-            Ok((story_id, segment_index, segment_type, character_name, raw_text, snip))
+            Ok((story_id, segment_index, segment_type, character_name, raw_text))
         }) {
             Ok(r) => r,
             Err(err) => {
@@ -3461,8 +3514,7 @@ impl DataService {
         let mut hits: Vec<SegmentHit> = Vec::new();
         let mut seen: std::collections::HashSet<(String, usize)> = Default::default();
         for row in rows {
-            let Ok((story_id, segment_index, segment_type, character_norm, raw_text, _snip)) = row
-            else {
+            let Ok((story_id, segment_index, segment_type, character_norm, raw_text)) = row else {
                 continue;
             };
             // Did the query actually hit the segment body / speaker? Used
@@ -4633,6 +4685,176 @@ mod tests {
     }
 
     #[test]
+    fn split_query_terms_atoms_break_at_punctuation_like_the_index() {
+        // FTS 侧 `term_to_clause` 在标点处断词：`0-1` → `(0* AND 1*)` 两个
+        // 独立 token。原子若切在去标点之后的文本上，会粘成要求连续出现的
+        // `01`——「0」「1」分居标题与正文的剧情就只有索引路径能搜到。
+        assert_eq!(
+            DataService::build_fts_query_advanced("0-1").as_deref(),
+            Some("(0* AND 1*)")
+        );
+        let terms = split_query_terms("0-1");
+        assert_eq!(terms.positive[0][0].atoms, vec!["0", "1"]);
+        assert!(terms.positives_match(&["编队0号与1号"]));
+
+        let terms = split_query_terms("prts-2");
+        assert_eq!(terms.positive[0][0].atoms, vec!["prts", "2"]);
+    }
+
+    #[test]
+    fn bare_and_is_the_same_query_as_implicit_and() {
+        // `凯尔希 AND 博士` 与 `凯尔希 博士`：FTS 串逐字节相同，回退侧
+        // 分组也逐项相同——裸词 and 只是无操作连接词。
+        assert_eq!(
+            DataService::build_fts_query_advanced("凯尔希 AND 博士"),
+            DataService::build_fts_query_advanced("凯尔希 博士")
+        );
+        assert_eq!(
+            split_query_terms("凯尔希 AND 博士"),
+            split_query_terms("凯尔希 博士")
+        );
+        assert_eq!(
+            positive_texts(&split_query_terms("凯尔希 AND 博士")),
+            vec![vec!["凯尔希"], vec!["博士"]]
+        );
+    }
+
+    #[test]
+    fn bare_not_is_the_same_query_as_minus_prefix() {
+        assert_eq!(
+            DataService::build_fts_query_advanced("凯尔希 NOT 博士"),
+            DataService::build_fts_query_advanced("凯尔希 -博士")
+        );
+        let terms = split_query_terms("凯尔希 NOT 博士");
+        assert_eq!(terms, split_query_terms("凯尔希 -博士"));
+        assert_eq!(positive_texts(&terms), vec![vec!["凯尔希"]]);
+        assert_eq!(negative_texts(&terms), vec!["博士"]);
+    }
+
+    #[test]
+    fn hanging_not_is_absorbed_by_an_already_negated_term() {
+        // `not -凯尔希 阿米娅`：悬挂的 `not` 被自带减号的 `-凯尔希` 无条件
+        // 消费，不能漂到「阿米娅」头上把正向词反转成排除词（85dff60）。
+        let terms = split_query_terms("not -凯尔希 阿米娅");
+        assert_eq!(positive_texts(&terms), vec![vec!["阿米娅"]]);
+        assert_eq!(negative_texts(&terms), vec!["凯尔希"]);
+        assert_eq!(
+            DataService::build_fts_query_advanced("not -凯尔希 阿米娅"),
+            DataService::build_fts_query_advanced("阿米娅 -凯尔希")
+        );
+    }
+
+    #[test]
+    fn hanging_not_is_absorbed_by_an_already_negated_phrase() {
+        // 开引号版：`not -"凯尔希" 博士` 里 dash_prefix 与悬挂 `not` 同时
+        // 出现，`not` 同样要被消费掉，「博士」保持正向。
+        let terms = split_query_terms("not -\"凯尔希\" 博士");
+        assert_eq!(positive_texts(&terms), vec![vec!["博士"]]);
+        assert_eq!(negative_texts(&terms), vec!["凯尔希"]);
+        assert_eq!(
+            DataService::build_fts_query_advanced("not -\"凯尔希\" 博士"),
+            DataService::build_fts_query_advanced("博士 -\"凯尔希\"")
+        );
+    }
+
+    #[test]
+    fn quoted_and_dashed_connective_words_are_literals() {
+        // 引号里的 and/not 是要搜的词，不是连接词。
+        assert_eq!(
+            DataService::build_fts_query_advanced("\"and\"").as_deref(),
+            Some("\"and\"")
+        );
+        assert_eq!(
+            DataService::build_fts_query_advanced("\"not\"").as_deref(),
+            Some("\"not\"")
+        );
+        assert_eq!(
+            positive_texts(&split_query_terms("\"and\"")),
+            vec![vec!["and"]]
+        );
+        assert_eq!(
+            positive_texts(&split_query_terms("\"not\"")),
+            vec![vec!["not"]]
+        );
+
+        // `-and` / `-not` 是「排除对应字面量」：连接词判定发生在去减号之前。
+        let terms = split_query_terms("博士 -and");
+        assert_eq!(positive_texts(&terms), vec![vec!["博士"]]);
+        assert_eq!(negative_texts(&terms), vec!["and"]);
+        let q = DataService::build_fts_query_advanced("博士 -and").unwrap();
+        assert!(q.contains(" NOT and*"), "{}", q);
+
+        let terms = split_query_terms("博士 -not");
+        assert_eq!(negative_texts(&terms), vec!["not"]);
+        let q = DataService::build_fts_query_advanced("博士 -not").unwrap();
+        assert!(q.contains(" NOT not*"), "{}", q);
+    }
+
+    #[test]
+    fn pure_not_query_is_empty_on_both_paths() {
+        // 只有否定项的查询没有意义：FTS 侧给 None（调用方短路成空结果），
+        // 回退侧没有任何正向组（扫描器同样直接返回空）。
+        for query in ["NOT 博士", "-博士"] {
+            assert!(
+                DataService::build_fts_query_advanced(query).is_none(),
+                "{:?} 只有否定项，FTS 必须给 None",
+                query
+            );
+            let terms = split_query_terms(query);
+            assert!(terms.positive.is_empty(), "{:?}", query);
+            assert_eq!(negative_texts(&terms), vec!["博士"], "{:?}", query);
+        }
+    }
+
+    #[test]
+    fn or_before_hanging_not_is_consumed_with_the_negated_term() {
+        // `or` 归它后面的词；那个词经悬挂 `not` 反转成否定项时 `or` 随之
+        // 作废，不能漂给再下一个正向词把 AND 变成 OR。
+        let terms = split_query_terms("凯尔希 or not 博士 阿米娅");
+        assert_eq!(positive_texts(&terms), vec![vec!["凯尔希"], vec!["阿米娅"]]);
+        assert_eq!(negative_texts(&terms), vec!["博士"]);
+        assert_eq!(
+            DataService::build_fts_query_advanced("凯尔希 or not 博士 阿米娅"),
+            DataService::build_fts_query_advanced("凯尔希 阿米娅 -博士")
+        );
+
+        // 开头的 `or not X`：没有左操作数的 `or` 是噪音，剩下纯否定。
+        assert!(DataService::build_fts_query_advanced("or not 博士").is_none());
+        let terms = split_query_terms("or not 博士");
+        assert!(terms.positive.is_empty());
+        assert_eq!(negative_texts(&terms), vec!["博士"]);
+    }
+
+    #[test]
+    fn connective_variants_keep_polarity_aligned_across_paths() {
+        // 每一对等价写法在 FTS 串与回退解析上都必须逐字节 / 逐项相同——
+        // 任何一边分叉，索引建好前后同一查询的结果集就不一样。
+        let pairs = [
+            ("凯尔希 AND 博士", "凯尔希 博士"),
+            ("凯尔希 NOT 博士", "凯尔希 -博士"),
+            ("not -凯尔希 阿米娅", "阿米娅 -凯尔希"),
+            ("not -\"凯尔希\" 博士", "博士 -\"凯尔希\""),
+            ("凯尔希 or not 博士 阿米娅", "凯尔希 阿米娅 -博士"),
+        ];
+        for (variant, canonical) in pairs {
+            assert_eq!(
+                DataService::build_fts_query_advanced(variant),
+                DataService::build_fts_query_advanced(canonical),
+                "FTS 串分叉: {:?} vs {:?}",
+                variant,
+                canonical
+            );
+            assert_eq!(
+                split_query_terms(variant),
+                split_query_terms(canonical),
+                "回退解析分叉: {:?} vs {:?}",
+                variant,
+                canonical
+            );
+        }
+    }
+
+    #[test]
     fn fts_query_escapes_specials_and_is_nonempty() {
         let q = DataService::build_fts_query_advanced("凯尔希*").expect("non-empty");
         // `*` is a FTS special and gets sanitized away for CJK terms.
@@ -5131,6 +5353,24 @@ mod tests {
         assert_eq!(ids, vec!["Obt/Roguelike/ro2/ro2_1"]);
     }
 
+    #[test]
+    fn count_reports_unavailable_index_as_none_not_zero() {
+        let fx = Fixture::new("count");
+
+        // 索引没建：给不出权威总数，必须是 None 而不是谎报 0。此时页面
+        // 的总数只能取「已返回条数」，且不能宣称截断。
+        assert_eq!(fx.service.count_fts_matches("凯尔希").unwrap(), None);
+        let page = fx.service.search_stories_ex("凯尔希").unwrap();
+        assert_eq!(page.total_matched, page.results.len());
+        assert!(!page.truncated);
+
+        fx.service.rebuild_story_index().expect("index builds");
+        // 建好后是权威数字：主线 00-01 + 肉鸽 ro2_1。
+        assert_eq!(fx.service.count_fts_matches("凯尔希").unwrap(), Some(2));
+        // 纯否定查询在索引路径同样明确空集：0 是权威的，不是「不可用」。
+        assert_eq!(fx.service.count_fts_matches("-凯尔希").unwrap(), Some(0));
+    }
+
     fn sorted_ids(results: &[SearchResult]) -> Vec<String> {
         let mut ids: Vec<String> = results.iter().map(|r| r.story_id.clone()).collect();
         ids.sort();
@@ -5155,6 +5395,17 @@ mod tests {
             "凯尔希 or -博士 雪",
             // `or` 后面是切不出原子的词：同样随之作废，语义是 凯尔希 AND 雪。
             "凯尔希 or アイ 雪",
+            // 裸词连接词与显式减号 / 隐式 AND 的等价写法。
+            "凯尔希 AND 博士",
+            "凯尔希 NOT 博士",
+            // 悬挂 `not` 被已否定的 `-凯尔希` 消费，「雪」保持正向。
+            "not -凯尔希 雪",
+            // 开头的 `or` 是噪音，`not` 把「博士」反转成排除项。
+            "or not 博士 凯尔希",
+            // 引号里的连接词是字面量（语料里没有 → 两边都是空集）。
+            "\"and\"",
+            // storyCode 查询：原子在标点处断开，与 FTS 的 `(0* AND 1*)` 一致。
+            "0-1",
             "启程",
             // 脚本指令、素材 token：渲染出来的正文里没有，两边都不该命中。
             "avg_1",
@@ -5269,13 +5520,33 @@ mod tests {
 
         // 整词在正文里并不连续，退回单字原子仍要给出上下文。
         let terms = split_query_terms("凯尔希阿米娅");
-        let preview = fx.service.preview_for(content, terms.primary());
+        let preview = fx.service.preview_for(content, &terms);
         assert!(preview.contains("凯尔希"), "{}", preview);
 
         // 一个字都对不上时给开头预览，而不是一个空字符串。
         let terms = split_query_terms("缄默");
-        let preview = fx.service.preview_for(content, terms.primary());
+        let preview = fx.service.preview_for(content, &terms);
         assert!(!preview.trim().is_empty());
+    }
+
+    #[test]
+    fn preview_centres_on_whichever_positive_term_hit() {
+        let fx = Fixture::new("preview_or");
+        let filler = "这是一段很长的开场白。".repeat(30);
+
+        // OR 组命中的是第二个备选：预览必须围绕「阿米娅」，而不是因为
+        // 第一个词落空就退回开头片段（±50 字符的窗口根本罩不到结尾）。
+        let content = format!("{}阿米娅终于登场了。", filler);
+        let terms = split_query_terms("凯尔希 or 阿米娅");
+        let preview = fx.service.preview_for(&content, &terms);
+        assert!(preview.contains("阿米娅"), "{}", preview);
+
+        // 整词优先于单字原子：第一个词只有零散单字、第二个词整词命中时，
+        // 选整词片段——单字碎片远不如整词命中可读。
+        let scattered = format!("凯字打头。{}博士在结尾。", filler);
+        let terms = split_query_terms("凯尔希 博士");
+        let preview = fx.service.preview_for(&scattered, &terms);
+        assert!(preview.contains("博士"), "{}", preview);
     }
 
     #[test]
