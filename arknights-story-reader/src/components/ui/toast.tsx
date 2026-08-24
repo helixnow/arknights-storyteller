@@ -29,7 +29,7 @@ interface ToastContextValue {
 
 const ToastContext = createContext<ToastContextValue | null>(null);
 
-/** 同屏最多堆叠的条数，再多就按 show() 里的优先级挤掉旧的。 */
+/** 同屏最多堆叠的条数；溢出的紧急提示排队，绝不挤掉仍在计时的错误。 */
 const MAX_VISIBLE = 3;
 
 /* 失败信息通常更长、也更需要用户读完再决定下一步，所以给它明显更长的停留
@@ -85,17 +85,16 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       };
       setToasts((prev) => {
         if (prev.length < MAX_VISIBLE) return [...prev, payload];
-        // 满员时优先挤掉最旧的普通/成功提示：错误和警告承载着「操作失败」
-        // 这类必须被读到的信息，不能被连发的成功提示无声顶掉。
-        const evict = prev.findIndex((t) => t.kind !== "error" && t.kind !== "warning");
+        // 只从当前可见的三条里挤普通/成功提示。数组尾部可能已有排队中的
+        // 错误；把搜索范围扩到整列会误删一条尚未展示、计时器都没启动的提示。
+        const evict = prev
+          .slice(0, MAX_VISIBLE)
+          .findIndex((t) => t.kind !== "error" && t.kind !== "warning");
         if (evict !== -1) return [...prev.filter((_, i) => i !== evict), payload];
-        // 整屏都是错误/警告：新来的紧急提示挤掉最旧那条；普通提示则临时
-        // 多占一个位置——为一句「已复制」牺牲一条没读完的错误得不偿失，
-        // 紧急提示停留 4–6s 会自己过期腾位。超出 +1 的极端连发才挤最旧。
-        if (kind === "error" || kind === "warning" || prev.length > MAX_VISIBLE) {
-          return [...prev.slice(1), payload];
-        }
-        return [...prev, payload];
+        // 三个可见位全是错误/警告时，新紧急提示留在队尾；前面的提示关闭或
+        // 到期后它才挂载并开始自己的完整倒计时。普通/成功提示直接丢弃，
+        // 避免一句迟到数秒的「已复制」在故障提示读完后反而冒出来误导用户。
+        return kind === "error" || kind === "warning" ? [...prev, payload] : prev;
       });
     },
     []
@@ -118,7 +117,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
           决定：底栏在就贴着它上沿，阅读器全屏时自动落回只避开 home indicator
           的安全间距，不需要在这里测量布局。 */}
       <div className="toast-viewport">
-        {toasts.map((t) => (
+        {toasts.slice(0, MAX_VISIBLE).map((t) => (
           <ToastItem key={t.id} toast={t} onDismiss={remove} />
         ))}
       </div>
