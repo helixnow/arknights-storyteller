@@ -210,6 +210,26 @@ pub async fn get_story_categories(
     .await
 }
 
+/// 剧情 / 简介路径必须是数据目录内的相对路径。合法值全部来自游戏
+/// JSON（`obt/main/...`、`activities/...`、`info/...`、`[uc]info/...`），
+/// 从不含 `..` 组件、不以 `/` 或 `\` 开头、不含 `:`。而 DataService
+/// 侧是裸 `PathBuf::join`：`..` 能一路爬出数据目录，以 `/`、`\` 开头
+/// 或带盘符（`C:`）的路径更会让 join 直接替换掉基目录——阅读器渲染
+/// 的是用户自行导入的 ZIP 里的文本，一旦 WebView 被注入，这三个命令
+/// 就是读任意 `*.txt` 的跳板。校验放在 IPC 边界，拒绝时明说原路径。
+fn ensure_story_relative_path(path: &str) -> Result<(), String> {
+    let escapes = path.starts_with('/')
+        || path.starts_with('\\')
+        || path.contains(':')
+        || path
+            .split(|c| c == '/' || c == '\\')
+            .any(|segment| segment == "..");
+    if escapes {
+        return Err(format!("非法的剧情路径: {path}"));
+    }
+    Ok(())
+}
+
 /// 读盘 + 解析一整篇剧情，长的有几千行；放到阻塞线程池里，
 /// 否则 WebView 每翻一篇就把一个 async worker 占满。
 #[tauri::command]
@@ -217,6 +237,7 @@ pub async fn get_story_content(
     state: State<'_, AppState>,
     story_path: String,
 ) -> Result<ParsedStoryContent, String> {
+    ensure_story_relative_path(&story_path)?;
     let service = clone_service(&state);
     run_blocking("get_story_content", move || {
         let content = service.read_story_text(&story_path)?;
@@ -230,6 +251,7 @@ pub async fn get_story_info(
     state: State<'_, AppState>,
     info_path: String,
 ) -> Result<String, String> {
+    ensure_story_relative_path(&info_path)?;
     let service = clone_service(&state);
     run_blocking("get_story_info", move || {
         service.read_story_info(&info_path)
@@ -254,6 +276,7 @@ pub async fn get_story_preview_token(
     state: State<'_, AppState>,
     story_path: String,
 ) -> Result<Option<StoryPreviewToken>, String> {
+    ensure_story_relative_path(&story_path)?;
     let service = clone_service(&state);
     run_blocking("get_story_preview_token", move || {
         service.get_story_preview_token(&story_path)
@@ -815,6 +838,46 @@ mod tests {
     fn parse_asset_kind_rejects_unknown_kind() {
         let err = parse_asset_kind("sprite").expect_err("未知 kind 必须报错");
         assert!(err.contains("sprite"), "错误信息应包含原始 kind: {err}");
+    }
+
+    /// 游戏 JSON 里真实出现的全部路径形态必须放行——校验绝不能误伤
+    /// 正常阅读。
+    #[test]
+    fn story_relative_path_accepts_real_data_shapes() {
+        for path in [
+            "obt/main/level_main_00-01_beg",
+            "activities/act9d0/level_act9d0_01_beg",
+            "obt/memory/story_char_002_amiya_mem_1",
+            "info/activities/act9d0/level_act9d0_01",
+            "[uc]info/activities/act9d0/level_act9d0_01",
+            "obt/roguelike/ro1/level_rogue1_1-1",
+        ] {
+            ensure_story_relative_path(path).unwrap_or_else(|err| {
+                panic!("真实数据路径 {path} 不该被拒绝: {err}");
+            });
+        }
+    }
+
+    /// 能逃出数据目录的形态必须全部被拒：`..` 组件（两种分隔符）、
+    /// 以 `/` 或 `\` 开头（PathBuf::join 会替换基目录）、盘符 / NTFS
+    /// 数据流（含 `:`）。
+    #[test]
+    fn story_relative_path_rejects_traversal() {
+        for path in [
+            "..",
+            "../secret",
+            "a/../../b",
+            "..\\windows\\secret",
+            "info/..\\..\\secret",
+            "/etc/passwd",
+            "\\\\server\\share\\x",
+            "C:/Users/x",
+            "C:\\Users\\x",
+            "story.txt:stream",
+        ] {
+            let err = ensure_story_relative_path(path).expect_err(path);
+            assert!(err.contains(path), "错误应包含原路径以便排查: {err}");
+        }
     }
 
     /// 测试专用的参照编码器：手写解码器的正确性用「任意字节 → 编码 →
