@@ -150,8 +150,23 @@ function loadSettings(): ReaderSettings {
 /** 失败提示的会话级闩锁：滑杆连拖会连发写入，同一轮失败只提醒一次。 */
 let persistFailureNotified = false;
 
+/**
+ * quota 满时没写进盘的最后一份设置。StoryReader 按 storyId 重挂，实例级
+ * pending 会随旧章节一起回收；不放到模块级暂存的话，用户刚调好的排版会在
+ * 切到下一章时退回盘上的旧值，「将自动重试」也无从兑现。
+ *
+ * 设置是一个整体对象，冲突口径仍是 last-write-wins：收到其它窗口的
+ * storage 事件时会直接丢掉这份暂存并采用外部值，不做逐字段合并。
+ */
+let failedSettingsWrite: ReaderSettings | null = null;
+
+/** 初始挂载 / 换章对账时优先保住本会话里尚未落盘的最新设置。 */
+function loadLatestSettings(): ReaderSettings {
+  return failedSettingsWrite ?? loadSettings();
+}
+
 export function useReaderSettings() {
-  const [settings, setSettings] = useState<ReaderSettings>(loadSettings);
+  const [settings, setSettings] = useState<ReaderSettings>(loadLatestSettings);
 
   // Persist on change, but coalesce bursts from slider drags so we don't
   // hit localStorage 18 times while the user is pulling the font-size
@@ -179,13 +194,14 @@ export function useReaderSettings() {
    * 改动 / 卸载冲刷会带着它重试。只有真正写成功才清空 pending。
    */
   const flushPendingSettings = useCallback(() => {
-    const pending = pendingSettingsRef.current;
+    const pending = pendingSettingsRef.current ?? failedSettingsWrite;
     if (pending === null) return;
     const raw = JSON.stringify(pending);
     if (raw === lastRawRef.current) {
       // 内容与盘上完全一致（典型场景：跟随 storage 事件之后的回写），
       // 再写一遍只会在别的窗口触发一轮多余的事件。
       pendingSettingsRef.current = null;
+      failedSettingsWrite = null;
       return;
     }
     try {
@@ -193,11 +209,14 @@ export function useReaderSettings() {
       lastRawRef.current = raw;
       persistFailureNotified = false;
       pendingSettingsRef.current = null;
+      failedSettingsWrite = null;
       return;
     } catch {
       // 隐私模式 / 配额不足时写入失败是原子的：旧数据原样保留，本次改动
       // 只在会话内生效。
     }
+    // 实例还活着时 pending 会继续重试；切章回收实例后由模块级快照接力。
+    failedSettingsWrite = pending;
     if (!persistFailureNotified) {
       persistFailureNotified = true;
       toastRef.current.warn("阅读设置未能保存到本地存储（空间可能已满），将自动重试");
@@ -248,7 +267,7 @@ export function useReaderSettings() {
   useEffect(() => {
     if (typeof window === "undefined") return;
     setSettings((prev) => {
-      const disk = loadSettings();
+      const disk = loadLatestSettings();
       const changed = (Object.keys(disk) as Array<keyof ReaderSettings>).some(
         (key) => disk[key] !== prev[key]
       );
@@ -288,6 +307,8 @@ export function useReaderSettings() {
       // 本窗口还压在防抖里的快照已经过期，冲出去会盖掉对方刚写的内容；
       // 外部写入以后到为准，把它丢弃。
       pendingSettingsRef.current = null;
+      failedSettingsWrite = null;
+      persistFailureNotified = false;
       setSettings((prev) => {
         const next = loadSettings();
         const changed = (Object.keys(next) as Array<keyof ReaderSettings>).some(

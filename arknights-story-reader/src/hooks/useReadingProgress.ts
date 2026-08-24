@@ -273,7 +273,10 @@ export function useReadingProgress(
         readingMode: partial.readingMode ?? prev?.readingMode ?? "scroll",
         updatedAt: partial.updatedAt ?? Date.now(),
         storyName: partial.storyName ?? prev?.storyName,
-        storyCode: partial.storyCode ?? prev?.storyCode,
+        // null 是有意义的清除值：数据更新后同一篇剧情可能不再带关卡号。
+        // 用 `??` 会把调用方明确传入的 null 当成缺省，旧 storyCode 因而
+        // 永久残留在「继续阅读」卡片里。
+        storyCode: partial.storyCode !== undefined ? partial.storyCode : prev?.storyCode,
       };
 
       latestRef.current = merged;

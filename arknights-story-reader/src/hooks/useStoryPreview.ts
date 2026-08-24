@@ -101,7 +101,10 @@ function purgeStaleCache() {
 
 function isExpired(entry: CacheEntry): boolean {
   if (!entry.failed) return false;
-  return Date.now() - (entry.ts ?? 0) > FAILURE_TTL_MS;
+  const age = Date.now() - (entry.ts ?? 0);
+  // Date.now() 会因 NTP / 手动校时回拨。负 age 若按「未过期」处理，一次
+  // 临时 IPC 失败就可能被缓存远超约定的 5 分钟，时钟回拨几天便空图几天。
+  return age < 0 || age > FAILURE_TTL_MS;
 }
 
 function readLsCache(path: string): CacheEntry | null {
