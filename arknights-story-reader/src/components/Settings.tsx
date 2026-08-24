@@ -172,6 +172,14 @@ export function Settings() {
   // 文件对话框弹出期间按钮必须先锁上：确认框与系统选择器都是异步的，
   // 此时 hook 的 importing 还没置起来，连点两下会开出两个选择器。
   const [preparingImport, setPreparingImport] = useState(false);
+  /**
+   * 导入的覆盖确认框弹着的阶段。preparingImport 横跨「确认框 → 文件选择器」
+   * 两个先后到场的系统对话框，busy 文案若一上来就说「等待选择文件 / 请在
+   * 系统对话框中选择 ZIP 压缩包」，用户面前明明是个是/否确认框，会按提示
+   * 去找根本不存在的选择器——preparingSync 的「等待确认」早就为同一件事
+   * 立过规矩，导入的确认阶段也得如实说。
+   */
+  const [importAwaitingConfirm, setImportAwaitingConfirm] = useState(false);
   /** 同步确认框弹出期间的忙态；此时 "sync" 任务锁已被 handleSyncClick 预占。 */
   const [preparingSync, setPreparingSync] = useState(false);
   const importBusy = importing || preparingImport;
@@ -366,10 +374,19 @@ export function Settings() {
     // 放锁，否则用户还在系统相册/文件器里挑文件，锁就被等待者截走了。
     let lockParkedForPicker = false;
     try {
-      const confirmed = await safeConfirm(
-        "导入 ZIP 会覆盖本机已有的剧情数据。请确保压缩包来自 ArknightsGameData。",
-        { title: "导入 ZIP", kind: "warning" }
-      );
+      // 确认阶段要单独标出来：busy 文案此刻该说「等待确认」，等确认框收场
+      // 进入选择器阶段再说「等待选择文件」。safeConfirm 自身不抛错，但仍用
+      // finally 收，保证任何退出路径都不会把「等待确认」漏在界面上。
+      setImportAwaitingConfirm(true);
+      let confirmed = false;
+      try {
+        confirmed = await safeConfirm(
+          "导入 ZIP 会覆盖本机已有的剧情数据。请确保压缩包来自 ArknightsGameData。",
+          { title: "导入 ZIP", kind: "warning" }
+        );
+      } finally {
+        setImportAwaitingConfirm(false);
+      }
       // 用户点了取消：安静退出，不要再弹文件选择器。
       if (!confirmed) return;
 
@@ -874,7 +891,7 @@ export function Settings() {
                           <span className="text-[hsl(var(--color-muted-foreground))]">
                             {syncing
                               ? "连接中"
-                              : preparingSync
+                              : preparingSync || importAwaitingConfirm
                               ? "等待确认"
                               : preparingImport && !importing
                               ? "等待选择文件"
@@ -892,6 +909,8 @@ export function Settings() {
                               ? "正在开始同步"
                               : preparingSync
                               ? "等待确认是否开始同步"
+                              : importAwaitingConfirm
+                              ? "等待确认是否导入"
                               : preparingImport && !importing
                               ? "等待选择文件"
                               : "正在导入"
@@ -905,6 +924,8 @@ export function Settings() {
                             ? "正在开始同步…"
                             : preparingSync
                             ? "请在弹出的对话框中确认是否开始同步"
+                            : importAwaitingConfirm
+                            ? "请在弹出的对话框中确认是否导入"
                             : preparingImport && !importing
                             ? "请在系统对话框中选择 ZIP 压缩包"
                             : "请稍候"}
@@ -957,7 +978,7 @@ export function Settings() {
                     {importBusy ? (
                       <span className="inline-flex items-center gap-2">
                         <Loader2 className="h-4 w-4 animate-spin" />
-                        {importing ? "导入中..." : "等待选择..."}
+                        {importing ? "导入中..." : importAwaitingConfirm ? "等待确认..." : "等待选择..."}
                       </span>
                     ) : (
                       <span className="inline-flex items-center gap-2">
