@@ -361,7 +361,7 @@ if (typeof window !== "undefined") {
   window.addEventListener("app:data-updated", invalidateStoryCatalog);
 }
 
-function isNotInstalledError(message: string) {
+export function isNotInstalledError(message: string) {
   return (
     message.includes("NOT_INSTALLED") ||
     message.includes("No such file") ||
@@ -582,7 +582,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
    * 该做的事（同步一次）藏在别处。
    *
    * `silent` 供已经与当前分类无关的过期请求使用：只记日志、不立错误卡。
-   * `installed = false` 仍然回写——数据目录没了是全局事实，与分类无关。
+   * 「未安装」结论若成立仍然回写 installed——数据目录没了是全局事实。
    */
   const handleLoadError = useCallback((label: string, err: unknown, silent = false) => {
     const errorMsg = err instanceof Error ? err.message : String(err ?? "");
@@ -593,8 +593,19 @@ export function StoryList({ onSelectStory }: StoryListProps) {
       return;
     }
     if (isNotInstalledError(errorMsg)) {
-      if (!silent) setError({ kind: "not-installed", label });
-      setInstalled(false);
+      // 「未安装」是全局结论，只有在本轮数据源还没有任何分块成功读出时
+      // 才敢下。别的分块刚读到数据、只有这一块报 NOT_INSTALLED（比如数据
+      // 包里恰好缺了密录目录），说明是数据不完整而不是整包没装——按未
+      // 安装处理会把健康的列表整块换成「本机还没有剧情数据」的安装引导，
+      // 和屏幕上明明已经读出来的内容自相矛盾。loadedRef 在数据重新同步时
+      // 整体清零，所以这里的「成功读出」一定是对当前数据源而言的。
+      const anyLoaded = Object.values(loadedRef.current).some(Boolean);
+      if (anyLoaded) {
+        if (!silent) setError({ kind: "unknown", label, detail: errorMsg || undefined });
+      } else {
+        if (!silent) setError({ kind: "not-installed", label });
+        setInstalled(false);
+      }
       return;
     }
     if (!silent) setError({ kind: "unknown", label, detail: errorMsg || undefined });
@@ -1518,8 +1529,11 @@ export function StoryList({ onSelectStory }: StoryListProps) {
               </div>
             </div>
 
-            {/* 「没装数据」下面那块引导已经把话说全了，这里不再重复报一次警。 */}
-            {error && !(installed === false && error.kind === "not-installed") && (
+            {/* 「没装数据」下面那块引导已经把话说全了（同步 / 导入 / 设置的
+                入口一个不少），错误卡不管什么成因都不再叠加：一张卡说「等
+                几秒再重试」、另一张说「还没有数据」，两套文案打架只会让
+                用户不知道该信谁。 */}
+            {error && installed !== false && (
               <LoadErrorCard
                 error={error}
                 online={online}

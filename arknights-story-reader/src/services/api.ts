@@ -56,15 +56,16 @@ async function invokeReporting<T>(command: string): Promise<T> {
 }
 
 export const api = {
-  // 是否已安装数据
+  // 是否已安装数据。IPC 失败必须原样抛给调用方，绝不能吞成 false：
+  // 「读不到安装状态」≠「未安装」。消费方全都按「会抛错」的契约写了
+  // 各自的失败分支——StoryList 挂载检查的 catch 改为乐观直读目录、
+  // HomePanel 立「重试 / 去设置」错误卡、CharactersPanel 走错误态、
+  // useAutoIndex 跳过本轮。吞成 false 会让这些分支全部变成死代码：
+  // 一次 IPC 抖动就弹同步对话框 / 显示「未安装」空态，把有数据的用户
+  // 带去做一次没必要的同步；false 还会被 storyCatalog 当成功结果缓存
+  // 60 秒，错误状态在 TTL 内都纠不回来（rejection 则不会进缓存）。
   isInstalled: async (): Promise<boolean> => {
-    try {
-      return await invoke<boolean>("is_installed");
-    } catch (error) {
-      // 读不到安装状态时按「未安装」处理，让首屏去引导同步而不是卡在报错上。
-      console.error("[API] is_installed 失败:", error);
-      return false;
-    }
+    return invokeReporting<boolean>("is_installed");
   },
   // 同步数据
   syncData: async (): Promise<void> => {

@@ -6,6 +6,7 @@ import { StoryThumbnail } from "@/components/StoryThumbnail";
 import {
   READ_FINISHED_PCT,
   getReadingProgress,
+  isNotInstalledError,
   storyCatalog,
   toReadPercent,
   useOnlineStatus,
@@ -203,9 +204,19 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
     // 内容全齐后一批亮相（见下），catch 里也要靠它把错误文案选对。
     let installedNow: boolean | null = null;
     try {
-      installedNow = await storyCatalog.isInstalled();
+      try {
+        installedNow = await storyCatalog.isInstalled();
+      } catch (probeErr) {
+        // isInstalled 抛错 ≠ 数据没装：IPC 抖动、后端忙都会走到这里。
+        // 与剧情列表同一策略：不急着报错，乐观地继续往下读目录——读得
+        // 出来就是装了（成功路径会把 installed 翻成 true），真读不出来
+        // 会落进外层 catch 再分诊。否则同一次抖动会变成：剧情页照常列出
+        // 目录、首页却挂着「读不出来」的错误卡，两个页面自相矛盾。
+        console.warn("[Home] isInstalled 失败，改为直接读目录判定:", probeErr);
+        installedNow = null;
+      }
       if (stale()) return;
-      if (!installedNow) {
+      if (installedNow === false) {
         setInstalled(false);
         setContentReady(false);
         setLoadFailed(false);
@@ -291,6 +302,23 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
     } catch (err) {
       if (stale()) return;
       console.warn("[Home] load failed", err);
+      const errorMsg = err instanceof Error ? err.message : String(err ?? "");
+      // isInstalled 没给出答案、目录读取又以「目录不存在」这类错误收场：
+      // 结论与剧情列表对同一状况的结论一致——就是没装数据，走「还没有
+      // 同步」的引导而不是错误卡。只在探测失败时才这么归因；isInstalled
+      // 明确说装了的话，「读不出来」就是读不出来，按失败报，别把用户支
+      // 去做一次没必要的同步。
+      if (installedNow === null && isNotInstalledError(errorMsg)) {
+        setInstalled(false);
+        setContentReady(false);
+        setLoadFailed(false);
+        setRecentStories((prev) => (prev.length === 0 ? prev : []));
+        setHighlight(null);
+        // 不记「已按此快照加载」：这是从失败推出的结论，留给下一次聚焦 /
+        // 可见性刷新复核（失败的请求不进共享缓存，重试是真重试）。
+        loadedFromRef.current = null;
+        return;
+      }
       // 读取失败 ≠ 没装数据。把两者混为一谈会让用户去做一次根本没必要的
       // 同步，所以这里只标记失败，由界面给出「重试 / 去设置」。isInstalled
       // 已经有答案的话要落下去：错误卡的文案靠它区分「数据在但这次没读

@@ -23,6 +23,9 @@ export interface FavoriteGroup {
    * 用户从整组收藏里单独摘掉的成员。目录校正（reconcileCatalog）按目录
    * 全量补齐成员时要跳过这些 id——否则「收藏了整个活动、又取消了其中
    * 一章」的用户，下一次目录刷新就会看到那一章被偷偷收藏回来。
+   *
+   * 标记不是永久的：用户重新点亮那一章（toggleFavorite）会把它清掉并
+   * 回组；取消收藏整组会连组带名单一起删掉，再收藏整组时从零建组。
    */
   excludedStoryIds?: string[];
 }
@@ -313,6 +316,34 @@ export function FavoritesProvider({ children }: { children: ReactNode }) {
       );
 
       if (!inStories && owningGroups.length === 0) {
+        // 重新点亮一个曾被从整组收藏里显式摘掉的章节：回到原来的组里，并把
+        // excludedStoryIds 里的标记清掉。用户这一下已经推翻了当初的「手动
+        // 取消」，标记再留着就永远清不掉——目录校正会一直把这一章挡在组外，
+        // 整组收藏从此永远缺这一章；而若把它塞进单章收藏，收藏页还会冒出
+        // 一个与已收藏分组同名的「散章」分组，两处同名列表互相打架。
+        let rejoined = false;
+        const nextGroups: Record<string, FavoriteGroup> = {};
+        for (const [groupId, group] of Object.entries(prev.groups)) {
+          if (!group.excludedStoryIds?.includes(story.storyId)) {
+            nextGroups[groupId] = group;
+            continue;
+          }
+          rejoined = true;
+          const excludedStoryIds = group.excludedStoryIds.filter(
+            (id) => id !== story.storyId
+          );
+          const { excludedStoryIds: _cleared, ...rest } = group;
+          nextGroups[groupId] = {
+            ...rest,
+            // 先补在成员末尾即可：下一次目录校正会按目录顺序重排。
+            storyIds: [...group.storyIds, story.storyId],
+            stories: { ...group.stories, [story.storyId]: story },
+            ...(excludedStoryIds.length > 0 ? { excludedStoryIds } : {}),
+          };
+        }
+        if (rejoined) {
+          return { ...prev, groups: nextGroups };
+        }
         return { ...prev, stories: { ...prev.stories, [story.storyId]: story } };
       }
 
@@ -387,6 +418,9 @@ export function FavoritesProvider({ children }: { children: ReactNode }) {
             type: group.type ?? "other",
             storyIds: uniqueStories.map((story) => story.storyId),
             stories: storyMap,
+            // 刻意不带 excludedStoryIds：重新收藏整组是「这组我全都要」的
+            // 显式表态。取消收藏时整组对象连同排除名单一起删掉了，这里从
+            // 零建组，保证上一轮摘掉过的章节不会被继承成新组的排除项。
           },
         },
       };
