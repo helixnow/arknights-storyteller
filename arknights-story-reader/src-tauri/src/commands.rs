@@ -401,11 +401,24 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
         }
     }
 
-    let stripped = input
-        .strip_suffix("==")
-        .or_else(|| input.strip_suffix('='))
-        .unwrap_or(input)
-        .as_bytes();
+    let bytes = input.as_bytes();
+    let padding = bytes.iter().rev().take_while(|&&byte| byte == b'=').count();
+    if padding > 2 {
+        return Err(IMPORT_CHUNK_ENCODING_BROKEN.to_string());
+    }
+    let payload_len = bytes.len().saturating_sub(padding);
+    let stripped = &bytes[..payload_len];
+    // `=` is legal only as the final one/two bytes. When padding is present,
+    // the complete encoded length must be a multiple of four and its count
+    // must agree with the payload remainder. This rejects strings such as
+    // `Zm9v=` that the old "strip suffix and decode" path silently accepted.
+    if stripped.contains(&b'=')
+        || (padding > 0 && bytes.len() % 4 != 0)
+        || (padding == 1 && stripped.len() % 4 != 3)
+        || (padding == 2 && stripped.len() % 4 != 2)
+    {
+        return Err(IMPORT_CHUNK_ENCODING_BROKEN.to_string());
+    }
     // 每 4 个字符解出 3 字节；余 1 个字符连一个字节都凑不出，必是坏块。
     if stripped.len() % 4 == 1 {
         return Err(IMPORT_CHUNK_ENCODING_BROKEN.to_string());
@@ -418,8 +431,22 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
         }
         match group.len() {
             4 => out.extend_from_slice(&[(acc >> 16) as u8, (acc >> 8) as u8, acc as u8]),
-            3 => out.extend_from_slice(&[(acc >> 10) as u8, (acc >> 2) as u8]),
-            2 => out.push((acc >> 4) as u8),
+            3 => {
+                // The final two bits are padding bits and must be zero in a
+                // canonical encoding. Accepting non-zero bits maps several
+                // distinct damaged strings to the same bytes.
+                if sextet(group[2])? & 0b11 != 0 {
+                    return Err(IMPORT_CHUNK_ENCODING_BROKEN.to_string());
+                }
+                out.extend_from_slice(&[(acc >> 10) as u8, (acc >> 2) as u8]);
+            }
+            2 => {
+                // Likewise, a one-byte tail has four unused low bits.
+                if sextet(group[1])? & 0b1111 != 0 {
+                    return Err(IMPORT_CHUNK_ENCODING_BROKEN.to_string());
+                }
+                out.push((acc >> 4) as u8);
+            }
             _ => return Err(IMPORT_CHUNK_ENCODING_BROKEN.to_string()),
         }
     }
@@ -452,13 +479,14 @@ static IMPORT_CHUNK_LOCK: Mutex<()> = Mutex::new(());
 /// （持锁期间新一轮传输的首块拿不到锁，不存在被误删的活暂存）；
 /// 抢不到说明 sync / 导入收尾正占着这组路径，严格 no-op——此时删
 /// 文件反而可能误伤它们正在处理的暂存。清理失败不影响放锁：guard
-/// 在返回前无条件 Drop，INSTALL_LOCK 一定回到空闲。
-fn abort_import_transfer(staging: &std::path::Path) -> Result<(), String> {
+/// 在返回前无条件 Drop，INSTALL_LOCK 一定回到空闲。返回值只表示本次
+/// 是否真的删除了暂存文件；让路 no-op 和文件本就不存在都返回 false。
+fn abort_import_transfer(staging: &std::path::Path) -> Result<bool, String> {
     let guard = match take_transfer_hold() {
         Some(guard) => guard,
         None => match acquire_install_lock("import_from_zip_bytes") {
             Ok(guard) => guard,
-            Err(_) => return Ok(()),
+            Err(_) => return Ok(false),
         },
     };
     // 删除与追加共用 IMPORT_CHUNK_LOCK：滞留在阻塞线程池里的迟到块
@@ -469,9 +497,9 @@ fn abort_import_transfer(staging: &std::path::Path) -> Result<(), String> {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match std::fs::remove_file(staging) {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(true),
             // 暂存本就不存在（首块还没落盘就失败了）不算错。
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(err) => Err(format!("清理导入暂存文件失败: {}", err)),
         }
     };
@@ -535,10 +563,7 @@ fn append_import_chunk(staging: &std::path::Path, offset: u64, chunk: &[u8]) -> 
 /// 放锁之后做（DataService::import_promoted_zip），不会堵住迟到块的
 /// 快速失败。调用时机在收尾块 append 成功之后，此时安装互斥（guard）
 /// 仍在手上，锁序仍是 INSTALL_LOCK → IMPORT_CHUNK_LOCK。
-fn promote_import_staging(
-    staging: &std::path::Path,
-    dest: &std::path::Path,
-) -> Result<(), String> {
+fn promote_import_staging(staging: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {
     let _serialized = IMPORT_CHUNK_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -549,9 +574,8 @@ fn promote_import_staging(
     }
     // Windows 的 rename 不覆盖已存在的目标。上一次导入若在改名转正之后、
     // finalize 删临时 ZIP 之前崩溃/断电（或按路径导入 fs::copy 到一半
-    // 失败），dest 会残留一个弃单——启动清理特意只删 `.part` 不碰它。
-    // 不先清掉，Windows 上此后每一轮分块导入都会在收尾报「写入 ZIP
-    // 数据失败」，重试、重启都救不回来。此刻 INSTALL_LOCK 与
+    // 失败），dest 会残留一个弃单。启动会清理它，但同一进程内立即重试
+    // 仍可能撞上，所以转正也必须自清。此刻 INSTALL_LOCK 与
     // IMPORT_CHUNK_LOCK 都在手上，没有任何同步/导入在用这个路径，
     // dest 只可能是弃单，删掉是安全的。
     match std::fs::remove_file(dest) {
@@ -560,6 +584,29 @@ fn promote_import_staging(
         Err(err) => return Err(format!("清理残留的导入临时文件失败: {}", err)),
     }
     std::fs::rename(staging, dest).map_err(|e| format!("写入 ZIP 数据失败: {}", e))
+}
+
+/// Acquire/continue the process-wide hold for one import chunk.
+///
+/// A fresh `offset == 0` transfer must not evict another live transfer. The
+/// old command unconditionally took and dropped `IMPORT_TRANSFER_HOLD`, so a
+/// second WebView/request could truncate the first user's staging file and
+/// subsequent equal-sized chunks could splice both ZIPs together. Normal
+/// cancellation already has an explicit `cancel` branch; abandoned holds are
+/// reaped by `acquire_install_lock` after the stale timeout.
+fn acquire_import_transfer_guard(offset: u64) -> Result<InstallLockGuard, String> {
+    if offset == 0 {
+        acquire_install_lock("import_from_zip_bytes")
+    } else {
+        // Continuation takes back the exact guard stowed by the preceding
+        // chunk. If it was reaped after a long pause, reacquiring still lets
+        // append_import_chunk's strict offset/file checks decide whether the
+        // stream can safely continue.
+        match take_transfer_hold() {
+            Some(guard) => Ok(guard),
+            None => acquire_install_lock("import_from_zip_bytes"),
+        }
+    }
 }
 
 /// 分块导入 ZIP。前端把文件切成几 MB 的块，逐块 base64 后调用本命令。
@@ -601,7 +648,9 @@ pub async fn import_from_zip_bytes(
         let service = clone_service(&state);
         return run_blocking("import_from_zip_bytes", move || {
             match service.import_staging_path() {
-                Ok(staging) => abort_import_transfer(&staging),
+                // 保持既有 IPC 返回形状 `null`；内部 bool 供后端区分
+                // 真删除与并发任务占锁时的安全让路。
+                Ok(staging) => abort_import_transfer(&staging).map(|_| ()),
                 Err(err) => {
                     // 放锁优先于清理：暂存路径都推导不出也不能把寄存
                     // 持有留到弃单超时。
@@ -612,21 +661,9 @@ pub async fn import_from_zip_bytes(
         })
         .await;
     }
-    let guard = if offset == 0 {
-        // 新一轮传输：上一轮的寄存持有（若有）直接作废——offset 0 本就
-        // 会截断重写暂存文件。随后重新抢锁，抢不到说明真有同步/导入
-        // 在跑，第一块就快速失败。
-        drop(take_transfer_hold());
-        acquire_install_lock("import_from_zip_bytes")?
-    } else {
-        // 续传块：取回寄存的持有接着扛。寄存已空说明持有被当弃单收走
-        // 了（传输停顿超时）或进程重启过，重新抢锁接续；抢不到说明
-        // 空档期里同步已经插进来，这轮传输注定失败，立即报错。
-        match take_transfer_hold() {
-            Some(guard) => guard,
-            None => acquire_install_lock("import_from_zip_bytes")?,
-        }
-    };
+    // offset 0 只有在安装锁真正空闲（或旧持有已超时回收）时才能开新轮；
+    // 活跃传输不能被另一个首块静默抢断。续传块则取回上一块寄存的 guard。
+    let guard = acquire_import_transfer_guard(offset)?;
     let service = clone_service(&state);
     run_blocking("import_from_zip_bytes", move || {
         let chunk = decode_base64(&chunk_base64)?;
@@ -935,7 +972,9 @@ mod tests {
         let cases: &[(&str, &[u8])] = &[
             ("", b""),
             ("Zg==", b"f"),
+            ("Zg", b"f"),
             ("Zm8=", b"fo"),
+            ("Zm8", b"fo"),
             ("Zm9v", b"foo"),
             ("Zm9vYg==", b"foob"),
             ("Zm9vYmE=", b"fooba"),
@@ -972,7 +1011,13 @@ mod tests {
     #[test]
     fn decode_base64_rejects_garbage() {
         // FileReader 产出的 base64 没有空白和换行，混进来就是坏块。
-        for input in ["Zm 9v", "Zm9v\n", "A", "Z=9v", "Zm9v!!"] {
+        for input in [
+            "Zm 9v", "Zm9v\n", "A", "Z=9v", "Zm9v!!",
+            // Padding must be trailing, canonical, and agree with length.
+            "Zg=", "Zg===", "Zm9v=",
+            "=Zg=", // Non-zero discarded bits are a damaged, non-canonical tail.
+            "Zh==", "Zm9=",
+        ] {
             let err = decode_base64(input).expect_err("坏块必须被拒绝");
             assert!(err.contains("编码损坏"), "输入 {input:?}: {err}");
         }
@@ -1299,6 +1344,36 @@ mod tests {
         drop(take_transfer_hold());
     }
 
+    #[test]
+    fn a_second_first_chunk_cannot_evict_a_live_import_transfer() {
+        let _serial = serialize_global_lock_tests();
+        drop(take_transfer_hold());
+
+        let first = acquire_import_transfer_guard(0).expect("first transfer starts");
+        stow_transfer_hold(first);
+
+        let err = acquire_import_transfer_guard(0)
+            .expect_err("a concurrent offset-zero chunk must be rejected");
+        assert!(
+            err.contains("import_from_zip_bytes"),
+            "error identifies the active transfer: {err}"
+        );
+        let continuing = take_transfer_hold()
+            .expect("rejected newcomer must not drop the original transfer's guard");
+        stow_transfer_hold(continuing);
+
+        // Once the original hold is genuinely stale, a new first chunk may
+        // reap it and start cleanly.
+        {
+            let mut slot = lock_transfer_hold();
+            slot.as_mut().unwrap().last_chunk_at =
+                Instant::now() - IMPORT_TRANSFER_STALE - Duration::from_secs(1);
+        }
+        let replacement = acquire_import_transfer_guard(0).expect("stale transfer may be replaced");
+        drop(replacement);
+        assert!(take_transfer_hold().is_none());
+    }
+
     /// 显式中止在途传输：立刻放锁 + 清理暂存，不必等 60 秒弃单超时；
     /// 寄存已空且锁归别人时必须是严格 no-op——既不删文件也不碰别人
     /// 持有的锁。
@@ -1320,7 +1395,10 @@ mod tests {
         append_import_chunk(&staging, 0, b"half transfer").expect("首块必须成功");
         let guard = acquire_install_lock("import_from_zip_bytes").expect("空闲时必须拿到锁");
         stow_transfer_hold(guard);
-        abort_import_transfer(&staging).expect("中止必须成功");
+        assert!(
+            abort_import_transfer(&staging).expect("中止必须成功"),
+            "实际删除暂存时应返回 true"
+        );
         assert!(!staging.exists(), "中止后半截暂存文件必须被删掉");
         assert!(take_transfer_hold().is_none(), "中止后寄存处必须为空");
         drop(acquire_install_lock("sync_data").expect("中止后 sync 必须立刻拿到锁"));
@@ -1329,7 +1407,10 @@ mod tests {
         // 不得放掉别人的锁。
         append_import_chunk(&staging, 0, b"someone else's bytes").expect("重建暂存必须成功");
         let others = acquire_install_lock("sync_data").expect("锁应空闲");
-        abort_import_transfer(&staging).expect("空寄存时中止必须静默成功");
+        assert!(
+            !abort_import_transfer(&staging).expect("空寄存时中止必须静默成功"),
+            "为在途任务让路时应返回 false"
+        );
         assert!(staging.exists(), "没有取到持有就不得删暂存文件");
         acquire_install_lock("import_from_zip").expect_err("别人持有的锁不能被中止放掉");
         drop(others);
@@ -1338,7 +1419,10 @@ mod tests {
         let guard = acquire_install_lock("import_from_zip_bytes").expect("锁应空闲");
         stow_transfer_hold(guard);
         std::fs::remove_file(&staging).unwrap();
-        abort_import_transfer(&staging).expect("暂存缺失时中止必须成功");
+        assert!(
+            !abort_import_transfer(&staging).expect("暂存缺失时中止必须成功"),
+            "没有文件可删时应返回 false"
+        );
         drop(acquire_install_lock("sync_data").expect("锁必须已被释放"));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1366,13 +1450,16 @@ mod tests {
         append_import_chunk(&staging, 0, b"chunk landed, next one failed").expect("首块必须成功");
         drop(acquire_install_lock("import_from_zip_bytes").expect("空闲时必须拿到锁"));
 
-        abort_import_transfer(&staging).expect("锁空闲时中止必须成功");
+        assert!(
+            abort_import_transfer(&staging).expect("锁空闲时中止必须成功"),
+            "抢到锁并删除残留时应返回 true"
+        );
         assert!(!staging.exists(), "锁空闲时中止必须删掉遗留的半截暂存");
         assert!(take_transfer_hold().is_none(), "中止不得凭空造出寄存持有");
         drop(acquire_install_lock("sync_data").expect("中止后锁必须回到空闲"));
 
         // 暂存本就不存在时同样静默成功（幂等），锁照样回到空闲。
-        abort_import_transfer(&staging).expect("暂存缺失且锁空闲时中止必须成功");
+        assert!(!abort_import_transfer(&staging).expect("暂存缺失且锁空闲时中止必须成功"));
         drop(acquire_install_lock("sync_data").expect("锁必须仍然空闲"));
 
         let _ = std::fs::remove_dir_all(&dir);
