@@ -2795,8 +2795,25 @@ impl DataService {
         let catalog = self.catalog()?;
         let fingerprint = self.index_dataset_fingerprint(catalog.stories.len());
 
-        let mut conn = self.open_index_connection()?;
-        Self::init_index_tables(&conn)?;
+        // 打不开、或建不了表的索引库几乎必然已经损坏（半截写入、坏块，
+        // open 时 PRAGMA 就报 "file is not a database"）。搜索路径遇到它
+        // 会静默回退线性扫描，但重建在这里直接报错就成了死局：除了整包
+        // 重新同步没有任何路径会清掉坏库，「重建索引」按钮从此永远失败。
+        // 库里只有派生数据，本来就要从头重建——清掉重开；清理或二次
+        // 打开仍失败才把错误抛给调用方。
+        let mut conn = match self
+            .open_index_connection()
+            .and_then(|conn| Self::init_index_tables(&conn).map(|()| conn))
+        {
+            Ok(conn) => conn,
+            Err(err) => {
+                eprintln!("[INDEX] 索引库不可用（{}），清空后从头重建", err);
+                self.clear_story_index()?;
+                let conn = self.open_index_connection()?;
+                Self::init_index_tables(&conn)?;
+                conn
+            }
+        };
 
         if let Some((stories, segments)) = Self::index_current_totals(&conn, &fingerprint) {
             emit(
@@ -3192,9 +3209,23 @@ impl DataService {
                 // 命中、索引建好后又消失，两条路径的结果集就不一致了；
                 // 点开也只会得到读文件错误。读得出来本身就是判定，正文
                 // 内容这里用不上。
-                self.read_story_text(&story.story_txt)
-                    .is_ok()
-                    .then(|| story.story_name.clone())
+                //
+                // 索引侧还有一条取舍要镜像：tokenized 全文为空的剧情整篇
+                // 不入库，storyCode 随之不可搜。标题流有 token 时全文流
+                // 必然非空（标题 ⊆ 全文），读得出来即可；标题流为空、
+                // 命中全靠 storyCode 时必须真的解析正文，确认这篇在索引
+                // 里存在——否则这类剧情只在索引建好前能凭 code 命中。
+                if !name_stream.trim().is_empty() {
+                    self.read_story_text(&story.story_txt)
+                        .is_ok()
+                        .then(|| story.story_name.clone())
+                } else {
+                    self.story_searchable_text(&story.story_name, &story.story_txt)
+                        .filter(|content| {
+                            !Self::build_tokenized_content(content).trim().is_empty()
+                        })
+                        .map(|_| story.story_name.clone())
+                }
             } else {
                 // 扫的是「标题 + 解析后的正文」，也就是索引里 `raw_content`
                 // 的同一份文本。直接扫原始脚本的话，`[name=...]`、素材 token
@@ -3204,6 +3235,12 @@ impl DataService {
                     .and_then(|content| {
                         // 与索引里 `tokenized_content` 逐 token 相同的流。
                         let content_stream = fts_token_stream(&content);
+                        // tokenized 全文为空的剧情在 rebuild 里整篇跳过
+                        // （不入 FTS 库），这里必须同样跳过——否则命中全靠
+                        // story_code 的这类剧情只在索引建好前可见。
+                        if content_stream.trim().is_empty() {
+                            return None;
+                        }
                         let haystacks = [content_stream.as_str(), code_stream.as_str()];
                         if terms.excluded_by(&haystacks) {
                             return None;
@@ -5732,6 +5769,56 @@ mod tests {
         );
     }
 
+    /// 索引侧的既有取舍：tokenized 全文为空的剧情（假名标题 + 无 token
+    /// 正文）整篇不入库，storyCode 随之不可搜。扫描回退必须同样跳过——
+    /// 以前标题快路径只要求「脚本读得出来」、正文分支也不做此判定，这类
+    /// 剧情在索引建好前能凭 code 命中、建好后又消失，结果集分叉。
+    #[test]
+    fn fallback_skips_tokenless_stories_like_the_index() {
+        let fx = Fixture::new("tokenless");
+        fx.set_review_table(&format!(
+            "{{\"main_0\":{{\"id\":\"main_0\",\"name\":\"黑暗时代\",\"entryType\":\"MAINLINE\",\
+              \"infoUnlockDatas\":[{},{}]}}}}",
+            entry_json(
+                "main_00-01",
+                "序章",
+                "main_0",
+                1,
+                "obt/main/level_main_00-01",
+                "0-1",
+            ),
+            entry_json(
+                "kana_only",
+                "アイ",
+                "main_0",
+                2,
+                "obt/main/level_main_kana_only",
+                "KN-1",
+            )
+        ));
+        // 假名和标点都进不了索引：这篇的 tokenized 全文是空的。
+        fx.write_story("obt/main/level_main_kana_only", "ふふ……\n");
+
+        // 索引没建好：不能凭 storyCode 命中一篇索引里根本不存在的剧情。
+        // 带排除词的写法走的是正文分支（非标题快路径），也必须一致。
+        assert!(fx.service.search_stories("KN-1").unwrap().is_empty());
+        assert!(fx.service.search_stories("KN-1 -博士").unwrap().is_empty());
+        // 对照组：全文有 token 的剧情照常凭 code 命中。
+        assert_eq!(
+            sorted_ids(&fx.service.search_stories("0-1").unwrap()),
+            vec!["main_00-01".to_string()]
+        );
+
+        // 建好索引后同一批结果——tokenized 为空的剧情两条路径都看不见。
+        fx.service.rebuild_story_index().expect("index builds");
+        assert!(fx.service.search_stories("KN-1").unwrap().is_empty());
+        assert!(fx.service.search_stories("KN-1 -博士").unwrap().is_empty());
+        assert_eq!(
+            sorted_ids(&fx.service.search_stories("0-1").unwrap()),
+            vec!["main_00-01".to_string()]
+        );
+    }
+
     /// 引号短语端到端：`"凯尔"` 要求凯、尔作为**相邻 token** 出现。分词器
     /// 丢掉的字符（假名）不打断相邻——`凯あ尔` 在索引里就是相邻的
     /// `凯 尔`，FTS 短语命中；真正隔着会成词的字（`凯不挨着尔`）才不命中。
@@ -6006,6 +6093,39 @@ mod tests {
         let status = fx.service.get_story_index_status().unwrap();
         assert!(status.ready);
         assert_eq!(status.total, 6);
+    }
+
+    /// 索引库文件损坏（半截写入、坏块——open 时 PRAGMA 就报 "file is
+    /// not a database"）：搜索路径静默回退扫描没问题，但重建以前直接把
+    /// 打开错误抛出去——除了整包重新同步没有任何路径会清掉坏库，
+    /// 「重建索引」按钮从此永远失败。重建必须自愈：清掉坏库、从头建好。
+    #[test]
+    fn rebuild_self_heals_a_corrupt_index_database() {
+        let fx = Fixture::new("index_corrupt");
+        fs::write(&fx.service.index_db_path, b"definitely not a sqlite file").unwrap();
+
+        // 坏库不该让搜索报错：回退扫描照常给结果。
+        let scanned = sorted_ids(&fx.service.search_stories("凯尔希").unwrap());
+        assert_eq!(
+            scanned,
+            vec!["Obt/Roguelike/ro2/ro2_1".to_string(), "main_00-01".to_string()]
+        );
+
+        fx.service
+            .rebuild_story_index()
+            .expect("重建必须清掉损坏的索引库并自愈");
+
+        let status = fx.service.get_story_index_status().unwrap();
+        assert!(status.ready);
+        assert_eq!(status.total, 6);
+        // 自愈后的索引真的在工作：FTS 路径可用、命中总数权威，且与扫描一致。
+        assert_eq!(fx.service.count_fts_matches("凯尔希").unwrap(), Some(2));
+        let indexed = fx
+            .service
+            .search_stories_with_index("凯尔希")
+            .unwrap()
+            .expect("自愈后索引路径必须可用");
+        assert_eq!(sorted_ids(&indexed), scanned);
     }
 
     #[test]
