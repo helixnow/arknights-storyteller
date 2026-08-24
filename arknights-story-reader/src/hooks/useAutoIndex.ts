@@ -69,6 +69,19 @@ export function useAutoIndex() {
       later(() => void ensureIndex(reason), RETRY_DELAY_MS);
     };
 
+    /**
+     * 后端重建在途时的等待：定到「停更即死」判定刚好过期的时刻回来。
+     * 活着的重建会用新进度把下次检查继续往后推（约每 60s 看一次），
+     * 死掉的则在判定过期后立刻被接手；索引一就绪就停，不会无限轮询。
+     * 不消耗让路预算，理由见两处调用点。
+     */
+    const retryWhenBackendQuiet = (reason: string) => {
+      later(
+        () => void ensureIndex(reason),
+        Math.max(RETRY_DELAY_MS, lastIndexProgressAt + INDEX_PROGRESS_STALE_MS - Date.now() + 1_000)
+      );
+    };
+
     const broadcast = (status: StoryIndexStatus | null, reason: string) => {
       const signature = `${status?.ready ?? false}:${status?.total ?? 0}`;
       if (signature === lastBroadcast) return;
@@ -102,14 +115,9 @@ export function useAutoIndex() {
           // index-progress（失败通知走 sync-progress），只要它发过几秒进度
           // 再死（磁盘满、IO 错都是这种形态），预算必先于判定窗耗尽，
           // 兜底重建从此整个会话不再发生。改为定到停更判定刚好过期的
-          // 时刻回来：活着的重建会用新进度把下次检查继续往后推（约每
-          // 60s 读一次状态），死掉的则在判定过期后立刻接手；索引一就绪
-          // 就停，不会无限轮询。让路预算留给锁竞争与前置检查失败的重试。
+          // 时刻回来。让路预算留给锁竞争与前置检查失败的重试。
           devLog(`索引未就绪，但后端已在重建，等它结束或停更再看（${reason}）`);
-          later(
-            () => void ensureIndex(reason),
-            Math.max(RETRY_DELAY_MS, lastIndexProgressAt + INDEX_PROGRESS_STALE_MS - Date.now() + 1_000)
-          );
+          retryWhenBackendQuiet(reason);
           return;
         }
 
@@ -141,14 +149,26 @@ export function useAutoIndex() {
         broadcast(rebuilt, "auto-rebuilt");
       } catch (err) {
         if (!buildStarted && !cancelled) {
-          // 前置检查抛错 ≠ 构建失败：isInstalled 的 IPC 在启动初期可能未就绪，
-          // 索引状态查询更会撞上后端自动重建正握着 story_index.db 写入——
-          // 本检查恰好安排在 data-updated 后 3 秒，正是重建热身的窗口，而
-          // 状态查询里的建表 DDL 没配 busy_timeout，撞锁直接返回 BUSY。这类
-          // 暂时性失败若就此放弃，兜底重建与状态广播就整个会话哑火：那次
-          // 重建随后死掉（磁盘满、IO 错）也没人接手，只剩用户自己去点手动
-          // 重建。按「让路」同等对待：用让路预算安排有限次重试，预算耗尽
-          // 才交给手动入口，不会无限轮询。
+          if (isBackendBuilding()) {
+            // 前置检查失败 + 后端重建在途：失败多半就是重建本身造成的——
+            // 状态查询里的建表 DDL 没配 busy_timeout，撞上重建的写锁直接
+            // 返回 BUSY，且会随重建反复出现。这种失败若按下面的普通前置
+            // 失败烧让路预算（6×10s=60s），一次超过一分钟的大数据集重建
+            // 就能把预算整个烧穿；它随后死掉（磁盘满、IO 错）就没人接手
+            // 了——预算重试想堵的洞从预算侧原样漏回来。和上面探针成功时
+            // 的「后端已在重建」同样处置：等停更判定过期再回来，预算原封
+            // 不动留给锁竞争与真正无解释的前置失败。
+            devLog(`索引前置检查失败，但后端正在重建，等它结束或停更再试（${reason}）`, err);
+            retryWhenBackendQuiet(reason);
+            return;
+          }
+          // 前置检查抛错 ≠ 构建失败：isInstalled 的 IPC 在启动初期可能未
+          // 就绪，索引状态查询也可能在后端重建刚起步、还没发出第一条进度
+          // （上面的分支认不出来）时撞上写锁。这类暂时性失败若就此放弃，
+          // 兜底重建与状态广播就整个会话哑火：那次重建随后死掉（磁盘满、
+          // IO 错）也没人接手，只剩用户自己去点手动重建。按「让路」同等
+          // 对待：用让路预算安排有限次重试，预算耗尽才交给手动入口，
+          // 不会无限轮询。
           devLog(`索引前置检查失败，稍后重试（${reason}）`, err);
           deferRetry(reason);
         } else {
