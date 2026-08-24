@@ -829,6 +829,7 @@ impl DataService {
             .map_err(|e| format!("Failed to open story index database: {}", e))?;
         conn.execute_batch(
             "
+            PRAGMA busy_timeout = 5000;
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
             ",
@@ -1898,11 +1899,28 @@ impl DataService {
         Some((stories as usize, segments as usize))
     }
 
+    /// Read paths must never migrate the schema. In particular, calling
+    /// `init_index_tables` from a status/search request could turn a harmless
+    /// version mismatch into DROP/CREATE work and then surface SQLITE_BUSY
+    /// while a rebuild transaction was in flight. Only the rebuild path may
+    /// migrate; readers treat every missing, malformed, older, or newer
+    /// version as unavailable.
+    fn index_schema_is_current(conn: &Connection) -> bool {
+        Self::extract_meta_value(conn, "index_version")
+            .ok()
+            .flatten()
+            .and_then(|value| value.parse::<i32>().ok())
+            == Some(INDEX_VERSION)
+    }
+
     /// 读路径使用的完整可用性判定。重建路径手里有解析后的篇数，可以直接
     /// 用完整 fingerprint；搜索/状态不该为此冷启动解析整张目录表，故拆掉
     /// fingerprint 最后一个 `|篇数`，用其余身份与当前包精确比较，再复用
     /// `index_current_totals` 校验元数据行数、实际行数及失忆探针。
     fn current_dataset_index_totals(&self, conn: &Connection) -> Option<(usize, usize)> {
+        if !Self::index_schema_is_current(conn) {
+            return None;
+        }
         let stored = Self::extract_meta_value(conn, META_DATASET_FINGERPRINT).ok()??;
         let (stored_identity, _) = stored.rsplit_once('|')?;
         if stored_identity != self.index_dataset_identity() {
@@ -2960,11 +2978,7 @@ impl DataService {
     }
 
     fn rebuild_story_index_inner(&self, app: Option<&AppHandle>) -> Result<(), String> {
-        if !self.is_installed() {
-            return Err("NOT_INSTALLED".to_string());
-        }
-
-        let emit = |phase: &str, cur: usize, total: usize, msg: &str| {
+        self.rebuild_story_index_emitting(|phase, cur, total, msg| {
             if let Some(app) = app {
                 let progress = IndexProgress {
                     phase: phase.to_string(),
@@ -2974,7 +2988,33 @@ impl DataService {
                 };
                 let _ = app.emit("index-progress", progress);
             }
-        };
+        })
+    }
+
+    /// Run a rebuild through one progress sink and guarantee that every error
+    /// leaves the consumer in a terminal state. `useAutoIndex` deliberately
+    /// keys off the stable phase literal "失败", so callers must not have to
+    /// infer failure from a dropped command future or from the last nonterminal
+    /// "收集"/"构建" event.
+    fn rebuild_story_index_emitting(
+        &self,
+        emit: impl Fn(&str, usize, usize, &str),
+    ) -> Result<(), String> {
+        let result = self.rebuild_story_index_attempt(&emit);
+        if let Err(err) = &result {
+            let message = format!("索引重建失败：{}", err);
+            emit("失败", 0, 0, &message);
+        }
+        result
+    }
+
+    fn rebuild_story_index_attempt(
+        &self,
+        emit: &impl Fn(&str, usize, usize, &str),
+    ) -> Result<(), String> {
+        if !self.is_installed() {
+            return Err("NOT_INSTALLED".to_string());
+        }
 
         // 同一份索引同时只允许一次重建。同步/导入完成后后台线程会自动重建，
         // 而前端的 `useAutoIndex`（以及设置页的手动按钮）可能同时也发起一次；
@@ -3030,7 +3070,7 @@ impl DataService {
         }
 
         let (total, segment_total) =
-            match self.build_index_once(&mut conn, &catalog, &dataset_probe, &fingerprint, &emit) {
+            match self.build_index_once(&mut conn, &catalog, &dataset_probe, &fingerprint, emit) {
                 Ok(Some(totals)) => totals,
                 Ok(None) => return Err(DATASET_SWAPPED_DURING_REBUILD.to_string()),
                 Err(err) => {
@@ -3051,7 +3091,7 @@ impl DataService {
                         &catalog,
                         &dataset_probe,
                         &fingerprint,
-                        &emit,
+                        emit,
                     )? {
                         Some(totals) => totals,
                         None => return Err(DATASET_SWAPPED_DURING_REBUILD.to_string()),
@@ -3301,8 +3341,6 @@ impl DataService {
             });
         };
 
-        Self::init_index_tables(&conn)?;
-
         // ready 必须同时回答三件事：索引属于当前数据包、两表行数与建库
         // 元数据一致、倒排索引仍认识自己的内容。只看 COUNT + 失忆探针会
         // 把「换包后尚未来得及清掉的旧库」和被截断的库都误报成可用，
@@ -3316,7 +3354,9 @@ impl DataService {
         // installed dataset.
         let total = current_totals.map(|(stories, _)| stories).unwrap_or(0);
         let last_built_at = if index_is_current {
-            Self::extract_meta_value(&conn, "last_built_at")?
+            Self::extract_meta_value(&conn, "last_built_at")
+                .ok()
+                .flatten()
                 .and_then(|value| value.parse::<i64>().ok())
         } else {
             None
@@ -3333,8 +3373,6 @@ impl DataService {
         let Some(conn) = self.try_open_index_connection()? else {
             return Ok(None);
         };
-
-        Self::init_index_tables(&conn)?;
 
         // 空表、失忆、行数截断或数据集已换：都不能把 FTS 结果当成当前
         // 语料的权威答案。剧情检索有扫描兜底，明确交回 None。
@@ -3553,29 +3591,40 @@ impl DataService {
     /// error — otherwise a single query over 1900+ stories can easily take
     /// 30s+ on lower-end devices.
     pub fn search_stories(&self, query: &str) -> Result<Vec<SearchResult>, String> {
+        self.search_stories_with_source(query)
+            .map(|(results, _index_used)| results)
+    }
+
+    /// Internal story search result plus provenance. `index_used` is true
+    /// only when `search_stories_with_index` returned an authoritative FTS
+    /// result set; every scanner/error/empty-query path is false.
+    fn search_stories_with_source(&self, query: &str) -> Result<(Vec<SearchResult>, bool), String> {
         let trimmed = query.trim();
         if trimmed.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         }
 
         match self.search_stories_with_index(trimmed) {
             // Index returned authoritative results — don't waste time on
             // linear scan. Char-level FTS5 is a superset of plain contains()
             // matching at this point.
-            Ok(Some(results)) => Ok(results),
+            Ok(Some(results)) => Ok((results, Self::build_fts_query_advanced(trimmed).is_some())),
             // Index not ready (never built, was cleared, or empty table).
             // Fall through to the slower scanner so the user can still get
             // *something* on first launch. The scanner caps at
             // SEARCH_RESULT_LIMIT and doesn't attempt to enumerate every
             // story — practical budget is single-digit seconds on a typical
             // machine.
-            Ok(None) => self.search_stories_fallback(trimmed),
+            Ok(None) => self
+                .search_stories_fallback(trimmed)
+                .map(|results| (results, false)),
             Err(err) => {
                 eprintln!(
                     "[INDEX] Failed to search using index ({}), fallback to linear scan",
                     err
                 );
                 self.search_stories_fallback(trimmed)
+                    .map(|results| (results, false))
             }
         }
     }
@@ -3618,18 +3667,23 @@ impl DataService {
                 total_matched: 0,
                 truncated: false,
                 facets: Default::default(),
+                index_used: false,
             });
         }
 
         // `total = 0` 是与前端约定的「不确定态」：还不知道要走索引还是扫全库，
         // 报一个 0/3 只是编出来的百分比。真实分母由线性扫描那一步给出。
         progress("检索", 0, 0, format!("搜索「{}」", trimmed));
-        let results = self.search_stories_emitting(app, trimmed)?;
+        let (results, index_used) = self.search_stories_emitting(app, trimmed)?;
 
         // Compute total via FTS (best effort — if the index is unavailable we
         // fall back to `results.len()` which is at least a lower bound).
         progress("统计", 0, 0, format!("命中 {} 篇，正在统计", results.len()));
-        let counted = self.count_fts_matches(trimmed).unwrap_or(None);
+        let counted = if index_used {
+            self.count_fts_matches(trimmed).unwrap_or(None)
+        } else {
+            None
+        };
         let (total_matched, truncated) = match counted {
             // 索引给出了权威总数：截断与否就看有没有没返回的命中。
             Some(count) => {
@@ -3665,6 +3719,7 @@ impl DataService {
             total_matched,
             truncated,
             facets,
+            index_used,
         })
     }
 
@@ -3738,6 +3793,7 @@ impl DataService {
                 hits: Vec::new(),
                 total_matched: 0,
                 truncated: false,
+                index_used: false,
             });
         }
 
@@ -3751,9 +3807,9 @@ impl DataService {
                 hits: Vec::new(),
                 total_matched: 0,
                 truncated: false,
+                index_used: false,
             });
         };
-        Self::init_index_tables(&conn)?;
 
         // 段落检索没有线性扫描兜底，因此只能接受属于当前数据集、两表行数
         // 完整且倒排索引仍能反查自身内容的索引。换包后残留的旧库尤其危险：
@@ -3765,6 +3821,7 @@ impl DataService {
                 hits: Vec::new(),
                 total_matched: 0,
                 truncated: false,
+                index_used: false,
             });
         };
 
@@ -3775,6 +3832,7 @@ impl DataService {
                 hits: Vec::new(),
                 total_matched: 0,
                 truncated: false,
+                index_used: false,
             });
         }
 
@@ -3784,6 +3842,7 @@ impl DataService {
                 hits: Vec::new(),
                 total_matched: 0,
                 truncated: false,
+                index_used: false,
             });
         };
 
@@ -3817,6 +3876,7 @@ impl DataService {
                     hits: Vec::new(),
                     total_matched: 0,
                     truncated: false,
+                    index_used: false,
                 });
             }
         };
@@ -3847,6 +3907,7 @@ impl DataService {
                     hits: Vec::new(),
                     total_matched: 0,
                     truncated: false,
+                    index_used: false,
                 });
             }
         };
@@ -3982,6 +4043,7 @@ impl DataService {
             hits,
             total_matched,
             truncated,
+            index_used: true,
         })
     }
 
@@ -4193,7 +4255,7 @@ impl DataService {
             return Ok(Vec::new());
         }
 
-        let results = self.search_stories_emitting(Some(app), trimmed)?;
+        let (results, _index_used) = self.search_stories_emitting(Some(app), trimmed)?;
         emit_search_progress(app, "完成", 1, 1, format!("命中 {} 篇", results.len()));
         Ok(results)
     }
@@ -4208,18 +4270,24 @@ impl DataService {
         &self,
         app: Option<&AppHandle>,
         trimmed: &str,
-    ) -> Result<Vec<SearchResult>, String> {
+    ) -> Result<(Vec<SearchResult>, bool), String> {
         const SCAN_PROGRESS_STRIDE: usize = 32;
 
         let Some(app) = app else {
-            return self.search_stories(trimmed);
+            return self.search_stories_with_source(trimmed);
         };
 
         emit_search_progress(app, "检索", 0, 0, "尝试全文索引");
         match self.search_stories_with_index(trimmed) {
             Ok(Some(results)) => {
-                emit_search_progress(app, "索引检索", 1, 1, "使用全文索引完成");
-                return Ok(results);
+                let index_used = Self::build_fts_query_advanced(trimmed).is_some();
+                let message = if index_used {
+                    "使用全文索引完成"
+                } else {
+                    "查询没有可用的正向词"
+                };
+                emit_search_progress(app, "索引检索", 1, 1, message);
+                return Ok((results, index_used));
             }
             // 索引没建好 / 查询失败：往下走线性扫描。
             Ok(None) => {}
@@ -4244,6 +4312,7 @@ impl DataService {
                 );
             }
         })
+        .map(|results| (results, false))
     }
 
     pub fn get_story_entry(&self, story_id: &str) -> Result<StoryEntry, String> {
@@ -6814,6 +6883,128 @@ mod tests {
             DataService::searchable_text("序章", &segments),
             "序章\n第一节\n凯尔希：博士。"
         );
+    }
+
+    #[test]
+    fn index_connections_install_a_five_second_busy_timeout() {
+        let fx = Fixture::new("index_busy_timeout");
+        let conn = fx.service.open_index_connection().unwrap();
+        let timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(timeout, 5000);
+    }
+
+    #[test]
+    fn locked_mismatched_index_is_read_only_not_ready_and_falls_back() {
+        let fx = Fixture::new("index_locked_mismatch");
+        fx.service.rebuild_story_index().expect("index builds");
+
+        // Commit an unknown schema version, then keep a separate write
+        // transaction open. The old read path called init_index_tables here,
+        // tried to DROP/CREATE both FTS tables, and surfaced SQLITE_BUSY.
+        let mut writer = fx.service.open_index_connection().unwrap();
+        writer
+            .execute(
+                "UPDATE story_index_meta SET value = ?1 WHERE key = 'index_version'",
+                params![(INDEX_VERSION + 1).to_string()],
+            )
+            .unwrap();
+        let tx = writer.transaction().unwrap();
+        tx.execute(
+            "INSERT OR REPLACE INTO story_index_meta (key, value) VALUES ('writer_lock', 'held')",
+            [],
+        )
+        .unwrap();
+
+        let status = fx
+            .service
+            .get_story_index_status()
+            .expect("a busy reader must degrade, not error");
+        assert!(!status.ready);
+
+        let stories = fx
+            .service
+            .search_stories_ex("凯尔希")
+            .expect("story search must fall back instead of returning SQLITE_BUSY");
+        assert!(!stories.index_used);
+        assert!(
+            stories
+                .results
+                .iter()
+                .any(|result| result.story_id == "main_00-01"),
+            "linear scan should still search the installed dataset"
+        );
+
+        let segments = fx
+            .service
+            .search_segments("凯尔希")
+            .expect("segment search must return a not-ready page, not SQLITE_BUSY");
+        assert!(!segments.index_used);
+        assert!(segments.hits.is_empty());
+
+        // No read request may have migrated the database behind our back.
+        let version: String = tx
+            .query_row(
+                "SELECT value FROM story_index_meta WHERE key = 'index_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, (INDEX_VERSION + 1).to_string());
+    }
+
+    #[test]
+    fn failed_rebuild_emits_a_terminal_failure_phase() {
+        let fx = Fixture::new("index_failure_progress");
+        fs::remove_file(fx.excel().join("story_review_table.json")).unwrap();
+        let events = Mutex::new(Vec::<(String, usize, usize, String)>::new());
+
+        let err = fx
+            .service
+            .rebuild_story_index_emitting(|phase, current, total, message| {
+                events.lock().unwrap().push((
+                    phase.to_string(),
+                    current,
+                    total,
+                    message.to_string(),
+                ));
+            })
+            .expect_err("missing dataset must fail rebuilding");
+        assert_eq!(err, "NOT_INSTALLED");
+
+        let events = events.into_inner().unwrap();
+        let terminal = events.last().expect("failure must emit a terminal event");
+        assert_eq!(terminal.0, "失败");
+        assert_eq!((terminal.1, terminal.2), (0, 0));
+        assert!(terminal.3.contains("NOT_INSTALLED"));
+    }
+
+    #[test]
+    fn search_pages_report_whether_fts_produced_the_results() {
+        let fx = Fixture::new("index_used");
+
+        let scanned = fx.service.search_stories_ex("凯尔希").unwrap();
+        assert!(
+            !scanned.index_used,
+            "linear scan must report indexUsed=false"
+        );
+        let unavailable_segments = fx.service.search_segments("凯尔希").unwrap();
+        assert!(!unavailable_segments.index_used);
+
+        fx.service.rebuild_story_index().expect("index builds");
+        let indexed = fx.service.search_stories_ex("凯尔希").unwrap();
+        assert!(
+            indexed.index_used,
+            "successful MATCH must report indexUsed=true"
+        );
+        let indexed_segments = fx.service.search_segments("凯尔希").unwrap();
+        assert!(indexed_segments.index_used);
+
+        // A pure-negative query is an intentional empty short-circuit; no
+        // MATCH statement ran even though the index itself is healthy.
+        assert!(!fx.service.search_stories_ex("-凯尔希").unwrap().index_used);
+        assert!(!fx.service.search_segments("   ").unwrap().index_used);
     }
 
     #[test]

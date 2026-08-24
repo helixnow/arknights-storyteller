@@ -237,6 +237,10 @@ pub struct SearchResultsPage {
     /// whatever it can).
     #[serde(default)]
     pub facets: std::collections::BTreeMap<String, usize>,
+    /// Whether the returned result set was produced by a successful FTS query.
+    /// Defaults to false when older cached/deserialized payloads lack the field.
+    #[serde(rename = "indexUsed", default)]
+    pub index_used: bool,
 }
 
 /// A single segment hit from the segment-level index. Enables precise
@@ -271,6 +275,9 @@ pub struct SegmentSearchPage {
     #[serde(rename = "totalMatched")]
     pub total_matched: usize,
     pub truncated: bool,
+    /// True only after the segment MATCH query itself completed successfully.
+    #[serde(rename = "indexUsed", default)]
+    pub index_used: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -442,5 +449,41 @@ mod tests {
         })
         .unwrap();
         assert_eq!(hit.get("characterName"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn search_page_index_used_is_serialized_and_defaults_when_missing() {
+        let legacy_story: SearchResultsPage = serde_json::from_value(json!({
+            "results": [],
+            "totalMatched": 0,
+            "truncated": false
+        }))
+        .unwrap();
+        let legacy_segment: SegmentSearchPage = serde_json::from_value(json!({
+            "hits": [],
+            "totalMatched": 0,
+            "truncated": false
+        }))
+        .unwrap();
+        assert!(!legacy_story.index_used);
+        assert!(!legacy_segment.index_used);
+
+        let story = serde_json::to_value(SearchResultsPage {
+            results: Vec::new(),
+            total_matched: 0,
+            truncated: false,
+            facets: Default::default(),
+            index_used: true,
+        })
+        .unwrap();
+        let segment = serde_json::to_value(SegmentSearchPage {
+            hits: Vec::new(),
+            total_matched: 0,
+            truncated: false,
+            index_used: true,
+        })
+        .unwrap();
+        assert_eq!(story.get("indexUsed"), Some(&Value::Bool(true)));
+        assert_eq!(segment.get("indexUsed"), Some(&Value::Bool(true)));
     }
 }
