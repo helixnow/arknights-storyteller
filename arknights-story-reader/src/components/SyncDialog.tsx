@@ -9,6 +9,7 @@ import {
   useDataSyncManager,
 } from "@/hooks/useDataSyncManager";
 import { safeConfirm } from "@/hooks/useAppUpdater";
+import { progressPercent } from "@/hooks/dataSyncUtils";
 
 interface SyncDialogProps {
   open: boolean;
@@ -62,6 +63,8 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
    * 「正在导入 ZIP」压下去。
    */
   const [preparingImport, setPreparingImport] = useState(false);
+  /** 选中文件后、覆盖确认框尚未收场；与「系统选择器仍打开」分开播报。 */
+  const [importAwaitingConfirm, setImportAwaitingConfirm] = useState(false);
 
   useEffect(() => {
     if (!open) {
@@ -82,11 +85,11 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
   }, [open, loadVersionInfo]);
 
   const handleClose = useCallback(() => {
-    if (busy) return;
+    if (busy || preparingSync || preparingImport) return;
     resetProgress();
     setError(null);
     onClose();
-  }, [busy, onClose, resetProgress, setError]);
+  }, [busy, onClose, preparingImport, preparingSync, resetProgress, setError]);
 
   const cardRef = useRef<HTMLDivElement | null>(null);
 
@@ -125,7 +128,15 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
       // Esc/Tab——否则 Tab 被 preventDefault 而焦点又进不了 inert 子树，
       // 整个应用的 Tab 键就失灵了（同 SheetShell 的 isPresented 守卫）。
       if (!card || card.closest("[inert]")) return;
-      if (event.key === "Escape") {
+      if (event.key === "Escape" || event.key === "BrowserBack" || event.key === "GoBack") {
+        // safeConfirm 的 DOM 兜底会作为更上层的 aria-modal sibling 挂到 body。
+        // 它拿到焦点时，返回应先交给它作「取消」，不能被底下的同步框截走。
+        if (event.target instanceof Node && !card.contains(event.target)) return;
+        // A modal owns the back intent even while it refuses to close. Without
+        // consuming the key, another view-level listener can navigate behind
+        // a still-running sync/import and hide the dialog in an inert panel.
+        event.preventDefault();
+        event.stopImmediatePropagation();
         handleClose();
         return;
       }
@@ -153,8 +164,8 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
         first.focus();
       }
     };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
   }, [open, handleClose]);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -299,10 +310,16 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
     }
     // 选完再确认：先弹确认框会丢掉用户手势，部分 WebView 就打不开文件选择器了。
     // 确认期间锁仍握在手里，排队等锁的自动更新安装抢不进来。
-    const confirmed = await safeConfirm(
-      `导入 ${file.name} 会覆盖本机已有的剧情数据，确定继续？`,
-      { title: "导入 ZIP", kind: "warning" }
-    );
+    setImportAwaitingConfirm(true);
+    let confirmed = false;
+    try {
+      confirmed = await safeConfirm(
+        `导入 ${file.name} 会覆盖本机已有的剧情数据。文件会先分块暂存，成功或失败后自动清理；确定继续？`,
+        { title: "导入 ZIP", kind: "warning" }
+      );
+    } finally {
+      setImportAwaitingConfirm(false);
+    }
     if (!confirmed) {
       transferredJob?.();
       setPreparingImport(false);
@@ -325,9 +342,7 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
 
   const actionsDisabled = busy || preparingSync || preparingImport || blockedBy !== null;
   const percent =
-    progress && progress.total > 0
-      ? Math.min(Math.round((progress.current / progress.total) * 100), 100)
-      : null;
+    progress ? progressPercent(progress.current, progress.total) : null;
 
   const handleImportClick = () => {
     // 连点第二下可能赶在重渲染禁用按钮之前：锁已寄存说明选择器正在打开，
@@ -348,7 +363,7 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-300"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 pt-[max(1rem,env(safe-area-inset-top,0px))] pb-[max(1rem,env(safe-area-inset-bottom,0px))] motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-300"
       onMouseDown={(event) => {
         overlayPressRef.current = event.target === event.currentTarget;
       }}
@@ -364,9 +379,9 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
         aria-modal="true"
         aria-labelledby="sync-dialog-title"
         aria-describedby="sync-dialog-description"
-        aria-busy={busy}
+        aria-busy={busy || preparingSync || preparingImport}
         tabIndex={-1}
-        className="w-full max-w-md mx-4 outline-none motion-safe:animate-in motion-safe:zoom-in-95 motion-safe:duration-300"
+        className="w-full max-w-md max-h-[calc(100dvh-2rem)] overflow-y-auto overscroll-contain outline-none motion-safe:animate-in motion-safe:zoom-in-95 motion-safe:duration-300"
       >
         <CardHeader>
           <CardTitle id="sync-dialog-title" className="flex items-center gap-2">
@@ -425,7 +440,7 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
             </div>
           )}
 
-          {(progress || busy) && (
+          {(progress || busy || preparingSync || preparingImport) && (
             <div className="space-y-2" aria-live="polite">
               {progress ? (
                 <>
@@ -468,7 +483,13 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
                 <>
                   <div className="flex justify-between text-sm">
                     <span className="text-[hsl(var(--color-muted-foreground))]">
-                      {syncing ? "连接中" : "正在导入"}
+                      {syncing
+                        ? "连接中"
+                        : preparingSync || importAwaitingConfirm
+                        ? "等待确认"
+                        : preparingImport && !importing
+                        ? "等待选择文件"
+                        : "正在导入"}
                     </span>
                     <span className="font-mono" aria-hidden="true">
                       …
@@ -477,13 +498,31 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
                   <div
                     role="progressbar"
                     aria-label="剧情数据处理进度"
-                    aria-valuetext={syncing ? "正在开始同步" : "正在导入"}
+                    aria-valuetext={
+                      syncing
+                        ? "正在开始同步"
+                        : preparingSync
+                        ? "等待确认是否重新同步"
+                        : importAwaitingConfirm
+                        ? "等待确认是否导入"
+                        : preparingImport && !importing
+                        ? "等待选择文件"
+                        : "正在导入"
+                    }
                     className="w-full bg-[hsl(var(--color-secondary))] rounded-full h-2 overflow-hidden"
                   >
                     <div className="bg-[hsl(var(--color-primary))] h-full animate-pulse" style={{ width: "30%" }} />
                   </div>
                   <p className="text-xs text-[hsl(var(--color-muted-foreground))]">
-                    {syncing ? "正在开始同步…" : "请稍候"}
+                    {syncing
+                      ? "正在开始同步…"
+                      : preparingSync
+                      ? "请在弹出的对话框中确认是否重新同步"
+                      : importAwaitingConfirm
+                      ? "请在弹出的对话框中确认是否导入"
+                      : preparingImport && !importing
+                      ? "请在系统对话框中选择 ZIP 压缩包"
+                      : "请稍候"}
                   </p>
                 </>
               )}
@@ -503,7 +542,12 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
           )}
 
           <div className="flex gap-2">
-            <Button variant="outline" onClick={handleClose} disabled={busy} className="flex-1 min-h-[44px]">
+            <Button
+              variant="outline"
+              onClick={handleClose}
+              disabled={busy || preparingSync || preparingImport}
+              className="flex-1 min-h-[44px]"
+            >
               关闭
             </Button>
             <Button
@@ -558,10 +602,10 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
               disabled={actionsDisabled}
               className="flex-1 min-h-[44px]"
             >
-              {importing ? (
+              {importing || preparingImport ? (
                 <span className="inline-flex items-center gap-2">
                   <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
-                  导入中...
+                  {importing ? "导入中..." : importAwaitingConfirm ? "等待确认..." : "等待选择..."}
                 </span>
               ) : (
                 <span className="inline-flex items-center gap-2">

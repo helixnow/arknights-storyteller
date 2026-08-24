@@ -32,6 +32,10 @@ import {
   type UpdateIssue,
 } from "@/hooks/useAppUpdater";
 import { useToast } from "@/components/ui/toast";
+import {
+  isDialogPluginUnavailableError,
+  progressPercent,
+} from "@/hooks/dataSyncUtils";
 
 const THEME_COLOR_OPTIONS = [
   {
@@ -63,12 +67,6 @@ const THEME_COLOR_OPTIONS = [
     darkSwatch: "#ada3ff",
   },
 ];
-
-// 插件未编译（Android）或未在 capability 中授权时，Tauri 会抛出 “not allowed” /
-// “plugin ... not found” 之类的错误，这类情况才需要回退到浏览器文件选择器。
-function isPluginUnavailableError(message: string): boolean {
-  return /not allowed|not found|unknown plugin|plugin/i.test(message);
-}
 
 function formatMegabytes(bytes: number): string {
   return `${(bytes / 1_048_576).toFixed(1)} MB`;
@@ -381,7 +379,7 @@ export function Settings() {
       let confirmed = false;
       try {
         confirmed = await safeConfirm(
-          "导入 ZIP 会覆盖本机已有的剧情数据。请确保压缩包来自 ArknightsGameData。",
+          "导入 ZIP 会覆盖本机已有的剧情数据。压缩包将先分块暂存，成功或失败后自动清理；请预留足够存储空间。",
           { title: "导入 ZIP", kind: "warning" }
         );
       } finally {
@@ -411,8 +409,7 @@ export function Settings() {
         });
         path = (Array.isArray(selected) ? selected[0] : selected) ?? null;
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        if (isPluginUnavailableError(message)) {
+        if (isDialogPluginUnavailableError(err)) {
           devLog("[Settings] 文件对话框不可用，回退到文件选择器", err);
           armPendingImportWatch(releaseJob);
           lockParkedForPicker = true;
@@ -637,7 +634,7 @@ export function Settings() {
         setUpdateMessage("更新已安装，应用即将重启");
         setAvailableUpdate(null);
       } else {
-        const response = await installAndroidUpdate(availableUpdate);
+        const response = await installAndroidUpdate(availableUpdate, setDownloadProgress);
         if (response?.needsPermission) {
           await openAndroidInstallPermissionSettings();
           setUpdateStatus("needs-permission");
@@ -675,9 +672,7 @@ export function Settings() {
    */
   const installBlocked = activeJob !== null && !isInstallingUpdate;
   const dataProgressPercent =
-    progress && progress.total > 0
-      ? Math.min(Math.round((progress.current / progress.total) * 100), 100)
-      : null;
+    progress ? progressPercent(progress.current, progress.total) : null;
   const updateIssueClass =
     updateIssue?.tone === "error"
       ? "text-[hsl(var(--color-destructive))]"
@@ -714,7 +709,7 @@ export function Settings() {
   };
 
   return (
-    <div className="h-full flex flex-col overflow-hidden">
+    <div className="h-full flex flex-col overflow-hidden [&_button]:min-h-11">
       <main className="flex-1 overflow-hidden">
         <CustomScrollArea
           className="h-full"
@@ -722,7 +717,12 @@ export function Settings() {
           trackOffsetTop="calc(3.5rem + 10px)"
           trackOffsetBottom="calc(4.5rem + env(safe-area-inset-bottom, 0px))"
         >
-          <div className="container py-6 pb-24 space-y-6 motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-700">
+          <div
+            className="container py-6 space-y-4 sm:space-y-6 motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-700"
+            style={{
+              paddingBottom: "max(6rem, calc(var(--bottom-nav-inset, 0px) + 1.5rem))",
+            }}
+          >
             <Card className="motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-500">
               <CardHeader>
                 <CardTitle>外观</CardTitle>
@@ -1338,20 +1338,25 @@ function Toggle({
       role="switch"
       aria-checked={on}
       onClick={() => onChange(!on)}
-      className={cn(
-        "relative inline-flex h-6 w-11 flex-shrink-0 items-center rounded-full border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--color-ring))] focus-visible:ring-offset-2 focus-visible:ring-offset-[hsl(var(--color-card))]",
-        on
-          ? "bg-[hsl(var(--color-primary))] border-[hsl(var(--color-primary))]"
-          : "bg-[hsl(var(--color-secondary))] border-[hsl(var(--color-border))]"
-      )}
+      className="relative inline-flex h-11 w-11 flex-shrink-0 items-center focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--color-ring))] focus-visible:ring-offset-2 focus-visible:ring-offset-[hsl(var(--color-card))]"
       aria-label={label}
     >
       <span
         className={cn(
-          "inline-block h-5 w-5 transform rounded-full bg-[hsl(var(--color-card))] shadow transition-transform",
-          on ? "translate-x-5" : "translate-x-0.5"
+          "absolute left-0 top-1/2 h-6 w-11 -translate-y-1/2 rounded-full border transition-colors",
+          on
+            ? "bg-[hsl(var(--color-primary))] border-[hsl(var(--color-primary))]"
+            : "bg-[hsl(var(--color-secondary))] border-[hsl(var(--color-border))]"
         )}
-      />
+        aria-hidden="true"
+      >
+        <span
+          className={cn(
+            "block h-5 w-5 translate-y-px transform rounded-full bg-[hsl(var(--color-card))] shadow transition-transform",
+            on ? "translate-x-5" : "translate-x-0.5"
+          )}
+        />
+      </span>
     </button>
   );
 }

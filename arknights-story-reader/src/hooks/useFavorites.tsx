@@ -10,47 +10,25 @@ import {
 } from "react";
 import type { StoryEntry } from "@/types/story";
 import { useToast } from "@/components/ui/toast";
+import {
+  EMPTY_FAVORITES,
+  collectFavoriteGroupStoryIds,
+  parseFavoritesStorage,
+  reconcileFavoritesState,
+  serializeFavoritesState,
+  type CatalogGroupSnapshot,
+  type FavoriteGroup,
+  type FavoriteGroupPayload,
+  type FavoriteStoryMap,
+  type FavoritesState,
+} from "@/hooks/favoritesUtils";
 
-export type FavoriteGroupType = "chapter" | "activity" | "memory" | "other";
-
-export interface FavoriteGroup {
-  id: string;
-  name: string;
-  type: FavoriteGroupType;
-  storyIds: string[];
-  stories: Record<string, StoryEntry>;
-  /**
-   * 用户从整组收藏里单独摘掉的成员。目录校正（reconcileCatalog）按目录
-   * 全量补齐成员时要跳过这些 id——否则「收藏了整个活动、又取消了其中
-   * 一章」的用户，下一次目录刷新就会看到那一章被偷偷收藏回来。
-   *
-   * 标记不是永久的：用户重新点亮那一章（toggleFavorite）会把它清掉并
-   * 回组；取消收藏整组会连组带名单一起删掉，再收藏整组时从零建组。
-   */
-  excludedStoryIds?: string[];
-}
-
-export interface FavoriteGroupPayload {
-  id: string;
-  name: string;
-  type?: FavoriteGroupType;
-  stories: StoryEntry[];
-}
-
-/** 目录侧的一个分组快照，供 `reconcileCatalog` 校正整组收藏用。 */
-export interface CatalogGroupSnapshot {
-  id: string;
-  name: string;
-  type: FavoriteGroupType;
-  stories: StoryEntry[];
-}
-
-type FavoriteStoryMap = Record<string, StoryEntry>;
-
-interface FavoritesState {
-  stories: FavoriteStoryMap;
-  groups: Record<string, FavoriteGroup>;
-}
+export type {
+  CatalogGroupSnapshot,
+  FavoriteGroup,
+  FavoriteGroupPayload,
+  FavoriteGroupType,
+} from "@/hooks/favoritesUtils";
 
 interface FavoritesContextValue {
   favoriteStories: FavoriteStoryMap;
@@ -76,115 +54,36 @@ interface FavoritesContextValue {
 }
 
 const STORAGE_KEY = "arknights-story-favorites";
-const INITIAL_STATE: FavoritesState = { stories: {}, groups: {} };
 
 const FavoritesContext = createContext<FavoritesContextValue | null>(null);
 
-function sanitizeStoryMap(input: unknown): FavoriteStoryMap {
-  if (!input || typeof input !== "object") return {};
-
-  const entries = Object.entries(input as Record<string, StoryEntry>);
-  const sanitized: FavoriteStoryMap = {};
-
-  for (const [storyId, story] of entries) {
-    if (
-      story &&
-      typeof story === "object" &&
-      typeof (story as StoryEntry).storyId === "string"
-    ) {
-      sanitized[storyId] = story;
-    }
-  }
-
-  return sanitized;
-}
-
-function sanitizeGroupMap(input: unknown): Record<string, FavoriteGroup> {
-  if (!input || typeof input !== "object") return {};
-
-  const groups: Record<string, FavoriteGroup> = {};
-
-  for (const [groupId, value] of Object.entries(input as Record<string, unknown>)) {
-    if (!value || typeof value !== "object") continue;
-    const raw = value as Partial<FavoriteGroup>;
-    const stories = sanitizeStoryMap(raw.stories);
-    const storyIds = Array.isArray(raw.storyIds)
-      ? raw.storyIds.filter((id): id is string => typeof id === "string")
-      : Object.keys(stories);
-
-    if (storyIds.length === 0) continue;
-
-    const excludedStoryIds = Array.isArray(raw.excludedStoryIds)
-      ? Array.from(
-          new Set(raw.excludedStoryIds.filter((id): id is string => typeof id === "string"))
-        )
-      : [];
-
-    // 逐字段收敛：id/name 必须是非空字符串，type 必须落在已知枚举内。
-    // localStorage 可能被旧版本或手改写入任意形状，脏值一律回落到安全默认。
-    groups[groupId] = {
-      id: typeof raw.id === "string" && raw.id ? raw.id : groupId,
-      name: typeof raw.name === "string" && raw.name ? raw.name : groupId,
-      type:
-        raw.type === "chapter" || raw.type === "activity" || raw.type === "memory"
-          ? raw.type
-          : "other",
-      storyIds: Array.from(new Set(storyIds)),
-      stories,
-      ...(excludedStoryIds.length > 0 ? { excludedStoryIds } : {}),
-    };
-  }
-
-  return groups;
-}
-
 function readFromStorage(): FavoritesState {
   if (typeof window === "undefined") {
-    return INITIAL_STATE;
+    return EMPTY_FAVORITES;
   }
 
   try {
     const stored = window.localStorage.getItem(STORAGE_KEY);
-    if (!stored) return INITIAL_STATE;
-    const parsed = JSON.parse(stored) as unknown;
-
-    if (parsed && typeof parsed === "object") {
-      const asState = parsed as Partial<FavoritesState>;
-
-      if ("stories" in asState || "groups" in asState) {
-        return {
-          stories: sanitizeStoryMap(asState.stories),
-          groups: sanitizeGroupMap(asState.groups),
-        };
-      }
-
-      // 向后兼容旧版本（仅保存关卡收藏）
-      return {
-        stories: sanitizeStoryMap(parsed),
-        groups: {},
-      };
-    }
-
-    return INITIAL_STATE;
+    return parseFavoritesStorage(stored);
   } catch (error) {
     console.warn("[Favorites] 读取本地收藏失败:", error);
-    return INITIAL_STATE;
+    return EMPTY_FAVORITES;
   }
-}
-
-function collectGroupStoryIds(groups: Record<string, FavoriteGroup>): Set<string> {
-  const ids = new Set<string>();
-  for (const group of Object.values(groups)) {
-    group.storyIds.forEach((id) => ids.add(id));
-  }
-  return ids;
 }
 
 /** 失败提示的会话级闩锁：同一轮连续失败只打扰用户一次，写成功后复位。 */
 let persistFailureNotified = false;
+/**
+ * quota/隐私模式写失败后的会话级接力。Provider 可能因路由或错误边界重挂载；
+ * 只把失败标记放 ref 里会连同尚未落盘的收藏一起丢掉。
+ */
+let failedFavoritesWrite: { state: FavoritesState; raw: string } | null = null;
 
 export function FavoritesProvider({ children }: { children: ReactNode }) {
-  const [favorites, setFavorites] = useState<FavoritesState>(() => readFromStorage());
+  const inheritedFailedWriteRef = useRef(failedFavoritesWrite !== null);
+  const [favorites, setFavorites] = useState<FavoritesState>(
+    () => failedFavoritesWrite?.state ?? readFromStorage()
+  );
 
   /**
    * 收藏口径：单章收藏 ∪ 收藏分组展开后的所有章节。
@@ -192,7 +91,7 @@ export function FavoritesProvider({ children }: { children: ReactNode }) {
    * 否则会出现「分组已收藏、组里每一条却是空心星」这种自相矛盾的状态。
    */
   const groupedStoryIds = useMemo(
-    () => collectGroupStoryIds(favorites.groups),
+    () => collectFavoriteGroupStoryIds(favorites.groups),
     [favorites.groups]
   );
 
@@ -222,34 +121,44 @@ export function FavoritesProvider({ children }: { children: ReactNode }) {
   const favoritesRef = useRef(favorites);
   favoritesRef.current = favorites;
   // 上一次写入失败后置位：等下一次改动或切后台 / 关页面时带最新状态重试。
-  const persistFailedRef = useRef(false);
+  const persistFailedRef = useRef(inheritedFailedWriteRef.current);
 
   const persistFavorites = useCallback(() => {
     try {
-      const raw = JSON.stringify(favoritesRef.current);
+      const raw = serializeFavoritesState(favoritesRef.current);
       if (raw === lastRawRef.current) {
         persistFailedRef.current = false;
+        failedFavoritesWrite = null;
         return;
       }
       window.localStorage.setItem(STORAGE_KEY, raw);
       lastRawRef.current = raw;
       persistFailedRef.current = false;
+      failedFavoritesWrite = null;
       persistFailureNotified = false;
     } catch (error) {
       // setItem 失败（quota 满 / 隐私模式）是原子的：旧数据原样保留。
       // 星标在界面上已经点亮，静默失败等于骗用户「已收藏」，重启后收藏
       // 全没了——提示一次，并留待重试（划线 / 阅读设置 / 进度同款处理）。
       persistFailedRef.current = true;
+      const state = favoritesRef.current;
+      failedFavoritesWrite = { state, raw: serializeFavoritesState(state) };
       console.warn("[Favorites] 写入本地收藏失败:", error);
       if (!persistFailureNotified) {
         persistFailureNotified = true;
-        toastRef.current.error("收藏未能保存到本地存储（空间可能已满），将自动重试");
+        toastRef.current.error(
+          "收藏未能保存到本地存储（空间可能已满），将自动重试",
+          15_000
+        );
       }
     }
   }, []);
 
   useEffect(() => {
     if (favorites === initialFavoritesRef.current) {
+      // 重挂载接手的是上一个 Provider 没写进去的快照；它不是普通首帧，
+      // 必须立刻再试一次，且失败后继续由 pagehide/后续改动重试。
+      if (inheritedFailedWriteRef.current) persistFavorites();
       return;
     }
     persistFavorites();
@@ -293,6 +202,8 @@ export function FavoritesProvider({ children }: { children: ReactNode }) {
       // 外部写入以后到为准：本窗口没写进去的旧状态即将被整体替换，
       // 失败重试标记一并清掉，免得兜底重试把对方刚写的内容盖掉。
       persistFailedRef.current = false;
+      failedFavoritesWrite = null;
+      persistFailureNotified = false;
       setFavorites(readFromStorage());
     };
     window.addEventListener("storage", onStorage);
@@ -442,108 +353,7 @@ export function FavoritesProvider({ children }: { children: ReactNode }) {
    */
   const reconcileCatalog = useCallback(
     (catalog: { entries: StoryEntry[]; groups: CatalogGroupSnapshot[] }) => {
-      const freshById = new Map<string, StoryEntry>();
-      for (const entry of catalog.entries) {
-        if (entry && typeof entry === "object" && typeof entry.storyId === "string") {
-          freshById.set(entry.storyId, entry);
-        }
-      }
-      if (freshById.size === 0) return;
-
-      const freshGroups = new Map<string, CatalogGroupSnapshot>();
-      for (const group of catalog.groups) {
-        if (group && typeof group.id === "string" && group.stories.length > 0) {
-          freshGroups.set(group.id, group);
-        }
-      }
-
-      const sameEntry = (a: StoryEntry, b: StoryEntry) =>
-        a === b || JSON.stringify(a) === JSON.stringify(b);
-
-      setFavorites((prev) => {
-        let changed = false;
-
-        /** 内容有变才返回新 map，否则返回 null 表示原样保留。 */
-        const refreshMap = (stored: FavoriteStoryMap): FavoriteStoryMap | null => {
-          let mapChanged = false;
-          const next: FavoriteStoryMap = {};
-          for (const [id, story] of Object.entries(stored)) {
-            const fresh = freshById.get(id);
-            if (fresh && !sameEntry(fresh, story)) {
-              next[id] = fresh;
-              mapChanged = true;
-            } else {
-              next[id] = story;
-            }
-          }
-          return mapChanged ? next : null;
-        };
-
-        const refreshedStories = refreshMap(prev.stories);
-        if (refreshedStories) changed = true;
-
-        let groupsChanged = false;
-        const nextGroups: Record<string, FavoriteGroup> = {};
-        for (const [groupId, group] of Object.entries(prev.groups)) {
-          const catalogGroup = freshGroups.get(groupId);
-          if (!catalogGroup) {
-            const refreshed = refreshMap(group.stories);
-            if (refreshed) {
-              nextGroups[groupId] = { ...group, stories: refreshed };
-              groupsChanged = true;
-            } else {
-              nextGroups[groupId] = group;
-            }
-            continue;
-          }
-
-          // 成员以目录为准补齐，但跳过用户显式摘掉的那些（excludedStoryIds）：
-          // 补齐是为了跟上新数据包，不是为了推翻用户的手动取消。
-          const excluded = new Set(group.excludedStoryIds ?? []);
-          const stories: FavoriteStoryMap = {};
-          const storyIds: string[] = [];
-          for (const story of catalogGroup.stories) {
-            if (!story || typeof story.storyId !== "string") continue;
-            if (excluded.has(story.storyId)) continue;
-            if (stories[story.storyId]) continue;
-            stories[story.storyId] = story;
-            storyIds.push(story.storyId);
-          }
-          if (storyIds.length === 0) {
-            nextGroups[groupId] = group;
-            continue;
-          }
-
-          const sameMembers =
-            storyIds.length === group.storyIds.length &&
-            storyIds.every((id, index) => id === group.storyIds[index]) &&
-            storyIds.every(
-              (id) => Boolean(group.stories[id]) && sameEntry(stories[id], group.stories[id])
-            );
-          if (sameMembers && catalogGroup.name === group.name && catalogGroup.type === group.type) {
-            nextGroups[groupId] = group;
-          } else {
-            nextGroups[groupId] = {
-              id: group.id,
-              name: catalogGroup.name,
-              type: catalogGroup.type,
-              storyIds,
-              stories,
-              ...(group.excludedStoryIds && group.excludedStoryIds.length > 0
-                ? { excludedStoryIds: group.excludedStoryIds }
-                : {}),
-            };
-            groupsChanged = true;
-          }
-        }
-        if (groupsChanged) changed = true;
-
-        if (!changed) return prev;
-        return {
-          stories: refreshedStories ?? prev.stories,
-          groups: groupsChanged ? nextGroups : prev.groups,
-        };
-      });
+      setFavorites((previous) => reconcileFavoritesState(previous, catalog));
     },
     []
   );
