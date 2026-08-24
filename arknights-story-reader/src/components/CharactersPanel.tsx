@@ -564,8 +564,17 @@ export function CharactersPanel({
       loadedOnceRef.current = false;
       if (!aliveRef.current) return;
       if (/NOT_INSTALLED|未安装/i.test(raw)) {
+        // 与上方探针显式返回 false 的分支保持同一套状态：数据已经没了，
+        // 旧统计不能留着——否则开着的角色详情会顶着「还没有剧情数据」
+        // 卡片继续渲染旧数据（详情块只看 selectedAgg，不看 notInstalled）。
         setNotInstalled(true);
+        setAggregates(new Map());
+        setProgress({ current: 0, total: 0 });
       } else {
+        // 走到这里说明这次连安装状态都读不到，之前探针得出的「未安装」
+        // 已经过期。不清掉的话，未安装空态和错误卡会叠在一起（各带一个
+        // 「去设置同步」/「重试」按钮），两句话互相矛盾。
+        setNotInstalled(false);
         setError(raw || "加载失败");
       }
     } finally {
