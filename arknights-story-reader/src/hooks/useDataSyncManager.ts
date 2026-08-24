@@ -335,7 +335,17 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
       onSuccessRef.current?.();
       await loadVersionInfo({ silent: true });
       if (mountedRef.current) {
-        setProgress({ phase: "完成", current: 1, total: 1, message: "同步完成" });
+        // 只是兜底：后端在 sync_data 返回前已发过同款「完成」事件。这里隔着
+        // loadVersionInfo 的几次网络往返，索引重建线程可能已经经 sync-progress
+        // 发来自己的终态——尤其是快速失败（磁盘满、索引库打不开）时的
+        // 「索引重建失败，可稍后在设置中手动重试」。无条件覆盖会把刚亮出来的
+        // 失败通知刷成「同步完成」，那是它在本流程里唯一的主动提示。已是终态
+        // 就保持原样，只在进度还停在中途（完成事件丢失/未达）时补写。
+        setProgress((prev) =>
+          prev && isTerminalProgress(prev)
+            ? prev
+            : { phase: "完成", current: 1, total: 1, message: "同步完成" }
+        );
       }
     } catch (err) {
       devWarn("[useDataSyncManager] 同步失败:", err);
@@ -386,7 +396,14 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
         onSuccessRef.current?.();
         await loadVersionInfo({ silent: true });
         if (mountedRef.current) {
-          setProgress({ phase: "完成", current: 100, total: 100, message: "导入完成" });
+          // 与 handleSync 同一句兜底纪律：后端已发过「完成」，这里只补
+          // 事件丢失的场景；索引重建线程若已发来终态（含失败通知），
+          // 保持原样，不许拿「导入完成」把它盖掉。
+          setProgress((prev) =>
+            prev && isTerminalProgress(prev)
+              ? prev
+              : { phase: "完成", current: 100, total: 100, message: "导入完成" }
+          );
         }
       } catch (err) {
         devWarn("[useDataSyncManager] 导入失败:", err);

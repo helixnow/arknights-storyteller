@@ -681,6 +681,19 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
       setProgress(null);
     };
 
+    // facet 只在真的换了结果集（换词 / 换模式）时清。同一条查询的强制重搜
+    // ——索引重建收场的自动补搜、「刷新缓存」、失败重试——是原地换数据，
+    // 用户手选的分类筛选必须留着：补搜由后台触发，用户没碰任何东西，正在
+    // 浏览的筛选列表不能突然膨胀回全量。新结果若不再含该分类，下面结果
+    // 落地处会对账清掉，不会留下看不见的僵尸筛选。
+    const sameResultSet = raw === lastQuery && activeMode === mode;
+    // 结果落地后按新页的 facets 对账：保留的 facet 若在新结果里已不存在
+    // （例如切进调试模式后 facets 恒为空），继续挂着会把列表过滤成空、
+    // 而"清除筛选"按钮又只在 facet 区渲染时才有，用户会被困在空列表里。
+    const reconcileFacet = (facets: Record<string, number> | undefined) => {
+      setActiveFacet((prev) => (prev !== null && (facets?.[prev] ?? 0) > 0 ? prev : null));
+    };
+
     autoFailedRef.current = null;
     inFlightRef.current = {
       mode: activeMode,
@@ -691,7 +704,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     setSearching(true);
     searchingRef.current = true;
     setSearchError(null);
-    setActiveFacet(null);
+    if (!sameResultSet) setActiveFacet(null);
     setActiveIndex(-1);
     // 还没收到后端进度事件之前保持 total = 0：UI 走不确定态 spinner，
     // 而不是显示一条永远停在 0% 的假进度条。
@@ -771,6 +784,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
         if (cached && cached.version === activeVersion) {
           setPage(cached.page);
           setSegmentPage(null);
+          reconcileFacet(cached.page.facets);
           setSearched(true);
           setFromCache({ used: true, updatedAt: cached.updatedAt });
           commitQuery();
@@ -790,6 +804,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
           facets: {},
         });
         setSegmentPage(null);
+        reconcileFacet({});
         setDebugLogs(data.logs);
         setDebugExpanded(true);
         setFromCache({ used: false });
@@ -798,6 +813,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
         if (isStale()) return;
         setPage(data);
         setSegmentPage(null);
+        reconcileFacet(data.facets);
         setDebugLogs([]);
         setDebugExpanded(false);
         // 索引不可信时这是线性扫描的结果（总数不准、可能不完整），只展示

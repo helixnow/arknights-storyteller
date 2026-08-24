@@ -431,6 +431,13 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   overlayOpenRef.current =
     settingsOpen || insightsOpen || shareDialogOpen || selectMode || moreMenuOpen;
 
+  // 正文是否被真正的遮罩盖住（抽屉 / 分享对话框 / 浮层菜单会挡住命中测试）。
+  // 选段模式不算：它只换了底部工具栏，正文完全可见，顶部锚点必须照常刷新
+  // ——否则在选段里翻了几屏再退出，重排锚定会按进选段前的旧锚点把读者拽
+  // 回去。
+  const textObscuredRef = useRef(false);
+  textObscuredRef.current = settingsOpen || insightsOpen || shareDialogOpen || moreMenuOpen;
+
   // 最近一次持久化的阅读进度。恢复逻辑只在换篇 / 换模式时读取它，所以用
   // ref 兜住，避免把持续变化的 `progress` 写进 effect 依赖。
   const progressRef = useRef(progress);
@@ -1121,7 +1128,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       lastScrollTopRef.current = storedTop;
       // 视口已被程序化挪到新位置，此前捕获的顶部锚点随之过期。不清掉的话，
       // 「切到分页读了很久 → 切回滚动（此时设置抽屉还开着，滚动监听因
-      // overlayOpenRef 不会刷新锚点）→ 顺手调字号」这条动线会让排版重排
+      // textObscuredRef 不会刷新锚点）→ 顺手调字号」这条动线会让排版重排
       // 效果按旧锚点把读者拽回上一次滚动会话的段落，随后进度落盘再把错误
       // 位置写成真实进度。清空后重排走 scrollRatioRef 的百分比兜底，位置
       // 与本次恢复一致；用户一旦真正滚动，锚点会照常重新捕获。
@@ -1218,7 +1225,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
         });
 
         // 抽屉盖住正文时命中测试会打在遮罩上，这时保留上一次的锚点。
-        if (!overlayOpenRef.current) {
+        if (!textObscuredRef.current) {
           const anchor = captureTopAnchor(container);
           if (anchor) topAnchorRef.current = anchor;
         }
@@ -1321,6 +1328,10 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     settings.pageWidth,
     settings.textAlign,
     settings.paragraphIndent ? 1 : 0,
+    // 进出选段模式会隐藏/恢复对话头像并同步收放 3rem 左内边距，全部对话段
+    // 重新换行，和调字号是同一类整体重排——不锚定的话，读者正想选的那一段
+    // 会随重排漂出视口。
+    selectMode ? 1 : 0,
   ].join("|");
   const typographyRef = useRef<string | null>(null);
   useLayoutEffect(() => {
