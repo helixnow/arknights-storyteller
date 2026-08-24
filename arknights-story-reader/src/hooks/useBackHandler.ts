@@ -1,9 +1,11 @@
 import { useEffect, useRef } from "react";
 import {
   createBackDispatcher,
+  createHistoryBackWatchdog,
   INITIAL_HISTORY_GUARD_STATE,
   reduceHistoryGuard,
   type BackDispatchEntry,
+  type HistoryBackWatchdog,
   type HistoryGuardEvent,
   type HistoryGuardState,
 } from "@/lib/appShellLogic";
@@ -143,6 +145,19 @@ export function requestBack({ minPriority = 0 }: RequestBackOptions = {}): boole
  * 因 effect 清理/挂载顺序丢掉返回栈。
  */
 let historyGuardState: HistoryGuardState = { ...INITIAL_HISTORY_GUARD_STATE };
+let historyBackWatchdog: HistoryBackWatchdog | null = null;
+
+function getHistoryBackWatchdog(): HistoryBackWatchdog {
+  if (historyBackWatchdog) return historyBackWatchdog;
+  historyBackWatchdog = createHistoryBackWatchdog<number>({
+    setTimer: (callback, delay) => window.setTimeout(callback, delay),
+    clearTimer: (handle) => window.clearTimeout(handle),
+    onTimeout: () => {
+      transitionHistoryGuard({ type: "history-back-failed" });
+    },
+  });
+  return historyBackWatchdog;
+}
 
 function transitionHistoryGuard(event: HistoryGuardEvent) {
   if (typeof window === "undefined") return;
@@ -158,9 +173,15 @@ function transitionHistoryGuard(event: HistoryGuardEvent) {
       continue;
     }
     if (effect === "history-back") {
+      // history.back() 在根条目上无声 no-op，既不抛错也不派发 popstate。
+      // 先上 watchdog；正常 popstate 会取消，250ms 内没回声就把状态机从
+      // continuing/disarming 中释放出来。
+      const watchdog = getHistoryBackWatchdog();
+      watchdog.arm();
       try {
         window.history.back();
       } catch {
+        watchdog.cancel();
         transitionHistoryGuard({ type: "history-back-failed" });
       }
       continue;
@@ -192,6 +213,7 @@ function installGlobalListener() {
   }
 
   window.addEventListener("popstate", () => {
+    historyBackWatchdog?.cancel();
     transitionHistoryGuard({
       type: "popstate",
       hasHandlers: hasAvailableHandlers(),

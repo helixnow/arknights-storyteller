@@ -299,6 +299,51 @@ export function createBackDispatcher<T extends BackDispatchEntry>({
   };
 }
 
+export const HISTORY_BACK_WATCHDOG_MS = 250;
+
+export interface HistoryBackWatchdog {
+  arm: () => void;
+  cancel: () => void;
+  isArmed: () => boolean;
+}
+
+/**
+ * history.back() has no completion callback and silently does nothing at the
+ * root entry. This watchdog lets popstate cancel the expected navigation; if
+ * no event arrives, the caller can feed history-back-failed to the reducer.
+ */
+export function createHistoryBackWatchdog<Handle>({
+  setTimer,
+  clearTimer,
+  onTimeout,
+  delay = HISTORY_BACK_WATCHDOG_MS,
+}: {
+  setTimer: (callback: () => void, delay: number) => Handle;
+  clearTimer: (handle: Handle) => void;
+  onTimeout: () => void;
+  delay?: number;
+}): HistoryBackWatchdog {
+  let handle: Handle | undefined;
+
+  const cancel = () => {
+    if (handle === undefined) return;
+    clearTimer(handle);
+    handle = undefined;
+  };
+
+  return {
+    arm: () => {
+      cancel();
+      handle = setTimer(() => {
+        handle = undefined;
+        onTimeout();
+      }, delay);
+    },
+    cancel,
+    isArmed: () => handle !== undefined,
+  };
+}
+
 export type HistoryGuardPhase = "idle" | "armed" | "disarming" | "continuing";
 
 export interface HistoryGuardState {

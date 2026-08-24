@@ -2,9 +2,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  HISTORY_BACK_WATCHDOG_MS,
   INITIAL_HISTORY_GUARD_STATE,
   READER_RETENTION_MS,
   createBackDispatcher,
+  createHistoryBackWatchdog,
   reduceHistoryGuard,
 } from "../lib/appShellLogic.ts";
 
@@ -198,6 +200,53 @@ test("useBackHandler：最后一层消费后哨兵不重装，首页下一次返
   });
   assert.equal(finished.state.phase, "idle");
   assert.deepEqual(finished.effects, []);
+});
+
+test("useBackHandler：history.back 无 popstate 时 250ms watchdog 释放 continuing", () => {
+  const timers = new Map();
+  let nextTimer = 1;
+  let state = { phase: "continuing", rearmAfterNavigation: true };
+  const watchdog = createHistoryBackWatchdog({
+    setTimer: (callback, delay) => {
+      assert.equal(delay, HISTORY_BACK_WATCHDOG_MS);
+      const id = nextTimer++;
+      timers.set(id, callback);
+      return id;
+    },
+    clearTimer: (id) => timers.delete(id),
+    onTimeout: () => {
+      state = reduceHistoryGuard(state, { type: "history-back-failed" }).state;
+    },
+  });
+
+  watchdog.arm();
+  assert.equal(watchdog.isArmed(), true);
+  assert.equal(timers.size, 1);
+  const callback = timers.values().next().value;
+  callback();
+  assert.equal(watchdog.isArmed(), false);
+  assert.equal(state.phase, "idle");
+});
+
+test("useBackHandler：popstate 及时取消 history.back watchdog", () => {
+  const timers = new Map();
+  let timedOut = 0;
+  const watchdog = createHistoryBackWatchdog({
+    setTimer: (callback) => {
+      timers.set(1, callback);
+      return 1;
+    },
+    clearTimer: (id) => timers.delete(id),
+    onTimeout: () => {
+      timedOut += 1;
+    },
+  });
+
+  watchdog.arm();
+  watchdog.cancel(); // popstate listener 的行为
+  assert.equal(watchdog.isArmed(), false);
+  assert.equal(timers.size, 0);
+  assert.equal(timedOut, 0);
 });
 
 test("App reader retention：隐藏实例 TTL 与五分钟预取窗口一致", () => {
