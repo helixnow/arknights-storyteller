@@ -1,10 +1,9 @@
 /**
  * 搜索查询串的纯函数工具。
  *
- * 从 SearchPanel 抽出来的原因只有一个：这两个函数承载了与后端查询语法
- * （`-排除`、`NOT`、`OR`/`AND`、`"短语"`）对齐的细则，历史上出过好几次
- * 回归（悬挂 NOT、`not -词` 连用、`"not"` 字面短语被当成连接词、粘连
- * 引号 `not"短语"` 的极性），必须能脱离 React 用 node:test 直接锁行为。
+ * 从 SearchPanel 抽出来的纯逻辑必须能脱离 React 用 node:test 直接锁行为：
+ * 查询词解析要与后端的 `-排除`、`NOT`、`OR`/`AND`、`"短语"` 语法一致，
+ * 缓存版本则只能接受后端正常同步产生的 commit 缩写。
  */
 
 /**
@@ -29,6 +28,27 @@ export const MAX_HIGHLIGHT_TERMS = 12;
  */
 function normalizeQuery(raw: string): string {
   return raw.normalize("NFKC");
+}
+
+/**
+ * `get_current_version` 的正常同步版本固定以 7 位十六进制 commit 缩写开头，
+ * 后面才是会随时间变化的相对日期。只有这个头部能证明缓存属于哪份数据。
+ *
+ * `manual-`（所有手动导入经后端截短后都相同）、`unknown`、CJK 状态文案，
+ * 以及手改 version.json 产生的任意 ASCII 文本都没有数据身份，必须折成空串，
+ * 让调用方停用缓存；loadCacheMap 也据此丢弃历史假版本条目。
+ */
+export function stableVersionOf(version: string): string {
+  const head = version.split(" ")[0] ?? "";
+  return /^[0-9a-f]{7}$/i.test(head) ? head : "";
+}
+
+/** 只有状态查询明确报 ready、且当前没有重建，搜索结果才具备索引可信度。 */
+export function isSearchIndexTrusted(
+  status: { ready: boolean } | null,
+  buildingIndex: boolean
+): boolean {
+  return status?.ready === true && !buildingIndex;
 }
 
 /**

@@ -12,8 +12,42 @@ import assert from "node:assert/strict";
 import {
   highlightTerms,
   isAutoSearchable,
+  isSearchIndexTrusted,
   MAX_HIGHLIGHT_TERMS,
+  stableVersionOf,
 } from "./searchTerms.ts";
+
+// ─────────────────────────────────────────────────────────
+// stableVersionOf：缓存只认真实 commit 缩写
+// ─────────────────────────────────────────────────────────
+
+test("stableVersionOf：只提取后端正常返回的 7 位十六进制 commit 头", () => {
+  assert.equal(stableVersionOf("abcdef1 (3天前)"), "abcdef1");
+  assert.equal(stableVersionOf("0123ABC (刚刚)"), "0123ABC");
+});
+
+test("stableVersionOf：假版本身份全部折成空串", () => {
+  for (const version of [
+    "",
+    "unknown (刚刚)",
+    "manual- (刚刚)",
+    "本地数据（版本未知）",
+    "未安装",
+    // 这些全是可见 ASCII，旧实现会误放行；但它们不是 commit 缩写。
+    "fixture (刚刚)",
+    "commit-1 (刚刚)",
+  ]) {
+    assert.equal(stableVersionOf(version), "", version);
+  }
+});
+
+test("isSearchIndexTrusted：只信明确就绪且不在重建的状态", () => {
+  assert.equal(isSearchIndexTrusted({ ready: true }, false), true);
+  assert.equal(isSearchIndexTrusted({ ready: false }, false), false);
+  assert.equal(isSearchIndexTrusted({ ready: true }, true), false);
+  // 状态尚未返回或查询失败时没有“索引完整”的证据，空页必须走待就绪分流。
+  assert.equal(isSearchIndexTrusted(null, false), false);
+});
 
 // ─────────────────────────────────────────────────────────
 // highlightTerms：NOT / 减号排除

@@ -24,7 +24,12 @@ import {
 import { CustomScrollArea } from "@/components/ui/custom-scroll-area";
 import { cn } from "@/lib/utils";
 // 查询串解析（高亮词提取 / 自动搜可发判定）抽到纯模块里，供 node:test 锁行为。
-import { highlightTerms, isAutoSearchable } from "@/lib/searchTerms";
+import {
+  highlightTerms,
+  isAutoSearchable,
+  isSearchIndexTrusted,
+  stableVersionOf,
+} from "@/lib/searchTerms";
 import { useToast } from "@/components/ui/toast";
 import {
   acquireDataJob,
@@ -195,34 +200,6 @@ function createHighlighter(query: string): Highlighter {
 /** facet 的 key 是 `category` 里 ` | ` 之前的类型前缀（见后端 build facets）。 */
 function facetKeyOf(category: string): string {
   return category.split(" | ")[0]?.trim() ?? category;
-}
-
-/**
- * get_current_version 返回 `abc1234 (3天前)` 这种带相对时间的串，隔天整串就变了。
- * 缓存版本只取 commit 部分，数据没变缓存就一直有效。
- *
- * 但取出来的头部必须真的能区分两份不同的数据，做不到就返回空串、走各调用点
- * 已有的"无版本→缓存整体停用"路径（见 activeVersion 判空处的注释）。后端有
- * 三种形态的版本串头部不具备数据身份，全是跨数据集的常量：
- *   - 哨兵文案：数据在而 version.json 读不出来（断电截断、换入后写失败）时
- *     返回"本地数据（版本未知）"，未安装时返回"未安装"。整串没有空格，旧实现
- *     的 `|| v` 会把它原样放行成 truthy 版本，把"版本未知窗口期停用缓存"的
- *     机制整个绕开；
- *   - `manual-`：手动导入存的 commit 是 `manual-<导入时间戳>`，但后端
- *     short_commit 只留前 7 个字符，时间戳恰好整个被截掉——所有手动导入的
- *     数据包都报同一个头。导入 A 包搜过的结果落了盘，换导 B 包再重启，
- *     版本对得上号，A 包的旧结果就会当作有效缓存直接端给用户；
- *   - `unknown`：同步时拿不到 remote commit（GitHub API 限流是常态）仍会
- *     下载默认分支并把 commit 记成 "unknown"，两次限流窗口里同步到的数据
- *     不同、版本却相同。
- * 真实 commit 头（hex 短串）全是可见 ASCII，哨兵文案全是 CJK，按形状分流比
- * 枚举文案措辞更稳。loadCacheMap 复用同一判定：按这些假版本落盘的历史条目
- * 在读入时经空版本守卫一并丢弃。
- */
-function stableVersionOf(v: string): string {
-  const head = v.split(" ")[0] || "";
-  if (head === "unknown" || head === "manual-") return "";
-  return /^[!-~]+$/.test(head) ? head : "";
 }
 
 function prune<T extends { updatedAt: number }>(map: Record<string, T>): Record<string, T> {
@@ -565,9 +542,12 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     [page]
   );
 
-  const indexReady = Boolean(indexStatus?.ready) && !buildingIndex;
-  /** 索引"还没有"和"搜不到"是两回事，空结果的文案要靠它分流。 */
-  const indexPending = buildingIndex || (indexStatus != null && !indexStatus.ready);
+  const indexReady = isSearchIndexTrusted(indexStatus, buildingIndex);
+  /**
+   * 索引"还没有"和"搜不到"是两回事，空结果的文案要靠它分流。状态尚未
+   * 返回或查询失败同样没有可信索引，不能反过来宣称空页是权威零命中。
+   */
+  const indexPending = !indexReady;
 
   const hitCount = mode === "segment" ? segmentHits.length : page?.results.length ?? 0;
   // 边打边搜时旧结果留在原地（只压暗），不然每敲一个字整页都要闪一次白。
@@ -1541,6 +1521,18 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
    *   3. 出错 —— 单独由错误卡片处理（见下方 renderSearchError）。
    */
   const renderEmptyState = () => {
+    // 状态还没回来：空页不可信，但不能假装已经确认「没有索引」。
+    if (indexStatus == null && !buildingIndex) {
+      return (
+        <div className="mx-auto flex max-w-md flex-col items-center gap-3 rounded-lg border border-dashed border-[hsl(var(--color-border))] p-6 text-center">
+          <Loader2 className="h-6 w-6 animate-spin text-[hsl(var(--color-muted-foreground))]" aria-hidden="true" />
+          <div className="text-sm font-medium">正在确认索引状态</div>
+          <p className="text-xs leading-relaxed text-[hsl(var(--color-muted-foreground))]">
+            还不能把空页当成搜不到，也还不能断定索引缺失。状态回来后会自动继续。
+          </p>
+        </div>
+      );
+    }
     if (indexPending) {
       return (
         <div className="mx-auto flex max-w-md flex-col items-center gap-3 rounded-lg border border-dashed border-[hsl(var(--color-border))] p-6 text-center">
@@ -1605,7 +1597,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
       <p className="break-words text-xs leading-relaxed text-[hsl(var(--color-muted-foreground))]">
         {failure.message}
       </p>
-      {indexPending && (
+      {indexPending && indexStatus != null && (
         <p className="text-xs text-[hsl(var(--color-muted-foreground))]">
           全文索引尚未就绪，很可能就是原因所在。
         </p>
@@ -1619,7 +1611,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
           <Search className="mr-2 h-4 w-4" aria-hidden="true" />
           重试
         </Button>
-        {indexPending && !buildingIndex && (
+        {indexPending && !buildingIndex && indexStatus != null && (
           <Button
             variant="outline"
             className="min-h-[44px]"
