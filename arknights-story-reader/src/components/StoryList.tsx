@@ -385,6 +385,23 @@ let summaryInflight = 0;
  */
 const SUMMARY_MAX_ATTEMPTS = 2;
 
+/**
+ * 简介四张表（缓存 / loading / 重试配额 / 在途）的共用键：storyId 拼上
+ * storyInfo 路径。只按 storyId 记账会埋一个换包时序坑：换包的重发信号
+ * （summaryEpoch）是同步递增的，而收藏行里旧 StoryEntry 要等新目录落地、
+ * reconcileCatalog 跑完才换成新对象——中间这段窗口，常驻的收藏行会先拿
+ * 旧 storyInfo 路径重发简介。新包里该路径多半已不存在，失败回来得极快，
+ * loading 复位又自动补一发，两次配额（SUMMARY_MAX_ATTEMPTS）转眼在新
+ * 代数下被旧路径耗尽；等目录校正把同 storyId 的新路径灌进来，请求
+ * effect 虽因 storyInfo 变化重跑，配额却查同一个 storyId 已满——新路径
+ * 整个会话都发不出去，行上永远挂着「暂无简介内容」。路径进键后新旧
+ * 路径各记各的配额与结果：旧路径的失败殃及不到新路径，旧路径晚到的
+ * 成功结果也写不进新键、污染不了新简介。
+ */
+function summaryStateKey(story: StoryEntry): string {
+  return `${story.storyId}|${story.storyInfo ?? ""}`;
+}
+
 function runSummaryQueue() {
   while (summaryInflight < SUMMARY_MAX_INFLIGHT && summaryQueue.length > 0) {
     const task = summaryQueue.shift();
@@ -578,7 +595,11 @@ export function StoryList({ onSelectStory }: StoryListProps) {
    * 活动剧情超时」立在健康的主线列表上就是把错误写到了别人的页面。
    */
   const activeCategoryRef = useRef<Category>(activeCategory);
-  /** 每条简介已发起的请求次数 / 在途标记，配合 SUMMARY_MAX_ATTEMPTS 封顶。 */
+  /**
+   * 每条简介已发起的请求次数 / 在途标记，配合 SUMMARY_MAX_ATTEMPTS 封顶。
+   * 键是 summaryStateKey（storyId+storyInfo 路径），不能只用 storyId——
+   * 换包后同 storyId 换了路径的行要有自己的一份配额（见 summaryStateKey）。
+   */
   const summaryAttemptsRef = useRef<Map<string, number>>(new Map());
   const summaryInflightRef = useRef<Set<string>>(new Set());
   /**
@@ -906,24 +927,26 @@ export function StoryList({ onSelectStory }: StoryListProps) {
   const handleRequestSummary = useCallback(async (story: StoryEntry) => {
     const storyInfo = story.storyInfo;
     if (!storyInfo) return;
-    // 同一条剧情可能同时出现在收藏和原分类里，两行都会来要简介。
-    if (summaryInflightRef.current.has(story.storyId)) return;
-    const attempts = summaryAttemptsRef.current.get(story.storyId) ?? 0;
+    const key = summaryStateKey(story);
+    // 同一条剧情可能同时出现在收藏和原分类里，两行都会来要简介；
+    // 两行的 storyInfo 一致时算出同一个键，在途标记照样去重。
+    if (summaryInflightRef.current.has(key)) return;
+    const attempts = summaryAttemptsRef.current.get(key) ?? 0;
     if (attempts >= SUMMARY_MAX_ATTEMPTS) return;
-    summaryAttemptsRef.current.set(story.storyId, attempts + 1);
-    summaryInflightRef.current.add(story.storyId);
+    summaryAttemptsRef.current.set(key, attempts + 1);
+    summaryInflightRef.current.add(key);
     // 发起时记下代数。落地时代数不符说明数据源已经换过，这份结果属于
     // 旧包，缓存和标记都不能再写（见 summaryGenerationRef 的注释）。
     const generation = summaryGenerationRef.current;
 
-    setSummaryLoadingIds((prev) => ({ ...prev, [story.storyId]: true }));
+    setSummaryLoadingIds((prev) => ({ ...prev, [key]: true }));
     try {
       const raw = await scheduleSummary(() => api.getStoryInfo(storyInfo));
       if (summaryGenerationRef.current !== generation) return;
       const normalized = raw.replace(/\r\n/g, "\n").trim();
       setSummaryCache((prev) => ({
         ...prev,
-        [story.storyId]: normalized.length > 0 ? normalized : "",
+        [key]: normalized.length > 0 ? normalized : "",
       }));
     } catch (err) {
       console.warn("[StoryList] 加载简介失败:", story.storyId, err);
@@ -932,10 +955,10 @@ export function StoryList({ onSelectStory }: StoryListProps) {
       // 代数已变时在途 / loading 标记在换包时整体清空过，此刻的同名标记
       // 属于换包后新发起的请求，旧请求不能替它收尾。
       if (summaryGenerationRef.current === generation) {
-        summaryInflightRef.current.delete(story.storyId);
+        summaryInflightRef.current.delete(key);
         setSummaryLoadingIds((prev) => {
           const next = { ...prev };
-          delete next[story.storyId];
+          delete next[key];
           return next;
         });
       }
@@ -1355,8 +1378,8 @@ export function StoryList({ onSelectStory }: StoryListProps) {
         isFavorite={isFavorite(story.storyId)}
         onToggleFavorite={handleToggleFavorite}
         showSummary={showSummaries}
-        summary={summaryCache[story.storyId]}
-        summaryLoading={Boolean(summaryLoadingIds[story.storyId])}
+        summary={summaryCache[summaryStateKey(story)]}
+        summaryLoading={Boolean(summaryLoadingIds[summaryStateKey(story)])}
         onRequestSummary={handleRequestSummary}
         summaryEpoch={summaryEpoch}
         progress={progress.percent[story.storyTxt]}
