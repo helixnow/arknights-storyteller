@@ -1,6 +1,18 @@
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { api } from "@/services/api";
 import type { StoryPreviewToken } from "@/types/story";
+import {
+  PREVIEW_CACHE_PREFIX,
+  PREVIEW_DATA_VERSION_KEY,
+  PREVIEW_FAILURE_TTL_MS,
+  isPreviewCacheEntryExpired,
+  isPreviewTaskCurrent,
+  parsePreviewCacheEntry,
+  previewCacheKey,
+  previewCachePrefix,
+  previewRequestKey,
+  type PreviewCacheEntry,
+} from "@/hooks/storyPreviewCache";
 
 /**
  * 缩略图 token 解析器。首页/剧情列表每条卡片都要展示一张剧情插画，
@@ -19,26 +31,10 @@ import type { StoryPreviewToken } from "@/types/story";
  *
  * 「查不到」也会缓存，但区分两种情况：
  *   - 后端明确返回 null（这章确实没有插画）→ 永久缓存。
- *   - 请求抛错（IPC 超时、文件还没落盘）→ 只缓存 FAILURE_TTL_MS，之后可重试。
+ *   - 请求抛错（IPC 超时、文件还没落盘）→ 只缓存短 TTL，之后可重试。
  */
 
-interface CacheEntry {
-  token: StoryPreviewToken | null; // null = 查过但没有
-  /** true 表示这是一次失败的请求，短 TTL 之后允许重试。 */
-  failed?: boolean;
-  /** 写入时间戳，仅 failed 条目需要。 */
-  ts?: number;
-  /** true 表示这条请求在真正发出前就被放弃了（没人再关心它），不代表结果。 */
-  skipped?: boolean;
-}
-
-const LS_PREFIX = "sp:";
-// schema 版本：如果脚本解析规则变了，统一 bump 就能清理旧缓存。
-const LS_SCHEMA = "v2";
-// 数据版本：剧情数据每同步一次就 +1，随 key 一起变。
-const DATA_VERSION_KEY = "sp:data-version";
-/** 失败缓存的存活时间，过期后允许重新请求。 */
-const FAILURE_TTL_MS = 5 * 60 * 1000;
+type CacheEntry = PreviewCacheEntry;
 
 const MEMO = new Map<string, CacheEntry>();
 /** 全量剧情几千条，条目本身只有两个短字符串；到顶后淘汰最早写入的一批。 */
@@ -61,7 +57,7 @@ function writeMemo(path: string, entry: CacheEntry) {
 function readDataVersion(): number {
   if (typeof window === "undefined") return 0;
   try {
-    const raw = window.localStorage.getItem(DATA_VERSION_KEY);
+    const raw = window.localStorage.getItem(PREVIEW_DATA_VERSION_KEY);
     const parsed = raw ? Number.parseInt(raw, 10) : 0;
     return Number.isFinite(parsed) ? parsed : 0;
   } catch {
@@ -86,11 +82,11 @@ function getDataVersionSnapshot(): number {
 }
 
 function keyPrefix() {
-  return `${LS_PREFIX}${LS_SCHEMA}:${dataVersion}:`;
+  return previewCachePrefix(dataVersion);
 }
 
 function lsKey(path: string) {
-  return `${keyPrefix()}${path}`;
+  return previewCacheKey(dataVersion, path);
 }
 
 /** 清掉所有不属于当前 schema + 数据版本的旧条目。 */
@@ -101,8 +97,8 @@ function purgeStaleCache() {
     const stale: string[] = [];
     for (let i = 0; i < window.localStorage.length; i += 1) {
       const key = window.localStorage.key(i);
-      if (!key || key === DATA_VERSION_KEY) continue;
-      if (key.startsWith(LS_PREFIX) && !key.startsWith(current)) {
+      if (!key || key === PREVIEW_DATA_VERSION_KEY) continue;
+      if (key.startsWith(PREVIEW_CACHE_PREFIX) && !key.startsWith(current)) {
         stale.push(key);
       }
     }
@@ -111,29 +107,15 @@ function purgeStaleCache() {
 }
 
 function isExpired(entry: CacheEntry): boolean {
-  if (!entry.failed) return false;
-  const age = Date.now() - (entry.ts ?? 0);
-  // Date.now() 会因 NTP / 手动校时回拨。负 age 若按「未过期」处理，一次
-  // 临时 IPC 失败就可能被缓存远超约定的 5 分钟，时钟回拨几天便空图几天。
-  return age < 0 || age > FAILURE_TTL_MS;
+  return isPreviewCacheEntryExpired(entry, Date.now(), PREVIEW_FAILURE_TTL_MS);
 }
 
 function readLsCache(path: string): CacheEntry | null {
   try {
     const raw = window.localStorage.getItem(lsKey(path));
     if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === "object") {
-      const entry: CacheEntry | null =
-        parsed.token === null
-          ? { token: null, failed: Boolean(parsed.failed), ts: Number(parsed.ts ?? 0) }
-          : parsed.token &&
-            typeof parsed.token.kind === "string" &&
-            typeof parsed.token.token === "string"
-          ? { token: parsed.token }
-          : null;
-      if (entry && !isExpired(entry)) return entry;
-    }
+    const entry = parsePreviewCacheEntry(JSON.parse(raw));
+    if (entry && !isExpired(entry)) return entry;
   } catch {}
   return null;
 }
@@ -260,7 +242,7 @@ function settle(task: Task, entry: CacheEntry, cacheable: boolean) {
   task.settled = true;
   INFLIGHT.delete(task.key);
   // 请求期间数据被重新同步过的话，这条结果属于旧版本，不能写进缓存。
-  if (cacheable && dataVersion === task.version) {
+  if (cacheable && isPreviewTaskCurrent(task.version, dataVersion)) {
     writeMemo(task.path, entry);
     writeLsCache(task.path, entry);
   }
@@ -299,7 +281,7 @@ function requestPreview(path: string, keep = false): PreviewRequest {
     return { promise: Promise.resolve(cached), release: NOOP };
   }
 
-  const key = `${dataVersion}:${path}`;
+  const key = previewRequestKey(dataVersion, path);
   let task = INFLIGHT.get(key);
   if (task) {
     task.waiters += 1;
@@ -352,7 +334,7 @@ function invalidateAll() {
   MEMO.clear();
   dataVersion += 1;
   try {
-    window.localStorage.setItem(DATA_VERSION_KEY, String(dataVersion));
+    window.localStorage.setItem(PREVIEW_DATA_VERSION_KEY, String(dataVersion));
   } catch {}
   dropQueuedTasks();
   purgeStaleCache();
@@ -392,7 +374,7 @@ if (typeof window !== "undefined") {
   window.addEventListener("app:data-updated", invalidateAll);
   window.addEventListener("storage", (event) => {
     // key 为 null 表示外部 storage.clear()：版本号键也被清掉了，同样对账。
-    if (event.key !== null && event.key !== DATA_VERSION_KEY) return;
+    if (event.key !== null && event.key !== PREVIEW_DATA_VERSION_KEY) return;
     adoptExternalDataVersion();
   });
 }

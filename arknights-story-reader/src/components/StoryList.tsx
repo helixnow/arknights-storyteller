@@ -40,6 +40,11 @@ import { useAppPreferences } from "@/hooks/useAppPreferences";
 import { StoryThumbnail } from "@/components/StoryThumbnail";
 import { AssetImage } from "@/components/AssetImage";
 import { CharacterAvatar } from "@/components/CharacterAvatar";
+import {
+  createVersionedRequestCache,
+  isMissingStoryCatalogError,
+  storySummaryKey,
+} from "@/components/storyListState";
 
 /**
  * 从干员密录类 storyTxt 路径里抠出 charId 候选。
@@ -297,41 +302,10 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
  * 就会变成一串没必要的 IPC；有了 TTL，这些刷新几乎只是重读 localStorage。
  */
 const CATALOG_TTL_MS = 60_000;
-
-interface CatalogHit {
-  value: unknown;
-  at: number;
-}
-
-const catalogValues = new Map<string, CatalogHit>();
-const catalogInflight = new Map<string, Promise<unknown>>();
-let catalogVersion = 0;
+const catalogCache = createVersionedRequestCache(CATALOG_TTL_MS);
 
 function catalogFetch<T>(key: string, loader: () => Promise<T>, force: boolean): Promise<T> {
-  if (force) catalogValues.delete(key);
-
-  const hit = catalogValues.get(key);
-  if (hit && Date.now() - hit.at < CATALOG_TTL_MS) {
-    return Promise.resolve(hit.value as T);
-  }
-
-  const pending = catalogInflight.get(key) as Promise<T> | undefined;
-  if (pending) return pending;
-
-  const startedAt = catalogVersion;
-  const request = loader().then((value) => {
-    // 请求期间数据被重新同步过，这份结果已经过期，不能进缓存。
-    if (catalogVersion === startedAt) {
-      catalogValues.set(key, { value, at: Date.now() });
-    }
-    return value;
-  });
-  const release = () => {
-    if (catalogInflight.get(key) === request) catalogInflight.delete(key);
-  };
-  request.then(release, release);
-  catalogInflight.set(key, request);
-  return request;
+  return catalogCache.fetch(key, loader, force);
 }
 
 const GROUPED_FETCHERS: Record<GroupedKey, () => Promise<GroupedStories>> = {
@@ -352,9 +326,7 @@ export const storyCatalog = {
 
 /** 剧情数据换了一批：整体失效，下一次请求重新打 IPC。 */
 export function invalidateStoryCatalog() {
-  catalogVersion += 1;
-  catalogValues.clear();
-  catalogInflight.clear();
+  catalogCache.invalidate();
 }
 
 if (typeof window !== "undefined") {
@@ -362,11 +334,7 @@ if (typeof window !== "undefined") {
 }
 
 export function isNotInstalledError(message: string) {
-  return (
-    message.includes("NOT_INSTALLED") ||
-    message.includes("No such file") ||
-    message === "TIMEOUT"
-  );
+  return isMissingStoryCatalogError(message);
 }
 
 /**
@@ -399,7 +367,7 @@ const SUMMARY_MAX_ATTEMPTS = 2;
  * 成功结果也写不进新键、污染不了新简介。
  */
 function summaryStateKey(story: StoryEntry): string {
-  return `${story.storyId}|${story.storyInfo ?? ""}`;
+  return storySummaryKey(story);
 }
 
 function runSummaryQueue() {
