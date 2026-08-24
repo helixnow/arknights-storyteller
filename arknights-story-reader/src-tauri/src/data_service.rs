@@ -1873,14 +1873,9 @@ impl DataService {
 
     pub fn get_current_version(&self) -> Result<String, String> {
         if let Some(info) = self.read_version() {
-            let commit_short = if info.commit.len() >= 7 {
-                &info.commit[..7]
-            } else {
-                info.commit.as_str()
-            };
             Ok(format!(
                 "{} ({})",
-                commit_short,
+                short_commit(&info.commit),
                 format_timestamp(info.fetched_at)
             ))
         } else if self.is_installed() {
@@ -1899,14 +1894,7 @@ impl DataService {
     pub fn get_remote_version(&self) -> Result<String, String> {
         let client = Self::create_http_client()?;
         match self.fetch_latest_commit(&client) {
-            Ok(commit) => {
-                let short = if commit.len() >= 7 {
-                    &commit[..7]
-                } else {
-                    commit.as_str()
-                };
-                Ok(short.to_string())
-            }
+            Ok(commit) => Ok(short_commit(&commit).to_string()),
             Err(_) => Ok("未知".to_string()),
         }
     }
@@ -2591,9 +2579,27 @@ impl DataService {
     }
 }
 
+/// commit 的短显示：取前 7 个「字符」。不能按字节切（`&s[..7]`）——正常
+/// commit 是 ASCII hex，但本地 version.json 可被手工编辑、远端 sha 又来自
+/// 网络响应，一旦混入多字节 UTF-8 且字节 7 落在字符中间，字节切片会让
+/// 整个命令 panic。字符数不足 7 时原样返回，与旧的 ASCII 行为一致。
+fn short_commit(commit: &str) -> &str {
+    commit
+        .char_indices()
+        .nth(7)
+        .map_or(commit, |(idx, _)| &commit[..idx])
+}
+
 /// 格式化时间戳
 fn format_timestamp(timestamp: i64) -> String {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    if timestamp <= 0 {
+        // 写入方最坏也只写 0；负数只会来自手工编辑的 version.json。负数
+        // `as u64` 会回绕成天文数字，加到 EPOCH 上直接溢出 panic。0 走原
+        // 逻辑本来也是「较早前」，一并在此短路。
+        return "较早前".to_string();
+    }
 
     let duration = Duration::from_secs(timestamp as u64);
     let datetime = UNIX_EPOCH + duration;
@@ -6301,6 +6307,50 @@ mod tests {
             .write_version(&info)
             .expect("write after stale tmp");
         assert_eq!(fx.service.read_version().unwrap().commit, info.commit);
+    }
+
+    /// version.json 是用户可手工编辑的文件：commit 填非 ASCII、fetched_at
+    /// 填负数都能通过 JSON 解析。get_current_version 曾按字节切
+    /// `commit[..7]`（字节 7 落在多字节字符中间直接 panic），又把负时间戳
+    /// `as u64` 回绕后加到 EPOCH 上（SystemTime 加法溢出 panic）。这种文件
+    /// 顶多显示得难看，绝不能把命令炸掉。
+    #[test]
+    fn hand_edited_version_file_never_panics_current_version() {
+        let fx = Fixture::new("ver_hand_edit");
+
+        // 「版本未知版本未知」的字符边界在 0/3/6/9…，字节 7 不是边界。
+        Fixture::write_file(
+            &fx.service.version_file_path(),
+            "{\"commit\":\"版本未知版本未知\",\"fetched_at\":-1}",
+        );
+        let shown = fx.service.get_current_version().unwrap();
+        assert!(
+            shown.starts_with("版本未知版本未"),
+            "取前 7 个字符而非前 7 字节: {}",
+            shown
+        );
+        assert!(shown.contains("较早前"), "负时间戳按太久远显示: {}", shown);
+
+        // 常规 ASCII commit 行为不变：仍取前 7 位十六进制。
+        fx.set_version("abcdef1234567890");
+        assert!(
+            fx.service
+                .get_current_version()
+                .unwrap()
+                .starts_with("abcdef1"),
+            "ASCII commit 仍显示前 7 位"
+        );
+    }
+
+    /// short_commit 的边界：恰好 7 字符原样返回、不足 7 字符原样返回、
+    /// 超过则截到第 7 个字符（无论单字节还是多字节）。
+    #[test]
+    fn short_commit_truncates_on_char_boundaries() {
+        assert_eq!(short_commit("abcdef1"), "abcdef1");
+        assert_eq!(short_commit("abc"), "abc");
+        assert_eq!(short_commit(""), "");
+        assert_eq!(short_commit("abcdef1234"), "abcdef1");
+        assert_eq!(short_commit("版本未知版本未知"), "版本未知版本未");
     }
 
     // ---- ZIP install safety ------------------------------------------------
