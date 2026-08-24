@@ -66,6 +66,10 @@ const META_SEGMENT_TOTAL: &str = "segment_total";
 /// 建这份索引时数据集的身份（commit + 三张表的大小/mtime + 篇数 + 索引版本）。
 /// 对得上就说明索引已经是最新的，重建可以整个跳过。
 const META_DATASET_FINGERPRINT: &str = "dataset_fingerprint";
+/// 重建进行到一半时数据集被同步/导入换掉的回滚说明。这不是索引库的病：
+/// 事务已回滚，重建让给在 `INDEX_BUILD_LOCKS` 上排队的下一次，不清库重试。
+const DATASET_SWAPPED_DURING_REBUILD: &str =
+    "数据集在索引重建期间被替换，本次结果已回滚，稍后会自动重建";
 
 #[derive(Clone, serde::Serialize)]
 struct SyncProgress {
@@ -2852,6 +2856,64 @@ impl DataService {
                 .or_insert(0) += 1;
         }
 
+        let (total, segment_total) = match self.build_index_once(
+            &mut conn,
+            &catalog,
+            &dataset_probe,
+            &fingerprint,
+            &emit,
+        ) {
+            Ok(Some(totals)) => totals,
+            Ok(None) => return Err(DATASET_SWAPPED_DURING_REBUILD.to_string()),
+            Err(err) => {
+                // 与「打不开 / 建不了表」同一条自愈路的另一半：坏块只落在
+                // FTS 内容页上时，open、建表、甚至剧情表的查询都探不出病，
+                // 损坏要到清表/灌入/提交才第一次暴露（vtable constructor
+                // failed）。不清库的话这里每次都失败在同一处，「重建索引」
+                // 按钮从此永远失败，和当初 open 失败的死局一模一样。库里
+                // 只有派生数据：关连接、清库、重开、从头再试一次；再失败
+                // （磁盘满这类环境问题）才把错误抛给调用方。
+                eprintln!("[INDEX] 索引写入失败（{}），清空索引库后从头重试", err);
+                drop(conn);
+                self.clear_story_index()?;
+                let mut fresh = self.open_index_connection()?;
+                Self::init_index_tables(&fresh)?;
+                match self.build_index_once(
+                    &mut fresh,
+                    &catalog,
+                    &dataset_probe,
+                    &fingerprint,
+                    &emit,
+                )? {
+                    Some(totals) => totals,
+                    None => return Err(DATASET_SWAPPED_DURING_REBUILD.to_string()),
+                }
+            }
+        };
+
+        emit(
+            "完成",
+            total,
+            total,
+            &format!("已索引 {} 篇 / {} 段", total, segment_total),
+        );
+
+        Ok(())
+    }
+
+    /// 一次完整的索引构建尝试：清表、灌入、提交前复核数据集身份、写元数据、
+    /// 提交。`Ok(None)` 表示数据集在构建期间被同步/导入换掉、事务已按约
+    /// 回滚；其余错误都是索引库自身的读写失败，由调用方决定是否清库重试。
+    fn build_index_once(
+        &self,
+        conn: &mut Connection,
+        catalog: &StoryCatalog,
+        dataset_probe: &CatalogFingerprint,
+        fingerprint: &str,
+        emit: &impl Fn(&str, usize, usize, &str),
+    ) -> Result<Option<(usize, usize)>, String> {
+        let indexed_stories = &catalog.stories;
+
         let tx = conn
             .transaction()
             .map_err(|e| format!("Failed to start index transaction: {}", e))?;
@@ -2861,7 +2923,6 @@ impl DataService {
         tx.execute("DELETE FROM story_segment_index", [])
             .map_err(|e| format!("Failed to clear story segment index: {}", e))?;
 
-        let indexed_stories = &catalog.stories;
         let mut story_insert_stmt = tx
             .prepare(
                 "
@@ -3024,11 +3085,10 @@ impl DataService {
         // 混合的内容，而此刻的磁盘指纹已经是新数据集的。若照常提交，这份
         // 杂交索引会被盖上新指纹，刚结束的那次同步随后自动发起的重建（在
         // `INDEX_BUILD_LOCKS` 上排队）一看指纹相符就直接跳过，坏索引从此
-        // 常驻。回滚本次事务，把重建让给排在后面的那一次。
-        if self.catalog_fingerprint() != dataset_probe {
-            return Err(
-                "数据集在索引重建期间被替换，本次结果已回滚，稍后会自动重建".to_string(),
-            );
+        // 常驻。回滚本次事务，把重建让给排在后面的那一次——这不是索引库
+        // 的病，调用方不得清库重试。
+        if self.catalog_fingerprint() != *dataset_probe {
+            return Ok(None);
         }
 
         let timestamp = SystemTime::now()
@@ -3041,7 +3101,7 @@ impl DataService {
             (META_TOTAL_COUNT, total.to_string()),
             (META_SEGMENT_TOTAL, segment_total.to_string()),
             // 最后写指纹：中途失败时事务回滚，下一次照样会完整重建。
-            (META_DATASET_FINGERPRINT, fingerprint),
+            (META_DATASET_FINGERPRINT, fingerprint.to_string()),
         ] {
             tx.execute(
                 "
@@ -3057,14 +3117,7 @@ impl DataService {
         tx.commit()
             .map_err(|e| format!("Failed to commit story index rebuild: {}", e))?;
 
-        emit(
-            "完成",
-            total,
-            total,
-            &format!("已索引 {} 篇 / {} 段", total, segment_total),
-        );
-
-        Ok(())
+        Ok(Some((total, segment_total)))
     }
 
     /// 获取索引状态
@@ -3083,11 +3136,22 @@ impl DataService {
             .query_row("SELECT COUNT(*) FROM story_index", [], |row| row.get(0))
             .unwrap_or(0);
 
+        // 段落表连 COUNT 都执行不了的库不算 ready。坏块只落在段落表的
+        // FTS 内容页上时，open、建表、剧情表查询全都正常，这里若照报
+        // ready，前端的 useAutoIndex 就永远不会来触发重建，段落检索从此
+        // 一直静默返回空页。COUNT 跑得动但为 0 不算病——那是重建还没跑
+        // 完的正常中间态，ready 与否由剧情表的行数说话。
+        let segments_queryable = conn
+            .query_row("SELECT COUNT(*) FROM story_segment_index", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .is_ok();
+
         let last_built_at = Self::extract_meta_value(&conn, "last_built_at")?
             .and_then(|value| value.parse::<i64>().ok());
 
         Ok(StoryIndexStatus {
-            ready: total > 0,
+            ready: total > 0 && segments_queryable,
             total: total.max(0) as usize,
             last_built_at,
         })
@@ -6417,6 +6481,62 @@ mod tests {
             .unwrap()
             .expect("自愈后索引路径必须可用");
         assert_eq!(sorted_ids(&indexed), scanned);
+    }
+
+    /// 上一条测的是「open 时就报错」的坏库；这条测坏块只落在 FTS 内容页
+    /// 上的库：open、建表、剧情表查询全都正常，损坏要到重建的清表/灌入
+    /// 阶段才第一次暴露（vtable constructor failed）。以前这类库有两重
+    /// 死局：状态照报 ready（前端永远不来触发重建），手动重建又每次都
+    /// 失败在同一处。状态必须承认不可用，重建必须清库自愈。
+    #[test]
+    fn rebuild_self_heals_when_corruption_surfaces_mid_build() {
+        let fx = Fixture::new("index_tail_corrupt");
+        fx.service.rebuild_story_index().expect("first build");
+        // 开一次连接再关掉：最后一个连接关闭时 WAL 会 checkpoint 回主文件，
+        // 之后的字节级破坏才真的落在库本体上。
+        drop(fx.service.open_index_connection().unwrap());
+
+        // 只破坏文件尾部（FTS 内容页），保住文件头、schema 和 meta 页，
+        // open 与建表都探不出病。
+        let db = fx.service.index_db_path.clone();
+        let len = fs::metadata(&db).unwrap().len();
+        assert!(len > 16384, "库文件太小，破坏窗口会伤到 schema 页");
+        use std::io::{Seek, SeekFrom};
+        let mut file = fs::OpenOptions::new().write(true).open(&db).unwrap();
+        file.seek(SeekFrom::Start(len - 16384)).unwrap();
+        file.write_all(&vec![0xAAu8; 16384]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        // 干掉 WAL/SHM，别让 SQLite 从日志里把好页找回来。
+        for suffix in ["-wal", "-shm"] {
+            let mut path = db.clone().into_os_string();
+            path.push(suffix);
+            let _ = fs::remove_file(PathBuf::from(path));
+        }
+
+        // 状态不能撒谎：段落表连 COUNT 都跑不动的库不算 ready——报 ready
+        // 的话 useAutoIndex 永远不会来触发重建，段落检索一直静默空页。
+        let status = fx.service.get_story_index_status().unwrap();
+        assert!(!status.ready, "损坏的段落表不该被报成 ready");
+
+        // 数据集更新后自动重建：必须清掉坏库从头建好，而不是永远失败。
+        fx.set_version("commit-2");
+        fx.service
+            .rebuild_story_index()
+            .expect("写入阶段才暴露的损坏必须清库自愈");
+
+        let status = fx.service.get_story_index_status().unwrap();
+        assert!(status.ready);
+        assert_eq!(status.total, 6);
+        let indexed = fx
+            .service
+            .search_stories_with_index("凯尔希")
+            .unwrap()
+            .expect("自愈后索引路径必须可用");
+        assert_eq!(
+            sorted_ids(&indexed),
+            vec!["Obt/Roguelike/ro2/ro2_1".to_string(), "main_00-01".to_string()]
+        );
     }
 
     #[test]
