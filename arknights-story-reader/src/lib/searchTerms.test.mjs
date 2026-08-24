@@ -89,6 +89,23 @@ test("highlightTerms：带空格的引号短语整体作为一个高亮词", () 
   assert.deepEqual(highlightTerms('"凯尔希 博士"'), ["凯尔希 博士"]);
 });
 
+test("highlightTerms：修掉词条首尾进不了索引的标点（弯引号、直角引号、感叹号）", () => {
+  // 中文输入法默认打出弯引号 “”（U+201C/201D）：它不是后端查询语法、
+  // NFKC 也不折叠成 `"`，后端按 凯/尔/希 逐字 AND 命中。高亮若拿字面
+  // `“凯尔希”` 去匹配原文，命中一堆结果却整页零高亮。
+  assert.deepEqual(highlightTerms("“凯尔希”"), ["凯尔希"]);
+  assert.deepEqual(highlightTerms("‘博士’"), ["博士"]);
+  assert.deepEqual(highlightTerms("「博士」 凯尔希"), ["凯尔希", "博士"]);
+  assert.deepEqual(highlightTerms("博士！"), ["博士"]);
+  // 引号短语内部的前导减号不是否定语法（否定在引号外），但后端 sanitize
+  // 会把它换成空格，命中的是 博/士——高亮同样要修掉。
+  assert.deepEqual(highlightTerms('"-博士"'), ["博士"]);
+  // 只修边不动内部：词内标点保留字面串做尽力匹配。
+  assert.deepEqual(highlightTerms("don't"), ["don't"]);
+  // 带音标的拉丁字母不是索引原子，但属于用户要找的字面内容，不能修掉。
+  assert.deepEqual(highlightTerms("café"), ["café"]);
+});
+
 test("highlightTerms：落不成索引 token 的词条不高亮（假名、纯标点）", () => {
   // 后端 term_to_clause 只保留 ASCII 字母数字与 CJK；纯标点/假名词条在
   // 子句生成阶段被丢弃。`博士 ！！` 只按博士匹配，`!!` 不是命中原因。
@@ -280,4 +297,19 @@ test("isAutoSearchable：少于两个字符返回 false，普通查询返回 tru
   assert.equal(isAutoSearchable("凯"), false);
   assert.equal(isAutoSearchable("博士"), true);
   assert.equal(isAutoSearchable("凯尔希 OR 博士"), true);
+});
+
+test("isAutoSearchable：门槛按索引原子数量，标点撑不起长度", () => {
+  // `凯。`/`"凯"`/`a.` 的检索内容都只有一个原子：后端丢掉标点后就是
+  // 单字/单字母全库拉取，不能因为原始串够长就自动发出去。
+  assert.equal(isAutoSearchable("凯。"), false);
+  assert.equal(isAutoSearchable('"凯"'), false);
+  assert.equal(isAutoSearchable("a."), false);
+  // Ext-B 单字是代理对（UTF-16 占两位），同样只算一个原子。
+  assert.equal(isAutoSearchable("𠀀"), false);
+  // 两个原子就恢复可搜：双字、跨词条各一字、带标点的双字。
+  assert.equal(isAutoSearchable("凯尔"), true);
+  assert.equal(isAutoSearchable("凯 尔"), true);
+  assert.equal(isAutoSearchable("“博士”"), true);
+  assert.equal(isAutoSearchable("𠀀𠀁"), true);
 });

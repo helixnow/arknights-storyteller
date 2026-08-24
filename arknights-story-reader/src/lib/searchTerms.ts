@@ -7,7 +7,12 @@
  * 引号 `not"短语"` 的极性），必须能脱离 React 用 node:test 直接锁行为。
  */
 
-/** 少于两个字符不自动搜：中文单字命中面太大，等于把整库拉一遍。 */
+/**
+ * 正向内容不足两个原子不自动搜：中文单字命中面太大，等于把整库拉一遍。
+ * 量的是「能落进索引的原子数」而不是原始串长度——`凯。`、`"凯"`、`a.`
+ * 检索内容都只有一个原子，标点撑起来的长度不算数；Ext-B 单字（代理对）
+ * 也只算一个原子，不因 UTF-16 占两位而放行。
+ */
 export const AUTO_SEARCH_MIN_LEN = 2;
 
 /** 高亮词上限：去重后仍超长的查询只取前几个，避免拼出超长正则。 */
@@ -30,7 +35,9 @@ function normalizeQuery(raw: string): string {
  * 半截的查询串先别发出去：引号还没配对、停在 `-` / `OR` 上，或者整句
  * 没有任何正向词（`""`、`-排除词`、`not 词`）时，后端只会返回一堆噪音
  * ——最后一类在后端是静态空集（FTS 串构造成 None 直接短路成空页），
- * 自动发出去必然闪一次"没有结果"。用户按回车仍可强制搜索。
+ * 自动发出去必然闪一次"没有结果"。正向词的门槛按索引原子数量（见
+ * AUTO_SEARCH_MIN_LEN）：`凯。` 这种靠标点撑长度的单字查询同样不发。
+ * 用户按回车仍可强制搜索。
  */
 export function isAutoSearchable(raw: string): boolean {
   const query = normalizeQuery(raw);
@@ -38,8 +45,16 @@ export function isAutoSearchable(raw: string): boolean {
   if ((query.match(/"/g)?.length ?? 0) % 2 === 1) return false;
   if (/-$/.test(query)) return false;
   if (/\b(or|and|not)$/i.test(query)) return false;
-  if (highlightTerms(query).length === 0) return false;
-  return true;
+  // 只数正向词条里能落成索引 token 的字符：CJK 逐字、ASCII 字母数字逐个，
+  // 标点/假名后端在子句生成阶段就丢掉，凑不出命中面。为 0 是静态空集
+  // （等价于旧的 highlightTerms 为空判定），为 1 是单原子全库拉取，都不发。
+  let positiveAtoms = 0;
+  for (const term of parseQueryTerms(query)) {
+    if (term.isNot) continue;
+    positiveAtoms += atomLengthOf(term.text);
+    if (positiveAtoms >= AUTO_SEARCH_MIN_LEN) return true;
+  }
+  return false;
 }
 
 /** 单个查询词条：text 已剥掉引号/减号等语法字符，isNot 标记它被排除。 */
@@ -141,6 +156,27 @@ function parseQueryTerms(query: string): ParsedTerm[] {
 const ATOM_CHAR_RE =
   /[0-9A-Za-z\u4e00-\u9fff\u3400-\u4dbf\u{20000}-\u{2a6df}\u{2a700}-\u{2b73f}\u{2b740}-\u{2b81f}\u{2b820}-\u{2ceaf}]/u;
 
+/** 词条里能落成索引 token 的字符数（按码点数，代理对只算一个）。 */
+function atomLengthOf(text: string): number {
+  let count = 0;
+  for (const ch of text) {
+    if (ATOM_CHAR_RE.test(ch)) count += 1;
+  }
+  return count;
+}
+
+/**
+ * 高亮词的修边正则：剥掉词条首尾的标点（\p{P}）、符号（\p{S}）、空白
+ * （\p{Z}）与控制/格式字符（\p{C}）。这些字符后端分词器一律不入索引、
+ * 不可能是命中原因，留在高亮词里只会让整个字面串在原文里失配——最常见
+ * 的是中文输入法默认打出的弯引号：`“凯尔希”` 在后端是 凯/尔/希 逐字
+ * AND（弯引号不是查询语法、NFKC 也不折叠成 `"`），命中一堆结果却因为
+ * 原文里没有字面 `“凯尔希”` 而整页零高亮；`「博士」`、`博士！`、引号
+ * 短语 `"-博士"` 同理。只修边不动内部：`don't`、`0-1` 这类词内标点
+ * 保留字面串做尽力匹配，原子间的邻接关系高亮本来就表达不了。
+ */
+const EDGE_TRIM_RE = /^[\p{P}\p{S}\p{Z}\p{C}]+|[\p{P}\p{S}\p{Z}\p{C}]+$/gu;
+
 /**
  * 把查询串拆成用于高亮的词：
  *   - `-排除词` 不该被高亮（它压根不该出现在结果里）；
@@ -157,9 +193,11 @@ export function highlightTerms(query: string): string[] {
   const terms: string[] = [];
   for (const parsed of parseQueryTerms(trimmed)) {
     if (parsed.isNot) continue;
-    // 双引号在扫描时已按语法剥掉；这里再剥一层成对单引号并收掉短语
-    // 首尾空白，`'博士'` 这类写法仍按内容高亮。
-    const stripped = parsed.text.replace(/^["']+|["']+$/g, "").trim();
+    // 双引号在扫描时已按语法剥掉；这里再修掉首尾所有进不了索引的
+    // 标点/符号/空白（见 EDGE_TRIM_RE），`'博士'`、`“博士”`、`「博士」`
+    // 这类写法都按内容高亮。字母（含 é 等带音标的拉丁字母）不修——
+    // 它们虽然不是索引原子，但仍是用户想找的字面内容的一部分。
+    const stripped = parsed.text.replace(EDGE_TRIM_RE, "");
     if (!stripped || !ATOM_CHAR_RE.test(stripped)) continue;
     terms.push(stripped);
     if (stripped.length >= 4 && /^[\u4e00-\u9fff\u3400-\u4dbf]+$/.test(stripped)) {
