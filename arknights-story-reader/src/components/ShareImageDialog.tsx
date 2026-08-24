@@ -1311,10 +1311,19 @@ export function ShareImageDialog({
         await ensureFontsLoaded(sample);
         if (cancelled) return;
 
+        // 走金句分支时取用的那条对话；null 表示本次渲染经典长图。头像
+        // 加载和下面的渲染分支必须共用这同一个判定：头像只被经典模板
+        // 消费，renderQuoteImage 的签名里根本没有它们。
+        const quoteDialogue = resolvedTemplate === "quote" ? firstDialogue : null;
+
         // 批量加载所有 dialogue 段的头像。关闭开关时跳过整段网络请求，
-        // 等于退回到"只有角色名文字"的旧版排版。
+        // 等于退回到"只有角色名文字"的旧版排版。金句模板同样整段跳过：
+        // 以前只看 showAvatar（默认开、且金句模式下开关根本不渲染），
+        // 选中多段对话再切金句时会把每个说话人的头像候选都拉一遍——
+        // 头像源半死（连上不回包）时每个候选要等满 8 秒超时，一张不画
+        // 任何头像的竖版海报要白转几十秒的加载态才出图。
         const avatarImages = new Map<number, HTMLImageElement | null>();
-        if (showAvatar) {
+        if (showAvatar && !quoteDialogue) {
           const dialogueEntries = segments.filter(
             (s): s is ShareSegmentInput & { segment: DialogueSegment } =>
               s.segment.type === "dialogue"
@@ -1338,10 +1347,9 @@ export function ShareImageDialog({
           .filter((x): x is string => Boolean(x))
           .join(" · ") || null;
 
-        const result =
-          resolvedTemplate === "quote" && firstDialogue
-            ? renderQuoteImage(storyName, subtitle, firstDialogue.segment, palette)
-            : renderImage(storyName, subtitle, segments, avatarImages, palette);
+        const result = quoteDialogue
+          ? renderQuoteImage(storyName, subtitle, quoteDialogue.segment, palette)
+          : renderImage(storyName, subtitle, segments, avatarImages, palette);
 
         if (cancelled) return;
         if (!result) {
