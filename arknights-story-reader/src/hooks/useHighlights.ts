@@ -176,10 +176,10 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
     if (raw === lastRawRef.current) {
       // 内容与盘上完全一致（典型场景：跟随 storage 事件之后的回写），
       // 再写一遍只会在别的窗口触发一轮多余的事件。
-      // 脏键只在其对应的 pending 真被并进 merged 时才算清账：pending 为
-      // null 时脏键仍可能非空（clearHighlights 清一个本就不存在的 key 会
-      // 记脏键但 state 原样 bail-out，layout effect 不跑），只带遗留重试
-      // 的冲刷不能把还没消费过的脏键顺手抹掉。
+      // 脏键只在其对应的 pending 真被并进 merged 时才算清账。物化改到
+      // layout effect、clearHighlights 又不再对不存在的 key 记脏键之后，
+      // 任何任务边界上「脏键非空 ⇒ pending 非空」应当成立；这里仍按
+      // pending 是否在场防御：只带遗留重试的冲刷绝不顺手抹掉脏键。
       if (pending !== null) {
         pendingStoreRef.current = null;
         dirtyKeysRef.current.clear();
@@ -233,7 +233,13 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
   // 改动，旧定时器也在新 commit 的同一任务里被 cleanup 拆掉，冲刷永远拿
   // 不到过期快照。
   const initialStoreRef = useRef(store);
+  // 最近一次已提交 store 的镜像。事件回调可能持有旧渲染的闭包（清空按钮
+  // 走异步确认对话框，等用户点「确定」时闭包里的 store 早已过期），要判断
+  // 「某个 key 现在还存不存在」只能读 ref。在 layout effect 里与 commit
+  // 同任务更新，事件处理器运行时（commit 之后）一定是新值。
+  const storeRef = useRef(store);
   useLayoutEffect(() => {
+    storeRef.current = store;
     if (typeof window === "undefined") return;
     if (store === initialStoreRef.current) {
       return;
@@ -294,10 +300,10 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
       lastRawRef.current = raw;
       const disk = readStorage();
       // 本地改动的判据以脏键（而不是 pending 是否已物化）为准：pending
-      // 物化虽已改到 layout effect（与 commit 同任务），但 state 原样
-      // bail-out 时它不跑（见冲刷回声路径的说明），pending 也可能只是跟随
-      // 上一次外部状态的回声快照。按「无本地改动」处理会清脏键 + 整表跟
-      // 盘，把还没上盘的改动从 UI 和持久化管线里同时抹掉。
+      // 非空也可能只是跟随上一次外部状态的回声快照，不代表有本地改动；
+      // 反过来物化在 layout effect（与 commit 同任务）里做，脏键非空时
+      // pending 在任何任务边界上都已就位。按「无本地改动」处理会清脏键 +
+      // 整表跟盘，把还没上盘的改动从 UI 和持久化管线里同时抹掉。
       const hasLocalChanges = dirtyKeysRef.current.size > 0 || failedHighlightWrites.size > 0;
       if (!hasLocalChanges) {
         // 脏键此刻必为空；pending 若非空也只是跟随上一次外部状态的回声
@@ -468,6 +474,15 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
   );
 
   const clearHighlights = useCallback(() => {
+    // 对不存在的 key 不能先记脏键再靠 setStore 原样 bail-out 兜底：bail-out
+    // 后 layout effect 不跑、冲刷不会被调度，这个脏键会一直挂着没人消费。
+    // 之后任何一次外部 storage 事件都会把它重放成「本地要删掉这个 key」
+    //（overlayLocalChanges 对不在 pending 里的脏键执行 delete）并随防抖
+    // 落盘——别的窗口在那之后新画的划线会被这份早已过期的清空意图无声
+    // 删掉。清空确认对话框是异步的，等待期间另一窗口先清空同一篇就会走
+    // 到这里；闭包里的 store 也早已过期，所以存在性只能查镜像 ref。
+    // 镜像里没有这个 key 就说明清空是 no-op，什么都不记。
+    if (!(storyPath in storeRef.current)) return;
     dirtyKeysRef.current.add(storyPath);
     setStore((prev) => {
       if (!(storyPath in prev)) {
