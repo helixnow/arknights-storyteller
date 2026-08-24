@@ -101,6 +101,9 @@ const SEGMENT_TYPE_LABEL: Record<SegmentHit["segmentType"], string> = {
   sticker: "标语",
   header: "标题",
   decision: "抉择",
+  // 带 caption 的插画段也在段级索引里（搜 caption 文字就会命中），
+  // 不补这条它会在一排中文标签里显示成大写英文 "IMAGE"。
+  image: "插画",
 };
 
 /** 只有开发构建才打日志；线上失败一律走 toast，不再往控制台灌噪音。 */
