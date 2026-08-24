@@ -2752,7 +2752,7 @@ impl DataService {
 
         for candidate in &candidates {
             match fs::read_to_string(candidate) {
-                Ok(content) => return Ok(content),
+                Ok(content) => return Ok(normalize_info_interpolations(&content)),
                 Err(err) if err.kind() == ErrorKind::NotFound => continue,
                 Err(err) => {
                     return Err(format!("Failed to read info file: {}", err));
@@ -4464,6 +4464,44 @@ impl DataService {
     }
 }
 
+/// 简介（`[uc]info`）不走解析器，正文里由 `clean_text` 落地的插值符在
+/// 这里要做同一套归一：`{@nbs}` 是不换行空格（act45side 的
+/// "Ave{@nbs}Mujica"，不替换就原样渲染到简介卡上），`{@nickname}` 是
+/// 玩家代称「博士」，两者都不区分大小写——与解析器的 `NBS_RE` /
+/// `NICKNAME_RE` 同语义。语料里的插值符全集只有这两种，其余花括号都是
+/// 正文，原样保留，不做通配剥除。
+fn normalize_info_interpolations(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(pos) = rest.find("{@") {
+        out.push_str(&rest[..pos]);
+        let candidate = &rest[pos..];
+        let replacement = candidate.find('}').and_then(|end| {
+            let name = &candidate[2..end];
+            if name.eq_ignore_ascii_case("nbs") {
+                Some((" ", end + 1))
+            } else if name.eq_ignore_ascii_case("nickname") {
+                Some(("博士", end + 1))
+            } else {
+                None
+            }
+        });
+        match replacement {
+            Some((text, consumed)) => {
+                out.push_str(text);
+                rest = &candidate[consumed..];
+            }
+            None => {
+                // 不认识的插值符（或没闭合的花括号）是正文，原样保留。
+                out.push_str("{@");
+                rest = &candidate["{@".len()..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// 从密录 storyTxt 里抠出「属于哪位干员」的分组 key，判定与前端
 /// `extractCharTokenFromStoryTxt` 保持一致。历史格式
 /// `obt/memory/char_002_amiya/...` 直接取 `char_` 段；当前主流格式
@@ -4613,7 +4651,45 @@ mod tests {
             .expect("should read summary from [uc]info directory");
         assert_eq!(content, "test summary");
 
+        // 简介不经解析器，插值符要在返回前按 `clean_text` 的语义落地：
+        // `{@nbs}`（不区分大小写）→ 空格，`{@nickname}` → 博士；其余
+        // 花括号是正文，原样保留。
+        fs::write(
+            info_dir.join("interp.txt"),
+            "Ave{@nbs}Mujica即将开演。\n{@NickName}，{@NBS}请入席。{保留}",
+        )
+        .unwrap();
+        let content = service
+            .read_story_info("info/demo/interp")
+            .expect("should read interpolated summary");
+        assert_eq!(content, "Ave Mujica即将开演。\n博士， 请入席。{保留}");
+
         let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn normalize_info_interpolations_matches_parser_semantics() {
+        assert_eq!(
+            normalize_info_interpolations("Ave{@nbs}Mujica"),
+            "Ave Mujica"
+        );
+        assert_eq!(normalize_info_interpolations("Ave{@NBS}Mujica"), "Ave Mujica");
+        assert_eq!(
+            normalize_info_interpolations("{@nickname}，你来了"),
+            "博士，你来了"
+        );
+        assert_eq!(
+            normalize_info_interpolations("{@NickName}早上好"),
+            "博士早上好"
+        );
+        // 只认这两种插值符：别的花括号（含没闭合的）都是正文。
+        assert_eq!(
+            normalize_info_interpolations("{@unknown}与{tag}与{@nbs"),
+            "{@unknown}与{tag}与{@nbs"
+        );
+        // 与正则语义一致：外层残缺花括号不影响内层完整插值符。
+        assert_eq!(normalize_info_interpolations("{@{@nbs}"), "{@ ");
+        assert_eq!(normalize_info_interpolations(""), "");
     }
 
     #[test]
