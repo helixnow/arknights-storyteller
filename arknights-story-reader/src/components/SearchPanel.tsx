@@ -484,6 +484,17 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
    * 尤其挂载那次迟到才失败的 catch——失去写回资格。
    */
   const versionSeqRef = useRef(0);
+  /**
+   * 索引状态的生成号，堵的是与 versionSeqRef 同一威胁模型（invoke 不保证
+   * 按序返回）下的另一半窗口：`app:data-updated` 把 ready 掰成 false 后，
+   * 换包前就已在途的 getStoryIndexStatus（挂载 / app:story-index-updated
+   * 广播 / index-progress 终态都会触发 refreshIndexStatus）若此刻才返回，
+   * 带回的是旧库的 ready=true，会把刚掰下去的 flip 原样撤销——毒化窗口
+   * 重新放行自动搜与 indexTrusted，而此时 version 补取拿到的已是新
+   * commit，空页/残缺页照样按新版本落缓存。每次数据更新 +1，落
+   * indexStatus 前核对；换包后发出的新查询代际相同，照常落值。
+   */
+  const indexStatusSeqRef = useRef(0);
   const searchingRef = useRef(false);
   /**
    * 在途搜索查的词、模式、是否自动触发、成功后是否写历史：防抖 effect 与
@@ -586,7 +597,9 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
       // 空页按它进缓存就把查询钉死在"零命中改搜整篇"，整篇残缺页还会落盘，
       // 而就绪上升沿只补 lastQuery 一条，窗口里搜过的其他词永久毒化。
       // 置 false 后由重建收场的 app:story-index-updated / index-progress
-      // 终态照常把状态刷回来。
+      // 终态照常把状态刷回来。代际号先 +1：换包前在途的 getStoryIndexStatus
+      // 响应描述的是旧库，迟到落地会把这个 flip 原样撤销（见 ref 注释）。
+      indexStatusSeqRef.current += 1;
       setIndexStatus((prev) => (prev && prev.ready ? { ...prev, ready: false } : prev));
       // version 必须立刻清空，不能等 getCurrentVersion 回来再改：事件到达时
       // 数据已经换成新 commit，等待期间（以及取失败后的无限期）旧 commit 若
@@ -796,7 +809,16 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
         }
         settle();
 
-        if (data.hits.length === 0 && allowFallback) {
+        // 回退门槛与写缓存同一把尺（indexTrusted）：索引不可信时这个空页
+        // 是退化路径伪造的"零命中"，不是真的没有。拿它触发回退，等于弹一条
+        // "段级索引暂无命中"的错话、擅自把用户刚选的段落模式掰回整篇，再
+        // 发起一次数秒级的整篇线性扫描——而专为此场景准备的空状态
+        // （renderEmptyState 的 indexPending 分支：说明索引没建好 + 建立
+        // 入口）反而永远轮不到展示。不回退时索引就绪的上升沿会按原模式把
+        // 这条查询补搜完整，真零命中再交给空状态里的"改搜整篇"按钮。
+        // 上面缓存命中分支的回退不受此限：能进缓存的零命中都是索引可信时
+        // 写下的，是真零命中。
+        if (data.hits.length === 0 && allowFallback && indexTrusted) {
           await fallbackToStory(raw);
         }
         return;
@@ -1054,13 +1076,21 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
   };
 
   const refreshIndexStatus = useCallback(async (): Promise<StoryIndexStatus | null> => {
+    const token = indexStatusSeqRef.current;
     try {
       const status = await api.getStoryIndexStatus();
+      // 等待期间数据整个换掉：这份状态描述的是旧库，ready=true 落地会把
+      // onUpdated 刚掰下去的未就绪 flip 撤销。丢弃写入，换包后的事件链
+      // （app:story-index-updated 广播 / index-progress 终态）会以新代际
+      // 重查。返回 null 而不是旧状态，免得调用方拿它当现状广播出去。
+      if (token !== indexStatusSeqRef.current) return null;
       setIndexStatus(status);
       setIndexError(null);
       return status;
     } catch (err) {
       devLog("获取索引状态失败", err);
+      // 迟到的失败同样无权写状态：错误横幅描述的必须是当前数据的状态查询。
+      if (token !== indexStatusSeqRef.current) return null;
       setIndexError("获取索引状态失败");
       return null;
     }
