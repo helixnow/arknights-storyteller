@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import { api } from "@/services/api";
 import type { StoryPreviewToken } from "@/types/story";
 
@@ -73,6 +73,17 @@ let dataVersion = readDataVersion();
 
 /** 版本变化时通知所有挂载中的 hook 重新解析。 */
 const subscribers = new Set<() => void>();
+
+function subscribeDataVersion(notify: () => void): () => void {
+  subscribers.add(notify);
+  return () => {
+    subscribers.delete(notify);
+  };
+}
+
+function getDataVersionSnapshot(): number {
+  return dataVersion;
+}
 
 function keyPrefix() {
   return `${LS_PREFIX}${LS_SCHEMA}:${dataVersion}:`;
@@ -406,26 +417,25 @@ export function useStoryPreview(
   token: StoryPreviewToken | null;
   loading: boolean;
 } {
-  const [version, setVersion] = useState(dataVersion);
+  // 外部版本可能在 render 与 effect 注册之间变化。useSyncExternalStore 会在
+  // 订阅落地时复核快照，避免漏掉换包通知并把旧 token 提交到屏幕。
+  const version = useSyncExternalStore(
+    subscribeDataVersion,
+    getDataVersionSnapshot,
+    getDataVersionSnapshot
+  );
   const [state, setState] = useState(() => initialStateFor(storyPath));
 
-  // storyPath 原地切换（列表复用行、首页卡片换目标）的那一帧不能把上一篇
-  // 的 token 渲染出去——下游会把旧插画当命中候选继续展示，等 useEffect
-  // （paint 之后）才纠正，用户能看到串篇闪帧。与 <AssetImage> 同一套
-  // 渲染期同步重置的模式。
+  // storyPath 原地切换或数据版本变化的那一帧不能把旧 token 渲染出去——
+  // 下游会把旧插画当命中候选继续展示，等 useEffect（paint 之后）才纠正，
+  // 用户能看到串篇闪帧。与 <AssetImage> 同一套渲染期同步重置的模式。
   const [renderedPath, setRenderedPath] = useState(storyPath);
-  if (renderedPath !== storyPath) {
+  const [renderedVersion, setRenderedVersion] = useState(version);
+  if (renderedPath !== storyPath || renderedVersion !== version) {
     setRenderedPath(storyPath);
+    setRenderedVersion(version);
     setState(initialStateFor(storyPath));
   }
-
-  useEffect(() => {
-    const notify = () => setVersion(dataVersion);
-    subscribers.add(notify);
-    return () => {
-      subscribers.delete(notify);
-    };
-  }, []);
 
   useEffect(() => {
     if (!storyPath) {
