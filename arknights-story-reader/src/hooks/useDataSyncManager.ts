@@ -217,7 +217,15 @@ export function localizeBackendError(error: unknown, fallback = "操作失败"):
 }
 
 function isTerminalProgress(progress: SyncProgress): boolean {
-  return progress.phase === "完成" || (progress.total > 0 && progress.current >= progress.total);
+  // sync-progress 的 current/total 是「当前阶段」刻度，不是整条任务刻度：
+  // 后端会先发准备 1/1、下载 100/100，之后才解压并发真正的「完成」。
+  // 只有后台索引没有沿用「完成」phase，而以「索引」1/1 报成功/失败终态。
+  // 若把任意满刻度阶段都当终态，完成事件丢失时下面的本地兜底会误保留
+  // 「下载完成」，让同步看起来停在下载阶段后直接收起。
+  return (
+    progress.phase === "完成" ||
+    (progress.phase === "索引" && progress.total > 0 && progress.current >= progress.total)
+  );
 }
 
 /**

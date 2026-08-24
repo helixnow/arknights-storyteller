@@ -278,11 +278,24 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
     event.target.value = "";
     // 同步取走寄存的锁并撤掉取消侦测：选择器收场的回焦宽限可能已经在倒
     // 计时，晚一个 await 锁就会被当成「用户取消」放掉。
-    const transferredJob = takePendingImportJob();
+    let transferredJob = takePendingImportJob();
     if (!file) {
       transferredJob?.();
       setPreparingImport(false);
       return;
+    }
+    // 无失焦平台上的 5 分钟兜底可能已把寄存锁释放，但迟到的 change 仍会
+    // 到达。此时不能无锁弹覆盖确认框：确认期间自动索引 / 自动更新会抢入，
+    // 用户点头后导入只能报冲突。先补抢一把锁；若已经有别的任务开工，就在
+    // 确认前如实拦住，绝不让用户确认一件无法执行的操作。
+    if (!transferredJob) {
+      transferredJob = acquireDataJob("import");
+      if (!transferredJob) {
+        setError(dataJobConflictMessage("导入"));
+        setPreparingImport(false);
+        return;
+      }
+      setPreparingImport(true);
     }
     // 选完再确认：先弹确认框会丢掉用户手势，部分 WebView 就打不开文件选择器了。
     // 确认期间锁仍握在手里，排队等锁的自动更新安装抢不进来。
