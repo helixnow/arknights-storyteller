@@ -29,7 +29,12 @@ import {
   type ShareImagePayload,
 } from "@/hooks/useImageSharer";
 import { peekAssetCandidates } from "@/hooks/useAsset";
-import { getAssetHealthVersion, isAssetUrlDead, markAssetUrlAlive } from "@/lib/assetUrls";
+import {
+  getAssetHealthVersion,
+  hasNpcAvatarOverride,
+  isAssetUrlDead,
+  markAssetUrlAlive,
+} from "@/lib/assetUrls";
 import { isBrowserOffline } from "@/components/AssetImage";
 import type { DialogueSegment, StorySegment } from "@/types/story";
 import { Download, Loader2, RotateCcw, Share2, X } from "lucide-react";
@@ -370,10 +375,20 @@ async function loadAvatarImage(
   const key = avatarCacheKey(name, charId);
   if (avatarCache.has(key)) return avatarCache.get(key) ?? null;
 
+  // NPC 覆盖名（普瑞赛斯 / 希尔达）不在干员表里，随台词传来的 charId 只
+  // 可能是解析器「只写显示名就继承上一条 [Character] 立绘」启发式误配的
+  // 别人的 id——该 id 的头像必然加载成功，若仍让它排在前面，分享长图里
+  // NPC 行就会画上前一位干员的头像。与 CharacterAvatar 展示路径同一判定：
+  // 命中覆盖表时显示名才是权威身份，charId 直接跳过。
+  const npcName = name && hasNpcAvatarOverride(name) ? name.trim() : null;
   // 组装候选链：优先 charId（稳定），然后中文名（character_table 反查兜底）。
   const tokens: string[] = [];
-  if (charId) tokens.push(charId);
-  if (name && name !== charId) tokens.push(name);
+  if (npcName) {
+    tokens.push(npcName);
+  } else {
+    if (charId) tokens.push(charId);
+    if (name && name !== charId) tokens.push(name);
+  }
   const seen = new Set<string>();
   const candidates: string[] = [];
   for (const t of tokens) {
