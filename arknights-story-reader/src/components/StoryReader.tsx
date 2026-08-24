@@ -1971,7 +1971,11 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       const searchPulseActive = state.searchPulseActive;
       const characterHighlighted = highlightable && state.characterHighlighted;
       const isSelected = state.selected;
-      const selectable = selectMode && segment.type !== "decision"; // selecting a decision block is awkward; skip
+      // decision：整块选中很别扭；image：ReaderImageSegment 没接选中点击，
+      // 分享渲染器（prepareSegment）也不支持插画段——若标成 selectable，
+      // 插画在选段模式会顶着 cursor-pointer 的可选假象，点了却毫无反应。
+      const selectable =
+        selectMode && segment.type !== "decision" && segment.type !== "image";
 
       const segmentStyle: CSSProperties = { marginBottom: spacing };
       // 给右上角的收藏按钮留位，否则长句会被角标压住。
