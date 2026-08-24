@@ -47,6 +47,16 @@ const CLEANUP_STEPS: Array<{ version: number; keys: string[] }> = [
       "arknights-story-segment-cache-v2",
     ],
   },
+  {
+    version: 4,
+    keys: [
+      // 搜索缓存最早的一代键。换代到 v2 时没有顺手删除，也一直漏在这张表
+      // 外面；那一代的写入还没有 LRU 上限，每个搜过的词都整页整页地存，
+      // 老用户可能压着几 MB 的死数据。localStorage 配额是整个应用共享的，
+      // 白占的这块正是阅读进度「quota 满写不进」故障的直接推手。
+      "arknights-story-search-cache-v1",
+    ],
+  },
 ];
 
 const CLEANUP_VERSION = CLEANUP_STEPS[CLEANUP_STEPS.length - 1]?.version ?? 0;

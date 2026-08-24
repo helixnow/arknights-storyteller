@@ -140,50 +140,60 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
       return (
         <div
           role="alert"
-          className="h-full flex flex-col items-center justify-center gap-3 px-6 text-center pt-[max(env(safe-area-inset-top,0px),12px)] bg-[hsl(var(--color-background))] text-[hsl(var(--color-foreground))]"
+          /*
+           * 崩溃页必须自己能滚：html/body 是 overflow:hidden 的，而错误消息
+           * 长度不可控，加上展开的「错误详情」，横屏矮视口里内容很容易超出
+           * 一屏。此前根节点直接 justify-center 且无滚动容器——flex 居中的
+           * 溢出会向上下两端裁切，「重载 / 回首页 / 复制」都可能被裁到视口外
+           * 且无法够到。改成外层滚动、内层 min-h-full 居中：装得下时照旧
+           * 居中，装不下时内层随内容撑高、整页可滚。
+           */
+          className="h-full overflow-y-auto overscroll-y-contain bg-[hsl(var(--color-background))] text-[hsl(var(--color-foreground))]"
         >
-          <div className="text-base font-medium text-[hsl(var(--color-destructive))]">
-            页面出错了
-          </div>
-          <p className="max-w-[28rem] text-sm text-[hsl(var(--color-muted-foreground))] break-words">
-            {error.message || "发生了未知错误"}
-          </p>
-          <p className="max-w-[28rem] text-xs text-[hsl(var(--color-muted-foreground))]">
-            可以先回首页继续使用；如果仍然报错，请重载应用。
-          </p>
-          <div className="mt-2 flex flex-wrap items-center justify-center gap-2">
-            <Button onClick={this.handleReload} className="min-h-[44px]">
-              <RefreshCw className="mr-2 h-4 w-4" />
-              重载
-            </Button>
-            <Button onClick={this.handleGoHome} variant="outline" className="min-h-[44px]">
-              <Home className="mr-2 h-4 w-4" />
-              回首页
-            </Button>
-          </div>
-          <details className="group mt-1 w-full max-w-[28rem] rounded-lg border border-[hsl(var(--color-border))] bg-[hsl(var(--color-muted)/0.1)] text-left">
-            <summary className="flex min-h-[44px] cursor-pointer list-none items-center justify-between px-4 py-3 text-sm text-[hsl(var(--color-foreground))]">
-              <span>复制错误详情</span>
-              <span className="text-xs text-[hsl(var(--color-muted-foreground))] transition-transform group-open:rotate-180">
-                ▾
-              </span>
-            </summary>
-            <div className="space-y-2 border-t border-[hsl(var(--color-border))] px-4 py-3">
-              <pre className="max-h-40 select-text overflow-auto whitespace-pre-wrap break-words font-mono text-xs leading-relaxed text-[hsl(var(--color-muted-foreground))]">
-                {this.buildErrorDetails()}
-              </pre>
-              <Button
-                onClick={this.handleCopyDetails}
-                variant="outline"
-                size="sm"
-                className="w-full"
-                aria-live="polite"
-              >
-                {copied ? <Check className="mr-2 h-4 w-4" /> : <Copy className="mr-2 h-4 w-4" />}
-                {copied ? "已复制" : "复制"}
+          <div className="min-h-full flex flex-col items-center justify-center gap-3 px-6 text-center pt-[max(env(safe-area-inset-top,0px),12px)] pb-[max(env(safe-area-inset-bottom,0px),12px)]">
+            <div className="text-base font-medium text-[hsl(var(--color-destructive))]">
+              页面出错了
+            </div>
+            <p className="max-w-[28rem] text-sm text-[hsl(var(--color-muted-foreground))] break-words">
+              {error.message || "发生了未知错误"}
+            </p>
+            <p className="max-w-[28rem] text-xs text-[hsl(var(--color-muted-foreground))]">
+              可以先回首页继续使用；如果仍然报错，请重载应用。
+            </p>
+            <div className="mt-2 flex flex-wrap items-center justify-center gap-2">
+              <Button onClick={this.handleReload} className="min-h-[44px]">
+                <RefreshCw className="mr-2 h-4 w-4" />
+                重载
+              </Button>
+              <Button onClick={this.handleGoHome} variant="outline" className="min-h-[44px]">
+                <Home className="mr-2 h-4 w-4" />
+                回首页
               </Button>
             </div>
-          </details>
+            <details className="group mt-1 w-full max-w-[28rem] rounded-lg border border-[hsl(var(--color-border))] bg-[hsl(var(--color-muted)/0.1)] text-left">
+              <summary className="flex min-h-[44px] cursor-pointer list-none items-center justify-between px-4 py-3 text-sm text-[hsl(var(--color-foreground))]">
+                <span>复制错误详情</span>
+                <span className="text-xs text-[hsl(var(--color-muted-foreground))] transition-transform group-open:rotate-180">
+                  ▾
+                </span>
+              </summary>
+              <div className="space-y-2 border-t border-[hsl(var(--color-border))] px-4 py-3">
+                <pre className="max-h-40 select-text overflow-auto whitespace-pre-wrap break-words font-mono text-xs leading-relaxed text-[hsl(var(--color-muted-foreground))]">
+                  {this.buildErrorDetails()}
+                </pre>
+                <Button
+                  onClick={this.handleCopyDetails}
+                  variant="outline"
+                  size="sm"
+                  className="w-full"
+                  aria-live="polite"
+                >
+                  {copied ? <Check className="mr-2 h-4 w-4" /> : <Copy className="mr-2 h-4 w-4" />}
+                  {copied ? "已复制" : "复制"}
+                </Button>
+              </div>
+            </details>
+          </div>
         </div>
       );
     }

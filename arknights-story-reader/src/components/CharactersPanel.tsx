@@ -200,6 +200,30 @@ const STORY_ROW_STYLE: CSSProperties = {
   containIntrinsicSize: "1px 72px",
 };
 
+const CACHE_PREFIX = "arknights-characters-cache";
+
+/**
+ * 清掉本前缀下不属于当前数据版本的统计缓存。
+ *
+ * 缓存键带数据 commit，每次同步都会产生一个新键；旧键（一条就有几百 KB
+ * 到 MB 级）从此无人读也无人删，几次同步就能把 localStorage 配额塞满。
+ * 满了之后不止本缓存写不进（每次冷启动都重扫几千篇剧情），阅读进度、
+ * 高亮这些共享 localStorage 的落盘也会跟着静默失败。必须在写入之前扫：
+ * 配额已被旧键占满时，先腾出地方本次落盘才有机会成功。
+ */
+function sweepStaleStatsCaches(currentKey: string): void {
+  try {
+    const stale: string[] = [];
+    for (let i = 0; i < localStorage.length; i += 1) {
+      const key = localStorage.key(i);
+      if (key && key !== currentKey && key.startsWith(`${CACHE_PREFIX}:`)) stale.push(key);
+    }
+    stale.forEach((key) => localStorage.removeItem(key));
+  } catch {
+    // localStorage 不可用（隐私模式等）：读写路径各自有兜底，跳过即可。
+  }
+}
+
 function countCharactersInStory(content: ParsedStoryContent): Map<string, number> {
   const map = new Map<string, number>();
   content.segments.forEach((seg) => {
@@ -254,7 +278,6 @@ export function CharactersPanel({
     };
   }, []);
 
-  const CACHE_PREFIX = "arknights-characters-cache";
   // 缓存 key 只取 commit hash 部分（版本字符串前 7 位），忽略时间戳。
   // 这样只要底层数据没变（同一个 commit），缓存就一直有效，不会因为
   // 重启或重新同步（同版本）而失效。
@@ -290,6 +313,8 @@ export function CharactersPanel({
       const ver = await api.getCurrentVersion();
       if (!aliveRef.current) return;
       setVersion(ver);
+      // 数据版本换过之后，旧版本的缓存键就成了纯垃圾，趁写入前清掉。
+      if (ver) sweepStaleStatsCaches(getCacheKey(ver));
 
       // 本次统计是否缺斤短两：目录拉挂被 catch 吞掉、或个别剧情读取失败。
       // 残缺结果本次会话先凑合显示，但绝不能写进缓存（见下方保存处）。
@@ -589,8 +614,6 @@ export function CharactersPanel({
     return allCharacters.filter((_, i) => searchNeedles[i].includes(q));
   }, [allCharacters, searchNeedles, deferredSearch]);
 
-  const handleSelectCharacter = useCallback((name: string) => setSelected(name), []);
-
   // 网格和详情共用同一个滚动容器，面板又是 KeepAlive 常驻的——容器从不
   // 重建，偏移一直留着。在网格里滚到深处再点开博士这类角色，详情会停在
   // 旧偏移的半腰（几千行的关卡列表夹不回顶部），头像和金句根本看不见；
@@ -598,6 +621,17 @@ export function CharactersPanel({
   // 列表再还原。用 layout effect：在绘制前落位，不闪半截内容。
   const scrollViewportRef = useRef<HTMLDivElement | null>(null);
   const gridScrollTopRef = useRef(0);
+
+  // 网格偏移必须在点击那一刻、DOM 还没换成详情之前保存。等到 layout
+  // effect 再读，提交里网格已经卸载，读 scrollTop 会按详情的新高度强制
+  // 重排并夹小偏移——低出场角色恰好排在网格底部（滚得最深）、详情又最
+  // 短，保存值直接塌到 0，返回时「还原」的就是坏值。
+  const handleSelectCharacter = useCallback((name: string) => {
+    const viewport = scrollViewportRef.current;
+    if (viewport) gridScrollTopRef.current = viewport.scrollTop;
+    setSelected(name);
+  }, []);
+
   const prevSelectedRef = useRef(selected);
   useLayoutEffect(() => {
     const prev = prevSelectedRef.current;
@@ -606,8 +640,6 @@ export function CharactersPanel({
     const viewport = scrollViewportRef.current;
     if (!viewport) return;
     if (selected !== null) {
-      // 只有「从网格进来」才记网格偏移；详情间切换（悬空重选等）只归顶。
-      if (prev === null) gridScrollTopRef.current = viewport.scrollTop;
       viewport.scrollTop = 0;
     } else {
       // 卡片有 contain-intrinsic-size，本次提交里 scrollHeight 已就位，

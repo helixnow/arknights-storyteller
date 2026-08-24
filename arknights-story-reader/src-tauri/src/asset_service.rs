@@ -170,7 +170,14 @@ fn background_candidates(token: &str) -> Vec<String> {
 fn strip_image_ext(token: &str) -> &str {
     for ext in [".png", ".jpg", ".jpeg", ".webp"] {
         if token.len() >= ext.len() {
-            let (head, tail) = token.split_at(token.len() - ext.len());
+            let split = token.len() - ext.len();
+            // 切点落在多字节字符中间（token 以中文等结尾）时 `split_at`
+            // 会 panic。这种位置是 UTF-8 续字节，不可能等于 ASCII 的 `.`，
+            // 后缀必然不匹配——跳过即可，与 JS 正则「不匹配」的行为一致。
+            if !token.is_char_boundary(split) {
+                continue;
+            }
+            let (head, tail) = token.split_at(split);
             if tail.eq_ignore_ascii_case(ext) {
                 return head;
             }
@@ -351,6 +358,18 @@ mod tests {
         assert_eq!(strip_image_ext("kv_main.v2"), "kv_main.v2");
         // token 本身就是个裸后缀：JS 正则会削成空串，这里必须一致。
         assert_eq!(strip_image_ext(".png"), "");
+    }
+
+    #[test]
+    fn strip_image_ext_survives_multibyte_tails() {
+        // token 以多字节字符结尾时，`len - ext.len()` 可能落在 UTF-8 字符
+        // 中间（如 `act_封面`：10 字节，削 `.png` 的切点 6 在「封」内部），
+        // `split_at` 会 panic 把整条 resolve 命令带崩；JS 正则对这种 token
+        // 只是不匹配。两边都必须原样返回。
+        assert_eq!(strip_image_ext("act_封面"), "act_封面");
+        assert_eq!(strip_image_ext("活动"), "活动");
+        // 多字节主体 + 合法 ASCII 后缀仍然照削。
+        assert_eq!(strip_image_ext("封面.png"), "封面");
     }
 
     #[test]
