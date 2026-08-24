@@ -8,8 +8,8 @@
 //! - 解析全程宽容：单条记录坏了只跳过那一条，整份 JSON 坏了保留嵌入表；
 //! - 任何路径都不 panic——读写锁毒化后就地恢复（索引只做插入，
 //!   半途 panic 也不会破坏结构不变量）；
-//! - overlay 以指纹（路径 + 大小 + mtime）去重，并忽略比已应用版本
-//!   更旧的过期刷新，避免并发窗口里旧数据覆盖新数据。
+//! - overlay 以指纹（路径 + 大小 + mtime）去重；数据包变化时从嵌入表
+//!   重新构建，不能让上一包已删除的角色/别名残留在运行时索引。
 
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
@@ -57,21 +57,10 @@ fn fingerprint(path: &Path) -> Option<TableFingerprint> {
     })
 }
 
-/// 判断这次刷新是否应被忽略：
-/// - 同一份文件已经处理过（指纹完全一致）；
-/// - 或同一路径但 mtime 比已应用的版本更旧——并发/排队窗口里抓到的
-///   过期快照，直接丢弃，防止旧表覆盖新表。
-fn is_stale_refresh(applied: Option<&TableFingerprint>, incoming: &TableFingerprint) -> bool {
-    match applied {
-        None => false,
-        Some(prev) if prev == incoming => true,
-        Some(prev) => {
-            prev.path == incoming.path
-                && prev.modified_nanos >= 0
-                && incoming.modified_nanos >= 0
-                && incoming.modified_nanos < prev.modified_nanos
-        }
-    }
+/// 只有完全相同的文件才可跳过。用户允许导入旧数据包，mtime 变小是合法
+/// 回滚，不是并发旧响应；把它判 stale 会让剧情已经回滚而角色索引仍停在新包。
+fn is_duplicate_refresh(applied: Option<&TableFingerprint>, incoming: &TableFingerprint) -> bool {
+    applied == Some(incoming)
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -169,20 +158,26 @@ fn apply_entries(index: &mut CharacterIndex, entries: &[ParsedEntry]) {
     }
 }
 
+fn index_from_entries(entries: &[ParsedEntry]) -> CharacterIndex {
+    let mut index = CharacterIndex::from_embedded();
+    apply_entries(&mut index, entries);
+    index
+}
+
 /// 用运行时的 `character_table.json` 覆盖嵌入数据。静默失败，绝不 panic。
 /// 同一份文件只 overlay 一次；数据包换了（大小或 mtime 变化）会重新读；
-/// 比已应用版本更旧的过期刷新会被忽略。
+/// 每次变化都从嵌入表重建，上一数据包独有的条目不会泄漏到新索引。
 pub fn refresh_from_file(path: &Path) {
-    // 文件不存在/不可 stat：没有可刷新的内容，保持现状。
+    // OVERLAID 写锁贯穿整个刷新：既让并发调用只解析一次这份十几 MB 的
+    // JSON，也保证去重判断与指纹更新是原子的。锁毒化就地恢复——
+    // 指纹只是缓存优化，最坏情况多解析一次。
+    let mut overlaid = OVERLAID.write().unwrap_or_else(PoisonError::into_inner);
+    // 在拿到串行锁后再 stat：排队期间数据目录可能已经被另一轮同步换掉，
+    // 不能拿进锁前捕获的旧 mtime 去决定当前路径是否该读。
     let Some(current) = fingerprint(path) else {
         return;
     };
-
-    // OVERLAID 写锁贯穿整个刷新：既让并发调用只解析一次这份十几 MB 的
-    // JSON，也保证 stale 判断与指纹更新是原子的。锁毒化就地恢复——
-    // 指纹只是缓存优化，最坏情况多解析一次。
-    let mut overlaid = OVERLAID.write().unwrap_or_else(PoisonError::into_inner);
-    if is_stale_refresh(overlaid.as_ref(), &current) {
+    if is_duplicate_refresh(overlaid.as_ref(), &current) {
         return;
     }
 
@@ -191,21 +186,17 @@ pub fn refresh_from_file(path: &Path) {
         return;
     };
 
-    match parse_character_table(&raw) {
-        Some(entries) if !entries.is_empty() => {
-            let mut index = RUNTIME.write().unwrap_or_else(PoisonError::into_inner);
-            apply_entries(&mut index, &entries);
-        }
-        Some(_) => {
-            // 合法 JSON 但没有任何干员记录：保留嵌入表。
-        }
+    let next = match parse_character_table(&raw) {
+        Some(entries) => index_from_entries(&entries),
         None => {
             eprintln!(
                 "[char-table] {} is not a valid character table; keeping embedded map",
                 path.display()
             );
+            CharacterIndex::from_embedded()
         }
-    }
+    };
+    *RUNTIME.write().unwrap_or_else(PoisonError::into_inner) = next;
 
     // 解析成败都记录指纹：同一份字节重复解析结果不会变，解析失败也没有
     // 必要每次冷启动重来一遍；文件内容一变（len/mtime 变化）自然会重试。
@@ -214,6 +205,19 @@ pub fn refresh_from_file(path: &Path) {
 
 /// 导出当前索引（给前端一次性拿走缓存，避免频繁查询）。
 pub fn snapshot() -> CharacterIndex {
+    // 数据目录被卸载，或换入的是只含剧情表的最小合法包时，commands 层
+    // 拿不到 character_table_path，因而不会调用 refresh_from_file。这里
+    // 必须主动撤掉上一包的 overlay，否则 snapshot 会永久回传旧角色索引。
+    let mut overlaid = OVERLAID.write().unwrap_or_else(PoisonError::into_inner);
+    if overlaid
+        .as_ref()
+        .is_some_and(|applied| fingerprint(&applied.path).is_none())
+    {
+        *RUNTIME.write().unwrap_or_else(PoisonError::into_inner) =
+            CharacterIndex::from_embedded();
+        *overlaid = None;
+    }
+    drop(overlaid);
     RUNTIME
         .read()
         .unwrap_or_else(PoisonError::into_inner)
@@ -456,7 +460,44 @@ mod tests {
         );
     }
 
-    // ---------- 过期刷新判定 ----------
+    #[test]
+    fn rebuilding_for_a_new_package_drops_old_overlay_entries() {
+        let old = index_from_entries(&[entry(
+            "char_9997_old_package_only",
+            "旧包专属测试干员",
+            Some("OldPackageOnly"),
+        )]);
+        assert_eq!(
+            old.name_to_char_id
+                .get("旧包专属测试干员")
+                .map(String::as_str),
+            Some("char_9997_old_package_only")
+        );
+
+        let new = index_from_entries(&[entry(
+            "char_9996_new_package_only",
+            "新包专属测试干员",
+            Some("NewPackageOnly"),
+        )]);
+        assert!(
+            !new.char_id_to_name
+                .contains_key("char_9997_old_package_only"),
+            "新包索引不能残留上一包已删除的 charId"
+        );
+        assert!(
+            !new.name_to_char_id.contains_key("旧包专属测试干员")
+                && !new.name_to_char_id.contains_key("OldPackageOnly"),
+            "新包索引不能残留上一包已删除的名字/别名"
+        );
+        assert_eq!(
+            new.name_to_char_id
+                .get("新包专属测试干员")
+                .map(String::as_str),
+            Some("char_9996_new_package_only")
+        );
+    }
+
+    // ---------- 刷新去重判定 ----------
 
     fn fp(path: &str, len: u64, mtime: i128) -> TableFingerprint {
         TableFingerprint {
@@ -467,39 +508,39 @@ mod tests {
     }
 
     #[test]
-    fn stale_refresh_detection() {
+    fn duplicate_refresh_detection_allows_package_rollbacks() {
         let applied = fp("/data/character_table.json", 100, 2_000);
 
-        // 尚未 overlay 过：任何指纹都不算过期。
-        assert!(!is_stale_refresh(None, &applied));
+        // 尚未 overlay 过：必须读取。
+        assert!(!is_duplicate_refresh(None, &applied));
         // 完全相同的指纹：已处理过，跳过。
-        assert!(is_stale_refresh(Some(&applied), &applied.clone()));
-        // 同一路径、更旧的 mtime：过期快照，忽略。
-        assert!(is_stale_refresh(
+        assert!(is_duplicate_refresh(Some(&applied), &applied.clone()));
+        // 同一路径、更旧的 mtime 是合法的数据包回滚，必须重新应用。
+        assert!(!is_duplicate_refresh(
             Some(&applied),
             &fp("/data/character_table.json", 90, 1_000)
         ));
         // 同一路径、更新的 mtime：正常刷新。
-        assert!(!is_stale_refresh(
+        assert!(!is_duplicate_refresh(
             Some(&applied),
             &fp("/data/character_table.json", 110, 3_000)
         ));
         // 同一路径、mtime 相同但大小变了：内容变化，重新应用。
-        assert!(!is_stale_refresh(
+        assert!(!is_duplicate_refresh(
             Some(&applied),
             &fp("/data/character_table.json", 110, 2_000)
         ));
         // 路径不同（数据目录迁移）：不算过期。
-        assert!(!is_stale_refresh(
+        assert!(!is_duplicate_refresh(
             Some(&applied),
             &fp("/elsewhere/character_table.json", 90, 1_000)
         ));
         // mtime 未知（-1）：无法比较新旧，宁可重新应用。
-        assert!(!is_stale_refresh(
+        assert!(!is_duplicate_refresh(
             Some(&fp("/data/character_table.json", 100, -1)),
             &fp("/data/character_table.json", 90, 1_000)
         ));
-        assert!(!is_stale_refresh(
+        assert!(!is_duplicate_refresh(
             Some(&applied),
             &fp("/data/character_table.json", 90, -1)
         ));
@@ -582,5 +623,20 @@ mod tests {
 
         let _ = std::fs::remove_file(&bad);
         let _ = std::fs::remove_file(&good);
+        let reset = snapshot();
+        assert!(
+            !reset
+                .name_to_char_id
+                .contains_key("泽兹测试干员"),
+            "运行时 character_table 消失后必须撤掉上一包 overlay"
+        );
+        assert_eq!(
+            reset
+                .name_to_char_id
+                .get("夜刀")
+                .map(String::as_str),
+            Some("char_502_nblade"),
+            "撤掉 overlay 后仍应保留嵌入索引"
+        );
     }
 }

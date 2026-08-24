@@ -214,6 +214,95 @@ const STORY_ROW_STYLE: CSSProperties = {
 };
 
 const CACHE_PREFIX = "arknights-characters-cache";
+// v1 缓存由旧版本在单篇读取失败时仍会落盘，升级后不能继续信任。
+const STATS_CACHE_SCHEMA_VERSION = 2;
+
+interface StatsCacheItem {
+  name: string;
+  total: number;
+  perStory: Array<{ storyId: string; count: number }>;
+}
+
+interface StatsCachePayload {
+  schemaVersion: number;
+  builtAt: number;
+  /** 构建时完整目录；用来拒绝同一显示版本下来自另一份数据包的缓存。 */
+  storyIds: string[];
+  data: Record<string, StatsCacheItem>;
+}
+
+/**
+ * 后端展示字符串只保留 commit 前 7 位；常规 Git 版本可稳定复用。
+ * 手动导入会被统一截成 `manual-`，版本文件损坏时又统一显示「本地数据」，
+ * 两者都无法唯一标识数据包，给它们落缓存必然会跨包串统计。
+ */
+function statsCacheKeyForVersion(version: string): string | null {
+  const commitPart = version.trim().split(/\s+/, 1)[0] ?? "";
+  if (!/^[0-9a-f]{7}$/i.test(commitPart)) return null;
+  return `${CACHE_PREFIX}:v${STATS_CACHE_SCHEMA_VERSION}:${commitPart.toLowerCase()}`;
+}
+
+function isStatsCachePayload(
+  value: unknown,
+  expectedStoryIds: readonly string[],
+): value is StatsCachePayload {
+  if (!value || typeof value !== "object") return false;
+  const payload = value as Partial<StatsCachePayload>;
+  if (
+    payload.schemaVersion !== STATS_CACHE_SCHEMA_VERSION ||
+    typeof payload.builtAt !== "number" ||
+    !Number.isFinite(payload.builtAt) ||
+    !Array.isArray(payload.storyIds) ||
+    !payload.data ||
+    typeof payload.data !== "object" ||
+    Array.isArray(payload.data)
+  ) {
+    return false;
+  }
+  if (
+    payload.storyIds.length !== expectedStoryIds.length ||
+    payload.storyIds.some((id, i) => typeof id !== "string" || id !== expectedStoryIds[i])
+  ) {
+    return false;
+  }
+
+  const validStoryIds = new Set(expectedStoryIds);
+  for (const [cacheName, rawItem] of Object.entries(payload.data)) {
+    if (!rawItem || typeof rawItem !== "object") return false;
+    const item = rawItem as Partial<StatsCacheItem>;
+    if (
+      typeof item.name !== "string" ||
+      !item.name ||
+      item.name !== cacheName ||
+      typeof item.total !== "number" ||
+      !Number.isSafeInteger(item.total) ||
+      item.total < 0 ||
+      !Array.isArray(item.perStory)
+    ) {
+      return false;
+    }
+    const seenStories = new Set<string>();
+    let total = 0;
+    for (const rawPerStory of item.perStory) {
+      if (!rawPerStory || typeof rawPerStory !== "object") return false;
+      const perStory = rawPerStory as { storyId?: unknown; count?: unknown };
+      if (
+        typeof perStory.storyId !== "string" ||
+        !validStoryIds.has(perStory.storyId) ||
+        seenStories.has(perStory.storyId) ||
+        typeof perStory.count !== "number" ||
+        !Number.isSafeInteger(perStory.count) ||
+        perStory.count <= 0
+      ) {
+        return false;
+      }
+      seenStories.add(perStory.storyId);
+      total += perStory.count;
+    }
+    if (total !== item.total) return false;
+  }
+  return true;
+}
 
 /**
  * 清掉本前缀下不属于当前数据版本的统计缓存。
@@ -224,7 +313,7 @@ const CACHE_PREFIX = "arknights-characters-cache";
  * 高亮这些共享 localStorage 的落盘也会跟着静默失败。必须在写入之前扫：
  * 配额已被旧键占满时，先腾出地方本次落盘才有机会成功。
  */
-function sweepStaleStatsCaches(currentKey: string): void {
+function sweepStaleStatsCaches(currentKey: string | null): void {
   try {
     const stale: string[] = [];
     for (let i = 0; i < localStorage.length; i += 1) {
@@ -291,15 +380,16 @@ export function CharactersPanel({
     };
   }, []);
 
-  // 缓存 key 只取 commit hash 部分（版本字符串前 7 位），忽略时间戳。
-  // 这样只要底层数据没变（同一个 commit），缓存就一直有效，不会因为
-  // 重启或重新同步（同版本）而失效。
-  const getCacheKey = useCallback((v: string) => {
-    const commitPart = v.split(" ")[0] || v;
-    return `${CACHE_PREFIX}:${commitPart}`;
-  }, []);
-
   const loadAll = useCallback(async (opts?: { forceRefresh?: boolean }) => {
+    if (opts?.forceRefresh) {
+      // 数据包已经换掉，旧金句的 story/segmentIndex 从这一刻起就不再可信。
+      // 先让在途抓取失效并撤下旧按钮；等新统计落地后 quote effect 会重抓。
+      quotesRunRef.current += 1;
+      setQuotes([]);
+      setQuoteCandidates([]);
+      setQuotesFor(null);
+      setLoadingQuotes(false);
+    }
     if (loadingRef.current) {
       // 数据刚换完却撞上正在跑的扫描：本轮读到的可能是新旧混合的内容，
       // 这次刷新请求不能就地丢掉，记下来等本轮结束再重跑。
@@ -326,8 +416,17 @@ export function CharactersPanel({
       const ver = await api.getCurrentVersion();
       if (!aliveRef.current) return;
       setVersion(ver);
-      // 数据版本换过之后，旧版本的缓存键就成了纯垃圾，趁写入前清掉。
-      if (ver) sweepStaleStatsCaches(getCacheKey(ver));
+      const cacheKey = ver ? statsCacheKeyForVersion(ver) : null;
+      // 数据版本换过之后，旧版 schema、旧 commit 和无法唯一识别的手动包
+      // 缓存都成了纯垃圾，趁写入前清掉。
+      sweepStaleStatsCaches(cacheKey);
+      if (opts?.forceRefresh && cacheKey) {
+        // 即便显示 commit 没变，强刷也代表底层数据可能被原地替换。先删旧
+        // 缓存，避免本轮读取失败/应用退出后下次启动又把旧包统计捞回来。
+        try {
+          localStorage.removeItem(cacheKey);
+        } catch {}
+      }
 
       // 本次统计是否缺斤短两：目录拉挂被 catch 吞掉、或个别剧情读取失败。
       // 残缺结果本次会话先凑合显示，但绝不能写进缓存（见下方保存处）。
@@ -422,6 +521,7 @@ export function CharactersPanel({
       memoryStories.forEach((s) => storiesMap.set(s.storyId, s));
 
       const stories = Array.from(storiesMap.values());
+      const storyIds = Array.from(storiesMap.keys()).sort();
       setGroupInfoByStoryId(groupInfo);
       setProgress({ current: 0, total: stories.length });
 
@@ -429,14 +529,14 @@ export function CharactersPanel({
 
       // 1) 先尝试命中缓存
       let cacheApplied = false;
-      if (!opts?.forceRefresh && ver) {
+      if (!opts?.forceRefresh && cacheKey) {
         try {
-          const raw = localStorage.getItem(getCacheKey(ver));
+          const raw = localStorage.getItem(cacheKey);
           if (raw) {
-            const parsed: {
-              builtAt: number;
-              data: Record<string, { name: string; total: number; perStory: Array<{ storyId: string; count: number }> }>;
-            } = JSON.parse(raw);
+            const parsed: unknown = JSON.parse(raw);
+            if (!isStatsCachePayload(parsed, storyIds)) {
+              throw new Error("invalid character stats cache");
+            }
             Object.values(parsed.data).forEach((item) => {
               const perStory: CharacterStatsPerStory[] = [];
               item.perStory.forEach((ps) => {
@@ -455,7 +555,7 @@ export function CharactersPanel({
           // 残留计数上继续累加，统计翻倍后还会被原样写回缓存。
           aggMap.clear();
           try {
-            localStorage.removeItem(getCacheKey(ver));
+            localStorage.removeItem(cacheKey);
           } catch {}
         }
       }
@@ -537,9 +637,9 @@ export function CharactersPanel({
       // 2) 没用缓存则保存缓存（精简 perStory 为 storyId + count）。
       // 扫描不完整时跳过落盘：缓存 key 只随数据版本变，一次瞬时失败算出
       // 的偏小计数一旦写进去，就会顶着「已使用缓存」活到下个数据版本。
-      if (!cacheApplied && ver && !statsIncomplete) {
+      if (!cacheApplied && cacheKey && !statsIncomplete) {
         try {
-          const plain: Record<string, { name: string; total: number; perStory: Array<{ storyId: string; count: number }> }> = {};
+          const plain: Record<string, StatsCacheItem> = Object.create(null);
           aggMap.forEach((agg, name) => {
             plain[name] = {
               name,
@@ -549,8 +649,13 @@ export function CharactersPanel({
           });
           const builtAt = Date.now();
           localStorage.setItem(
-            getCacheKey(ver),
-            JSON.stringify({ builtAt, data: plain })
+            cacheKey,
+            JSON.stringify({
+              schemaVersion: STATS_CACHE_SCHEMA_VERSION,
+              builtAt,
+              storyIds,
+              data: plain,
+            } satisfies StatsCachePayload)
           );
           setCacheBuiltAt(builtAt);
         } catch {
@@ -592,7 +697,7 @@ export function CharactersPanel({
         }
       }
     }
-  }, [getCacheKey]);
+  }, []);
 
   // 只在面板首次可见时统计；之后除非数据变了，切回来不重跑。
   useEffect(() => {

@@ -35,12 +35,13 @@ const EMPTY: CharacterContextValue = {
 };
 
 const CharacterContext = createContext<CharacterContextValue>(EMPTY);
+const EMPTY_INDEX: CharacterIndex = {
+  charIdToName: {},
+  nameToCharId: {},
+};
 
 export function CharacterResolverProvider({ children }: { children: ReactNode }) {
-  const [index, setIndex] = useState<CharacterIndex>({
-    charIdToName: {},
-    nameToCharId: {},
-  });
+  const [index, setIndex] = useState<CharacterIndex>(EMPTY_INDEX);
   const [loaded, setLoaded] = useState(false);
   const mountedRef = useRef(true);
   // 同步完成、手动重试可能在几百毫秒内连着触发几次 refresh。只认最后一次
@@ -68,7 +69,15 @@ export function CharacterResolverProvider({ children }: { children: ReactNode })
     void refresh();
     // 首次启动时数据可能还没同步，此时索引是空的。同步完成后重新拉一次，
     // 否则头像要等到下次冷启动才出得来。
-    const handler = () => void refresh();
+    const handler = () => {
+      // 数据目录已经原子换包，旧 name→charId 从这一刻起就不再可信。后端
+      // 解析十几 MB 表格期间先退回无索引态；若刷新失败也不能继续拿旧包
+      // 映射生成头像 URL。refresh 同步递增 runId，旧在途响应随后会被挡掉。
+      setIndex(EMPTY_INDEX);
+      setGlobalCharacterIndex(null);
+      setLoaded(false);
+      void refresh();
+    };
     window.addEventListener("app:data-updated", handler);
     return () => {
       mountedRef.current = false;
