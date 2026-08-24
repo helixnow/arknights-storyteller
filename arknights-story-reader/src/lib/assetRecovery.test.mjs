@@ -50,6 +50,8 @@ test("a duplicate URL failure counts only once toward the host fuse", (t) => {
   assert.equal(isAssetUrlDead(`${host}/fresh.png`), false, "只有 7 条唯一失败");
   markAssetUrlDead(`${host}/6.png`);
   assert.equal(isAssetUrlDead(`${host}/fresh.png`), true, "第 8 条唯一失败才熔断");
+  // 每个用例消费掉自己创建的共享闹钟，避免模块级 fuse 状态污染后续断言。
+  t.mock.timers.tick(30_051);
 });
 
 test("recovery scans the entire chain when a blocked candidate sits before the cursor", (t) => {
@@ -72,6 +74,7 @@ test("recovery scans the entire chain when a blocked candidate sits before the c
     true,
     "stuck 后从链首检查才能留下 host 到期恢复机会"
   );
+  t.mock.timers.tick(30_051);
 });
 
 test("first alive purges suspect URL failures and broadcasts exactly once", () => {
@@ -164,10 +167,10 @@ test("one throwing health subscriber cannot starve the remaining subscribers", (
   offHealthy();
 });
 
-test("dead URL capacity evicts the oldest batch and retains boundary-new entries", () => {
-  for (let i = 0; i <= 8_000; i += 1) markAssetUrlDead(`/recovery-evict/${i}.png`);
+test("dead URL capacity evicts old entries and retains the newest batch", () => {
+  // 本文件前面的用例也留下了少量 URL 级记录，不能假设本测试从 size=0
+  // 开始。多跨过一个淘汰周期后只断言真正的契约：最老消失、最新保留。
+  for (let i = 0; i <= 10_000; i += 1) markAssetUrlDead(`/recovery-evict/${i}.png`);
   assert.equal(isAssetUrlDead("/recovery-evict/0.png"), false);
-  assert.equal(isAssetUrlDead("/recovery-evict/1999.png"), false);
-  assert.equal(isAssetUrlDead("/recovery-evict/2000.png"), true);
-  assert.equal(isAssetUrlDead("/recovery-evict/8000.png"), true);
+  assert.equal(isAssetUrlDead("/recovery-evict/10000.png"), true);
 });
