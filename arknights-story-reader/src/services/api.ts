@@ -42,13 +42,21 @@ function onProgress(
 }
 
 /**
- * 同步 / 版本这类生命周期命令一旦失败就是异常路径：留一条 console.error
- * 方便从用户日志里定位，再把原始错误原样抛回去交给调用方做 UI 提示。
+ * 同步 / 导入 / 索引重建 / 版本这类生命周期命令一旦失败就是异常路径：
+ * 留一条 console.error 方便从用户日志里定位，再把原始错误原样抛回去交给
+ * 调用方做 UI 提示。调用方失败分支里的 devWarn / devLog 在正式包里是
+ * 静默的（见 useAppUpdater 的 IS_DEV 开关），这里是失败在生产日志里唯一
+ * 的落点，漏挂等于把该命令的线上故障变成无迹可查。
+ * 日志只记命令名与错误，绝不记 args——分块导入的参数里是整块 base64，
+ * 导入路径里还有用户目录名，截图求助时不该被一并带出去。
  * 目录读取那类命令的失败由调用方自行处理（不少是可以静默的），不走这里。
  */
-async function invokeReporting<T>(command: string): Promise<T> {
+async function invokeReporting<T>(
+  command: string,
+  args?: Record<string, unknown>
+): Promise<T> {
   try {
-    return await invoke<T>(command);
+    return await invoke<T>(command, args);
   } catch (error) {
     console.error(`[API] ${command} 失败:`, error);
     throw error;
@@ -87,26 +95,33 @@ export const api = {
     return invokeReporting<boolean>("check_update");
   },
 
-  // 手动导入 ZIP（按路径，避免整包穿过 JS 堆）
+  // 手动导入 ZIP（按路径，避免整包穿过 JS 堆）。导入与同步在后端共用
+  // 同一把安装互斥，是同级别的生命周期命令：失败必须走 invokeReporting
+  // 在生产日志里留痕（调用方 runImport 的 devWarn 正式包里不输出）。
   importFromZip: async (path: string): Promise<void> => {
-    return invoke<void>("import_from_zip", { path });
+    return invokeReporting<void>("import_from_zip", { path });
   },
 
   // 手动导入 ZIP 的分块通道（移动端 / <input type="file"> 回退）。
   // 千万不要把 Uint8Array 塞进 invoke 参数：Android 的 IPC 走 postMessage，
   // 二进制会被 JSON 化成数字数组，整包几百 MB 的 ZIP 直接 OOM——
   // 所以按块传 base64。offset 为该块的字节偏移（0 开启新一轮传输），
-  // last 为 true 时后端把暂存文件转正并执行导入。
+  // last 为 true 时后端把暂存文件转正并执行导入。失败同样要留生产日志
+  // （invokeReporting 只记命令名与错误，不会把整块 base64 打进控制台）；
+  // 一轮传输至多一块失败——循环在第一个 reject 处就停了，不会刷屏。
   importZipChunk: async (chunkBase64: string, offset: number, last: boolean): Promise<void> => {
-    return invoke<void>("import_from_zip_bytes", { chunkBase64, offset, last });
+    return invokeReporting<void>("import_from_zip_bytes", { chunkBase64, offset, last });
   },
 
   // 显式中止在途的分块导入。FileReader 读块失败 / 某块 IPC 没送达后端时，
   // 后端寄存的安装互斥没有任何回调会来释放，只能干等 60 秒弃单超时，
   // 期间点「同步」只会收到「导入正在进行」。复用同一个命令的 cancel
   // 分支（免得后端再注册一个 invoke handler）：立刻放锁并清理暂存文件。
+  // 中止失败意味着安装互斥要攥到 60 秒弃单超时、期间同步一直报「导入
+  // 正在进行」，而调用方 catch 里只有 devWarn（正式包静默）——必须在
+  // 这里留生产日志，事后才对得上「同步莫名被锁」的用户反馈。
   abortZipImport: async (): Promise<void> => {
-    return invoke<void>("import_from_zip_bytes", { chunkBase64: "", offset: 0, last: false, cancel: true });
+    return invokeReporting<void>("import_from_zip_bytes", { chunkBase64: "", offset: 0, last: false, cancel: true });
   },
 
   // 监听同步进度
@@ -153,9 +168,11 @@ export const api = {
     return invoke("get_story_index_status");
   },
 
-  // 重建全文索引
+  // 重建全文索引。也是生命周期命令：失败后搜索会静默退化成线性扫描，
+  // 而三个调用方（SearchPanel、useAutoIndex、设置页事件链）的失败分支
+  // 全走 devLog/devWarn（正式包静默），不留这条日志线上就无从定位。
   buildStoryIndex: async (): Promise<void> => {
-    return invoke("build_story_index");
+    return invokeReporting<void>("build_story_index");
   },
 
   // 搜索剧情
