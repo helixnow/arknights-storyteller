@@ -83,17 +83,11 @@ function isPresented(panel: HTMLElement | null): panel is HTMLElement {
  * 「谁先打开谁先执行」排队——没有这层判定，一次 Escape 会关掉最底下的
  * sheet 并用 preventDefault 把真正在顶上的那个挡住；useBackHandler 里
  * dismissPresentedModal 专门派发给最顶层对话框的合成 Escape 同样会被
- * 底层实例截走，返回手势于是关错层。判定规则：事件目标落在哪个 dialog
- * 里就归谁；不在任何 dialog 里时，按 DOM 顺序取最后一个仍在呈现的
- * aria-modal 对话框当顶层（后开的 sheet 挂载在后，与视觉层叠一致）。
+ * 底层实例截走，返回手势于是关错层。不能信任 event.target：顶层刚打开而
+ * 焦点还滞留在底层一帧时，按键目标仍会落在底层。始终按 DOM 顺序取最后一个
+ * 仍在呈现的 aria-modal 对话框（后开的 sheet 挂载在后，与视觉层叠一致）。
  */
-function isTopmostPresentedDialog(
-  panel: HTMLElement,
-  target: EventTarget | null
-): boolean {
-  const targetEl = target instanceof Element ? target : null;
-  const targetDialog = targetEl?.closest?.('[role="dialog"]');
-  if (targetDialog) return targetDialog === panel;
+function isTopmostPresentedDialog(panel: HTMLElement): boolean {
   const dialogs = document.querySelectorAll<HTMLElement>(
     '[role="dialog"][aria-modal="true"]'
   );
@@ -188,7 +182,7 @@ export function SheetShell({
     const handleKeyDown = (event: KeyboardEvent) => {
       const panel = panelRef.current;
       if (!isPresented(panel)) return;
-      if (!isTopmostPresentedDialog(panel, event.target)) return;
+      if (!isTopmostPresentedDialog(panel)) return;
 
       if (event.key === "Escape") {
         if (event.defaultPrevented || isTextEntry(event.target)) return;
@@ -236,7 +230,7 @@ export function SheetShell({
       if (target.closest?.('[role="dialog"]')) return;
       // 焦点跌到所有模态之外（body 等）时，只有最顶层的 sheet 有资格把它
       // 请回来；底下那层抢的话焦点会穿到被遮住的面板里。
-      if (!isTopmostPresentedDialog(panel, null)) return;
+      if (!isTopmostPresentedDialog(panel)) return;
       panel.focus({ preventScroll: true });
     };
     document.addEventListener("focusin", handleFocusIn);
@@ -311,12 +305,18 @@ export function SheetShell({
           className
         )}
       >
+        {/* 整个 flex 内容区先避开 home indicator：有 footer 时安全区落在
+            footer 外侧；没有 footer 时滚动区本身也不会沉到手势条下面。 */}
         <div
           ref={panelRef}
+          data-state={state}
           role="dialog"
-          aria-modal="true"
+          aria-modal={state === "open" ? true : undefined}
+          aria-hidden={state === "closed" ? true : undefined}
+          inert={state === "closed"}
           aria-label={ariaLabel}
           tabIndex={-1}
+          style={{ paddingBottom: "env(safe-area-inset-bottom, 0px)" }}
           className={cn(
             // 同 scrim：退场中的面板不再接收输入，避免用户点中一个正在
             // 滑出、状态即将被卸载的控件。
@@ -376,8 +376,8 @@ export function SheetHeader({
 }
 
 /**
- * Footer pinned to the bottom of a `SheetShell`. Picks up the safe-area
- * bottom inset on iOS so action buttons clear the home indicator.
+ * Footer pinned to the bottom of a `SheetShell`. The parent panel owns the
+ * safe-area inset, so this component only adds its visual bottom spacing.
  */
 export function SheetFooter({
   children,
@@ -394,7 +394,7 @@ export function SheetFooter({
         "border-t border-[hsl(var(--color-foreground)/0.06)]",
         className
       )}
-      style={{ paddingBottom: "calc(env(safe-area-inset-bottom, 0px) + 0.75rem)" }}
+      style={{ paddingBottom: "0.75rem" }}
     >
       {children}
     </footer>

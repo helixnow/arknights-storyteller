@@ -18,23 +18,41 @@ interface ErrorBoundaryState {
 
 /** execCommand 兜底：部分 WebView（非安全上下文/无权限）拿不到 navigator.clipboard。 */
 function copyViaTextarea(text: string): boolean {
+  if (!document.body) return false;
+  const previousFocus = document.activeElement instanceof HTMLElement
+    ? document.activeElement
+    : null;
   const textarea = document.createElement("textarea");
   textarea.value = text;
   textarea.setAttribute("readonly", "");
+  textarea.setAttribute("aria-hidden", "true");
   textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  textarea.style.top = "0";
+  // iOS 会对聚焦的 <16px 表单控件缩放视口；复制兜底不该让崩溃页再跳一下。
+  textarea.style.fontSize = "16px";
   textarea.style.opacity = "0";
-  document.body.appendChild(textarea);
-  textarea.select();
-  // iOS WebView 里 select() 常常不产生实际选区，execCommand("copy") 会静默
-  // 失败（按钮点了没反应）。显式设置选区是这条兜底路径在 iOS 上能用的前提。
-  textarea.setSelectionRange(0, textarea.value.length);
   let ok = false;
   try {
+    document.body.appendChild(textarea);
+    textarea.focus({ preventScroll: true });
+    textarea.select();
+    // iOS WebView 里 select() 常常不产生实际选区，execCommand("copy") 会静默
+    // 失败（按钮点了没反应）。显式设置选区是这条兜底路径在 iOS 上能用的前提。
+    textarea.setSelectionRange(0, textarea.value.length);
     ok = document.execCommand("copy");
   } catch {
     ok = false;
+  } finally {
+    textarea.remove();
+    if (previousFocus && document.contains(previousFocus)) {
+      try {
+        previousFocus.focus({ preventScroll: true });
+      } catch {
+        previousFocus.focus();
+      }
+    }
   }
-  textarea.remove();
   return ok;
 }
 
@@ -55,9 +73,13 @@ function ensureThemeClass() {
   } catch {
     stored = null;
   }
-  const dark =
-    stored === "dark" ||
-    (stored !== "light" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+  let systemDark = false;
+  try {
+    systemDark = window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false;
+  } catch {
+    systemDark = false;
+  }
+  const dark = stored === "dark" || (stored !== "light" && systemDark);
   root.classList.add(dark ? "dark" : "light");
   // 原生控件（错误详情 pre 的滚动条等）的明暗也要跟上，否则深色页里是白色滚动条。
   root.style.colorScheme = dark ? "dark" : "light";
@@ -122,6 +144,7 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
     if (!text) return;
     let copied = false;
     try {
+      if (!navigator.clipboard?.writeText) throw new Error("Clipboard API unavailable");
       await navigator.clipboard.writeText(text);
       copied = true;
     } catch {

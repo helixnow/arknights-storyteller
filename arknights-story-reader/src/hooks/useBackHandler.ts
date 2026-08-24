@@ -1,4 +1,10 @@
 import { useEffect, useRef } from "react";
+import {
+  INITIAL_HISTORY_GUARD_STATE,
+  reduceHistoryGuard,
+  type HistoryGuardEvent,
+  type HistoryGuardState,
+} from "@/lib/appShellLogic";
 
 /**
  * Register a handler for Android hardware back button and browser popstate.
@@ -151,24 +157,45 @@ export function requestBack({ minPriority = 0 }: RequestBackOptions = {}): boole
  * 东西可弹。只 replaceState 的话第一次返回会直接离开页面，处理器根本没机会
  * 跑，所以要垫一层哨兵条目。
  *
- * 哨兵是「按需」上的：只有存在处理器时才 push，而且一次只留一个。这样在
- * 首页（没有任何处理器注册）按返回会原样落到系统，不会被我们吞掉。哨兵被
- * 弹掉后如果没人消费这次返回，就不再补回去 —— 那次返回本来就该退出。
+ * 哨兵是「按需」上的：只有存在处理器时才 push，而且一次只留一个。最后一个
+ * 处理器注销时主动把哨兵弹掉，首页稳定态没有多余历史项。若某个残留处理器
+ * 抛错或明确返回 false，哨兵被用户弹掉后会继续执行原本那次 history.back，
+ * 而不是让用户在首页再按一次。
  *
- * 代价是浏览器里可能多按一次：上一次消费返回时补的哨兵会一直留到下一次
- * 返回。真正的退出路径在 Android，那边走的是原生 `app-back` 通道，不经过
- * history，所以「该退出的那一下」永远是一按即出。history 里不做补偿性的
- * `history.back()`：在提交期间反向导航很容易和正在进行的返回撞车。
+ * 主动弹哨兵和继续默认导航都会再产生一次 popstate；状态机用 disarming /
+ * continuing 标记压住这次回声。React 同一提交里「关阅读器、注册 tab 返回」
+ * 会短暂经过零处理器，rearmAfterNavigation 会在回声到达后重新补一层，不会
+ * 因 effect 清理/挂载顺序丢掉返回栈。
  */
-let guardArmed = false;
+let historyGuardState: HistoryGuardState = { ...INITIAL_HISTORY_GUARD_STATE };
 
-function armHistoryGuard() {
-  if (guardArmed || typeof window === "undefined") return;
-  try {
-    window.history.pushState({ __appBack: true }, "");
-    guardArmed = true;
-  } catch {
-    // 某些 WebView 会限制 pushState 次数，失败就退回默认返回行为。
+function transitionHistoryGuard(event: HistoryGuardEvent) {
+  if (typeof window === "undefined") return;
+  const transition = reduceHistoryGuard(historyGuardState, event);
+  historyGuardState = transition.state;
+  for (const effect of transition.effects) {
+    if (effect === "push-guard") {
+      try {
+        window.history.pushState({ __appBack: true }, "");
+      } catch {
+        transitionHistoryGuard({ type: "push-failed" });
+      }
+      continue;
+    }
+    if (effect === "history-back") {
+      try {
+        window.history.back();
+      } catch {
+        transitionHistoryGuard({ type: "history-back-failed" });
+      }
+      continue;
+    }
+    const consumed = requestBack();
+    transitionHistoryGuard({
+      type: "back-dispatched",
+      consumed,
+      hasHandlers: entries.length > 0,
+    });
   }
 }
 
@@ -190,20 +217,24 @@ function installGlobalListener() {
   }
 
   window.addEventListener("popstate", () => {
-    // 走到这里哨兵已经被浏览器弹掉了。
-    guardArmed = false;
-    if (requestBack()) armHistoryGuard();
+    transitionHistoryGuard({
+      type: "popstate",
+      hasHandlers: entries.length > 0,
+    });
   });
 }
 
 function registerBackHandler(entry: BackEntry): () => void {
   installGlobalListener();
   entries.push(entry);
-  // 有人能消费返回了，才值得垫哨兵。
-  armHistoryGuard();
+  transitionHistoryGuard({ type: "handlers-changed", hasHandlers: true });
   return () => {
     const idx = entries.indexOf(entry);
     if (idx >= 0) entries.splice(idx, 1);
+    transitionHistoryGuard({
+      type: "handlers-changed",
+      hasHandlers: entries.length > 0,
+    });
   };
 }
 

@@ -353,6 +353,17 @@ html, body, #root {
   margin: 0;
   padding: 0;
   height: 100%;
+  min-height: 0;
+  width: 100%;
+}
+
+/* 100%/vh 在移动浏览器地址栏展开、旋转以及软键盘出现时仍按旧布局视口算，
+   根节点会比用户真正看见的区域高一截。支持 dvh 的内核改用动态视口；
+   老 WebView 保留上面的 100% 兜底。 */
+@supports (height: 100dvh) {
+  html, body, #root {
+    height: 100dvh;
+  }
 }
 
 body {
@@ -405,8 +416,9 @@ body {
     touch-action: manipulation;
   }
 
-  :where(input, textarea) {
+  :where(input:not([type="range"]), textarea, select) {
     -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
   }
 }
 
@@ -894,7 +906,10 @@ body {
 
 @media (max-width: 640px) {
   .reader-content {
-    padding: 1.5rem 1rem 2rem;
+    padding-top: 1.5rem;
+    padding-left: max(1rem, env(safe-area-inset-left, 0px));
+    padding-right: max(1rem, env(safe-area-inset-right, 0px));
+    padding-bottom: max(2rem, calc(env(safe-area-inset-bottom, 0px) + 1rem));
   }
 }
 
@@ -907,6 +922,8 @@ input[type="range"] {
   width: 100%;
   height: 1.5rem;
   display: block;
+  /* 横向拖滑块交给控件，纵向手势仍可滚动 sheet。 */
+  touch-action: pan-y;
 }
 
 input[type="range"]::-webkit-slider-runnable-track {
@@ -1343,6 +1360,13 @@ input[type="range"]::-moz-range-thumb {
   padding-left: max(1rem, env(safe-area-inset-left, 0px));
   padding-right: max(1rem, env(safe-area-inset-right, 0px));
   pointer-events: none;
+}
+
+/* 列表页历史上统一写 pb-24；字号放大或系统安全区抬高底栏后，固定的 6rem
+   可能不够，最后一行会沉到玻璃导航下面。保留原基线，只在实测导航更高时扩容。
+   阅读器没有 --bottom-nav-inset，仍保持原来的 6rem。 */
+[data-keepalive-active="true"] .pb-24 {
+  padding-bottom: max(6rem, calc(var(--bottom-nav-inset, 0px) + 1rem));
 }
 
 /* ===== KeepAlive 面板 =====
