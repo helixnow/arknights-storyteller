@@ -62,14 +62,17 @@ const failedHighlightWrites = new Map<string, HighlightLike[] | null>();
 /**
  * 把本地尚未落盘的改动叠到 `base`（刚读出的盘上整表）上：先叠上一批实例
  * 遗留的失败重试，再叠本实例的脏键——后者一定更新，压轴生效。
+ * `stash` 默认取实时的模块级暂存；storage 事件的更新器要传事件时刻的
+ * 快照（见监听器里的说明）。
  */
 function overlayLocalChanges(
   base: HighlightStore,
   pending: HighlightStore | null,
-  dirtyKeys?: ReadonlySet<string>
+  dirtyKeys?: ReadonlySet<string>,
+  stash: ReadonlyMap<string, HighlightLike[] | null> = failedHighlightWrites
 ): HighlightStore {
   const merged: HighlightStore = { ...base };
-  for (const [key, value] of failedHighlightWrites) {
+  for (const [key, value] of stash) {
     if (value === null) delete merged[key];
     else merged[key] = value;
   }
@@ -297,7 +300,15 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
       // 一致，冲刷里的回声抑制会直接清账，不产生多余写入）。
       // 脏键的值从函数式更新的 prev 里取而不是 pending：prev 一定含有刚
       // 提交还没物化进 pending 的 toggle，只新不旧；非脏键仍以盘为准。
-      setStore((prev) => overlayLocalChanges(disk, prev, dirtyKeysRef.current));
+      // 脏键集和遗留暂存必须在此刻拍快照，不能让更新器读实时引用：更新器
+      // 要等 React 调度的渲染任务才执行，防抖 / pagehide 冲刷完全可能抢在
+      // 中间成功落盘并把两者清空。那时实时引用已空，更新器会退化成整表跟
+      // `disk`——而 `disk` 是冲刷前的旧盘快照，刚落盘的划线就从 UI 里被
+      // 无声抹掉（盘上其实是对的），要等下一次外部事件或重挂才恢复。快照
+      // 与 `disk` 同一时刻取，视图自洽；随后的冲刷仍对实时状态收敛落盘。
+      const dirtyAtEvent = new Set(dirtyKeysRef.current);
+      const stashAtEvent = new Map(failedHighlightWrites);
+      setStore((prev) => overlayLocalChanges(disk, prev, dirtyAtEvent, stashAtEvent));
     };
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);
