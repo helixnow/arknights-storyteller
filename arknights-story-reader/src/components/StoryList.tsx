@@ -543,6 +543,16 @@ export function StoryList({ onSelectStory }: StoryListProps) {
   const { showSummaries, setShowSummaries } = useAppPreferences();
   const [summaryCache, setSummaryCache] = useState<Record<string, string>>({});
   const [summaryLoadingIds, setSummaryLoadingIds] = useState<Record<string, boolean>>({});
+  /**
+   * 简介的「重发信号」，换包清空简介缓存与重试配额时 +1，作为行组件
+   * 请求 effect 的依赖强制它重跑一遍。必须有这个外力：收藏分类的行
+   * 渲染自收藏数据、不随目录清空而卸载重挂，其中换包前已把重试配额
+   * （SUMMARY_MAX_ATTEMPTS）耗尽的行，effect 的依赖在清空前后全都没变
+   * ——summary 本来就是 undefined（失败不进缓存）、loading 本来就是
+   * false、storyId / storyInfo 换包后通常同字符串——effect 不会重发，
+   * 刚清零的配额没人用，「暂无简介内容」会一直挂到用户切走分类再回来。
+   */
+  const [summaryEpoch, setSummaryEpoch] = useState(0);
   const online = useOnlineStatus();
   /** 分批挂载的 IntersectionObserver 需要真正的滚动容器当 root。 */
   const scrollRootRef = useRef<HTMLDivElement | null>(null);
@@ -815,6 +825,9 @@ export function StoryList({ onSelectStory }: StoryListProps) {
       summaryInflightRef.current.clear();
       setSummaryCache({});
       setSummaryLoadingIds({});
+      // 收藏分类的行常驻不卸载（见 summaryEpoch 的注释）：清空后必须
+      // 递增信号，耗尽过重试配额的行才会重发请求、用上新配额。
+      setSummaryEpoch((epoch) => epoch + 1);
       setOpenGroups({});
       // 旧目录的分组/密录列表立即清空。换包后旧条目的书名、txt 路径都可能
       // 已失效，而没被下面强制重载覆盖到的分类（比如之前逛过的密录）要等
@@ -1313,6 +1326,8 @@ export function StoryList({ onSelectStory }: StoryListProps) {
     summaryInflightRef.current.clear();
     setSummaryCache({});
     setSummaryLoadingIds({});
+    // 同 data-updated：常驻的收藏行靠这个信号重发简介请求。
+    setSummaryEpoch((epoch) => epoch + 1);
     setOpenGroups({});
     setGroups(emptyGroups());
     setMemoryStories([]);
@@ -1343,6 +1358,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
         summary={summaryCache[story.storyId]}
         summaryLoading={Boolean(summaryLoadingIds[story.storyId])}
         onRequestSummary={handleRequestSummary}
+        summaryEpoch={summaryEpoch}
         progress={progress.percent[story.storyTxt]}
       />
     ),
@@ -1354,6 +1370,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
       progress,
       showSummaries,
       summaryCache,
+      summaryEpoch,
       summaryLoadingIds,
     ]
   );
@@ -2176,6 +2193,12 @@ interface StoryItemProps {
   summary?: string | null;
   summaryLoading?: boolean;
   onRequestSummary?: (story: StoryEntry) => void;
+  /**
+   * 简介重发信号（见父级 summaryEpoch）。换包清空简介缓存/重试配额时
+   * 递增，作为请求 effect 的依赖，把常驻挂载、其余依赖全都没变的行
+   * （收藏分类里换包前耗尽过重试配额的那些）重新踢进请求逻辑。
+   */
+  summaryEpoch?: number;
   /** 阅读进度 0~1，来自共享的 `reading-progress` 快照。 */
   progress?: number;
 }
@@ -2197,6 +2220,7 @@ const StoryItem = memo(function StoryItem({
   summary,
   summaryLoading = false,
   onRequestSummary,
+  summaryEpoch = 0,
   progress,
 }: StoryItemProps) {
   useEffect(() => {
@@ -2205,7 +2229,17 @@ const StoryItem = memo(function StoryItem({
     if ((summary === undefined || summary === null) && !summaryLoading) {
       onRequestSummary?.(story);
     }
-  }, [showSummary, story.storyId, story.storyInfo, summary, summaryLoading, onRequestSummary]);
+    // summaryEpoch 刻意留在依赖里：effect 体不读它，它只在换包清空简介
+    // 缓存/重试配额时递增，用途就是让其余依赖全都没变的常驻行重跑一遍。
+  }, [
+    showSummary,
+    story.storyId,
+    story.storyInfo,
+    summary,
+    summaryLoading,
+    onRequestSummary,
+    summaryEpoch,
+  ]);
 
   const normalizedSummary = summary ? summary.trim() : "";
   let summaryContent: string;
