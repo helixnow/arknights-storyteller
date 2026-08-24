@@ -23,6 +23,7 @@ import {
   hasRecoverableCandidate,
   subscribeAssetHealth,
   getAssetHealthVersion,
+  isStaleOfflineAssetError,
   hashHue,
   gradientFallbackBackground,
 } from "./assetUrls.ts";
@@ -322,6 +323,35 @@ test("hashHue 确定且落在 [0, 360)，gradientFallbackBackground 稳定", () 
     gradientFallbackBackground("ark"),
     "linear-gradient(135deg, hsl(18 26% 46% / 0.32), hsl(58 32% 36% / 0.28))"
   );
+});
+
+test("离线余波：发出时离线或在途经历 online 都不是可信 404", () => {
+  const url = "https://asset.invalid/avatar.png";
+  assert.equal(
+    isStaleOfflineAssetError({ url, version: 3, offline: true }, url, 3),
+    true,
+    "发出时离线，即使落地时版本没变也应判为暂态失败"
+  );
+  assert.equal(
+    isStaleOfflineAssetError({ url, version: 3, offline: false }, url, 4),
+    true,
+    "请求在途期间经历 online 不应当成 404"
+  );
+  assert.equal(
+    isStaleOfflineAssetError({ url, version: 4, offline: false }, url, 4),
+    false,
+    "在线期间发出并在同一网络代际失败才是可信判决"
+  );
+  assert.equal(
+    isStaleOfflineAssetError(
+      { url: "https://asset.invalid/old.png", version: 3, offline: true },
+      url,
+      4
+    ),
+    false,
+    "旧请求快照不能误套到另一条 URL"
+  );
+  assert.equal(isStaleOfflineAssetError(null, url, 4), false);
 });
 
 // ─────────────────────────────────────────────────────────────

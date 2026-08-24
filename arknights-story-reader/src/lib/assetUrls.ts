@@ -213,6 +213,33 @@ function chapterCoverCandidates(token: string): string[] {
   );
 }
 
+/**
+ * 一次图片请求发出时的网络快照。`onlineVersion` 由调用方维护：每收到一次
+ * `online` 事件就递增，用来识别「请求在途期间经历过网络恢复」。
+ */
+export interface AssetIssueNetSnapshot {
+  url: string | null;
+  version: number;
+  offline: boolean;
+}
+
+/**
+ * 这次 onerror 是否属于离线余波。发出时已离线，或发出后经历过 online
+ * 事件，都不能当成可靠 404。保持纯函数，普通 `<img>` 与 Canvas 头像加载
+ * 共用同一条判定，也便于不依赖 DOM 地回归测试。
+ */
+export function isStaleOfflineAssetError(
+  issue: AssetIssueNetSnapshot | null,
+  failedUrl: string,
+  currentOnlineVersion: number
+): boolean {
+  return (
+    issue !== null &&
+    issue.url === failedUrl &&
+    (issue.offline || issue.version !== currentOnlineVersion)
+  );
+}
+
 // ─────────────────────────────────────────────────────────────
 // Session 级候选健康度
 //

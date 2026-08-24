@@ -11,9 +11,11 @@ import { useAsset, useAssetHealthNonce } from "@/hooks/useAsset";
 import {
   gradientFallbackBackground,
   hasRecoverableCandidate,
+  isStaleOfflineAssetError,
   markAssetUrlAlive,
   markAssetUrlDead,
   pickLiveCandidate,
+  type AssetIssueNetSnapshot,
 } from "@/lib/assetUrls";
 import type { AssetKind } from "@/types/story";
 
@@ -110,22 +112,14 @@ export function getOnlineVersion(): number {
   return onlineVersion;
 }
 
-export interface IssueNetSnapshot {
-  url: string | null;
-  version: number;
-  offline: boolean;
-}
+export type IssueNetSnapshot = AssetIssueNetSnapshot;
 
 /** 这次 onerror 是否属于离线余波（发出时离线，或在途期间网络恢复过）。 */
 export function isStaleOfflineError(
   issue: IssueNetSnapshot | null,
   failedUrl: string
 ): boolean {
-  return (
-    issue !== null &&
-    issue.url === failedUrl &&
-    (issue.offline || issue.version !== onlineVersion)
-  );
+  return isStaleOfflineAssetError(issue, failedUrl, onlineVersion);
 }
 
 const NOOP_UNSUBSCRIBE = () => {};
@@ -183,6 +177,9 @@ export function AssetImage({
 }: AssetImageProps) {
   const { candidates, loading } = useAsset(kind, token ?? null);
   const [currentIdx, setCurrentIdx] = useState(0);
+  // 同一 URL 的离线余波要在网络恢复后原地重发一次。仅重置游标不会让
+  // React 重挂相同 key/src 的 <img>，所以用 nonce 明确创建一轮新请求。
+  const [requestNonce, setRequestNonce] = useState(0);
   const [loaded, setLoaded] = useState(false);
   /** 成功解码并正在展示的 URL；`loaded` 只在它与当前候选一致时才算数。 */
   const loadedUrlRef = useRef<string | null>(null);
@@ -207,6 +204,7 @@ export function AssetImage({
     loadedUrlRef.current = null;
     offlineFailedRef.current = false;
     setCurrentIdx(0);
+    setRequestNonce(0);
     setLoaded(false);
   }
 
@@ -320,7 +318,7 @@ export function AssetImage({
     >
       {currentUrl ? (
         <img
-          key={currentUrl.url}
+          key={`${currentUrl.url}::${requestNonce}`}
           src={currentUrl.url}
           alt={alt ?? ""}
           loading={lazy ? "lazy" : "eager"}
@@ -355,12 +353,20 @@ export function AssetImage({
               // 离线时的失败不落账（见模块顶部说明），只推进本地游标；
               // 候选烧完后停在 stuck 态，等 online 事件拨回游标重试。
               offlineFailedRef.current = true;
-            } else if (!isStaleOfflineError(issueNetRef.current, currentUrl.url)) {
+            } else if (isStaleOfflineError(issueNetRef.current, currentUrl.url)) {
+              // online 已经发生，不能等下一次事件；原地重挂同一 URL，让恢复
+              // 后的网络给出一次可信结果。否则它若恰好是最后一个候选，
+              // 推进游标会误报 exhausted，阅读器会永久卸掉这段插画。
+              issueNetRef.current = {
+                url: currentUrl.url,
+                version: getOnlineVersion(),
+                offline: false,
+              };
+              setRequestNonce((nonce) => nonce + 1);
+              return;
+            } else {
               markAssetUrlDead(currentUrl.url);
             }
-            // 横跨离线窗口的失败（此刻已在线）两边都不做：不落账也不等
-            // online 事件（它已经过去了），只推进游标——网络已恢复，
-            // 后面的候选会正常加载。
             setCurrentIdx(Math.min(currentUrl.index + 1, candidates.length));
           }}
           className={cn(

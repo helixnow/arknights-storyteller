@@ -35,7 +35,12 @@ import {
   isAssetUrlDead,
   markAssetUrlAlive,
 } from "@/lib/assetUrls";
-import { isBrowserOffline } from "@/components/AssetImage";
+import {
+  getOnlineVersion,
+  isBrowserOffline,
+  isStaleOfflineError,
+  type IssueNetSnapshot,
+} from "@/components/AssetImage";
 import type { DialogueSegment, StorySegment } from "@/types/story";
 import { Download, Loader2, RotateCcw, Share2, X } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -409,9 +414,17 @@ async function loadAvatarImage(
     return null;
   }
 
-  let sawTimeout = false;
+  let sawTransientFailure = false;
   for (const url of candidates) {
     let timedOut = false;
+    // Canvas 头像不走 React <img>，仍须在真正给 Image.src 赋值前留同款
+    // 网络快照。否则请求跨过 online 后才报错时，会在恢复事件清缓存之后
+    // 又写入 canvasFailedUrls / null 头像，把一次断网固化到整个会话。
+    const issue: IssueNetSnapshot = {
+      url,
+      version: getOnlineVersion(),
+      offline: isBrowserOffline(),
+    };
     const img = await loadImage(url).catch((err: unknown) => {
       timedOut = err instanceof ImageLoadTimeoutError;
       return null;
@@ -424,16 +437,17 @@ async function loadAvatarImage(
     // 离线时的失败与真 404 无法区分，不能记进任何一本永久账；本次直接
     // 放弃，网络恢复后重试（与 AssetImage 展示路径的离线纪律一致）。
     if (isBrowserOffline()) return null;
-    // 超时同理：慢源 ≠ 死源。跳过这一条继续试下一张镜像，但不记失败账。
-    if (timedOut) {
-      sawTimeout = true;
+    // 超时、发出时离线、或在途期间经历过 online 都不是可信 404。继续试
+    // 后面的镜像，但不写失败 URL，也不把角色永久缓存成「无头像」。
+    if (timedOut || isStaleOfflineError(issue, url)) {
+      sawTransientFailure = true;
       continue;
     }
     canvasFailedUrls.add(url);
   }
-  // 有候选因超时被跳过时不能盖「无头像」章——那只说明此刻网络慢，缓存
-  // null 会让这个角色在整个会话里都缺头像，下次打开弹窗理应重试。
-  if (!sawTimeout) rememberAvatar(key, null);
+  // 有候选因暂态故障被跳过时不能盖「无头像」章——缓存 null 会让这个
+  // 角色在整个会话里都缺头像，下次打开弹窗理应重试。
+  if (!sawTransientFailure) rememberAvatar(key, null);
   return null;
 }
 

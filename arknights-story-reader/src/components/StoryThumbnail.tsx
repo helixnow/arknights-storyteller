@@ -69,6 +69,9 @@ export function StoryThumbnail({
   /** 有失败发生在离线窗口内（没写进共享失败缓存），等 online 后要重试。 */
   const offlineFailedRef = useRef(false);
   const [cursor, setCursor] = useState(0);
+  // 离线余波落地时需要原地重挂相同 URL；只把 cursor 留在原处不会让
+  // React 对同一个 key/src 再发请求。
+  const [requestNonce, setRequestNonce] = useState(0);
   const [loaded, setLoaded] = useState(false);
 
   // candidates 变了就同步 state（React 允许在 render 中条件性 setState，
@@ -78,6 +81,7 @@ export function StoryThumbnail({
   if (appliedKeyRef.current !== candidatesKey) {
     appliedKeyRef.current = candidatesKey;
     offlineFailedRef.current = false;
+    setRequestNonce(0);
     const keptIdx = loadedUrlRef.current ? candidates.indexOf(loadedUrlRef.current) : -1;
     if (keptIdx >= 0) {
       setCursor(keptIdx);
@@ -171,7 +175,7 @@ export function StoryThumbnail({
       />
       {live ? (
         <img
-          key={live.url}
+          key={`${live.url}::${requestNonce}`}
           src={live.url}
           alt={alt ?? story.storyName}
           loading={lazy ? "lazy" : "eager"}
@@ -200,12 +204,19 @@ export function StoryThumbnail({
               // 离线时的失败不落账，只推进本地游标；候选烧完后停在
               // stuck 态，等 online 事件拨回游标重试。
               offlineFailedRef.current = true;
-            } else if (!isStaleOfflineError(issueNetRef.current, live.url)) {
+            } else if (isStaleOfflineError(issueNetRef.current, live.url)) {
+              // online 已经过去，不能再靠恢复订阅叫醒；重挂当前 URL 取得
+              // 一次恢复后的可信结果。最后一条候选也不会因此被误推进到空。
+              issueNetRef.current = {
+                url: live.url,
+                version: getOnlineVersion(),
+                offline: false,
+              };
+              setRequestNonce((nonce) => nonce + 1);
+              return;
+            } else {
               markAssetUrlDead(live.url);
             }
-            // 横跨离线窗口的失败（此刻已在线）不落账也不等 online 事件
-            // （它已经过去了），只推进游标——后面的候选在恢复后的网络上
-            // 正常加载。
             setCursor(Math.min(live.index + 1, candidates.length));
           }}
           className={cn(
