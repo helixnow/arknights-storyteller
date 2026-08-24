@@ -990,6 +990,12 @@ export function CharactersPanel({
                   重新载入
                 </button>
               </div>
+            ) : error ? (
+              // 统计本身都失败了（损坏安装时索引和目录常一起读不出来），
+              // 「没有可显示的内容」的锅不在索引。这块大卡若照常渲染，就
+              // 会和上面的错误卡叠在一起，各给一套指引。让错误卡独占话筒，
+              // 重试成功后索引还缺再露出来。
+              null
             ) : (
               <div className="rounded-2xl border border-dashed border-[hsl(var(--color-border))] p-5">
                 <div className="text-sm font-medium">角色索引没有载入</div>
