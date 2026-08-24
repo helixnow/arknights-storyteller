@@ -53,6 +53,15 @@ class ApkUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
   @Volatile
   private var activeCall: Call? = null
 
+  /**
+   * 并发下载守卫。前端有会话级 flag 与数据任务锁两道闸，但那都在 JS 层：
+   * 万一两条 invoke 还是同时到达（未来新增的调用点、或 WebView 重载后
+   * 旧 promise 仍在飞），两个协程会写同一个 cache 文件、互相截断出一个
+   * 损坏的 APK，`activeCall` 也会被覆盖导致 onDestroy 只能中止其一。
+   * 原生层作为最后防线直接拒绝后到的那条。
+   */
+  private val downloadInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
+
   @Command
   fun downloadAndInstall(invoke: Invoke) {
     val args = invoke.parseArgs(DownloadArgs::class.java)
@@ -62,6 +71,11 @@ class ApkUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
     val httpUrl = args.url.trim().toHttpUrlOrNull()
     if (httpUrl == null || (httpUrl.scheme != "http" && httpUrl.scheme != "https")) {
       invoke.reject("更新地址无效")
+      return
+    }
+
+    if (!downloadInFlight.compareAndSet(false, true)) {
+      invoke.reject("已有更新下载正在进行，请等待完成后再试")
       return
     }
 
@@ -98,6 +112,10 @@ class ApkUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
         throw cancelled
       } catch (error: Exception) {
         runOnMain { invoke.reject(sanitizeErrorMessage(error.message)) }
+      } finally {
+        // CancellationException 走 rethrow 也会经过这里：守卫必须复位，
+        // 否则一次被中止的下载会把后续所有更新请求永远锁在门外。
+        downloadInFlight.set(false)
       }
     }
   }

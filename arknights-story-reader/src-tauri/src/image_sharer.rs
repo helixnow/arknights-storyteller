@@ -48,8 +48,9 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
                 Ok(sharer) => {
                     app.manage(sharer);
                 }
-                Err(err) => {
-                    eprintln!("[image-sharer] 注册 Android 插件失败：{err}");
+                Err(_err) => {
+                    #[cfg(debug_assertions)]
+                    eprintln!("[image-sharer] 注册 Android 插件失败：{_err}");
                 }
             }
             Ok(())
@@ -74,7 +75,7 @@ async fn save_image<R: Runtime>(
 ) -> Result<SaveImageResponse, String> {
     let payload = normalize_base64_payload(&base64)?;
     let file_name = sanitize_png_file_name(file_name.as_deref());
-    sharer(&app)?.save_image(payload, file_name)
+    sharer(&app)?.save_image(payload, file_name).await
 }
 
 #[tauri::command]
@@ -87,14 +88,14 @@ async fn share_image<R: Runtime>(
     let payload = normalize_base64_payload(&base64)?;
     let file_name = sanitize_png_file_name(file_name.as_deref());
     let title = sanitize_share_title(title.as_deref());
-    sharer(&app)?.share_image(payload, file_name, title)
+    sharer(&app)?.share_image(payload, file_name, title).await
 }
 
 #[tauri::command]
 async fn open_storage_permission_settings<R: Runtime>(
     app: tauri::AppHandle<R>,
 ) -> Result<(), String> {
-    sharer(&app)?.open_storage_permission_settings()
+    sharer(&app)?.open_storage_permission_settings().await
 }
 
 /// 归一化 `data:image/png;base64,...` / 裸 base64，顺带做完整性体检。
@@ -282,18 +283,24 @@ impl<R: Runtime> AndroidImageSharer<R> {
 
     /// `base64` 必须已经过 [`normalize_base64_payload`]，`file_name`
     /// 必须已经过 [`sanitize_png_file_name`]。
-    fn save_image(
+    ///
+    /// 三条命令都走 `run_mobile_plugin_async`：同步版会在
+    /// `std::sync::mpsc::recv()` 上挂起 tokio worker 直到 Kotlin resolve，
+    /// 而几十 MB 的 base64 跨 JNI + 解码 + 落盘要数百毫秒到数秒，
+    /// 与 apk_updater.rs 的下载同池——不该有任何一条命令占着线程干等。
+    async fn save_image(
         &self,
         base64: String,
         file_name: Option<String>,
     ) -> PluginResult<SaveImageResponse> {
         let request = SaveImageRequest { base64, file_name };
         self.0
-            .run_mobile_plugin("saveImage", request)
+            .run_mobile_plugin_async("saveImage", request)
+            .await
             .map_err(|err| describe_plugin_error("保存到相册失败", err))
     }
 
-    fn share_image(
+    async fn share_image(
         &self,
         base64: String,
         file_name: Option<String>,
@@ -305,13 +312,15 @@ impl<R: Runtime> AndroidImageSharer<R> {
             title,
         };
         self.0
-            .run_mobile_plugin("shareImage", request)
+            .run_mobile_plugin_async("shareImage", request)
+            .await
             .map_err(|err| describe_plugin_error("打开系统分享面板失败", err))
     }
 
-    fn open_storage_permission_settings(&self) -> PluginResult<()> {
+    async fn open_storage_permission_settings(&self) -> PluginResult<()> {
         self.0
-            .run_mobile_plugin::<()>("openStoragePermissionSettings", ())
+            .run_mobile_plugin_async::<()>("openStoragePermissionSettings", ())
+            .await
             .map_err(|err| describe_plugin_error("打开系统设置失败", err))
     }
 }

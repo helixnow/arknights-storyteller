@@ -61,7 +61,7 @@ async fn download_and_install<R: Runtime>(
     let updater = app
         .try_state::<AndroidUpdater<R>>()
         .ok_or_else(|| STATE_MISSING_ERROR.to_string())?;
-    updater.download_and_install(url, file_name)
+    updater.download_and_install(url, file_name).await
 }
 
 #[tauri::command]
@@ -71,7 +71,7 @@ async fn open_install_permission_settings<R: Runtime>(
     let updater = app
         .try_state::<AndroidUpdater<R>>()
         .ok_or_else(|| STATE_MISSING_ERROR.to_string())?;
-    updater.open_install_permission_settings()
+    updater.open_install_permission_settings().await
 }
 
 #[derive(Debug, Serialize)]
@@ -170,7 +170,12 @@ impl<R: Runtime> AndroidUpdater<R> {
         Ok(Self(handle))
     }
 
-    fn download_and_install(
+    /// 用 `run_mobile_plugin_async` 而不是同步的 `run_mobile_plugin`：
+    /// 后者在 `std::sync::mpsc::recv()` 上挂起调用线程直到 Kotlin resolve，
+    /// 而 APK 下载动辄数分钟——这条 async command 跑在 Tauri 的 tokio
+    /// runtime 上，同步等待会把一个 worker 线程扣住整个下载时长，用户
+    /// 边下边读剧情时其余 invoke 全都在同一个池上排队。
+    async fn download_and_install(
         &self,
         url: String,
         file_name: Option<String>,
@@ -183,7 +188,8 @@ impl<R: Runtime> AndroidUpdater<R> {
 
         let request = DownloadRequest { url, file_name };
         self.0
-            .run_mobile_plugin("downloadAndInstall", request)
+            .run_mobile_plugin_async("downloadAndInstall", request)
+            .await
             .map_err(|err| {
                 #[cfg(debug_assertions)]
                 eprintln!("[apk-updater] downloadAndInstall failed: {err}");
@@ -194,9 +200,10 @@ impl<R: Runtime> AndroidUpdater<R> {
             })
     }
 
-    fn open_install_permission_settings(&self) -> PluginResult<()> {
+    async fn open_install_permission_settings(&self) -> PluginResult<()> {
         self.0
-            .run_mobile_plugin::<()>("openInstallPermissionSettings", ())
+            .run_mobile_plugin_async::<()>("openInstallPermissionSettings", ())
+            .await
             .map_err(|err| {
                 #[cfg(debug_assertions)]
                 eprintln!("[apk-updater] openInstallPermissionSettings failed: {err}");
