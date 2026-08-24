@@ -716,7 +716,11 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   ]);
 
   const readerSpacing = useMemo(
-    () => `${Math.max(settings.paragraphSpacing, 0.5)}rem`,
+    // 下限必须与滑杆 / sanitize 的区间下限（0.3）一致。早前这里钳到 0.5：
+    // 滑杆 0.3、0.4 两档能选、标签也如实显示，段距却纹丝不动——和行距
+    // 1.2/1.4 区间错位是同一类「界面与生效值脱节」的病。0.3 只是防御，
+    // sanitizeSettings 已保证不会更小。
+    () => `${Math.max(settings.paragraphSpacing, 0.3)}rem`,
     [settings.paragraphSpacing]
   );
 
@@ -1165,14 +1169,23 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     // 这两个 prop 在整个阅读会话里都不会消失，只看 prop 是否存在的话，
     // 搜索进来的读者之后每次切换阅读模式都会被跳过恢复、直接甩回开头，
     // 随后的进度落盘还会把 ~0% 写回存储，真实进度就此丢失。
+    // issuedAt 缺失时的判重必须与应用侧的记账口径一致：应用 effect 记的是
+    // `issuedAt ?? Date.now()`，这里若仍与 null 比较，「已应用」会被永远当成
+    // 挂起——之后每次切换阅读模式都跳过恢复，读者被留在原地、进度再被
+    // ~0% 覆盖。App 目前总是带 issuedAt，此处是对齐两侧口径的加固：缺失
+    // 时只在「从未应用过任何意图」时才算挂起。
     const focusPending =
       initialFocus &&
       initialFocus.storyId === storyId &&
-      focusAppliedRef.current !== (initialFocus.issuedAt ?? null);
+      (initialFocus.issuedAt != null
+        ? focusAppliedRef.current !== initialFocus.issuedAt
+        : focusAppliedRef.current === null);
     const jumpPending =
       initialJump &&
       initialJump.storyId === storyId &&
-      jumpAppliedRef.current !== (initialJump.issuedAt ?? null);
+      (initialJump.issuedAt != null
+        ? jumpAppliedRef.current !== initialJump.issuedAt
+        : jumpAppliedRef.current === null);
     const shouldSkipRestore =
       pendingScrollIndexRef.current !== null || focusPending || jumpPending;
     if (shouldSkipRestore) {
@@ -1337,6 +1350,15 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     // 重新换行，和调字号是同一类整体重排——不锚定的话，读者正想选的那一段
     // 会随重排漂出视口。
     selectMode ? 1 : 0,
+    // 插画显隐 / 极简模式（隐藏头像与插画）同样是全文级重排，且能在阅读
+    // 中途变化：useAppPreferences 会跟随其它窗口的 storage 事件实时翻转。
+    // 概述块则是异步加载完才插进正文顶部的——恢复完阅读位置它才出现，
+    // 正文整体被压下去一截。这三者以前都不在签名里，重排后没人把读者
+    // 钉回原段。（阅读器隐藏时容器量不出高度，锚定 effect 会自行跳过，
+    // 不会在后台乱滚。）
+    inlineImages ? 1 : 0,
+    minimalMode ? 1 : 0,
+    showSummaries && storyInfoText ? 1 : 0,
   ].join("|");
   const typographyRef = useRef<string | null>(null);
   useLayoutEffect(() => {
@@ -1587,6 +1609,17 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
         setHighlightSegmentIndex(null);
       }
 
+      // 落点兜底快照：restore 的让位路径只覆盖「搜索 / 跳转进篇」那一次。
+      // 会话中途的跳转（导览章节 / 划线 / 二次搜索同一篇）若最终落空——
+      // 目标是被隐藏 / 加载失败的插画段，30 帧重试后放弃——分页模式的页码
+      // 此刻已经切过去了，读者会被扔在错误页的页首，随后的进度落盘还把它
+      // 写成真实进度。这里在没有更早快照（进篇让位记的那份优先，它才是
+      // 未被本次会话污染的进度）时补记当前位置，give-up 路径统一用它送回。
+      // 跳转成功的路径会立刻清空快照，不会残留。
+      if (pendingLandingFallbackRef.current === null) {
+        pendingLandingFallbackRef.current = getProgress();
+      }
+
       pendingScrollIndexRef.current = index;
       if (settings.readingMode !== "scroll") {
         // Binary search the dynamic page boundaries to land on the right page.
@@ -1629,7 +1662,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
         setPendingScrollTick((prev) => prev + 1);
       }
     },
-    [processedSegments, scrollToSegment, settings.readingMode, totalPages, pageBoundaries]
+    [processedSegments, scrollToSegment, settings.readingMode, totalPages, pageBoundaries, getProgress]
   );
 
   // 优先处理初始段落跳转（搜索结果点击、人物面板等）

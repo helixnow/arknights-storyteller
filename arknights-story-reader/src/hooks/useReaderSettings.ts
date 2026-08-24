@@ -238,6 +238,24 @@ export function useReaderSettings() {
   // 最终值写掉，而不是悄悄丢弃。
   useEffect(() => () => flushPendingSettings(), [flushPendingSettings]);
 
+  // 切后台 / 关标签页冲刷：移动端杀掉 app、桌面端直接关窗口都不会走
+  // unmount（阅读器被 KeepAlive 常驻挂载，settings hook 跟着常驻）。
+  // 调完字号 200ms 内锁屏或关掉 app，防抖窗口里的最终值以前会静默丢失，
+  // 下次打开排版被打回旧样。与阅读进度 hook 的同名兜底对齐。
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handleHide = () => {
+      if (document.visibilityState === "hidden") flushPendingSettings();
+    };
+    const handlePageHide = () => flushPendingSettings();
+    document.addEventListener("visibilitychange", handleHide);
+    window.addEventListener("pagehide", handlePageHide);
+    return () => {
+      document.removeEventListener("visibilitychange", handleHide);
+      window.removeEventListener("pagehide", handlePageHide);
+    };
+  }, [flushPendingSettings]);
+
   // 多窗口（桌面端可以开多个）时跟随其它窗口的修改。设置是整对象回写：
   // 不跟随的话，A 窗口刚调好的字号会在 B 窗口下一次改主题的回写里被 B 的
   // 旧内存快照打回（收藏 / 偏好 hook 修过同一个坑）。

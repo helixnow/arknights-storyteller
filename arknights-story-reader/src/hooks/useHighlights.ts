@@ -178,6 +178,25 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
   // instead of silently dropping the annotation.
   useEffect(() => () => flushPendingStore(), [flushPendingStore]);
 
+  // 切后台 / 关标签页冲刷：移动端杀掉 app、桌面端直接关窗口都不会走
+  // unmount（阅读器被 KeepAlive 常驻挂载）。划线的防抖只有一个宏任务，
+  // 但「点完书签立刻锁屏 / 关 app」仍可能抢在 setTimeout(0) 之前；quota
+  // 失败后留着重试的 pending 更是只能靠这里兜底落盘。与阅读进度 hook 的
+  // 同名兜底对齐。
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handleHide = () => {
+      if (document.visibilityState === "hidden") flushPendingStore();
+    };
+    const handlePageHide = () => flushPendingStore();
+    document.addEventListener("visibilitychange", handleHide);
+    window.addEventListener("pagehide", handlePageHide);
+    return () => {
+      document.removeEventListener("visibilitychange", handleHide);
+      window.removeEventListener("pagehide", handlePageHide);
+    };
+  }, [flushPendingStore]);
+
   // 多窗口（桌面端可以开多个）时跟随其它窗口的修改。划线和收藏一样是
   // 「整表读进内存 → 任意改动整表回写」，不跟随的话：A 窗口刚画的线会在
   // B 窗口的下一次回写里被 B 的旧内存快照整体覆盖，无声丢失（收藏 hook
