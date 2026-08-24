@@ -1,7 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
 import { useStoryPreview } from "@/hooks/useStoryPreview";
-import { isBrowserOffline, useOnlineRecoveryNonce } from "@/components/AssetImage";
+import {
+  getOnlineVersion,
+  isBrowserOffline,
+  isStaleOfflineError,
+  useOnlineRecoveryNonce,
+  type IssueNetSnapshot,
+} from "@/components/AssetImage";
 import { peekAssetCandidates, useAssetHealthNonce } from "@/hooks/useAsset";
 import {
   gradientFallbackBackground,
@@ -134,6 +140,20 @@ export function StoryThumbnail({
   const currentUrlRef = useRef<string | null>(null);
   currentUrlRef.current = live?.url ?? null;
 
+  // 当前候选发起请求那一刻的网络快照。断网时挂起的在途请求常拖到网络
+  // 恢复后才报错，那一刻 navigator.onLine 已是 true，单看错误时刻会把
+  // 这次不可靠的失败当真 404 永久落账（host 已 proven 时撤销不掉）。
+  // 与 <AssetImage> 同一套判定：发出时离线、或在途期间经历过 online
+  // 事件，都视同离线余波。URL 换了才刷新——img 以 URL 为 key。
+  const issueNetRef = useRef<IssueNetSnapshot | null>(null);
+  if (issueNetRef.current === null || issueNetRef.current.url !== (live?.url ?? null)) {
+    issueNetRef.current = {
+      url: live?.url ?? null,
+      version: getOnlineVersion(),
+      offline: isBrowserOffline(),
+    };
+  }
+
   const tintClass = tint === "soft" ? "filter saturate-[0.85]" : "";
 
   return (
@@ -180,9 +200,12 @@ export function StoryThumbnail({
               // 离线时的失败不落账，只推进本地游标；候选烧完后停在
               // stuck 态，等 online 事件拨回游标重试。
               offlineFailedRef.current = true;
-            } else {
+            } else if (!isStaleOfflineError(issueNetRef.current, live.url)) {
               markAssetUrlDead(live.url);
             }
+            // 横跨离线窗口的失败（此刻已在线）不落账也不等 online 事件
+            // （它已经过去了），只推进游标——后面的候选在恢复后的网络上
+            // 正常加载。
             setCursor(Math.min(live.index + 1, candidates.length));
           }}
           className={cn(

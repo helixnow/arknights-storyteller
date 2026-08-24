@@ -77,6 +77,14 @@ function rememberNaturalSize(url: string, width: number, height: number) {
 // 所以离线期间的失败只推进本地游标、完全不落账，并在网络恢复（`online`
 // 事件）时把游标拨回 0，整条候选链原样重试。
 //
+// 「离线期间」按请求发出的时刻算，不是 onerror 落地的时刻：断网时挂起的
+// 在途请求常常拖到网络恢复之后才报错，那一刻 `navigator.onLine` 已经是
+// true，单看错误时刻会把这次不可靠的失败当真 404 落账。串行 fallback 下
+// 每次断网每个组件恰好有一条这样的在途请求，host 已 proven 时这笔账整个
+// 会话都撤销不掉。所以发起请求时记一份网络快照（`getOnlineVersion` +
+// `isBrowserOffline`），onerror 时「发出时离线，或发出后经历过 online
+// 事件」都视同离线余波。
+//
 // 与 `useAssetHealthNonce` 同一套共享订阅表模式：整个模块只挂一个
 // window listener，不随组件数量增长。
 // ─────────────────────────────────────────────────────────────
@@ -93,8 +101,31 @@ if (typeof window !== "undefined") {
   });
 }
 
-function getOnlineVersion(): number {
+/**
+ * 「网络恢复」事件的版本号。请求发出时记下它，onerror 时不相等就说明
+ * 这条请求横跨了一次断网窗口——错误判决不可靠，不该写进共享失败缓存。
+ * `<StoryThumbnail>` 与本组件共用。
+ */
+export function getOnlineVersion(): number {
   return onlineVersion;
+}
+
+export interface IssueNetSnapshot {
+  url: string | null;
+  version: number;
+  offline: boolean;
+}
+
+/** 这次 onerror 是否属于离线余波（发出时离线，或在途期间网络恢复过）。 */
+export function isStaleOfflineError(
+  issue: IssueNetSnapshot | null,
+  failedUrl: string
+): boolean {
+  return (
+    issue !== null &&
+    issue.url === failedUrl &&
+    (issue.offline || issue.version !== onlineVersion)
+  );
 }
 
 const NOOP_UNSUBSCRIBE = () => {};
@@ -252,6 +283,17 @@ export function AssetImage({
   const currentUrlRef = useRef<string | null>(null);
   currentUrlRef.current = currentUrl?.url ?? null;
 
+  // 当前候选发起请求那一刻的网络快照（见模块顶部「离线期间按发出时刻算」）。
+  // 渲染的 URL 换了才刷新——img 以 URL 为 key，URL 不变就不会重新发请求。
+  const issueNetRef = useRef<IssueNetSnapshot | null>(null);
+  if (issueNetRef.current === null || issueNetRef.current.url !== (currentUrl?.url ?? null)) {
+    issueNetRef.current = {
+      url: currentUrl?.url ?? null,
+      version: getOnlineVersion(),
+      offline: isBrowserOffline(),
+    };
+  }
+
   const tintClass =
     tint === "none"
       ? ""
@@ -313,9 +355,12 @@ export function AssetImage({
               // 离线时的失败不落账（见模块顶部说明），只推进本地游标；
               // 候选烧完后停在 stuck 态，等 online 事件拨回游标重试。
               offlineFailedRef.current = true;
-            } else {
+            } else if (!isStaleOfflineError(issueNetRef.current, currentUrl.url)) {
               markAssetUrlDead(currentUrl.url);
             }
+            // 横跨离线窗口的失败（此刻已在线）两边都不做：不落账也不等
+            // online 事件（它已经过去了），只推进游标——网络已恢复，
+            // 后面的候选会正常加载。
             setCurrentIdx(Math.min(currentUrl.index + 1, candidates.length));
           }}
           className={cn(
