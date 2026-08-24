@@ -464,43 +464,70 @@ impl QueryTerms {
 /// Quoted phrases are kept intact, a literal `or` joins the surrounding terms
 /// into one OR group, and a leading `-` marks an exclusion. Returns already
 /// fuzzy-normalized terms.
+///
+/// 解析必须发生在与 `build_fts_query_advanced` 相同的文本上：先对整个查询
+/// 做 NFKC + 小写 + 去组合符，再按空白/引号切词。在原始文本上解析的话，
+/// 全角减号 `－词`（NFKC 之后才是 `-`）在 FTS 侧是排除、在这里却成了肯定
+/// 词，全角引号 `＂`（NFKC 后是 `"`）也只有 FTS 侧认得——索引建好前后
+/// 同一查询的语义会分叉甚至反转。
 fn split_query_terms(query: &str) -> QueryTerms {
     struct Raw {
         text: String,
         is_not: bool,
         is_quoted: bool,
+        /// 整个 token 恰好是裸词 `or`：连接词占位，第二遍改写分组用。
+        is_or: bool,
     }
 
     fn flush_bare(buf: &mut String, terms: &mut Vec<Raw>) {
         if buf.is_empty() {
             return;
         }
-        let raw = std::mem::take(buf);
-        let is_not = raw.starts_with('-');
-        let normalized = normalize_for_fuzzy(&raw);
-        if normalized.is_empty() {
+        let t = std::mem::take(buf);
+        // 与 FTS 侧一致：连接词判定发生在去减号之前，所以 `-or` 是
+        // 「排除 or」，`or，`、`(or)` 是普通词，都不是连接词。
+        if t == "or" {
+            terms.push(Raw {
+                text: String::new(),
+                is_not: false,
+                is_quoted: false,
+                is_or: true,
+            });
             return;
         }
+        let is_not = t.starts_with('-');
+        let content = t.trim_start_matches('-');
+        // 纯减号串在 FTS 侧同样不产生词条，它前面的 `or` 顺延给下一个词，
+        // 两边要漂一起漂。
+        if content.is_empty() {
+            return;
+        }
+        // 归一化后为空的词（纯标点等）也要保留占位：FTS 侧这种词要到子句
+        // 生成阶段才被丢弃，其前面的 `or` 已随之作废，这里必须同样消费。
         terms.push(Raw {
-            text: normalized,
+            text: normalize_for_fuzzy(content),
             is_not,
             is_quoted: false,
+            is_or: false,
         });
     }
 
     fn flush_quoted(buf: &mut String, terms: &mut Vec<Raw>, is_not: bool) {
         let phrase = std::mem::take(buf);
-        let normalized = normalize_for_fuzzy(&phrase);
-        if normalized.is_empty() {
+        // 空引号 `""` 在 FTS 侧不产生词条也不消费 `or`；非空短语即使归一化
+        // 后为空（如 `"，"`）也要占位，理由同 flush_bare。
+        if phrase.is_empty() {
             return;
         }
         terms.push(Raw {
-            text: normalized,
+            text: normalize_for_fuzzy(&phrase),
             is_not,
             is_quoted: true,
+            is_or: false,
         });
     }
 
+    let query = normalize_nfkc_lower_strip_marks(query.trim());
     let mut raw_terms: Vec<Raw> = Vec::new();
     let mut buf = String::new();
     let mut in_quotes = false;
@@ -536,8 +563,9 @@ fn split_query_terms(query: &str) -> QueryTerms {
     let mut out = QueryTerms::default();
     let mut pending_or = false;
     for raw in raw_terms {
-        // 引号里的 `or` 是要搜的字面量，不是连接词。
-        if !raw.is_quoted && raw.text == "or" {
+        // 连接词在 flush 时就按「整个 token 恰好是裸词 or」判定过了；
+        // 引号里的 `or` 自然是要搜的字面量。
+        if raw.is_or {
             // `or` only connects when there is something on the left to
             // connect to; a leading `or` is just noise.
             pending_or = !out.positive.is_empty();
@@ -545,9 +573,10 @@ fn split_query_terms(query: &str) -> QueryTerms {
         }
         // `or` 归它后面紧跟的那个词——FTS 侧解析时就把 `prev_was_or` 记到
         // 该词头上并立刻清零。这里必须同样先消费掉：这个词若是否定项、或
-        // 切不出任何原子（假名等）而被丢弃，`or` 要随它一起消失，不能漂给
-        // 再下一个正向词。否则 `A or -B C` 在扫描回退里会变成 `(A OR C)`，
-        // 而索引路径是 `A AND C`，索引建好前后同一查询的结果集就分叉了。
+        // 切不出任何原子（假名、纯标点等）而被丢弃，`or` 要随它一起消失，
+        // 不能漂给再下一个正向词。否则 `A or -B C` 在扫描回退里会变成
+        // `(A OR C)`，而索引路径是 `A AND C`，索引建好前后同一查询的结果
+        // 集就分叉了。
         let is_or_before = std::mem::take(&mut pending_or);
         let term = if raw.is_quoted {
             Term::phrase(raw.text)
@@ -4500,6 +4529,53 @@ mod tests {
     }
 
     #[test]
+    fn split_query_terms_fullwidth_minus_is_negation() {
+        // 全角减号（中文输入法全角标点档）要 NFKC 之后才是 `-`。FTS 侧对
+        // 整个查询先归一化再解析，把 `－凯尔希` 当排除；回退侧必须一致，
+        // 否则索引建好前后同一查询的语义正好相反。
+        let terms = split_query_terms("－凯尔希 博士");
+        assert_eq!(positive_texts(&terms), vec![vec!["博士"]]);
+        assert_eq!(negative_texts(&terms), vec!["凯尔希"]);
+    }
+
+    #[test]
+    fn split_query_terms_fullwidth_quotes_make_a_phrase() {
+        // 全角引号 U+FF02 NFKC 后是 `"`，FTS 侧按短语解析；回退侧一致。
+        let terms = split_query_terms("＂凯尔希 阿米娅＂");
+        assert_eq!(positive_texts(&terms), vec![vec!["凯尔希阿米娅"]]);
+        assert_eq!(terms.positive[0][0].atoms, vec!["凯尔希阿米娅"]);
+    }
+
+    #[test]
+    fn split_query_terms_decorated_or_is_a_term_not_a_connective() {
+        // FTS 侧只有整个 token 恰好是 `or` 才算连接词。回退侧此前在去掉
+        // 标点之后的文本上判定，`or，` 会被误当连接词，同一查询在两条
+        // 路径下一个是 OR、一个是 AND。
+        let terms = split_query_terms("凯尔希 or， 阿米娅");
+        assert_eq!(
+            positive_texts(&terms),
+            vec![vec!["凯尔希"], vec!["or"], vec!["阿米娅"]]
+        );
+
+        // `-or` 是「排除 or」，不是连接词；负项标记不能丢。
+        let terms = split_query_terms("博士 -or");
+        assert_eq!(positive_texts(&terms), vec![vec!["博士"]]);
+        assert_eq!(negative_texts(&terms), vec!["or"]);
+    }
+
+    #[test]
+    fn split_query_terms_or_dies_with_punct_only_term() {
+        // 纯标点词在 FTS 侧要到子句生成阶段才被丢掉，它前面的 `or` 已被
+        // 消费掉了；回退侧此前在归一化时就丢词，`or` 漂给下一个词变成 OR。
+        let terms = split_query_terms("希 or ， 雪");
+        assert_eq!(positive_texts(&terms), vec![vec!["希"], vec!["雪"]]);
+
+        // 纯减号串两边都不产生词条，`or` 照旧顺延——与 FTS 侧一致。
+        let terms = split_query_terms("希 or - 雪");
+        assert_eq!(positive_texts(&terms), vec![vec!["希", "雪"]]);
+    }
+
+    #[test]
     fn split_query_terms_or_group_matches_either_alternative() {
         let terms = split_query_terms("凯尔希 or 阿米娅");
         assert!(terms.positives_match(&["只提到凯尔希"]));
@@ -4576,6 +4652,36 @@ mod tests {
         // we return None so the caller short-circuits to empty results.
         assert!(DataService::build_fts_query_advanced("-凯尔希").is_none());
         assert!(DataService::build_fts_query_advanced("-凯尔希 -博士").is_none());
+    }
+
+    #[test]
+    fn fts_query_fullwidth_minus_is_negation() {
+        // NFKC 把全角减号折成 `-`，所以 FTS 侧把 `－凯尔希` 当排除；
+        // 与 split_query_terms_fullwidth_minus_is_negation 对齐。
+        let q = DataService::build_fts_query_advanced("－凯尔希 博士").expect("non-empty");
+        let not_idx = q.find(" NOT ").expect("fullwidth minus must negate");
+        assert!(q[..not_idx].contains('博'), "positives first: {}", q);
+        assert!(q[not_idx..].contains('凯'), "凯尔希 must be negated: {}", q);
+    }
+
+    #[test]
+    fn fts_query_or_survival_matches_fallback_for_dropped_terms() {
+        // 与 split_query_terms_or_dies_with_punct_only_term 逐条对齐：
+        // 纯标点词在子句生成时被丢，但它已消费掉前面的 `or` → AND；
+        // 纯减号串在解析时就没产生词条，`or` 顺延给下一个词 → OR。
+        let q = DataService::build_fts_query_advanced("希 or ， 雪").expect("non-empty");
+        assert_eq!(q, "\"希\" AND \"雪\"");
+        let q = DataService::build_fts_query_advanced("希 or - 雪").expect("non-empty");
+        assert_eq!(q, "(\"希\" OR \"雪\")");
+    }
+
+    #[test]
+    fn fts_query_decorated_or_is_a_term_not_a_connective() {
+        // 只有整个 token 恰好是 `or` 才是连接词；`or，` 是要搜的词。
+        // 与 split_query_terms_decorated_or_is_a_term_not_a_connective 对齐。
+        let q = DataService::build_fts_query_advanced("凯尔希 or， 阿米娅").expect("non-empty");
+        assert!(!q.contains(" OR "), "no OR group expected: {}", q);
+        assert!(q.contains("or*"), "`or，` must survive as a term: {}", q);
     }
 
     #[test]

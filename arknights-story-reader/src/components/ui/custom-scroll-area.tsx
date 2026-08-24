@@ -89,9 +89,16 @@ export const CustomScrollArea = forwardRef<HTMLDivElement, CustomScrollAreaProps
           return;
         }
 
+        /* 滑块的行程坐标系是轨道而不是 viewport：轨道被 CSS 上下各内缩
+           clamp(0.75rem, 2vw, 1rem)，调用方还会叠加 trackOffset*（阅读器里
+           上下合计约 170px）。若按 clientHeight 推位置，滚到底时滑块会冲出
+           轨道下端、压进 trackOffsetBottom 特意避开的底栏；而拖动/轨道点击
+           用的是 trackRect.height，两套坐标一长一短，拖动中每帧 rAF 重算还
+           会把滑块从指针握点下方拽走。 */
+        const trackHeight = trackRef.current?.clientHeight ?? clientHeight;
         const ratio = clientHeight / scrollHeight;
-        const height = Math.max(clientHeight * ratio, 36);
-        const maxOffset = clientHeight - height;
+        const height = Math.min(Math.max(trackHeight * ratio, 36), trackHeight);
+        const maxOffset = Math.max(trackHeight - height, 0);
         const top =
           maxOffset <= 0 ? 0 : (scrollTop / (scrollHeight - clientHeight)) * maxOffset;
 
@@ -119,6 +126,9 @@ export const CustomScrollArea = forwardRef<HTMLDivElement, CustomScrollAreaProps
       });
 
       resizeObserver.observe(viewport);
+      // 轨道高度不只跟着 viewport 变：trackOffset* 是 CSS 变量，阅读模式
+      // 切换（分页↔滚动）只改它不改容器尺寸，得单独观察轨道本身。
+      if (trackRef.current) resizeObserver.observe(trackRef.current);
 
       // 只监听 viewport 直接子节点的增删（整篇剧情/列表切换等）。
       // 早期版本用 `subtree: true`，每张图加载完都会触发一次子树变动，

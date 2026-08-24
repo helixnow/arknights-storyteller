@@ -365,6 +365,11 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   // animation. Bumped each time the reader jumps to a new hit; cleared
   // after the pulse keyframes finish so the data attribute auto-removes.
   const [searchPulseToken, setSearchPulseToken] = useState(0);
+  // 跳转目标段「本应已在文档里却查不到」时 bump 一次（见 jumpToSegment），
+  // 用来触发下面的 30 帧兜底重试链。pending 本体是 ref（多处需要同步读写、
+  // 也不想让每次跳转都重渲染整棵正文），代价是兜底 layout effect 的依赖里
+  // 没有任何东西会因这类 miss 而变化——不显式踢一脚它就永远不跑。
+  const [pendingScrollTick, setPendingScrollTick] = useState(0);
   const [activeCharacter, setActiveCharacter] = useState<string | null>(null);
   const [storyEntry, setStoryEntry] = useState<StoryEntry | null>(() =>
     storyEntryCache.get(storyId)
@@ -1610,6 +1615,18 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
         pendingScrollIndexRef.current = null;
         // 落点已成功应用，进篇兜底快照不再需要。
         pendingLandingFallbackRef.current = null;
+      } else {
+        // 查不到目标元素。分页模式跳到别的页时 setCurrentPage 会带来新渲染、
+        // renderableSegments 一变兜底重试链自然会跑；但连续滚动模式（全量
+        // 渲染）以及分页模式命中当前页时，目标查不到意味着它渲染成了 null
+        // ——被隐藏 / 加载失败的插画段（搜索是索引 caption 的，能把读者带到
+        // 这里）。此时没有任何新渲染会去触发兜底 effect，pending 就永远挂着：
+        // 读者停在原地、搜索进篇被跳过的进度恢复不再有人兜底，随后的进度
+        // 落盘还会把 ~0% 写成真实进度，残留的 pending 还会在下一次正文重排
+        // 时把读者拽向不存在的段。显式 bump 让重试链跑起来，30 帧后由它
+        // 统一执行放弃与进度回退。目标真的稍后出现（页面切换、失败插画被
+        // 健康事件复活）时，同一条链会照常完成滚动。
+        setPendingScrollTick((prev) => prev + 1);
       }
     },
     [processedSegments, scrollToSegment, settings.readingMode, totalPages, pageBoundaries]
@@ -1731,7 +1748,16 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       cancelled = true;
       cancelAnimationFrame(frame);
     };
-  }, [renderableSegments, currentPage, settings.readingMode, scrollToSegment, applyStoredProgress]);
+    // pendingScrollTick 只是触发器：目标段本应在文档里却查不到时（隐藏 /
+    // 失败的插画段），jumpToSegment 靠它启动这条重试链，其余依赖都不会变。
+  }, [
+    renderableSegments,
+    currentPage,
+    settings.readingMode,
+    scrollToSegment,
+    applyStoredProgress,
+    pendingScrollTick,
+  ]);
 
   useEffect(() => {
     if (!initialFocus || !processedSegments.length) return;
