@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useToast } from "@/components/ui/toast";
 
 /**
@@ -176,9 +176,10 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
     if (raw === lastRawRef.current) {
       // 内容与盘上完全一致（典型场景：跟随 storage 事件之后的回写），
       // 再写一遍只会在别的窗口触发一轮多余的事件。
-      // 脏键只在其对应的 pending 真被并进 merged 时才算清账：toggle 是先
-      // 同步记脏键、等 persist effect 才物化 pending 的，中间若插进一次
-      // 只带遗留重试的冲刷，不能把还没消费过的脏键顺手抹掉。
+      // 脏键只在其对应的 pending 真被并进 merged 时才算清账：pending 为
+      // null 时脏键仍可能非空（clearHighlights 清一个本就不存在的 key 会
+      // 记脏键但 state 原样 bail-out，layout effect 不跑），只带遗留重试
+      // 的冲刷不能把还没消费过的脏键顺手抹掉。
       if (pending !== null) {
         pendingStoreRef.current = null;
         dirtyKeysRef.current.clear();
@@ -218,8 +219,21 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
   // StrictMode 开发模式下挂载期 effect 连跑两次、ref 不会重置，第二次就把
   // 初始状态写回去了（收藏 hook 踩过同一个坑）。改为与初始 state 做引用
   // 比较——任何真实改动都会产生新对象，自然落盘。
+  //
+  // 物化 pending 必须用 layout effect（与 commit 同任务同步执行），不能等
+  // passive：toggle 是「同步记脏键 → setStore → 本任务内 commit」，而
+  // passive effect 要到 paint 之后的调度任务才跑。中间隔着的任务边界上：
+  //   - pagehide / visibilitychange 的兜底冲刷看到的 pending 还是 null，
+  //     直接 no-op——「点完书签立刻锁屏 / 关 app」时刚点的划线救不回来；
+  //   - 上一次 commit 布下的 setTimeout(0) 冲刷更糟：它会按脏键把旧
+  //     pending 快照并盘并清空全部脏键，新 toggle 的值既没上盘、重试凭据
+  //     （脏键）也没了；随后新 pending 物化时脏键已空，一个键都并不进去，
+  //     合并结果与盘一致又被回声抑制清账——UI 亮着、重启后划线消失。
+  // 改成 layout effect 后：任何任务边界上 pending 一定覆盖了所有已记脏的
+  // 改动，旧定时器也在新 commit 的同一任务里被 cleanup 拆掉，冲刷永远拿
+  // 不到过期快照。
   const initialStoreRef = useRef(store);
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (typeof window === "undefined") return;
     if (store === initialStoreRef.current) {
       return;
@@ -279,11 +293,11 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
       if (event.key === STORAGE_KEY && raw === lastRawRef.current) return;
       lastRawRef.current = raw;
       const disk = readStorage();
-      // 本地改动的判据不能要求 pending 已物化：toggle 是先同步记脏键、等
-      // persist effect（passive 宏任务）才把 store 快照写进 pending 的，而
-      // 这个监听器是原生事件，完全可能插在两者之间。那一刻若按「无本地改
-      // 动」处理，清脏键 + 整表跟盘会把用户刚点的划线从 UI 和持久化管线里
-      // 同时抹掉——冲刷里的回声路径为同一中间态特意保过脏键，这里对齐。
+      // 本地改动的判据以脏键（而不是 pending 是否已物化）为准：pending
+      // 物化虽已改到 layout effect（与 commit 同任务），但 state 原样
+      // bail-out 时它不跑（见冲刷回声路径的说明），pending 也可能只是跟随
+      // 上一次外部状态的回声快照。按「无本地改动」处理会清脏键 + 整表跟
+      // 盘，把还没上盘的改动从 UI 和持久化管线里同时抹掉。
       const hasLocalChanges = dirtyKeysRef.current.size > 0 || failedHighlightWrites.size > 0;
       if (!hasLocalChanges) {
         // 脏键此刻必为空；pending 若非空也只是跟随上一次外部状态的回声
