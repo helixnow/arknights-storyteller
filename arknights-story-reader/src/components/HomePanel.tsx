@@ -391,7 +391,10 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
   const contentVisible = installed === true && contentReady;
   const goToSettings = useCallback(() => onGoToTab("settings"), [onGoToTab]);
   const retryLoad = useCallback(() => {
-    setLoadFailed(false);
+    // 不预先清 loadFailed：冷启动就失败的场景里 contentReady 还是 false，
+    // 错误卡是页面上唯一的内容——先清标记会让它立刻卸载，重试期间整页
+    // 只剩标题一片空白，失败后又闪回来。成功 / 未安装路径自会把标记翻掉，
+    // 重试期间卡片上的按钮转为「重试中…」并禁用（见下）。
     void loadHome({ force: true });
   }, [loadHome]);
 
@@ -446,7 +449,13 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
                     : "可能是数据目录被移动或损坏了。先重试，仍然失败就去设置里重新同步或导入 ZIP。"
                 }
                 actions={[
-                  { label: "重试", onClick: retryLoad, icon: RotateCcw, variant: "default" },
+                  {
+                    label: refreshing ? "重试中…" : "重试",
+                    onClick: retryLoad,
+                    icon: RotateCcw,
+                    variant: "default",
+                    disabled: refreshing,
+                  },
                   { label: "打开设置", onClick: goToSettings, icon: Settings2 },
                 ]}
               />
@@ -572,6 +581,8 @@ interface HomeNoticeAction {
   onClick: () => void;
   icon?: LucideIcon;
   variant?: "default" | "outline";
+  /** 动作正在执行（如重试请求在途）时禁用，防止连点打出一串重复请求。 */
+  disabled?: boolean;
 }
 
 /**
@@ -624,14 +635,17 @@ function HomeNotice({
         </div>
       </div>
       <div className="flex flex-wrap gap-2">
-        {actions.map((action) => {
+        {actions.map((action, index) => {
           const ActionIcon = action.icon;
           return (
             <Button
-              key={action.label}
+              // 不用 label 当 key：重试按钮的文案会在「重试 / 重试中…」之间
+              // 切换，key 跟着变会让按钮整个重挂载。动作列表按位置稳定。
+              key={index}
               variant={action.variant ?? "outline"}
               className="min-h-[44px]"
               onClick={action.onClick}
+              disabled={action.disabled}
             >
               {ActionIcon && <ActionIcon className="mr-2 h-4 w-4" />}
               {action.label}

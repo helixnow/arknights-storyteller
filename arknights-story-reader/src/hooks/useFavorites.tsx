@@ -19,12 +19,26 @@ export interface FavoriteGroup {
   type: FavoriteGroupType;
   storyIds: string[];
   stories: Record<string, StoryEntry>;
+  /**
+   * 用户从整组收藏里单独摘掉的成员。目录校正（reconcileCatalog）按目录
+   * 全量补齐成员时要跳过这些 id——否则「收藏了整个活动、又取消了其中
+   * 一章」的用户，下一次目录刷新就会看到那一章被偷偷收藏回来。
+   */
+  excludedStoryIds?: string[];
 }
 
 export interface FavoriteGroupPayload {
   id: string;
   name: string;
   type?: FavoriteGroupType;
+  stories: StoryEntry[];
+}
+
+/** 目录侧的一个分组快照，供 `reconcileCatalog` 校正整组收藏用。 */
+export interface CatalogGroupSnapshot {
+  id: string;
+  name: string;
+  type: FavoriteGroupType;
   stories: StoryEntry[];
 }
 
@@ -46,6 +60,16 @@ interface FavoritesContextValue {
   toggleFavorite: (story: StoryEntry) => void;
   isGroupFavorite: (groupId: string) => boolean;
   toggleFavoriteGroup: (group: FavoriteGroupPayload) => void;
+  /**
+   * 目录加载后调用：把收藏里存的旧 StoryEntry 快照换成当前目录的版本，
+   * 整组收藏的成员也以目录为准补齐/校正。收藏是「收藏那一刻的对象快照」
+   * 落在 localStorage 里的，不校正的话换包后收藏页会一直显示旧书名、
+   * 点开走的还是旧 txt 路径，新补的章节也永远进不了已收藏的组。
+   */
+  reconcileCatalog: (catalog: {
+    entries: StoryEntry[];
+    groups: CatalogGroupSnapshot[];
+  }) => void;
 }
 
 const STORAGE_KEY = "arknights-story-favorites";
@@ -87,6 +111,12 @@ function sanitizeGroupMap(input: unknown): Record<string, FavoriteGroup> {
 
     if (storyIds.length === 0) continue;
 
+    const excludedStoryIds = Array.isArray(raw.excludedStoryIds)
+      ? Array.from(
+          new Set(raw.excludedStoryIds.filter((id): id is string => typeof id === "string"))
+        )
+      : [];
+
     // 逐字段收敛：id/name 必须是非空字符串，type 必须落在已知枚举内。
     // localStorage 可能被旧版本或手改写入任意形状，脏值一律回落到安全默认。
     groups[groupId] = {
@@ -98,6 +128,7 @@ function sanitizeGroupMap(input: unknown): Record<string, FavoriteGroup> {
           : "other",
       storyIds: Array.from(new Set(storyIds)),
       stories,
+      ...(excludedStoryIds.length > 0 ? { excludedStoryIds } : {}),
     };
   }
 
@@ -247,6 +278,10 @@ export function FavoritesProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (typeof window === "undefined") return;
     const onStorage = (event: StorageEvent) => {
+      // 只认 localStorage：sessionStorage.clear() 也会派发 key 为 null 的
+      // storage 事件，不区分来源会把收藏整表白白重读一遍，还顺手把
+      // lastRawRef 的去重基准清掉。
+      if (event.storageArea && event.storageArea !== window.localStorage) return;
       // key 为 null 表示外部 storage.clear()，也要跟随。
       if (event.key !== null && event.key !== STORAGE_KEY) return;
       const raw = event.key === STORAGE_KEY ? event.newValue : null;
@@ -297,7 +332,12 @@ export function FavoritesProvider({ children }: { children: ReactNode }) {
         const storyIds = group.storyIds.filter((id) => id !== story.storyId);
         if (storyIds.length === 0) continue;
         const { [story.storyId]: _removed, ...restStories } = group.stories;
-        nextGroups[groupId] = { ...group, storyIds, stories: restStories };
+        // 记下「这是用户显式摘掉的」：目录校正按全量补齐成员时要跳过它，
+        // 不然下一次目录刷新就会把这一章偷偷收藏回来。
+        const excludedStoryIds = Array.from(
+          new Set([...(group.excludedStoryIds ?? []), story.storyId])
+        );
+        nextGroups[groupId] = { ...group, storyIds, stories: restStories, excludedStoryIds };
       }
 
       return { stories: nextStories, groups: nextGroups };
@@ -310,10 +350,17 @@ export function FavoritesProvider({ children }: { children: ReactNode }) {
   );
 
   const toggleFavoriteGroup = useCallback((group: FavoriteGroupPayload) => {
-    const uniqueStories = group.stories.filter(
-      (story, index, self) =>
-        story && typeof story === "object" && self.findIndex((item) => item.storyId === story.storyId) === index
-    );
+    // 去重顺便挡脏值：payload 里若混进 null / 缺 storyId 的条目（收藏页把
+    // localStorage 里的旧快照原样传回来），原先的 findIndex 会在 null 上取
+    // storyId 直接抛错，整个「收藏该组」点击就崩掉。
+    const seen = new Set<string>();
+    const uniqueStories: StoryEntry[] = [];
+    for (const story of group.stories) {
+      if (!story || typeof story !== "object" || typeof story.storyId !== "string") continue;
+      if (seen.has(story.storyId)) continue;
+      seen.add(story.storyId);
+      uniqueStories.push(story);
+    }
 
     setFavorites((prev) => {
       if (prev.groups[group.id]) {
@@ -346,6 +393,127 @@ export function FavoritesProvider({ children }: { children: ReactNode }) {
     });
   }, []);
 
+  /**
+   * 用目录里的最新版本校正收藏。只「更新」，绝不新增或删除收藏本身：
+   * - 单章收藏与分组成员的 StoryEntry 换成目录里的同 id 新对象（书名、
+   *   编号、txt 路径跟着数据包走）；
+   * - 整组收藏若还在目录里，成员名单以目录为准（换包补了章节就跟着补，
+   *   改名/换类型也同步）；
+   * - 组不在传入目录里（对应分类还没加载、或数据包移除了它）时不动名单，
+   *   只刷新已存成员的内容。
+   *
+   * 变化判定是内容级（JSON 比较）而不是引用级：目录缓存过期后每次重取
+   * 都是新对象，按引用比会把「内容没变」也当成变化，每次聚焦都空写一遍
+   * localStorage。真没变化时原样返回 prev，state 与存储都零扰动。
+   */
+  const reconcileCatalog = useCallback(
+    (catalog: { entries: StoryEntry[]; groups: CatalogGroupSnapshot[] }) => {
+      const freshById = new Map<string, StoryEntry>();
+      for (const entry of catalog.entries) {
+        if (entry && typeof entry === "object" && typeof entry.storyId === "string") {
+          freshById.set(entry.storyId, entry);
+        }
+      }
+      if (freshById.size === 0) return;
+
+      const freshGroups = new Map<string, CatalogGroupSnapshot>();
+      for (const group of catalog.groups) {
+        if (group && typeof group.id === "string" && group.stories.length > 0) {
+          freshGroups.set(group.id, group);
+        }
+      }
+
+      const sameEntry = (a: StoryEntry, b: StoryEntry) =>
+        a === b || JSON.stringify(a) === JSON.stringify(b);
+
+      setFavorites((prev) => {
+        let changed = false;
+
+        /** 内容有变才返回新 map，否则返回 null 表示原样保留。 */
+        const refreshMap = (stored: FavoriteStoryMap): FavoriteStoryMap | null => {
+          let mapChanged = false;
+          const next: FavoriteStoryMap = {};
+          for (const [id, story] of Object.entries(stored)) {
+            const fresh = freshById.get(id);
+            if (fresh && !sameEntry(fresh, story)) {
+              next[id] = fresh;
+              mapChanged = true;
+            } else {
+              next[id] = story;
+            }
+          }
+          return mapChanged ? next : null;
+        };
+
+        const refreshedStories = refreshMap(prev.stories);
+        if (refreshedStories) changed = true;
+
+        let groupsChanged = false;
+        const nextGroups: Record<string, FavoriteGroup> = {};
+        for (const [groupId, group] of Object.entries(prev.groups)) {
+          const catalogGroup = freshGroups.get(groupId);
+          if (!catalogGroup) {
+            const refreshed = refreshMap(group.stories);
+            if (refreshed) {
+              nextGroups[groupId] = { ...group, stories: refreshed };
+              groupsChanged = true;
+            } else {
+              nextGroups[groupId] = group;
+            }
+            continue;
+          }
+
+          // 成员以目录为准补齐，但跳过用户显式摘掉的那些（excludedStoryIds）：
+          // 补齐是为了跟上新数据包，不是为了推翻用户的手动取消。
+          const excluded = new Set(group.excludedStoryIds ?? []);
+          const stories: FavoriteStoryMap = {};
+          const storyIds: string[] = [];
+          for (const story of catalogGroup.stories) {
+            if (!story || typeof story.storyId !== "string") continue;
+            if (excluded.has(story.storyId)) continue;
+            if (stories[story.storyId]) continue;
+            stories[story.storyId] = story;
+            storyIds.push(story.storyId);
+          }
+          if (storyIds.length === 0) {
+            nextGroups[groupId] = group;
+            continue;
+          }
+
+          const sameMembers =
+            storyIds.length === group.storyIds.length &&
+            storyIds.every((id, index) => id === group.storyIds[index]) &&
+            storyIds.every(
+              (id) => Boolean(group.stories[id]) && sameEntry(stories[id], group.stories[id])
+            );
+          if (sameMembers && catalogGroup.name === group.name && catalogGroup.type === group.type) {
+            nextGroups[groupId] = group;
+          } else {
+            nextGroups[groupId] = {
+              id: group.id,
+              name: catalogGroup.name,
+              type: catalogGroup.type,
+              storyIds,
+              stories,
+              ...(group.excludedStoryIds && group.excludedStoryIds.length > 0
+                ? { excludedStoryIds: group.excludedStoryIds }
+                : {}),
+            };
+            groupsChanged = true;
+          }
+        }
+        if (groupsChanged) changed = true;
+
+        if (!changed) return prev;
+        return {
+          stories: refreshedStories ?? prev.stories,
+          groups: groupsChanged ? nextGroups : prev.groups,
+        };
+      });
+    },
+    []
+  );
+
   const value = useMemo<FavoritesContextValue>(
     () => ({
       favoriteStories: favorites.stories,
@@ -356,6 +524,7 @@ export function FavoritesProvider({ children }: { children: ReactNode }) {
       toggleFavorite,
       isGroupFavorite,
       toggleFavoriteGroup,
+      reconcileCatalog,
     }),
     [
       favorites.groups,
@@ -366,6 +535,7 @@ export function FavoritesProvider({ children }: { children: ReactNode }) {
       toggleFavorite,
       isGroupFavorite,
       toggleFavoriteGroup,
+      reconcileCatalog,
     ]
   );
 

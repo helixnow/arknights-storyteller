@@ -35,7 +35,7 @@ import { Collapsible } from "@/components/ui/collapsible";
 import { CustomScrollArea } from "@/components/ui/custom-scroll-area";
 import { Input } from "@/components/ui/input";
 import { useFavorites } from "@/hooks/useFavorites";
-import type { FavoriteGroupType } from "@/hooks/useFavorites";
+import type { CatalogGroupSnapshot, FavoriteGroupType } from "@/hooks/useFavorites";
 import { useAppPreferences } from "@/hooks/useAppPreferences";
 import { StoryThumbnail } from "@/components/StoryThumbnail";
 import { AssetImage } from "@/components/AssetImage";
@@ -546,6 +546,8 @@ export function StoryList({ onSelectStory }: StoryListProps) {
   const online = useOnlineStatus();
   /** 分批挂载的 IntersectionObserver 需要真正的滚动容器当 root。 */
   const scrollRootRef = useRef<HTMLDivElement | null>(null);
+  /** 分类 pill 的横向滚动容器，切分类后把选中 pill 滚进可视区。 */
+  const pillRowRef = useRef<HTMLDivElement | null>(null);
 
   // 每块数据是否已加载 / 在途的 Promise。用 ref 保存，这样 loadSection
   // 能保持稳定引用，effect 不会因为 state 变化重复触发。
@@ -571,6 +573,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
     toggleFavorite,
     isGroupFavorite,
     toggleFavoriteGroup,
+    reconcileCatalog,
   } = useFavorites();
 
   /**
@@ -641,6 +644,9 @@ export function StoryList({ onSelectStory }: StoryListProps) {
             setGroups((prev) => ({ ...prev, [key]: data }));
           }
           loadedRef.current[key] = true;
+          // 目录读出来了就说明数据在：isInstalled 自己失败时（见下方挂载
+          // effect 的 catch）靠这里把 installed 回正；平时是幂等 no-op。
+          setInstalled(true);
         } catch (err) {
           // 被顶替的任务连错误也不该报：数据源已换，这份失败没有意义。
           // 归属还在但用户已切去别的分类时，只记日志不立卡（silent）：
@@ -690,18 +696,24 @@ export function StoryList({ onSelectStory }: StoryListProps) {
         }
       } catch (e) {
         if (cancelled) return;
-        console.error("[StoryList] isInstalled 失败，回退到同步对话框:", e);
-        setInstalled(false);
-        setError({ kind: "not-installed", label: "本地数据" });
-        setSyncDialogOpen(true);
-        setSectionBusy("main", false);
+        // isInstalled 抛错/超时 ≠ 数据没装：IPC 抖动、后端忙都会走到这里。
+        // 以前直接判成「未安装」、弹同步对话框，数据明明在的用户会被带去做
+        // 一次没必要的同步——而首页对同一故障给的是「读不出来，重试」，两个
+        // 页面自相矛盾。改为乐观地直接读目录：读得出来就是装了（loadSection
+        // 成功会回写 installed=true）；真没装会以 NOT_INSTALLED 落进
+        // handleLoadError，由那里下「未安装」的结论并给出同步入口。
+        console.warn("[StoryList] isInstalled 失败，改为直接读目录判定:", e);
+        void loadSection("main", true);
+        if (activeCategoryRef.current !== "main") {
+          void loadCategory(activeCategoryRef.current, true);
+        }
       }
     })();
 
     return () => {
       cancelled = true;
     };
-  }, [setSectionBusy]);
+  }, [loadCategory, loadSection, setSectionBusy]);
 
   // 数据就绪后：当前分类按需加载；主线始终加载（收藏分组名依赖它）。
   useEffect(() => {
@@ -743,6 +755,13 @@ export function StoryList({ onSelectStory }: StoryListProps) {
       setSummaryCache({});
       setSummaryLoadingIds({});
       setOpenGroups({});
+      // 旧目录的分组/密录列表立即清空。换包后旧条目的书名、txt 路径都可能
+      // 已失效，而没被下面强制重载覆盖到的分类（比如之前逛过的密录）要等
+      // 用户切进去才重新拉——期间列表非空就不会进骨架屏，一直挂着可点的
+      // 旧卡，点进去读的是一篇可能已不存在的剧情。清空后由骨架屏顶到新
+      // 数据落地。
+      setGroups(emptyGroups());
+      setMemoryStories([]);
       setError(null);
       setInstalled(true);
       // 主线不管在哪个分类都要重来一次：收藏分组名依赖它的映射表。
@@ -766,6 +785,27 @@ export function StoryList({ onSelectStory }: StoryListProps) {
     window.addEventListener("app:open-favorites", handler);
     return () => window.removeEventListener("app:open-favorites", handler);
   }, []);
+
+  // 选中的分类 pill 必须留在横向滚动区的可视范围里。用户把 pill 行划到
+  // 最右边看密录、再从首页统计格跳「收藏」时，高亮落在最左端的收藏 pill
+  // 上——不滚回来的话 pill 行看起来毫无变化，像是点了没反应。KeepAlive
+  // 用 visibility 隐藏面板、布局盒还在，所以隐藏时切换也能量到真实几何。
+  useEffect(() => {
+    const row = pillRowRef.current;
+    if (!row) return;
+    const active = row.querySelector<HTMLElement>('[aria-pressed="true"]');
+    if (!active) return;
+    const rowRect = row.getBoundingClientRect();
+    if (rowRect.width <= 0) return;
+    const rect = active.getBoundingClientRect();
+    // 留一点边距，让相邻的 pill 露出半截，暗示两侧还能继续滚。
+    const margin = 12;
+    if (rect.left < rowRect.left + margin) {
+      row.scrollLeft += rect.left - (rowRect.left + margin);
+    } else if (rect.right > rowRect.right - margin) {
+      row.scrollLeft += rect.right - (rowRect.right - margin);
+    }
+  }, [activeCategory]);
 
   // 阅读进度刷新时机：窗口重新聚焦、页面重新可见、数据更新，以及
   // `app:home-refresh` —— 打开剧情和从阅读器返回都会广播它，这正是进度
@@ -992,6 +1032,32 @@ export function StoryList({ onSelectStory }: StoryListProps) {
     [visibleGroups]
   );
 
+  // 目录落地后，把收藏里存的旧快照校正成当前目录的版本：换包后收藏页
+  // 不再显示旧书名、点开不再走旧 txt 路径，整组收藏的成员也以目录为准
+  // 补齐（新数据包给已收藏的章节/活动补了剧情就跟着进组）。只对已加载
+  // 的分类生效；数据同步时列表被清空、entries 为空，这里直接跳过，绝不
+  // 会拿「空目录」去校正收藏。
+  useEffect(() => {
+    const entries: StoryEntry[] = [];
+    const catalogGroups: CatalogGroupSnapshot[] = [];
+    (Object.keys(GROUPED_CATEGORY_META) as GroupedKey[]).forEach((key) => {
+      const meta = GROUPED_CATEGORY_META[key];
+      visibleGroups[key].forEach(([name, stories]) => {
+        entries.push(...stories);
+        catalogGroups.push({
+          // 与渲染处同一套分组 id 规则，收藏分组才能对得上号。
+          id: `${meta.idPrefix}:${stories[0]?.storyGroup || name}`,
+          name,
+          type: meta.favoriteType,
+          stories,
+        });
+      });
+    });
+    entries.push(...memoryStories);
+    if (entries.length === 0) return;
+    reconcileCatalog({ entries, groups: catalogGroups });
+  }, [memoryStories, reconcileCatalog, visibleGroups]);
+
   /** 组名命中就整组保留，否则只留命中的条目；空组直接丢掉。 */
   const filterGrouped = useCallback(
     (list: GroupedStories): GroupedStories => {
@@ -1169,12 +1235,16 @@ export function StoryList({ onSelectStory }: StoryListProps) {
     // 同步对话框不一定广播 `app:data-updated`，这里自己把共享缓存清掉。
     invalidateStoryCatalog();
     loadedRef.current = initialSectionFlags(false);
-    // 同上面 data-updated 的处理：在途任务全部作废，免得旧数据回写。
+    // 同上面 data-updated 的处理：在途任务全部作废，免得旧数据回写；
+    // 旧目录的列表也一并清空，不给换包后的旧卡留展示窗口。
     pendingRef.current = {};
     summaryAttemptsRef.current.clear();
     summaryInflightRef.current.clear();
     setSummaryCache({});
     setSummaryLoadingIds({});
+    setOpenGroups({});
+    setGroups(emptyGroups());
+    setMemoryStories([]);
     // 并发发起：目录层有 in-flight 去重，主线不会打两次 IPC。
     await Promise.all([loadSection("main", true), loadCategory(activeCategory, true)]);
     setSyncDialogOpen(false);
@@ -1220,9 +1290,12 @@ export function StoryList({ onSelectStory }: StoryListProps) {
   /** 只在「还没有任何数据」时铺骨架，刷新已有列表不闪。 */
   const isSectionPending = useCallback(
     (key: SectionKey) => {
-      if (installed === null) return true;
       const empty = key === "memory" ? memoryStories.length === 0 : groups[key].length === 0;
       if (!empty) return false;
+      // isInstalled 还没答案时先按加载中处理（冷启动骨架）；但它自己失败、
+      // 乐观读目录也失败后（error 非空且没有在途请求），必须把话筒交给
+      // 错误卡，不能拿骨架把它盖住，否则错误卡和骨架屏叠在一起打架。
+      if (installed === null) return sectionLoading[key] || !error;
       // 加载由 effect 在绘制之后才发起：首次切到一个没加载过的分类，
       // 首帧 busy 仍是 false。若此时按「没有数据」渲染，会先闪一帧
       // 「本地数据里没有 X，多半是数据包版本偏旧」的误导空态，再变成
@@ -1385,6 +1458,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
             <div className="space-y-3">
               {/* 分类 pill：移动端横向滚动，触控目标 ≥44px。加载中也保持可见。 */}
               <div
+                ref={pillRowRef}
                 role="group"
                 aria-label="剧情分类"
                 className="-mx-1 flex gap-2 overflow-x-auto px-1 pb-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
