@@ -2196,6 +2196,16 @@ impl DataService {
     /// 旧数据在换入期间的暂存目录（`<data_dir>_old`）。上一次换入若在
     /// 「挪开旧目录」和「删掉暂存」之间崩溃会留下残骸：能清就清掉复用
     /// 固定名字；清不掉就退化成带时间戳的名字，绝不往已有目录上改名。
+    ///
+    /// 例外：固定名残骸装着**有效数据集**而 `data_dir` 只是壳子时，它不是
+    /// 陈骸，而是唯一完整副本——跨设备拷贝断电或回滚半途而废都会造出
+    /// 这个局面（启动恢复清壳失败、或同进程内直接重试同步时根本没有
+    /// 启动恢复兜底），此刻新树还没落位、随时可能落不了位（磁盘满正是
+    /// 换入失败最常见的诱因），先删 `_old` 等于把恢复来源和新数据一起
+    /// 押上赌桌。此时保留固定名不碰，直接退化用时间戳名字给壳子腾位；
+    /// 换入成功后 `data_dir` 重新有效，这份 `_old` 才降格为陈骸，由下一
+    /// 次换入照常回收。与 `restore_data_dir_from_aside` 的目录不变量同一
+    /// 把尺子：手里没握着有效数据集之前，绝不销毁最后一份有效数据。
     fn old_data_aside_path(&self) -> PathBuf {
         let mut name = self
             .data_dir
@@ -2204,7 +2214,9 @@ impl DataService {
             .unwrap_or_else(|| std::ffi::OsString::from("ArknightsGameData"));
         name.push("_old");
         let fixed = self.data_dir.with_file_name(&name);
-        if !fixed.exists() || fs::remove_dir_all(&fixed).is_ok() {
+        let fixed_is_recovery_source =
+            Self::holds_valid_dataset(&fixed) && !Self::holds_valid_dataset(&self.data_dir);
+        if !fixed_is_recovery_source && (!fixed.exists() || fs::remove_dir_all(&fixed).is_ok()) {
             return fixed;
         }
         let nanos = SystemTime::now()
@@ -6613,6 +6625,97 @@ mod tests {
             !stale.exists(),
             "成功换入后不应留下任何 _old 暂存目录（包括崩溃残骸）"
         );
+    }
+
+    /// data_dir 只是壳子（空 review 表）而固定名 `_old` 装着唯一完整数据
+    /// 副本时，腾暂存名绝不能删 `_old`——那是启动恢复的口粮，此刻新树
+    /// 还没落位。必须退化用时间戳名字，且时间戳变体要能被
+    /// restore_data_dir_from_aside 的候选扫描解析出来。
+    #[test]
+    fn aside_path_preserves_only_valid_copy_when_data_dir_is_husk() {
+        let fx = Fixture::new("aside_keep_recovery");
+        let parent = fx.service.data_dir.parent().unwrap().to_path_buf();
+
+        // data_dir 变成壳子：review 表清空。
+        fs::write(fx.service.data_dir.join(REVIEW_TABLE_REL), "").unwrap();
+        // 固定名 `_old` 是唯一完整数据副本。
+        let old = parent.join("ArknightsGameData_old");
+        Fixture::write_file(&old.join(REVIEW_TABLE_REL), REVIEW_TABLE_JSON);
+        Fixture::write_file(&old.join("marker.txt"), "only complete copy");
+
+        let aside = fx.service.old_data_aside_path();
+
+        assert!(
+            old.join("marker.txt").exists(),
+            "data_dir 是壳子时，装着有效数据的 _old 一个字节都不能动"
+        );
+        assert_ne!(aside, old, "暂存名必须避开恢复来源");
+        let name = aside.file_name().unwrap().to_str().unwrap();
+        let stamp = name
+            .strip_prefix("ArknightsGameData_old_")
+            .expect("退化名必须是固定名加时间戳后缀");
+        assert!(
+            stamp.parse::<u128>().is_ok(),
+            "时间戳后缀必须能被启动恢复的候选扫描解析: {}",
+            name
+        );
+    }
+
+    /// 端到端的危险链路：data_dir 只剩壳子、唯一完整数据在 `_old`（跨设备
+    /// 拷贝断电 + 启动恢复清壳失败后的典型现场），用户在同一进程里重试
+    /// 同步，而新树又落不了位。修复前 swap_in_extracted 开场就把 `_old`
+    /// 删掉腾名字，落位再失败就两头落空；修复后失败归失败，恢复来源必须
+    /// 原封不动，且重启后必须还能把旧数据接回来。
+    #[test]
+    fn failed_swap_on_husk_keeps_recovery_source_for_restart() {
+        let fx = Fixture::new("husk_swap_keep");
+        let parent = fx.service.data_dir.parent().unwrap().to_path_buf();
+
+        // 现场布置：完整数据挪进 _old，data_dir 里只留一张空 review 表。
+        let old = parent.join("ArknightsGameData_old");
+        fs::rename(&fx.service.data_dir, &old).unwrap();
+        Fixture::write_file(&fx.service.data_dir.join(REVIEW_TABLE_REL), "");
+
+        // 新目录不存在：rename 和整树拷贝都必然失败，逼出失败路径。
+        let missing = parent.join("does_not_exist");
+        let err = fx
+            .service
+            .swap_in_extracted(&missing)
+            .expect_err("swapping in a missing tree must fail");
+        assert!(!err.is_empty());
+
+        assert!(
+            DataService::holds_valid_dataset(&old),
+            "换入失败后唯一完整副本必须还完整躺在 _old 里"
+        );
+
+        let relaunched = DataService::new(fx.root.clone());
+        assert!(
+            relaunched.is_installed(),
+            "重启后必须能从 _old 把旧数据接回 data_dir"
+        );
+        assert!(!old.exists(), "恢复即改名回 data_dir，不留副本");
+        assert_eq!(
+            relaunched.get_story_entry("main_00-01").unwrap().story_name,
+            "序章"
+        );
+    }
+
+    /// 反向护栏：data_dir 本身有效时，装着旧数据集的固定名 `_old` 就是
+    /// 上次成功换入后没删掉的陈骸，腾暂存名必须照常回收复用固定名，
+    /// 不能因为它「看起来有效」就留着白占一份数据集的磁盘。
+    #[test]
+    fn aside_path_still_reclaims_stale_valid_old_when_data_dir_is_valid() {
+        let fx = Fixture::new("aside_reclaim_stale");
+        let parent = fx.service.data_dir.parent().unwrap().to_path_buf();
+
+        let old = parent.join("ArknightsGameData_old");
+        Fixture::write_file(&old.join(REVIEW_TABLE_REL), REVIEW_TABLE_JSON);
+        Fixture::write_file(&old.join("marker.txt"), "superseded dataset");
+
+        let aside = fx.service.old_data_aside_path();
+        assert_eq!(aside, old, "data_dir 有效时固定名陈骸必须回收复用");
+        assert!(!old.exists(), "陈骸必须被当场删掉腾出名字");
     }
 
     // ---- Crash recovery on startup ------------------------------------------
