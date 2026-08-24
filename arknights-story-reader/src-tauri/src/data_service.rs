@@ -543,6 +543,12 @@ fn split_query_terms(query: &str) -> QueryTerms {
             pending_or = !out.positive.is_empty();
             continue;
         }
+        // `or` 归它后面紧跟的那个词——FTS 侧解析时就把 `prev_was_or` 记到
+        // 该词头上并立刻清零。这里必须同样先消费掉：这个词若是否定项、或
+        // 切不出任何原子（假名等）而被丢弃，`or` 要随它一起消失，不能漂给
+        // 再下一个正向词。否则 `A or -B C` 在扫描回退里会变成 `(A OR C)`，
+        // 而索引路径是 `A AND C`，索引建好前后同一查询的结果集就分叉了。
+        let is_or_before = std::mem::take(&mut pending_or);
         let term = if raw.is_quoted {
             Term::phrase(raw.text)
         } else {
@@ -553,14 +559,12 @@ fn split_query_terms(query: &str) -> QueryTerms {
             out.negative.push(term);
             continue;
         }
-        if pending_or {
+        if is_or_before {
             if let Some(group) = out.positive.last_mut() {
                 group.push(term);
-                pending_or = false;
                 continue;
             }
         }
-        pending_or = false;
         out.positive.push(vec![term]);
     }
 
@@ -4470,6 +4474,25 @@ mod tests {
     }
 
     #[test]
+    fn split_query_terms_or_is_consumed_by_negative_term() {
+        // `or` 归它后面紧跟的词；那个词是否定项时 `or` 随之作废，不能漂给
+        // 再下一个正向词。FTS 侧对同一查询生成 `(希 AND 雪) NOT 章`，
+        // 扫描回退必须给出同样的 AND 分组。
+        let terms = split_query_terms("希 or -章 雪");
+        assert_eq!(positive_texts(&terms), vec![vec!["希"], vec!["雪"]]);
+        assert_eq!(negative_texts(&terms), vec!["章"]);
+    }
+
+    #[test]
+    fn split_query_terms_or_dies_with_untokenizable_term() {
+        // 假名切不出原子，词被整个丢弃时要把它前面的 `or` 一起带走——
+        // FTS 侧此时生成 `希 AND 雪`，不是 `希 OR 雪`。
+        let terms = split_query_terms("希 or アイ 雪");
+        assert_eq!(positive_texts(&terms), vec![vec!["希"], vec!["雪"]]);
+        assert!(terms.negative.is_empty());
+    }
+
+    #[test]
     fn split_query_terms_quoted_or_is_a_literal() {
         // 引号里的 `or` 是要搜的词，不是连接词。
         let terms = split_query_terms("\"or\" 博士");
@@ -4972,6 +4995,11 @@ mod tests {
             "凯尔希 or 德克萨斯",
             // (凯尔希 OR 德克萨斯) AND 雪 —— 只有活动篇同时满足。
             "凯尔希 or 德克萨斯 雪",
+            // `or` 后面紧跟否定项：`or` 随之作废，语义是 (凯尔希 AND 雪)
+            // NOT 博士。扫描侧若让 `or` 漂给「雪」，会多出一批错误命中。
+            "凯尔希 or -博士 雪",
+            // `or` 后面是切不出原子的词：同样随之作废，语义是 凯尔希 AND 雪。
+            "凯尔希 or アイ 雪",
             "启程",
             // 脚本指令、素材 token：渲染出来的正文里没有，两边都不该命中。
             "avg_1",
