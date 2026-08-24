@@ -633,6 +633,7 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
               className="hidden"
               tabIndex={-1}
               onChange={handleFileSelected}
+              // @ts-expect-error React 19 的 input 类型尚未声明浏览器文件选择器 cancel 事件。
               onCancel={() => {
                 takePendingImportJob()?.();
                 setPreparingImport(false);
