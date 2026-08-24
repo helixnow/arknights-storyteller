@@ -59,6 +59,45 @@ test("highlightTerms：粘连 `not\"博士\"` 是单个字面 token，不触发 
   assert.deepEqual(highlightTerms('not"博士"'), ['not"博士']);
 });
 
+test("highlightTerms：`and not X` —— and 是无操作连接词，not 照常排除下一词", () => {
+  assert.deepEqual(highlightTerms("and not 干员"), []);
+  assert.deepEqual(highlightTerms("博士 and not 干员"), ["博士"]);
+});
+
+test("highlightTerms：`not and X` —— and 不消费悬挂 NOT，X 仍被排除", () => {
+  // 后端 flush 里裸词 and 直接 return、不碰 pending_not，悬挂的 not
+  // 越过它落在下一个真正成词的 token 上。
+  assert.deepEqual(highlightTerms("not and 干员"), []);
+  assert.deepEqual(highlightTerms("博士 not and 干员"), ["博士"]);
+});
+
+test("highlightTerms：全角 ＮＯＴ／－ 经 NFKC 折叠后与半角同义", () => {
+  // 后端解析前整体过 normalize_nfkc_lower_strip_marks：`ＮＯＴ` 是连接词、
+  // `－词` 是排除。前端不折叠的话，用户明确排除的 干员/博士 会被高亮成命中。
+  assert.deepEqual(highlightTerms("博士 ＮＯＴ 干员"), ["博士"]);
+  assert.deepEqual(highlightTerms("凯尔希 －博士"), ["凯尔希"]);
+  // 全角引号 ＂博士＂ 同样折叠成短语。
+  assert.deepEqual(highlightTerms("＂博士＂"), ["博士"]);
+});
+
+test("highlightTerms：`OR AND` 连用只是连接词堆叠，两侧词照常高亮", () => {
+  assert.deepEqual(highlightTerms("凯尔希 OR AND 博士"), ["凯尔希", "博士"]);
+});
+
+test("highlightTerms：空引号不产生词条，但要消费悬挂的 NOT", () => {
+  assert.deepEqual(highlightTerms('""'), []);
+  // 后端在开引号那一刻就消费 pending_not，空短语与 not 一起作废：
+  // `not "" 博士` 的博士是正向词，必须高亮。
+  assert.deepEqual(highlightTerms('not "" 博士'), ["博士"]);
+});
+
+test("highlightTerms：纯减号串不消费悬挂 NOT，顺延给下一个词", () => {
+  // 后端里 `-` 不产生词条也不吸收 not（对照 `not -博士 凯尔希`：
+  // 成词的 `-博士` 才吸收）——`not - 博士` 的博士被排除，不高亮。
+  assert.deepEqual(highlightTerms("not - 博士"), []);
+  assert.deepEqual(highlightTerms("凯尔希 not - 博士"), ["凯尔希"]);
+});
+
 // ─────────────────────────────────────────────────────────
 // highlightTerms：OR / AND 连接词
 // ─────────────────────────────────────────────────────────
@@ -136,6 +175,29 @@ test("isAutoSearchable：尾部悬挂 OR / AND / NOT 返回 false（大小写不
   assert.equal(isAutoSearchable("博士 and"), false);
   assert.equal(isAutoSearchable("博士 NOT"), false);
   assert.equal(isAutoSearchable("博士 not"), false);
+  // `OR AND` 连用后停在 AND 上：单个尾连接词已由上面几条覆盖，
+  // 这里钉住堆叠写法也被同一条正则拦下。
+  assert.equal(isAutoSearchable("凯尔希 OR AND"), false);
+});
+
+test("isAutoSearchable：全角 ＮＯＴ／－／＂ 经 NFKC 折叠后同样拦截", () => {
+  // 后端把全角折成半角解析，前端不折叠的话这些"半截查询"会被自动发出去。
+  assert.equal(isAutoSearchable("博士 ＮＯＴ"), false);
+  assert.equal(isAutoSearchable("博士 －"), false);
+  assert.equal(isAutoSearchable("＂博士"), false);
+  // 折叠后配对完整则照常可搜。
+  assert.equal(isAutoSearchable("＂博士＂"), true);
+});
+
+test("isAutoSearchable：没有正向词的查询不自动发（后端静态空集）", () => {
+  // `""`、纯否定在后端 build_fts_query_advanced 里直接构造成 None →
+  // 空页。自动发出去只会闪一次"没有结果"；回车强搜不受影响。
+  assert.equal(isAutoSearchable('""'), false);
+  assert.equal(isAutoSearchable("-博士"), false);
+  assert.equal(isAutoSearchable("not 博士"), false);
+  // 有正向词就恢复可搜：空引号旁的词、排除词旁的词。
+  assert.equal(isAutoSearchable('"" 博士'), true);
+  assert.equal(isAutoSearchable("凯尔希 -博士"), true);
 });
 
 test("isAutoSearchable：`\\b` 只拦裸连接词，不误伤以 not 结尾的英文单词", () => {

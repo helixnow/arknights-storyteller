@@ -14,14 +14,31 @@ export const AUTO_SEARCH_MIN_LEN = 2;
 export const MAX_HIGHLIGHT_TERMS = 12;
 
 /**
- * 半截的查询串先别发出去：引号还没配对、或者停在 `-` / `OR` 上时，
- * 后端只会返回一堆噪音，用户每敲一个符号就闪一次"没有结果"。
+ * 与后端 `normalize_nfkc_lower_strip_marks` 的 NFKC 一步对齐：后端解析
+ * 查询前先整体折叠兼容形，全角 `ＮＯＴ`／`－`／`＂` 因此与半角同义
+ * （Rust 侧有 `fts_query_fullwidth_minus_is_negation` 等测试钉着）。
+ * 前端若在原始文本上判定，全角写法下用户明确排除的词会被当成正向词
+ * 高亮成"命中"。只做 NFKC、不小写化也不去组合符：连接词正则本就带
+ * `i`，而高亮词最终要拿去匹配未归一化的原文——把 café 折成 cafe
+ * 反而会让本来能命中的高亮失配。
+ */
+function normalizeQuery(raw: string): string {
+  return raw.normalize("NFKC");
+}
+
+/**
+ * 半截的查询串先别发出去：引号还没配对、停在 `-` / `OR` 上，或者整句
+ * 没有任何正向词（`""`、`-排除词`、`not 词`）时，后端只会返回一堆噪音
+ * ——最后一类在后端是静态空集（FTS 串构造成 None 直接短路成空页），
+ * 自动发出去必然闪一次"没有结果"。用户按回车仍可强制搜索。
  */
 export function isAutoSearchable(raw: string): boolean {
-  if (raw.length < AUTO_SEARCH_MIN_LEN) return false;
-  if ((raw.match(/"/g)?.length ?? 0) % 2 === 1) return false;
-  if (/-$/.test(raw)) return false;
-  if (/\b(or|and|not)$/i.test(raw)) return false;
+  const query = normalizeQuery(raw);
+  if (query.length < AUTO_SEARCH_MIN_LEN) return false;
+  if ((query.match(/"/g)?.length ?? 0) % 2 === 1) return false;
+  if (/-$/.test(query)) return false;
+  if (/\b(or|and|not)$/i.test(query)) return false;
+  if (highlightTerms(query).length === 0) return false;
   return true;
 }
 
@@ -36,15 +53,17 @@ export function isAutoSearchable(raw: string): boolean {
  *   - 纯中文长词后端按二元组匹配，顺带把单字也标出来，让用户看得出命中原因。
  */
 export function highlightTerms(query: string): string[] {
-  const trimmed = query.trim();
+  const trimmed = normalizeQuery(query).trim();
   if (!trimmed) return [];
   const tokens = trimmed.match(/"[^"]*"|\S+/g) ?? [];
   const terms: string[] = [];
   let pendingNot = false;
   for (const token of tokens) {
     if (token.startsWith("-")) {
-      // 后端里 `-词` 会消费掉悬挂的 not（`not -博士 凯尔希` 的凯尔希是正向词）。
-      pendingNot = false;
+      // 后端里只有真正成词的 `-词` 才消费悬挂的 not（`not -博士 凯尔希`
+      // 的凯尔希是正向词）；纯减号串不产生词条，not 顺延给下一个词
+      // （`not - 博士` 的博士仍是排除词），两边要漂一起漂。
+      if (/[^-]/.test(token)) pendingNot = false;
       continue;
     }
     // 连接词判定必须在去引号之前、只认裸词——与后端一致：`"not"` 是要
@@ -55,7 +74,13 @@ export function highlightTerms(query: string): string[] {
     }
     if (/^(or|and)$/i.test(token)) continue;
     const stripped = token.replace(/^["']+|["']+$/g, "").trim();
-    if (!stripped) continue;
+    if (!stripped) {
+      // 空引号 `""`（或引号里只有空白）在后端不产生词条，但悬挂的 not
+      // 在开引号那一刻就已被消费：`not "" 博士` 的博士是正向词。这里
+      // 不消费的话 not 会漂到下一个词上，把正向词反成排除词。
+      pendingNot = false;
+      continue;
+    }
     if (pendingNot) {
       pendingNot = false;
       continue;
