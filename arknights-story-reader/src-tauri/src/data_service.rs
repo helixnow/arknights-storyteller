@@ -1747,6 +1747,57 @@ impl DataService {
         .map_err(|e| format!("Failed to read story index meta {}: {}", key, e))
     }
 
+    /// 失忆索引探针。FTS5 把内容和倒排索引存在不同的影子表里（`*_content`
+    /// 与 `*_data`），坏块只吃掉 `*_data` 的页内数据时，全零的结构记录会被
+    /// 解码成「合法的空索引」：schema、COUNT、MATCH 全都不报错，只是查什么
+    /// 都静默返回空集。COUNT 走 `*_content`（行数照旧），MATCH 走 `*_data`
+    /// （空空如也），两边各自「没错」，合起来就是一张有内容却搜不到任何
+    /// 东西的索引——比会报错的坏库更隐蔽。
+    ///
+    /// 取证方式：从内容里取第一行 `token_col` 的第一个 token 反查。该 token
+    /// 必然被这一行索引过（`tokenized_*` 列本身就是入索引的 token 流，建库
+    /// 时就滤掉了空流），MATCH 查不到它就说明倒排索引已经不认识自己的内容。
+    /// token 只可能是 ASCII 字母数字段或单个 CJK 字符（见 `tokenize_for_fts`），
+    /// 直接包进 FTS 短语引号是安全的。
+    ///
+    /// 空表没有可反查的证据，按健康论——ready 与否由行数那头说话；取样或
+    /// 反查本身报错（vtable 构造失败等）同样算失忆，那是另一形态的同一种病。
+    fn fts_index_recalls_its_content(conn: &Connection, table: &str, token_col: &str) -> bool {
+        let sample = match conn
+            .query_row(
+                &format!("SELECT {} FROM {} LIMIT 1", token_col, table),
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+        {
+            Ok(Some(text)) => text,
+            Ok(None) => return true,
+            Err(_) => return false,
+        };
+        let Some(token) = sample.split_whitespace().next() else {
+            // 建库时就不会写入空 token 流；真遇到只能弃证，交回行数判定。
+            return true;
+        };
+        conn.query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM {t} WHERE {t} MATCH ?1)",
+                t = table
+            ),
+            params![format!("\"{}\"", token)],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|found| found != 0)
+        .unwrap_or(false)
+    }
+
+    /// 两张 FTS 表的失忆探针合并版：任意一张查不到自己的内容，整份索引就
+    /// 不能再被当成「可用/最新」。
+    fn index_recalls_its_content(conn: &Connection) -> bool {
+        Self::fts_index_recalls_its_content(conn, "story_index", "tokenized_content")
+            && Self::fts_index_recalls_its_content(conn, "story_segment_index", "tokenized_text")
+    }
+
     fn index_build_lock(&self) -> Arc<Mutex<()>> {
         let mut guard = INDEX_BUILD_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
         let map = guard.get_or_insert_with(HashMap::new);
@@ -1793,6 +1844,13 @@ impl DataService {
             || count("SELECT COUNT(*) FROM story_index")? != stories
             || count("SELECT COUNT(*) FROM story_segment_index")? != segments
         {
+            return None;
+        }
+        // 行数对得上不代表倒排索引还认识这些行：坏块把 `*_data` 抹成零后
+        // MATCH 静默返回空集而 COUNT（走 `*_content`）照旧。这里若认成
+        // 「已是最新」，「重建索引」按钮和同步后排队的自动重建都会直接
+        // 跳过，失忆索引从此常驻——与 75455a8 治过的写入死局同病异形。
+        if !Self::index_recalls_its_content(conn) {
             return None;
         }
         Some((stories as usize, segments as usize))
@@ -3136,22 +3194,19 @@ impl DataService {
             .query_row("SELECT COUNT(*) FROM story_index", [], |row| row.get(0))
             .unwrap_or(0);
 
-        // 段落表连 COUNT 都执行不了的库不算 ready。坏块只落在段落表的
-        // FTS 内容页上时，open、建表、剧情表查询全都正常，这里若照报
-        // ready，前端的 useAutoIndex 就永远不会来触发重建，段落检索从此
-        // 一直静默返回空页。COUNT 跑得动但为 0 不算病——那是重建还没跑
-        // 完的正常中间态，ready 与否由剧情表的行数说话。
-        let segments_queryable = conn
-            .query_row("SELECT COUNT(*) FROM story_segment_index", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .is_ok();
+        // 查不到自己内容的库不算 ready，两种病同一个探针：坏块落在段落表
+        // 上让查询直接报错（vtable constructor failed），或坏块把 `*_data`
+        // 抹成零让 MATCH 静默空集（COUNT 走 `*_content` 照常）。这里若照报
+        // ready，前端的 useAutoIndex 就永远不会来触发重建，检索从此一直
+        // 静默返回空页。空表不算病——那是重建还没跑完的正常中间态，
+        // ready 与否由剧情表的行数说话。
+        let index_recalls = Self::index_recalls_its_content(&conn);
 
         let last_built_at = Self::extract_meta_value(&conn, "last_built_at")?
             .and_then(|value| value.parse::<i64>().ok());
 
         Ok(StoryIndexStatus {
-            ready: total > 0 && segments_queryable,
+            ready: total > 0 && index_recalls,
             total: total.max(0) as usize,
             last_built_at,
         })
@@ -3168,6 +3223,14 @@ impl DataService {
             .query_row("SELECT COUNT(*) FROM story_index", [], |row| row.get(0))
             .unwrap_or(0);
         if total == 0 {
+            return Ok(None);
+        }
+
+        // 失忆的索引（坏块抹零 `*_data`，MATCH 静默空集）不能把空集当权威
+        // 结果返回——那会让所有查询「命中 0 篇」还不回退扫描。状态探针与
+        // 重建自愈要等下一轮广播才跑到，这中间的每次搜索也必须给出真结果。
+        if !Self::fts_index_recalls_its_content(&conn, "story_index", "tokenized_content") {
+            eprintln!("[INDEX] 索引查不到自己的内容（疑似坏块致失忆），回退线性扫描");
             return Ok(None);
         }
 
@@ -3514,6 +3577,12 @@ impl DataService {
         if indexed == 0 {
             return Ok(None);
         }
+        // 失忆索引的 MATCH COUNT 是权威口吻的 0：检索此刻走的是扫描，报 0
+        // 会被 `max(results.len())` 抹平成「恰好没截断」，扫描在命中上限
+        // 提前收针时就谎报成一条不少。与检索路径同一把尺子：拒答。
+        if !Self::fts_index_recalls_its_content(&conn, "story_index", "tokenized_content") {
+            return Ok(None);
+        }
         let Some(fts_query) = Self::build_fts_query_advanced(query) else {
             // 纯否定/纯标点查询：索引路径同样明确返回空集，0 是权威的。
             return Ok(Some(0));
@@ -3596,6 +3665,19 @@ impl DataService {
             .unwrap_or(0);
         if seg_total == 0 {
             progress("完成", 1, 1, "段落索引为空".to_string());
+            return Ok(SegmentSearchPage {
+                hits: Vec::new(),
+                total_matched: 0,
+                truncated: false,
+            });
+        }
+
+        // 段落检索没有线性扫描兜底，失忆的段落表（坏块抹零 `*_data`，
+        // MATCH 静默空集）会把每个查询都伪装成「真的没有命中」。宁可
+        // 明说不可用——状态探针同一时刻也在报未就绪，自动重建会来接手。
+        if !Self::fts_index_recalls_its_content(&conn, "story_segment_index", "tokenized_text") {
+            eprintln!("[SEG-INDEX] 段落索引查不到自己的内容（疑似坏块致失忆）");
+            progress("完成", 1, 1, "段落索引不可用".to_string());
             return Ok(SegmentSearchPage {
                 hits: Vec::new(),
                 total_matched: 0,
@@ -6537,6 +6619,94 @@ mod tests {
             sorted_ids(&indexed),
             vec!["Obt/Roguelike/ro2/ro2_1".to_string(), "main_00-01".to_string()]
         );
+    }
+
+    /// 前两条测的都是「会报错」的坏库；这条测**失忆**的库：倒排索引住在
+    /// `*_data` 影子表里，坏块把它抹成零后，全零的结构记录会被解码成
+    /// 「合法的空索引」——schema、COUNT、MATCH 全都不报错，只是查什么都
+    /// 静默返回空集（COUNT 走 `*_content`，行数照旧）。以前这形态三处
+    /// 一起撒谎：搜索把空集当权威结果返回（不回退扫描）、状态照报 ready
+    /// （useAutoIndex 永远不来）、重建看指纹和行数都对得上直接跳过——
+    /// 比报错的坏库更隐蔽的永久死局。
+    #[test]
+    fn amnesiac_index_falls_back_to_scan_and_rebuild_heals_it() {
+        let fx = Fixture::new("index_amnesia");
+        fx.service.rebuild_story_index().expect("first build");
+        let db = fx.service.index_db_path.clone();
+        let before = index_build_count(&db);
+
+        // 只抹掉剧情表的倒排索引（*_data），内容影子表保持完好——模拟
+        // 坏块恰好落在索引页上的形态。SQL 层动手，库文件本身依旧健康。
+        {
+            let conn = fx.service.open_index_connection().unwrap();
+            conn.execute_batch("UPDATE story_index_data SET block = zeroblob(length(block));")
+                .unwrap();
+        }
+
+        // 状态不能撒谎：查不到自己内容的索引不算 ready。
+        let status = fx.service.get_story_index_status().unwrap();
+        assert!(!status.ready, "失忆的索引不该被报成 ready");
+
+        // 搜索不能把失忆索引的空集当权威结果，必须回退线性扫描。
+        let scanned = sorted_ids(&fx.service.search_stories("凯尔希").unwrap());
+        assert_eq!(
+            scanned,
+            vec!["Obt/Roguelike/ro2/ro2_1".to_string(), "main_00-01".to_string()]
+        );
+
+        // 指纹没变也必须重建：行数对得上不代表倒排索引还认识这些行。
+        fx.service.rebuild_story_index().expect("失忆索引必须能重建自愈");
+        assert_eq!(
+            index_build_count(&db) - before,
+            1,
+            "失忆索引不得被当成「已是最新」跳过"
+        );
+
+        let status = fx.service.get_story_index_status().unwrap();
+        assert!(status.ready);
+        assert_eq!(status.total, 6);
+        let indexed = fx
+            .service
+            .search_stories_with_index("凯尔希")
+            .unwrap()
+            .expect("自愈后索引路径必须可用");
+        assert_eq!(sorted_ids(&indexed), scanned);
+    }
+
+    /// 失忆库的段落表变体。段落检索没有线性扫描兜底，状态与重建就是它
+    /// 唯一的生路：状态必须承认未就绪（useAutoIndex 才会来触发重建），
+    /// 重建必须无视「指纹相符 + 行数相符」真的重建。
+    #[test]
+    fn amnesiac_segment_index_is_rebuilt_not_skipped() {
+        let fx = Fixture::new("segment_amnesia");
+        fx.service.rebuild_story_index().expect("first build");
+        let db = fx.service.index_db_path.clone();
+        let before = index_build_count(&db);
+
+        {
+            let conn = fx.service.open_index_connection().unwrap();
+            conn.execute_batch(
+                "UPDATE story_segment_index_data SET block = zeroblob(length(block));",
+            )
+            .unwrap();
+        }
+
+        let status = fx.service.get_story_index_status().unwrap();
+        assert!(!status.ready, "段落表失忆的索引不该被报成 ready");
+
+        // 失忆期间的段落检索给不出真结果，但绝不能报错吓退调用方。
+        let page = fx.service.search_segments("凯尔希").unwrap();
+        assert!(page.hits.is_empty());
+
+        fx.service.rebuild_story_index().expect("失忆的段落表必须能重建自愈");
+        assert_eq!(
+            index_build_count(&db) - before,
+            1,
+            "失忆的段落表不得被当成「已是最新」跳过"
+        );
+
+        let page = fx.service.search_segments("凯尔希").unwrap();
+        assert!(!page.hits.is_empty(), "自愈后段落检索必须真的有命中");
     }
 
     #[test]
