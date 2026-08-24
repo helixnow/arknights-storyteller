@@ -382,6 +382,10 @@ export function CharactersPanel({
 
   const loadAll = useCallback(async (opts?: { forceRefresh?: boolean }) => {
     if (opts?.forceRefresh) {
+      // 强刷通常意味着数据包已经换掉；旧统计里的 story 对象也和旧金句
+      // 一样不再可信。立即撤下，避免新目录读取失败时继续展示旧包数据，
+      // 同时也避免 selectedAgg 引用不变让下方金句永久停在加载骨架。
+      setAggregates(new Map());
       // 数据包已经换掉，旧金句的 story/segmentIndex 从这一刻起就不再可信。
       // 先让在途抓取失效并撤下旧按钮；等新统计落地后 quote effect 会重抓。
       quotesRunRef.current += 1;
