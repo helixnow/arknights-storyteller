@@ -19,7 +19,12 @@ args.push(
   "--test",
   path.join("src", "lib", "assetUrls.test.mjs"),
   path.join("src", "lib", "segmentDigest.test.mjs"),
-  path.join("src", "lib", "searchTerms.test.mjs")
+  path.join("src", "lib", "searchTerms.test.mjs"),
+  path.join("src", "components", "storyListState.test.mjs"),
+  path.join("src", "components", "homeState.test.mjs"),
+  path.join("src", "components", "storyThumbnailSources.test.mjs"),
+  path.join("src", "hooks", "storyPreviewCache.test.mjs"),
+  path.join("src", "hooks", "useReadingProgress.test.mjs")
 );
 
 const result = spawnSync(process.execPath, args, {

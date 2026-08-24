@@ -25,6 +25,13 @@ import {
   WifiOff,
   type LucideIcon,
 } from "lucide-react";
+import {
+  effectiveStreakDays,
+  localDayKey,
+  nextReadingStreak,
+  normalizeStreakInfo,
+  type ReadingStreakInfo,
+} from "@/components/homeState";
 
 type Tab = "home" | "stories" | "characters" | "search" | "settings";
 
@@ -61,73 +68,17 @@ const REFRESH_HINT_DELAY_MS = 400;
 const PARTIAL_RETRY_DELAY_MS = 2500;
 const PARTIAL_RETRY_MAX = 2;
 
-interface StreakInfo {
-  currentStreak: number;
-  lastReadOn: string; // YYYY-MM-DD
-  totalDays: number;
-}
-
-function dayKey(d: Date) {
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-}
+type StreakInfo = ReadingStreakInfo;
 
 function todayKey() {
-  return dayKey(new Date());
-}
-
-function yesterdayKey() {
-  const d = new Date();
-  d.setDate(d.getDate() - 1);
-  return dayKey(d);
-}
-
-/** 把 YYYY-MM-DD 平移 N 天。Date 构造器会自动处理跨月/跨年。 */
-function shiftDayKey(key: string, deltaDays: number): string {
-  const [y, m, d] = key.split("-").map((n) => Number.parseInt(n, 10));
-  return dayKey(new Date(y, m - 1, d + deltaDays));
-}
-
-/**
- * localStorage 里的 currentStreak 只会在下一次打开剧情时被 bumpReadingStreak
- * 惰性重算。断签超过一天后回来，存的还是断签前的旧值——直接展示就是在撒谎
- * （显示「连续 12 天」，一打开剧情立刻跳回 1 天）。展示前按 lastReadOn 校验：
- * 最后一次阅读在今天或昨天，streak 才还活着。
- *
- * `today` 由调用方传入（组件里是跟着零点定时器/聚焦刷新走的 state），
- * 这样跨天后一定会带着新日期重算，而不是停在挂载那一刻的日期上。
- */
-function effectiveStreakDays(streak: StreakInfo, today: string): number {
-  const last = streak.lastReadOn;
-  if (!last) return 0;
-  // 时钟回拨（向西跨时区旅行 / 手动改时间）后 lastReadOn 会落在「未来」。
-  // 这不是断签，按仍然存活处理，别把连续天数清成 0。
-  if (last > today) return streak.currentStreak;
-  return last === today || last === shiftDayKey(today, -1) ? streak.currentStreak : 0;
+  return localDayKey(new Date());
 }
 
 function readStreak(): StreakInfo {
   try {
     const raw = window.localStorage.getItem(STREAK_KEY);
     if (raw) {
-      // JSON.parse 的结果不一定是对象（可能是 null / 数字 / 数组），
-      // 逐字段校验，别让手改过的 localStorage 把 streak 算成 NaN。
-      const parsed: unknown = JSON.parse(raw);
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        const p = parsed as Partial<StreakInfo>;
-        if (
-          typeof p.currentStreak === "number" &&
-          Number.isFinite(p.currentStreak) &&
-          typeof p.lastReadOn === "string" &&
-          typeof p.totalDays === "number" &&
-          Number.isFinite(p.totalDays)
-        ) {
-          return {
-            currentStreak: p.currentStreak,
-            lastReadOn: p.lastReadOn,
-            totalDays: p.totalDays,
-          };
-        }
-      }
+      return normalizeStreakInfo(JSON.parse(raw));
     }
   } catch {}
   return { currentStreak: 0, lastReadOn: "", totalDays: 0 };
@@ -943,32 +894,10 @@ export function notifyHomeRefresh() {
 export function bumpReadingStreak() {
   const t = todayKey();
   const current = readStreak();
-  if (current.lastReadOn === t) {
+  const next = nextReadingStreak(current, t);
+  if (sameStreak(current, next)) {
     notifyHomeRefresh();
     return;
-  }
-  // 时钟回拨（向西跨时区旅行 / 手动调时间）后 lastReadOn 落在未来：既不是
-  // 断签也不是新的一天。原逻辑会走到最下面的 else 把连签清成 1、totalDays
-  // 再 +1。这里只把日期拉回今天，连续天数与总天数原样保留。
-  if (current.lastReadOn > t) {
-    try {
-      window.localStorage.setItem(
-        STREAK_KEY,
-        JSON.stringify({ ...current, lastReadOn: t } satisfies StreakInfo)
-      );
-    } catch {}
-    notifyHomeRefresh();
-    return;
-  }
-  let next: StreakInfo;
-  if (current.lastReadOn === yesterdayKey()) {
-    next = {
-      currentStreak: current.currentStreak + 1,
-      lastReadOn: t,
-      totalDays: current.totalDays + 1,
-    };
-  } else {
-    next = { currentStreak: 1, lastReadOn: t, totalDays: current.totalDays + 1 };
   }
   try {
     window.localStorage.setItem(STREAK_KEY, JSON.stringify(next));
