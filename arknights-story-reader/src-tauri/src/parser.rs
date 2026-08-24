@@ -9,10 +9,6 @@ lazy_static! {
     /// `[name='麦哲伦']` 的单引号写法，不认单引号就会把引号一起当成名字。
     static ref ATTR_RE: Regex = Regex::new(r#"(?i)([a-z0-9_]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s,()\[\]"]+))"#)
         .expect("invalid attribute regex");
-    static ref DECISION_NUMBERED_RE: Regex =
-        Regex::new(r#"(?i)option\d+="([^"]+)""#).expect("invalid decision regex");
-    static ref DECISION_VALUE_NUMBERED_RE: Regex =
-        Regex::new(r#"(?i)value\d+="([^"]+)""#).expect("invalid decision value regex");
     static ref GENERIC_TAG_RE: Regex = Regex::new(r#"<[^>]+>"#).expect("invalid generic tag regex");
     static ref PARAGRAPH_TAG_RE: Regex =
         Regex::new(r"(?i)<p[^>]*>").expect("invalid paragraph tag regex");
@@ -66,27 +62,20 @@ fn normalize_char_id(raw: &str) -> String {
 /// 文字跟 dialogHead 说话人拆散——先拼回逻辑行再解析。
 ///
 /// 语料里续行的第一行必然以 `[` 开头（正文行从不以 `\` 结尾），所以只认
-/// 指令行，防止误吞真的以反斜杠收尾的台词。空行终止续行：纯手势教程
-/// （`[Tutorial(...)] \` 后面直接空行）没有正文，不能把下一条指令吞进来。
+/// 指令行，防止误吞真的以反斜杠收尾的台词。空行和新的指令行都终止续行：
+/// 纯手势教程（`[Tutorial(...)] \`）后面可能直接空行，也可能不留空行就接
+/// 下一条指令——把 `[` 开头的行拼进来会让那条指令的原文漏成教程正文、
+/// 指令本身（可能是一句对白）也被吞掉。属性续行（`animStyle=..., \`）和
+/// 教程正文从不以 ASCII `[` 开头，中文正文用的是全角【】。
 fn logical_lines(content: &str) -> Vec<std::borrow::Cow<'_, str>> {
     use std::borrow::Cow;
     let mut out: Vec<Cow<'_, str>> = Vec::new();
     let mut buf: Option<String> = None;
     for raw in content.lines() {
         let end_trimmed = raw.trim_end();
-        match buf.as_mut() {
-            None => match end_trimmed.strip_suffix('\\') {
-                Some(head) if head.trim_start().starts_with('[') => {
-                    buf = Some(head.to_string());
-                }
-                _ => out.push(Cow::Borrowed(raw)),
-            },
-            Some(joined) => {
-                if end_trimmed.trim_start().is_empty() {
-                    out.push(Cow::Owned(std::mem::take(joined)));
-                    buf = None;
-                    continue;
-                }
+        let stripped = end_trimmed.trim_start();
+        if let Some(joined) = buf.as_mut() {
+            if !stripped.is_empty() && !stripped.starts_with('[') {
                 joined.push(' ');
                 match end_trimmed.strip_suffix('\\') {
                     Some(more) => joined.push_str(more),
@@ -96,7 +85,21 @@ fn logical_lines(content: &str) -> Vec<std::borrow::Cow<'_, str>> {
                         buf = None;
                     }
                 }
+                continue;
             }
+            // 续行终止；`[` 开头的当前行还要按普通行重新走一遍下面的逻辑
+            // （它自己也可能又是一条续行的开头）。
+            out.push(Cow::Owned(std::mem::take(joined)));
+            buf = None;
+            if stripped.is_empty() {
+                continue;
+            }
+        }
+        match end_trimmed.strip_suffix('\\') {
+            Some(head) if head.trim_start().starts_with('[') => {
+                buf = Some(head.to_string());
+            }
+            _ => out.push(Cow::Borrowed(raw)),
         }
     }
     if let Some(joined) = buf {
@@ -228,42 +231,64 @@ fn parse_command_line(line: &str, current_char_id: Option<&str>) -> Option<Story
             })
         }
         "decision" => {
+            // 前端按 `values[optionIndex]` 取每个选项的标签，两个 Vec 必须
+            // 逐位对齐。空选项要连同它自己的 value 一起丢；某个下标缺 value
+            // 时用空串占位（前端把空串当没有）——绝不能把后面的 value 平移
+            // 到前面的选项头上。
             let mut options = Vec::new();
             let mut values = Vec::new();
             if let Some(raw_options) = attrs.get("options") {
-                options.extend(
-                    raw_options
-                        .split(';')
-                        .map(|s| clean_text(s))
-                        .filter(|s| !s.is_empty()),
-                );
-            } else {
-                let target_source = attr_source.unwrap_or(inside);
-                for caps in DECISION_NUMBERED_RE.captures_iter(target_source) {
-                    if let Some(option) = caps.get(1) {
-                        let option_text = clean_text(option.as_str());
-                        if !option_text.is_empty() {
-                            options.push(option_text);
-                        }
+                // 分号形态：`options="走;留", values="1;2"`，按分号下标配对。
+                let raw_values: Option<Vec<String>> = attrs
+                    .get("values")
+                    .map(|v| v.split(';').map(|s| clean_text(s)).collect());
+                for (idx, raw_option) in raw_options.split(';').enumerate() {
+                    let option_text = clean_text(raw_option);
+                    if option_text.is_empty() {
+                        continue;
+                    }
+                    options.push(option_text);
+                    if let Some(vals) = &raw_values {
+                        values.push(vals.get(idx).cloned().unwrap_or_default());
                     }
                 }
-            }
-
-            if let Some(raw_values) = attrs.get("values") {
-                values.extend(
-                    raw_values
-                        .split(';')
-                        .map(|s| clean_text(s))
-                        .filter(|s| !s.is_empty()),
-                );
             } else {
+                // 编号形态：`option1=.../value1=...`。脚本可能乱序或跳号
+                // （option1/option3），按「第几个出现」数就会张冠李戴，
+                // 必须按数字下标配对。
                 let target_source = attr_source.unwrap_or(inside);
-                for caps in DECISION_VALUE_NUMBERED_RE.captures_iter(target_source) {
-                    if let Some(value) = caps.get(1) {
-                        let val_text = clean_text(value.as_str());
-                        if !val_text.is_empty() {
-                            values.push(val_text);
-                        }
+                let mut numbered_options: Vec<(u64, String)> = Vec::new();
+                let mut numbered_values: HashMap<u64, String> = HashMap::new();
+                for caps in ATTR_RE.captures_iter(target_source) {
+                    let Some(key) = caps.get(1) else { continue };
+                    let Some(value) =
+                        caps.get(2).or_else(|| caps.get(3)).or_else(|| caps.get(4))
+                    else {
+                        continue;
+                    };
+                    let key = key.as_str().to_ascii_lowercase();
+                    if let Some(idx) = key
+                        .strip_prefix("option")
+                        .and_then(|n| n.parse::<u64>().ok())
+                    {
+                        numbered_options.push((idx, clean_text(value.as_str())));
+                    } else if let Some(idx) = key
+                        .strip_prefix("value")
+                        .and_then(|n| n.parse::<u64>().ok())
+                    {
+                        numbered_values.insert(idx, clean_text(value.as_str()));
+                    }
+                }
+                // 稳定排序：同一下标写两遍时保持文档顺序。
+                numbered_options.sort_by_key(|(idx, _)| *idx);
+                let has_values = !numbered_values.is_empty();
+                for (idx, option_text) in numbered_options {
+                    if option_text.is_empty() {
+                        continue;
+                    }
+                    options.push(option_text);
+                    if has_values {
+                        values.push(numbered_values.get(&idx).cloned().unwrap_or_default());
                     }
                 }
             }
@@ -307,18 +332,12 @@ fn parse_command_line(line: &str, current_char_id: Option<&str>) -> Option<Story
             Some(StorySegment::Music { key })
         }
         "subtitle" => {
-            let text = attrs
-                .get("text")
-                .map(|t| clean_text(t))
-                .filter(|t| !t.is_empty())?;
+            let text = overlay_text(&attrs, remainder)?;
             let alignment = attrs.get("alignment").map(|s| s.trim().to_string());
             Some(StorySegment::Subtitle { text, alignment })
         }
         "sticker" => {
-            let text = attrs
-                .get("text")
-                .map(|t| clean_text(t))
-                .filter(|t| !t.is_empty())?;
+            let text = overlay_text(&attrs, remainder)?;
             let alignment = attrs.get("alignment").map(|s| s.trim().to_string());
             Some(StorySegment::Sticker { text, alignment })
         }
@@ -404,6 +423,21 @@ fn parse_command_line(line: &str, current_char_id: Option<&str>) -> Option<Story
             }
         }
     }
+}
+
+/// `[Subtitle]` / `[Sticker]` 的正文：标准写法在 `text=` 属性里，但老脚本
+/// 偶尔把正文直接写在 `]` 后面（`[Subtitle] 正文`），只认属性会把整句丢掉。
+/// 裸指令（清掉屏幕上字幕/贴纸的信号）和残渣级 remainder（`[Sticker]。`
+/// 这类手滑标点）都不算正文——不能因此产出空段或渣段。
+fn overlay_text(attrs: &HashMap<String, String>, remainder: &str) -> Option<String> {
+    attrs
+        .get("text")
+        .map(|t| clean_text(t))
+        .filter(|t| !t.is_empty())
+        .or_else(|| {
+            let trailing = clean_text(remainder);
+            has_meaningful_content(&trailing).then_some(trailing)
+        })
 }
 
 /// 只更新「当前说话人」而不产出任何段落的指令。
@@ -1244,6 +1278,55 @@ mod tests {
         assert!(parse_story_text(r#"[Decision(values="1;2")]"#).segments.is_empty());
     }
 
+    /// 前端按 `values[optionIndex]` 逐位取标签：option/value 必须按下标配对。
+    /// 乱序、跳号、空选项、数量不等都不能把 value 平移到别的选项头上。
+    #[test]
+    fn test_decision_options_pair_values_by_index() {
+        // 编号形态乱序 + 跳号：按数字下标配对，不按「第几个出现」。
+        let segment =
+            only(r#"[Decision(option3="慢慢来", value3="3", option1="立刻出发", value1="1")]"#);
+        match segment {
+            StorySegment::Decision { options, values } => {
+                assert_eq!(options, vec!["立刻出发".to_string(), "慢慢来".to_string()]);
+                assert_eq!(values, vec!["1".to_string(), "3".to_string()]);
+            }
+            other => panic!("expected decision segment, got {:?}", other),
+        }
+
+        // 分号形态的空选项连同它自己的 value 一起丢，后面的选项不平移。
+        let segment = only(r#"[Decision(options="走;;留", values="1;2;3")]"#);
+        match segment {
+            StorySegment::Decision { options, values } => {
+                assert_eq!(options, vec!["走".to_string(), "留".to_string()]);
+                assert_eq!(values, vec!["1".to_string(), "3".to_string()]);
+            }
+            other => panic!("expected decision segment, got {:?}", other),
+        }
+
+        // 数量不等：缺 value 的选项用空串占位（前端把空串当没有），不平移。
+        let segment = only(r#"[Decision(options="走;留;再想想", values="1;2")]"#);
+        match segment {
+            StorySegment::Decision { options, values } => {
+                assert_eq!(options.len(), 3);
+                assert_eq!(
+                    values,
+                    vec!["1".to_string(), "2".to_string(), String::new()]
+                );
+            }
+            other => panic!("expected decision segment, got {:?}", other),
+        }
+
+        // 编号形态缺某个下标的 value 同理：option1 拿空串，option2 拿 value2。
+        let segment = only(r#"[Decision(option1="A", option2="B", value2="2")]"#);
+        match segment {
+            StorySegment::Decision { options, values } => {
+                assert_eq!(options, vec!["A".to_string(), "B".to_string()]);
+                assert_eq!(values, vec![String::new(), "2".to_string()]);
+            }
+            other => panic!("expected decision segment, got {:?}", other),
+        }
+    }
+
     /// 场景切换后 `[Character]` 状态要跟着走；清空后不能把上一位的头像
     /// 继续挂到无主对白上。
     #[test]
@@ -1388,6 +1471,55 @@ mod tests {
         assert_eq!(segment.text(), Some("！！"));
     }
 
+    /// 不带任何属性的 `[dialog]......`（act21side 任务文本）是有意的沉默
+    /// 对白：有 `[Character]` 状态时挂当前立绘，什么状态都没有时也至少要
+    /// 以旁白留下，不能整行蒸发。
+    #[test]
+    fn test_bare_dialog_silence_is_kept() {
+        let content = "[Character(name=\"char_1012_skadi2_1\")]\n[dialog]......";
+        let segment = only(content);
+        assert_eq!(segment.kind(), "dialogue");
+        assert_eq!(segment.text(), Some("......"));
+        assert_eq!(segment.character_id(), Some("char_1012_skadi2"));
+
+        let segment = only("[dialog]......");
+        assert_eq!(segment.kind(), "narration");
+        assert_eq!(segment.text(), Some("......"));
+    }
+
+    /// `[Subtitle]` / `[Sticker]` 的正文可能写在 `]` 后面而不是 `text=` 里，
+    /// 不能整句丢掉；反过来，清屏用的裸指令、空 `text=`、手滑残渣也绝不能
+    /// 产出空段或渣段。
+    #[test]
+    fn test_subtitle_and_sticker_keep_trailing_text_and_never_emit_empty() {
+        let segment = only(r#"[Subtitle(alignment="center")]七日之后"#);
+        assert_eq!(segment.kind(), "subtitle");
+        assert_eq!(segment.text(), Some("七日之后"));
+
+        let segment = only("[Sticker] 档案编号：0021");
+        assert_eq!(segment.kind(), "sticker");
+        assert_eq!(segment.text(), Some("档案编号：0021"));
+
+        // `text=` 属性仍是权威来源，remainder 只是兜底。
+        let segment = only(r#"[Sticker(text="正文在属性里")]"#);
+        assert_eq!(segment.text(), Some("正文在属性里"));
+
+        for junk in [
+            "[Subtitle]",
+            "[Sticker]",
+            r#"[Subtitle(text="")]"#,
+            r#"[Sticker(text="", delay=0.5)]"#,
+            "[Sticker]。",
+            "[Subtitle]4",
+        ] {
+            assert!(
+                parse_story_text(junk).segments.is_empty(),
+                "empty/junk overlay leaked for {junk:?}: {:?}",
+                parse_story_text(junk).segments
+            );
+        }
+    }
+
     /// 教程/训练脚本把一条指令用行尾 `\` 折成多行（真实数据 training_8_b.txt、
     /// 316 个文件共 1975 行）。不拼回逻辑行的话：属性续行漏成旁白、孤 `\`
     /// 变成正文、教程文字跟 dialogHead 说话人拆散。
@@ -1429,6 +1561,35 @@ mod tests {
         // 正文行以 `\` 收尾不是续行（只有指令行才认续行），原样保留。
         let result = parse_story_text("路牌上写着：出口 \\\n下一行是别的旁白。");
         assert_eq!(kinds(&result), vec!["narration", "narration"]);
+    }
+
+    /// `[Tutorial(...)] \` 后面不留空行、直接跟下一条指令时，指令行必须
+    /// 终止续行：否则那条指令的原文会漏成教程正文，指令本身（可能是一句
+    /// 对白）也被吞掉。
+    #[test]
+    fn test_backslash_continuation_does_not_eat_next_command() {
+        let content =
+            "[Tutorial(waitForSignal=\"place_char\", animStyle=\"Drag\")] \\\n[Blocker(a=0, fadetime=0.5)]";
+        let result = parse_story_text(content);
+        assert!(
+            result.segments.is_empty(),
+            "next command was eaten into tutorial text: {:?}",
+            result.segments
+        );
+
+        // 被粘住的下一条指令若是对白，必须照常解析出来。
+        let content = "[PopupDialog(dialogHead=\"$avatar_doberm\")] \\\n[name=\"杜宾\"]全体集合！";
+        let segment = only(content);
+        assert_eq!(segment.kind(), "dialogue");
+        assert_eq!(segment.speaker(), Some("杜宾"));
+        assert_eq!(segment.text(), Some("全体集合！"));
+
+        // 终止续行的指令行自己也可以又是一条续行的开头。
+        let content = "[Tutorial(animStyle=\"Drag\")] \\\n[PopupDialog(dialogHead=\"$avatar_jesica\")] \\\n部署完毕后点击确认。";
+        let segment = only(content);
+        assert_eq!(segment.kind(), "system");
+        assert_eq!(segment.speaker(), Some("Jesica"));
+        assert_eq!(segment.text(), Some("部署完毕后点击确认。"));
     }
 
     /// 端到端跑一段贴近真实脚本的片段：段落种类和顺序都要稳。
