@@ -462,7 +462,8 @@ impl QueryTerms {
 
 /// Split a raw user query into logical terms for the fallback scanner.
 /// Quoted phrases are kept intact, a literal `or` joins the surrounding terms
-/// into one OR group, and a leading `-` marks an exclusion. Returns already
+/// into one OR group, a leading `-` (or a bare `not` before the term) marks
+/// an exclusion, and a bare `and` is a no-op connective. Returns already
 /// fuzzy-normalized terms.
 ///
 /// 解析必须发生在与 `build_fts_query_advanced` 相同的文本上：先对整个查询
@@ -479,13 +480,13 @@ fn split_query_terms(query: &str) -> QueryTerms {
         is_or: bool,
     }
 
-    fn flush_bare(buf: &mut String, terms: &mut Vec<Raw>) {
+    fn flush_bare(buf: &mut String, terms: &mut Vec<Raw>, pending_not: &mut bool) {
         if buf.is_empty() {
             return;
         }
         let t = std::mem::take(buf);
-        // 与 FTS 侧一致：连接词判定发生在去减号之前，所以 `-or` 是
-        // 「排除 or」，`or，`、`(or)` 是普通词，都不是连接词。
+        // 与 FTS 侧一致：连接词判定发生在去减号之前，所以 `-or`/`-and`/
+        // `-not` 是排除对应字面量，`or，`、`(or)` 是普通词，都不是连接词。
         if t == "or" {
             terms.push(Raw {
                 text: String::new(),
@@ -495,18 +496,30 @@ fn split_query_terms(query: &str) -> QueryTerms {
             });
             return;
         }
+        // 裸词 `and` 是无操作连接词、`not` 是挂到下一个词上的负向前缀，
+        // 与 build_fts_query_advanced 严格同步——否则同一查询在索引可用
+        // 与否两种状态下语义分叉（FTS 找 `and*`/`not*` token 几乎必空，
+        // 扫描按子串匹配 island/commander 又乱命中）。
+        if t == "and" {
+            return;
+        }
+        if t == "not" {
+            *pending_not = true;
+            return;
+        }
         let is_not = t.starts_with('-');
         let content = t.trim_start_matches('-');
-        // 纯减号串在 FTS 侧同样不产生词条，它前面的 `or` 顺延给下一个词，
-        // 两边要漂一起漂。
+        // 纯减号串在 FTS 侧同样不产生词条，它前面的 `or`/`not` 顺延给
+        // 下一个词，两边要漂一起漂。
         if content.is_empty() {
             return;
         }
         // 归一化后为空的词（纯标点等）也要保留占位：FTS 侧这种词要到子句
-        // 生成阶段才被丢弃，其前面的 `or` 已随之作废，这里必须同样消费。
+        // 生成阶段才被丢弃，其前面的 `or`/`not` 已随之作废，这里必须同样
+        // 消费。
         terms.push(Raw {
             text: normalize_for_fuzzy(content),
-            is_not,
+            is_not: is_not || std::mem::take(pending_not),
             is_quoted: false,
             is_or: false,
         });
@@ -531,9 +544,11 @@ fn split_query_terms(query: &str) -> QueryTerms {
     let mut raw_terms: Vec<Raw> = Vec::new();
     let mut buf = String::new();
     let mut in_quotes = false;
-    // `-"凯尔希"`：减号落在引号之前，`normalize_for_fuzzy` 会把孤零零的 `-`
-    // 抹成空串。先记下来，否则否定短语会被当成肯定短语，语义正好反过来。
+    // `-"凯尔希"` / `not "凯尔希"`：负向标记落在引号之前。孤零零的 `-`
+    // 会被 `normalize_for_fuzzy` 抹成空串、`not` 只留下悬挂标记——不在
+    // 开引号时收下它们，否定短语会被当成肯定短语，语义正好反过来。
     let mut quote_is_not = false;
+    let mut pending_not = false;
 
     for ch in query.chars() {
         match ch {
@@ -543,13 +558,16 @@ fn split_query_terms(query: &str) -> QueryTerms {
                     flush_quoted(&mut buf, &mut raw_terms, quote_is_not);
                     quote_is_not = false;
                 } else {
-                    quote_is_not = buf == "-";
-                    flush_bare(&mut buf, &mut raw_terms);
+                    // 与 FTS 侧同序：先记减号，再 flush（粘连写法
+                    // `not"凯尔希"` 由 flush 转成悬挂标记后一并收下）。
+                    let dash_prefix = buf == "-";
+                    flush_bare(&mut buf, &mut raw_terms, &mut pending_not);
+                    quote_is_not = dash_prefix || std::mem::take(&mut pending_not);
                     in_quotes = true;
                 }
             }
             c if c.is_whitespace() && !in_quotes => {
-                flush_bare(&mut buf, &mut raw_terms);
+                flush_bare(&mut buf, &mut raw_terms, &mut pending_not);
             }
             _ => buf.push(ch),
         }
@@ -558,7 +576,7 @@ fn split_query_terms(query: &str) -> QueryTerms {
     if in_quotes && quote_is_not {
         buf.insert(0, '-');
     }
-    flush_bare(&mut buf, &mut raw_terms);
+    flush_bare(&mut buf, &mut raw_terms, &mut pending_not);
 
     let mut out = QueryTerms::default();
     let mut pending_or = false;
@@ -1369,8 +1387,9 @@ impl DataService {
     //
     // Supports:
     //   * quoted phrase: `"foo bar"`
-    //   * NOT: leading `-` on a term
+    //   * NOT: leading `-` on a term, or a bare `not` before it
     //   * OR: literal `or` token between terms
+    //   * AND: implicit between terms; a bare `and` token is a no-op connective
     //   * otherwise: implicit AND
     fn build_fts_query_advanced(raw_query: &str) -> Option<String> {
         let q = normalize_nfkc_lower_strip_marks(raw_query.trim());
@@ -1390,15 +1409,33 @@ impl DataService {
         let mut buf = String::new();
         let mut in_quotes = false;
         let mut prev_was_or = false;
+        // 裸词 `not` 是挂到下一个词上的负向前缀（`not X` ≡ `-X`），裸词
+        // `and` 是无操作连接词（词间本就隐式 AND）。不这么认的话，
+        // `凯尔希 AND 博士` 会被要求正文出现 `and*` 前缀 token、
+        // `凯尔希 NOT 博士` 会去找 `not*`——中文语料里几乎不存在，整句
+        // 静默变成空结果；回退扫描却按子串匹配 `and`（island、commander
+        // 都命中），索引建好前后同一查询「有/无」互相矛盾。前端（高亮、
+        // 防抖）一直把 or/and/not 一律当连接词，这里必须对齐。
+        let mut prev_was_not = false;
         let flush_bare = |buf: &mut String,
                           terms: &mut Vec<UserTerm>,
-                          prev_was_or: &mut bool| {
+                          prev_was_or: &mut bool,
+                          prev_was_not: &mut bool| {
             if buf.is_empty() {
                 return;
             }
             let t = std::mem::take(buf);
+            // 连接词判定发生在去减号之前：`-or` / `-and` / `-not` 是排除
+            // 对应字面量的普通词；引号里的写法根本不进这里。
             if t == "or" {
                 *prev_was_or = true;
+                return;
+            }
+            if t == "and" {
+                return;
+            }
+            if t == "not" {
+                *prev_was_not = true;
                 return;
             }
             let is_not = t.starts_with('-');
@@ -1406,7 +1443,9 @@ impl DataService {
             if !content.is_empty() {
                 terms.push(UserTerm {
                     text: content,
-                    is_not,
+                    // 悬挂的 `not` 只被真正成词的 token 消费；纯减号串跟
+                    // `or` 一样让它顺延给下一个词。
+                    is_not: is_not || std::mem::take(prev_was_not),
                     is_or_before: *prev_was_or,
                     is_quoted: false,
                 });
@@ -1414,8 +1453,9 @@ impl DataService {
             }
         };
 
-        // `-"凯尔希"`：减号在引号之前，`flush_bare` 会把孤零零的 `-` 丢掉。
-        // 不记住它的话否定短语会变成肯定短语，语义正好反过来。
+        // `-"凯尔希"` / `not "凯尔希"`：负向标记落在引号之前。孤零零的
+        // `-` 会被 `flush_bare` 丢掉、`not` 只留下悬挂标记——不在开引号时
+        // 收下它们，否定短语会变成肯定短语，语义正好反过来。
         let mut quote_is_not = false;
         for ch in q.chars() {
             match ch {
@@ -1434,13 +1474,16 @@ impl DataService {
                         }
                         quote_is_not = false;
                     } else {
-                        quote_is_not = buf == "-";
-                        flush_bare(&mut buf, &mut terms, &mut prev_was_or);
+                        // 先记减号，再 flush（顺带处理粘连写法 `not"凯尔希"`
+                        // ——flush 会把 buf 里的 `not` 变成悬挂标记）。
+                        let dash_prefix = buf == "-";
+                        flush_bare(&mut buf, &mut terms, &mut prev_was_or, &mut prev_was_not);
+                        quote_is_not = dash_prefix || std::mem::take(&mut prev_was_not);
                         in_quotes = true;
                     }
                 }
                 c if c.is_whitespace() && !in_quotes => {
-                    flush_bare(&mut buf, &mut terms, &mut prev_was_or);
+                    flush_bare(&mut buf, &mut terms, &mut prev_was_or, &mut prev_was_not);
                 }
                 _ => buf.push(ch),
             }
@@ -1449,7 +1492,7 @@ impl DataService {
         if in_quotes && quote_is_not {
             buf.insert(0, '-');
         }
-        flush_bare(&mut buf, &mut terms, &mut prev_was_or);
+        flush_bare(&mut buf, &mut terms, &mut prev_was_or, &mut prev_was_not);
         if terms.is_empty() {
             return None;
         }
