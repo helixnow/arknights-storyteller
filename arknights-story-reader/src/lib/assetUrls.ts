@@ -59,35 +59,129 @@ export function hasNpcAvatarOverride(name: string | null | undefined): boolean {
   return npcOverride(name.trim()) !== null;
 }
 
-function resolveCharId(token: string, index: CharacterIndex | null): string | null {
-  if (token.startsWith("char_")) {
-    return token.split("#")[0] ?? token;
-  }
-  if (!index) return null;
-  const exact = ownString(index.nameToCharId, token);
-  if (exact) return exact;
-  // alias 兜底：干员密录等场景会传 `char_{num}_{alias}` 的 alias 部分
-  // （如 `kroos`、`amgoat`）。按 index 快照动态构造反向表并缓存，
-  // 避免每次都 O(N) 扫描。
-  const aliasMap = getAliasMap(index);
-  return aliasMap.get(token.toLowerCase()) ?? null;
+export interface CharacterResolverSnapshot {
+  hasIndex: boolean;
+  resolveCharId: (name: string | null | undefined) => string | null;
+  resolveName: (charId: string | null | undefined) => string | null;
 }
 
-// 按 CharacterIndex 快照缓存 alias→charId 反向表。index 在启动时稳定，
-// 同一个对象引用拿到的都是同一份 Map，不会重复构造。
-const aliasMapCache = new WeakMap<CharacterIndex, Map<string, string>>();
-function getAliasMap(index: CharacterIndex): Map<string, string> {
-  const hit = aliasMapCache.get(index);
-  if (hit) return hit;
-  const map = new Map<string, string>();
-  for (const cid of Object.keys(index.charIdToName ?? {})) {
-    const m = cid.match(/^char_\d+_(.+?)(?:#.*)?$/);
-    if (!m) continue;
-    const alias = m[1].toLowerCase();
-    if (!map.has(alias)) map.set(alias, cid);
+/**
+ * 名字侧的宽松匹配键。中文不受 lower-case 影响；英文代号 / appellation
+ * 因而也能大小写不敏感。只去掉项目里约定的分隔符，不吞普通标点，避免把
+ * 两个本来不同的显示名过度合并。
+ */
+function simplifyCharacterToken(value: string): string {
+  return value.trim().toLowerCase().replace(/[\s·‧•・]+/g, "");
+}
+
+/** 只归一化真正的 `char_` token；普通显示名返回 null。 */
+function directCharacterId(token: string): string | null {
+  const base = token.trim().split("#", 1)[0] ?? "";
+  if (!/^char_/i.test(base)) return null;
+  // 游戏数据里的 charId 是 ASCII 小写。路径前缀在数据侧没有大小写承诺，
+  // `Obt/Memory/CHAR_002_AMIYA/...` 必须和小写路径得到同一个素材 URL。
+  return base.toLowerCase();
+}
+
+/**
+ * CharacterIndex 快照对应的纯解析器。Provider 与素材 URL 解析必须共用同一
+ * 套规则，否则人物卡能认出的密录 alias 到分享图里又会变成无头像。
+ *
+ * WeakMap 让同一份后端快照只建一次反向表；数据换包会给出新对象，自然得到
+ * 全新 overlay，不会把旧包的 alias / 显示名混进来。
+ */
+const characterResolverCache = new WeakMap<CharacterIndex, CharacterResolverSnapshot>();
+
+export function createCharacterResolver(index: CharacterIndex): CharacterResolverSnapshot {
+  const cached = characterResolverCache.get(index);
+  if (cached) return cached;
+
+  const nameMap = index.nameToCharId ?? {};
+  const idMap = index.charIdToName ?? {};
+  const hasIndex = Object.keys(nameMap).length > 0 || Object.keys(idMap).length > 0;
+  const canonicalIdByLower = new Map<string, string>();
+  const idLookupKeyByLower = new Map<string, string>();
+  const aliasMap = new Map<string, string>();
+  const simplifiedNameMap = new Map<string, string>();
+
+  for (const cid of Object.keys(idMap)) {
+    const base = cid.split("#", 1)[0]?.trim();
+    if (!base || !/^char_/i.test(base)) continue;
+    const canonical = base.toLowerCase();
+    if (!canonicalIdByLower.has(canonical)) canonicalIdByLower.set(canonical, canonical);
+    if (!idLookupKeyByLower.has(canonical)) idLookupKeyByLower.set(canonical, cid);
+    const match = canonical.match(/^char_\d+_(.+)$/);
+    if (match && !aliasMap.has(match[1])) aliasMap.set(match[1], canonical);
   }
-  aliasMapCache.set(index, map);
-  return map;
+
+  const normalizeMappedId = (raw: string): string => {
+    const base = raw.trim().split("#", 1)[0] ?? raw.trim();
+    const direct = directCharacterId(base);
+    if (!direct) return base;
+    return canonicalIdByLower.get(direct) ?? direct;
+  };
+
+  for (const [name, cid] of Object.entries(nameMap)) {
+    if (typeof cid !== "string" || !cid.trim()) continue;
+    const key = simplifyCharacterToken(name);
+    if (key && !simplifiedNameMap.has(key)) {
+      simplifiedNameMap.set(key, normalizeMappedId(cid));
+    }
+  }
+
+  const resolvedIds = new Map<string, string | null>();
+  const resolvedNames = new Map<string, string | null>();
+
+  const resolveCharId = (name: string | null | undefined): string | null => {
+    if (!name) return null;
+    const trimmed = name.trim();
+    if (!trimmed) return null;
+    if (resolvedIds.has(trimmed)) return resolvedIds.get(trimmed) ?? null;
+
+    const direct = directCharacterId(trimmed);
+    const exact = ownString(nameMap, trimmed);
+    const out =
+      (direct ? canonicalIdByLower.get(direct) ?? direct : null) ??
+      (exact ? normalizeMappedId(exact) : null) ??
+      simplifiedNameMap.get(simplifyCharacterToken(trimmed)) ??
+      aliasMap.get(trimmed.toLowerCase()) ??
+      null;
+    resolvedIds.set(trimmed, out);
+    return out;
+  };
+
+  const resolveName = (charId: string | null | undefined): string | null => {
+    if (!charId) return null;
+    const trimmed = charId.trim();
+    if (!trimmed) return null;
+    if (resolvedNames.has(trimmed)) return resolvedNames.get(trimmed) ?? null;
+    const direct = directCharacterId(trimmed);
+    const canonical = direct ? canonicalIdByLower.get(direct) ?? direct : null;
+    const lookupKey = canonical ? idLookupKeyByLower.get(canonical) ?? canonical : null;
+    const out = lookupKey ? ownString(idMap, lookupKey) : null;
+    resolvedNames.set(trimmed, out);
+    return out;
+  };
+
+  const snapshot = { hasIndex, resolveCharId, resolveName };
+  characterResolverCache.set(index, snapshot);
+  return snapshot;
+}
+
+/** 不建 React context 时也能复用的单次 charId 解析。 */
+export function resolveCharacterIdLocal(
+  token: string,
+  index: CharacterIndex | null
+): string | null {
+  const direct = directCharacterId(token);
+  if (direct) {
+    return index ? createCharacterResolver(index).resolveCharId(direct) : direct;
+  }
+  return index ? createCharacterResolver(index).resolveCharId(token) : null;
+}
+
+function resolveCharId(token: string, index: CharacterIndex | null): string | null {
+  return resolveCharacterIdLocal(token, index);
 }
 
 function avatarCandidates(token: string, index: CharacterIndex | null): string[] {
@@ -405,6 +499,10 @@ export function markAssetUrlAlive(url: string): void {
   for (const dead of deadUrls) {
     if (hostOf(dead) === host) deadUrls.delete(dead);
   }
+  // 若这个 host 原本正占着共享闹钟，证明可达后旧闹钟已经没有意义；立即按
+  // 剩余 host 重排。否则 30 秒后还会多广播一次“恢复”，几百张兜底图会被
+  // 无缘无故叫醒重扫。
+  rescheduleNextHostWake();
   // 这个源刚被证明可达：之前因它熔断而放弃的候选现在值得重试。
   notifyAssetHealth();
 }
@@ -490,6 +588,14 @@ function scheduleNextHostWake() {
     }
   }
   if (next !== Infinity) scheduleHealthNotice(next);
+}
+
+/** 清掉已经失去目标的共享闹钟，再从当前 strike 表选择真正最早的到期点。 */
+function rescheduleNextHostWake() {
+  if (healthTimer !== null) clearTimeout(healthTimer);
+  healthTimer = null;
+  healthTimerAt = 0;
+  scheduleNextHostWake();
 }
 
 /** 订阅「候选健康度可能变好了」事件。返回取消订阅函数。 */

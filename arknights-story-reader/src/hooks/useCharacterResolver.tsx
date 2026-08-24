@@ -10,6 +10,7 @@ import {
 } from "react";
 import { api } from "@/services/api";
 import { setGlobalCharacterIndex } from "@/hooks/useAsset";
+import { createCharacterResolver } from "@/lib/assetUrls";
 import type { CharacterIndex } from "@/types/story";
 
 interface CharacterContextValue extends CharacterIndex {
@@ -88,56 +89,13 @@ export function CharacterResolverProvider({ children }: { children: ReactNode })
   const maps = useMemo(() => {
     const nameMap = index.nameToCharId ?? {};
     const idMap = index.charIdToName ?? {};
-    const hasIndex = Object.keys(nameMap).length > 0 || Object.keys(idMap).length > 0;
-    const simplify = (s: string) => s.trim().replace(/[\s·‧•・]+/g, "");
-    const simplifiedNameMap = new Map<string, string>();
-    Object.entries(nameMap).forEach(([k, v]) => {
-      const key = simplify(k);
-      if (key && !simplifiedNameMap.has(key)) simplifiedNameMap.set(key, v);
-    });
-    // `char_{num}_{alias}` 里的 alias（小写英文）映射。干员密录的
-    // storyTxt 形如 `obt/memory/story_{alias}_N_M`，没有 char_ 前缀也
-    // 不是中文名/appellation —— 直接从已有的 charIds 反推即可。
-    const aliasMap = new Map<string, string>();
-    Object.keys(idMap).forEach((cid) => {
-      const match = cid.match(/^char_\d+_(.+?)(?:#.*)?$/);
-      if (match) {
-        const alias = match[1].toLowerCase();
-        if (!aliasMap.has(alias)) aliasMap.set(alias, cid);
-      }
-    });
-    // 人物面板一次要解析几百个名字，命中结果（含 miss）缓存起来。
-    const resolved = new Map<string, string | null>();
-    const resolveCharId = (name: string | null | undefined): string | null => {
-      if (!name) return null;
-      const trimmed = name.trim();
-      if (!trimmed) return null;
-      const cached = resolved.get(trimmed);
-      if (cached !== undefined) return cached;
-      let out: string | null;
-      if (trimmed.startsWith("char_")) {
-        out = trimmed.split("#")[0];
-      } else {
-        out =
-          nameMap[trimmed] ??
-          simplifiedNameMap.get(simplify(trimmed)) ??
-          // 兜底尝试 alias（存 charId 小写英文片段），覆盖干员密录这类
-          // 只有 `story_{alias}_` 的路径。
-          aliasMap.get(trimmed.toLowerCase()) ??
-          null;
-      }
-      resolved.set(trimmed, out);
-      return out;
-    };
+    const resolver = createCharacterResolver(index);
     return {
       charIdToName: idMap,
       nameToCharId: nameMap,
-      hasIndex,
-      resolveCharId,
-      resolveName: (charId: string | null | undefined): string | null => {
-        if (!charId) return null;
-        return idMap[charId.split("#")[0]] ?? null;
-      },
+      hasIndex: resolver.hasIndex,
+      resolveCharId: resolver.resolveCharId,
+      resolveName: resolver.resolveName,
     };
   }, [index]);
 

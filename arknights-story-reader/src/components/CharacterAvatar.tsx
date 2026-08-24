@@ -27,6 +27,8 @@ function CharacterAvatarImpl({
   label,
 }: CharacterAvatarProps) {
   const resolver = useCharacterResolver();
+  const cleanName = name?.trim() || null;
+  const cleanCharId = charId?.trim() || null;
   // 既支持真正的 charId（char_xxx），也支持名字 / 内部 alias（如
   // 干员密录路径里的 `kroos`、`amgoat`）。charId 解析失败时必须再用
   // name 解析一次——密录路径里的 alias 与 charId 尾段对不上时，卡片
@@ -34,18 +36,19 @@ function CharacterAvatarImpl({
   // 把解析不出的原始 alias 当结果返回，name 这条救援路径永远走不到。
   // 两侧都失败才保留原始 charId 作为 monogram 兜底 token。
   const resolvedId =
-    (charId ? resolver.resolveCharId(charId) : null) ??
-    resolver.resolveCharId(name) ??
-    charId ??
+    (cleanCharId ? resolver.resolveCharId(cleanCharId) : null) ??
+    resolver.resolveCharId(cleanName) ??
+    cleanCharId ??
     null;
-  const resolvedName = name ?? (resolvedId ? resolver.resolveName(resolvedId) : null);
+  // 空字符串 / 纯空白不是有效显示名，不能挡住 charId → 中文名的回填。
+  const resolvedName = cleanName ?? (resolvedId ? resolver.resolveName(resolvedId) : null);
 
   // NPC 覆盖名（普瑞赛斯等）不在干员表里，随台词传来的 charId 只可能是
   // 解析器「[Dialog(name=...)] 只写显示名就继承上一条 [Character] 立绘」
   // 的启发式误配的别人的 id。charId 是 char_ 前缀时总能解析成功，若不在
   // 这里让覆盖名优先，NPC 的台词就会顶着上一位干员的头像。
-  const npcName = name && hasNpcAvatarOverride(name) ? name.trim() : null;
-  const token = npcName ?? resolvedId ?? name ?? null;
+  const npcName = cleanName && hasNpcAvatarOverride(cleanName) ? cleanName : null;
+  const token = npcName ?? resolvedId ?? cleanName ?? null;
   // 名字里可能出现增补平面字符（生僻汉字等），`String#slice` 按 UTF-16
   // 单元切会把代理对劈成两半、渲染成 "�"。先清洗掉标点再按码点取前两个。
   const initials =
@@ -58,7 +61,7 @@ function CharacterAvatarImpl({
     <AssetImage
       kind="avatar"
       token={token}
-      alt={resolvedName ?? name ?? ""}
+      alt={resolvedName ?? ""}
       // 默认不给头像加 CSS filter。`filter: saturate/brightness` 每个元素
       // 都会生成独立的合成层，一屏 100+ 头像时滚动会严重掉帧。tint=none
       // 让头像保持彩色——这也更符合"看清楚谁是谁"的直觉。

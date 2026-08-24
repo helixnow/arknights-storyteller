@@ -141,7 +141,7 @@ function FilterInput({
         value={draft}
         placeholder={placeholder}
         aria-label={ariaLabel}
-        className="pr-9"
+        className="pr-11"
         autoComplete="off"
         autoCorrect="off"
         spellCheck={false}
@@ -171,7 +171,7 @@ function FilterInput({
       {draft && (
         <button
           type="button"
-          className="absolute right-0 top-0 flex h-full w-9 items-center justify-center rounded-r-md text-[hsl(var(--color-muted-foreground))] transition-colors hover:text-[hsl(var(--color-foreground))] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--color-ring))]"
+          className="absolute right-0 top-0 flex h-full min-h-[44px] w-11 items-center justify-center rounded-r-md text-[hsl(var(--color-muted-foreground))] transition-colors hover:text-[hsl(var(--color-foreground))] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--color-ring))]"
           onClick={() => commit("")}
           aria-label={`清除${ariaLabel}`}
         >
@@ -195,7 +195,7 @@ const CharacterCard = memo(function CharacterCard({
   return (
     <button
       className={cn(
-        "character-grid-cell flex items-center gap-3 rounded-lg border border-[hsl(var(--color-border))] bg-[hsl(var(--color-card))] p-3 text-left"
+        "character-grid-cell flex min-h-[64px] touch-manipulation items-center gap-3 rounded-lg border border-[hsl(var(--color-border))] bg-[hsl(var(--color-card))] p-3 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--color-ring))]"
       )}
       onClick={() => onSelect(name)}
     >
@@ -350,6 +350,9 @@ export function CharactersPanel({
   const [selected, setSelected] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const loadingRef = useRef(false);
+  // 每次数据包失效都递增。强刷若撞上在途扫描，旧 worker 即刻停止发新 IPC，
+  // 已经返回的旧结果也不再有资格写回 UI。
+  const statsRunRef = useRef(0);
   // 扫描进行中又收到强制刷新（数据同步在后台完成）时先记账，本轮跑完
   // 立刻重跑。直接丢掉的话，这一轮读到的新旧混合统计会一直顶到下次
   // 数据更新为止。
@@ -380,19 +383,36 @@ export function CharactersPanel({
     };
   }, []);
 
+  /** 丢掉一份统计快照关联的全部派生状态，但不改变扫描代际。 */
+  const clearCharacterResults = useCallback(() => {
+    setAggregates(new Map());
+    setGroupInfoByStoryId(new Map());
+    setProgress({ current: 0, total: 0 });
+    setCacheUsed(false);
+    setCacheBuiltAt(null);
+    setVersion(null);
+    setSelected(null);
+    setGroupSearch({});
+    quotesRunRef.current += 1;
+    setQuotes([]);
+    setQuoteCandidates([]);
+    setQuotesFor(null);
+    setLoadingQuotes(false);
+  }, []);
+
+  /** 数据目录已换包：先使所有旧异步任务失效，再同步撤下旧数据。 */
+  const invalidateCharacterResults = useCallback(() => {
+    statsRunRef.current += 1;
+    loadedOnceRef.current = false;
+    clearCharacterResults();
+  }, [clearCharacterResults]);
+
   const loadAll = useCallback(async (opts?: { forceRefresh?: boolean }) => {
     if (opts?.forceRefresh) {
       // 强刷通常意味着数据包已经换掉；旧统计里的 story 对象也和旧金句
       // 一样不再可信。立即撤下，避免新目录读取失败时继续展示旧包数据，
       // 同时也避免 selectedAgg 引用不变让下方金句永久停在加载骨架。
-      setAggregates(new Map());
-      // 数据包已经换掉，旧金句的 story/segmentIndex 从这一刻起就不再可信。
-      // 先让在途抓取失效并撤下旧按钮；等新统计落地后 quote effect 会重抓。
-      quotesRunRef.current += 1;
-      setQuotes([]);
-      setQuoteCandidates([]);
-      setQuotesFor(null);
-      setLoadingQuotes(false);
+      invalidateCharacterResults();
     }
     if (loadingRef.current) {
       // 数据刚换完却撞上正在跑的扫描：本轮读到的可能是新旧混合的内容，
@@ -401,16 +421,17 @@ export function CharactersPanel({
       return;
     }
     loadingRef.current = true;
+    const runId = statsRunRef.current;
+    const isCurrent = () => aliveRef.current && runId === statsRunRef.current;
     setLoading(true);
     setError(null);
     try {
       // 数据没同步时后端每个命令都会抛错，先问一次省掉一串失败请求。
       const installed = await api.isInstalled();
-      if (!aliveRef.current) return;
+      if (!isCurrent()) return;
       if (!installed) {
         setNotInstalled(true);
-        setAggregates(new Map());
-        setProgress({ current: 0, total: 0 });
+        clearCharacterResults();
         // 不算"已加载"：同步完数据切回来要能自动重试。
         loadedOnceRef.current = false;
         return;
@@ -418,7 +439,7 @@ export function CharactersPanel({
       setNotInstalled(false);
 
       const ver = await api.getCurrentVersion();
-      if (!aliveRef.current) return;
+      if (!isCurrent()) return;
       setVersion(ver);
       const cacheKey = ver ? statsCacheKeyForVersion(ver) : null;
       // 数据版本换过之后，旧版 schema、旧 commit 和无法唯一识别的手动包
@@ -451,7 +472,7 @@ export function CharactersPanel({
           }),
           api.getMemoryStories(),
         ]);
-      if (!aliveRef.current) return;
+      if (!isCurrent()) return;
 
       // 生成 groupInfoByStoryId
       const groupInfo = new Map<string, GroupInfo>();
@@ -590,20 +611,21 @@ export function CharactersPanel({
           });
         };
         const worker = async () => {
-          // 面板卸载后剩下的几千次读取直接放弃，不再排队占用 IPC。
-          while (aliveRef.current) {
+          // 面板卸载或数据换包后剩下的几千次读取直接放弃，不再排队占用 IPC。
+          while (isCurrent()) {
             const i = cursor++;
             if (i >= stories.length) return;
             const story = stories[i];
             try {
               const content = await api.getStoryContent(story.storyTxt);
+              if (!isCurrent()) return;
               // JS 单线程，applyCounts 是同步的，不需要任何锁。
               applyCounts(story, countCharactersInStory(content));
             } catch {
               failed += 1;
             } finally {
               done += 1;
-              if (aliveRef.current && (done % PROGRESS_STEP === 0 || done === stories.length)) {
+              if (isCurrent() && (done % PROGRESS_STEP === 0 || done === stories.length)) {
                 setProgress({ current: done, total: stories.length });
               }
             }
@@ -612,7 +634,7 @@ export function CharactersPanel({
         await Promise.all(
           Array.from({ length: Math.min(STATS_POOL_SIZE, stories.length) }, () => worker())
         );
-        if (!aliveRef.current) return;
+        if (!isCurrent()) return;
         if (failed > 0) {
           statsIncomplete = true;
           console.warn(`[CharactersPanel] ${failed}/${stories.length} 篇剧情读取失败，已跳过`);
@@ -669,9 +691,12 @@ export function CharactersPanel({
 
       loadedOnceRef.current = true;
     } catch (err) {
+      if (!isCurrent()) return;
       const raw = err instanceof Error ? err.message : String(err);
       loadedOnceRef.current = false;
-      if (!aliveRef.current) return;
+      // 无论这次是否显式 force，失败结果都不能和上一次成功快照并排展示；
+      // 它们可能来自已经被原地替换、但更新事件丢失的数据目录。
+      clearCharacterResults();
       if (/NOT_INSTALLED|未安装/i.test(raw)) {
         // 与上方探针显式返回 false 的分支保持同一套状态：数据已经没了，
         // 旧统计不能留着——否则开着的角色详情会顶着「还没有剧情数据」
@@ -701,7 +726,7 @@ export function CharactersPanel({
         }
       }
     }
-  }, []);
+  }, [clearCharacterResults, invalidateCharacterResults]);
 
   // 只在面板首次可见时统计；之后除非数据变了，切回来不重跑。
   useEffect(() => {
@@ -718,8 +743,10 @@ export function CharactersPanel({
       // 面板不可见时只打个标记，等用户切回来再重算——后台重扫几千篇
       // 剧情会把正在阅读的页面拖卡。
       if (!activeRef.current) {
+        // KeepAlive 面板虽然不可见，下一帧切回来前也必须先撤下旧包快照，
+        // 不能等可见后的 effect 才清（那会闪一帧旧人物/旧金句）。
+        invalidateCharacterResults();
         staleRef.current = true;
-        loadedOnceRef.current = false;
         return;
       }
       void loadAll({ forceRefresh: true });
@@ -730,7 +757,7 @@ export function CharactersPanel({
       window.removeEventListener("app:refresh-character-stats", handler);
       window.removeEventListener("app:data-updated", handler);
     };
-  }, [loadAll]);
+  }, [invalidateCharacterResults, loadAll]);
 
   const allCharacters = useMemo(() => {
     return Array.from(aggregates.values())
@@ -1023,7 +1050,12 @@ export function CharactersPanel({
         trackOffsetTop="calc(3.25rem + 10px)"
         trackOffsetBottom="calc(4.5rem + env(safe-area-inset-bottom, 0px))"
       >
-        <div className="p-4 pb-24 space-y-4">
+        <div
+          className="p-4 space-y-4"
+          style={{
+            paddingBottom: "calc(var(--bottom-nav-inset, 4.5rem) + 1rem)",
+          }}
+        >
           {loading && (
             <div className="flex items-center gap-3 text-sm text-[hsl(var(--color-muted-foreground))]">
               <Loader2 className="h-4 w-4 animate-spin" />
@@ -1123,7 +1155,7 @@ export function CharactersPanel({
               </div>
             ))}
 
-          {!selected && !notInstalled && (
+          {!selected && !notInstalled && !error && (
             <div
               className={cn(
                 "grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3",
