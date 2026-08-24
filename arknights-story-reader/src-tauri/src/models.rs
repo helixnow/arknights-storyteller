@@ -100,10 +100,9 @@ pub enum StorySegment {
         character_name: String,
         text: String,
         /// 可选的对话位置（例如右侧头像）
-        #[serde(skip_serializing_if = "Option::is_none")]
         position: Option<String>,
         /// 对应角色的 charId（例如 `char_010_chen`），前端可用它拼头像 URL。
-        #[serde(rename = "characterId", skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "characterId")]
         character_id: Option<String>,
     },
     Narration {
@@ -138,7 +137,6 @@ pub enum StorySegment {
         /// 原始 token，例如 `avg_8_34`、`g_13_I01`。
         token: String,
         /// 可选标题/描述。
-        #[serde(skip_serializing_if = "Option::is_none")]
         caption: Option<String>,
     },
     /// 剧情 BGM 指令（`[PlayMusic]`），前端默认忽略；开启设置后可用。
@@ -304,4 +302,145 @@ pub struct StoryNeighbors {
     pub prev: Option<StoryEntry>,
     #[serde(rename = "next")]
     pub next: Option<StoryEntry>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn minimal_entry_json(story_code: Value) -> Value {
+        json!({
+            "storyId": "main_01",
+            "storyName": "序章",
+            "storyCode": story_code,
+            "storyGroup": "main_0",
+            "storySort": 1,
+            "storyTxt": "obt/main/main_01",
+            "storyReviewType": "NORMAL",
+            "unLockType": "AUTO"
+        })
+    }
+
+    #[test]
+    fn story_code_null_deserializes_as_an_explicit_clear() {
+        let with_code: StoryEntry =
+            serde_json::from_value(minimal_entry_json(json!("0-1"))).unwrap();
+        assert_eq!(with_code.story_code.as_deref(), Some("0-1"));
+
+        let cleared: StoryEntry = serde_json::from_value(minimal_entry_json(Value::Null)).unwrap();
+        assert!(
+            cleared.story_code.is_none(),
+            "IPC null must clear a previously populated storyCode"
+        );
+    }
+
+    #[test]
+    fn story_entry_optional_fields_serialize_as_null_not_missing() {
+        let entry: StoryEntry = serde_json::from_value(minimal_entry_json(Value::Null)).unwrap();
+        let value = serde_json::to_value(entry).unwrap();
+        for field in [
+            "storyCode",
+            "avgTag",
+            "storyInfo",
+            "storyPic",
+            "storyDependence",
+            "storyCanShow",
+            "storyCanEnter",
+            "stageCount",
+            "requiredStages",
+            "costItemType",
+            "costItemId",
+            "costItemCount",
+        ] {
+            assert_eq!(
+                value.get(field),
+                Some(&Value::Null),
+                "optional IPC field {field} must be present as null"
+            );
+        }
+    }
+
+    #[test]
+    fn dialogue_optional_fields_serialize_as_null() {
+        let segment = StorySegment::Dialogue {
+            character_name: "阿米娅".to_string(),
+            text: "博士。".to_string(),
+            position: None,
+            character_id: None,
+        };
+        let value = serde_json::to_value(segment).unwrap();
+        assert_eq!(value.get("position"), Some(&Value::Null));
+        assert_eq!(value.get("characterId"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn every_optional_segment_payload_is_explicitly_nullable() {
+        let cases = [
+            (
+                StorySegment::System {
+                    speaker: None,
+                    text: "系统消息".to_string(),
+                },
+                "speaker",
+            ),
+            (
+                StorySegment::Subtitle {
+                    text: "字幕".to_string(),
+                    alignment: None,
+                },
+                "alignment",
+            ),
+            (
+                StorySegment::Sticker {
+                    text: "贴纸".to_string(),
+                    alignment: None,
+                },
+                "alignment",
+            ),
+            (
+                StorySegment::Image {
+                    token: "avg_1".to_string(),
+                    caption: None,
+                },
+                "caption",
+            ),
+        ];
+        for (segment, field) in cases {
+            let value = serde_json::to_value(segment).unwrap();
+            assert_eq!(
+                value.get(field),
+                Some(&Value::Null),
+                "{field} must cross IPC as null"
+            );
+        }
+    }
+
+    #[test]
+    fn response_optionals_are_null_in_default_payloads() {
+        let neighbors = serde_json::to_value(StoryNeighbors::default()).unwrap();
+        assert_eq!(neighbors.get("prev"), Some(&Value::Null));
+        assert_eq!(neighbors.get("next"), Some(&Value::Null));
+
+        let status = serde_json::to_value(StoryIndexStatus {
+            ready: false,
+            total: 0,
+            last_built_at: None,
+        })
+        .unwrap();
+        assert_eq!(status.get("lastBuiltAt"), Some(&Value::Null));
+
+        let hit = serde_json::to_value(SegmentHit {
+            story_id: "s".to_string(),
+            story_name: "n".to_string(),
+            category: "c".to_string(),
+            segment_index: 0,
+            segment_type: "header".to_string(),
+            character_name: None,
+            matched_text: "n".to_string(),
+            match_target: "title".to_string(),
+        })
+        .unwrap();
+        assert_eq!(hit.get("characterName"), Some(&Value::Null));
+    }
 }
