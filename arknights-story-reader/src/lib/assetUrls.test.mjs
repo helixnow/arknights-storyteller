@@ -23,6 +23,7 @@ import {
   hasRecoverableCandidate,
   subscribeAssetHealth,
   getAssetHealthVersion,
+  getAssetRecoveryAction,
   isStaleOfflineAssetError,
   hashHue,
   gradientFallbackBackground,
@@ -352,6 +353,25 @@ test("离线余波：发出时离线或在途经历 online 都不是可信 404",
     "旧请求快照不能误套到另一条 URL"
   );
   assert.equal(isStaleOfflineAssetError(null, url, 4), false);
+});
+
+test("恢复版本：候选仍在途时不提前消费，耗尽后用同一事件回到链首", () => {
+  assert.equal(
+    getAssetRecoveryAction(3, 4, false, true),
+    "defer",
+    "已有离线失败或前序候选刚恢复、但尚未 stuck 时须保留恢复事件"
+  );
+  assert.equal(
+    getAssetRecoveryAction(3, 4, true, true),
+    "retry",
+    "在途候选也失败后，须用尚未消费的同一次恢复事件重扫候选链"
+  );
+  assert.equal(
+    getAssetRecoveryAction(3, 4, false, false),
+    "observe",
+    "当前候选成功并清掉待恢复标记后只消费版本，不应多发请求"
+  );
+  assert.equal(getAssetRecoveryAction(4, 4, true, true), "none");
 });
 
 // ─────────────────────────────────────────────────────────────

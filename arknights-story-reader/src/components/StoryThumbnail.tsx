@@ -10,6 +10,7 @@ import {
 } from "@/components/AssetImage";
 import { peekAssetCandidates, useAssetHealthNonce } from "@/hooks/useAsset";
 import {
+  getAssetRecoveryAction,
   gradientFallbackBackground,
   markAssetUrlAlive,
   markAssetUrlDead,
@@ -104,9 +105,17 @@ export function StoryThumbnail({
   const stuck = live === null && candidates.length > 0;
   const healthNonce = useAssetHealthNonce(stuck);
   const healthNonceRef = useRef(healthNonce);
-  if (healthNonceRef.current !== healthNonce) {
+  const healthRecoveryAction = getAssetRecoveryAction(
+    healthNonceRef.current,
+    healthNonce,
+    stuck,
+    stuck || (live !== null && !(loaded && loadedUrlRef.current === live.url))
+  );
+  if (healthRecoveryAction === "retry") {
     healthNonceRef.current = healthNonce;
-    if (stuck) setCursor(0);
+    setCursor(0);
+  } else if (healthRecoveryAction === "observe") {
+    healthNonceRef.current = healthNonce;
   }
 
   // 网络恢复时重试离线窗口内失败过的候选。离线时 onerror 不是「404」的
@@ -115,12 +124,18 @@ export function StoryThumbnail({
   // 本地记一笔，online 事件到来时把游标拨回 0 原样重扫。
   const onlineNonce = useOnlineRecoveryNonce(stuck && offlineFailedRef.current);
   const onlineNonceRef = useRef(onlineNonce);
-  if (onlineNonceRef.current !== onlineNonce) {
+  const onlineRecoveryAction = getAssetRecoveryAction(
+    onlineNonceRef.current,
+    onlineNonce,
+    stuck,
+    offlineFailedRef.current
+  );
+  if (onlineRecoveryAction === "retry") {
     onlineNonceRef.current = onlineNonce;
-    if (stuck && offlineFailedRef.current) {
-      offlineFailedRef.current = false;
-      setCursor(0);
-    }
+    offlineFailedRef.current = false;
+    setCursor(0);
+  } else if (onlineRecoveryAction === "observe") {
+    onlineNonceRef.current = onlineNonce;
   }
 
   // `loaded` 只对当初解码成功的那条 URL 有效。正在展示的 URL 可能被另一

@@ -240,6 +240,26 @@ export function isStaleOfflineAssetError(
   );
 }
 
+export type AssetRecoveryAction = "none" | "observe" | "defer" | "retry";
+
+/**
+ * 判定组件该如何消费一次恢复版本变化（`online` 或素材健康度）。
+ *
+ * 恢复可能发生在候选仍在途时，此时必须先保留通知。若当前候选成功，调用方
+ * 会清掉 `recoveryPending`，下次渲染只需 observe；若它仍然 404 并最终
+ * stuck，则用同一次已发生的恢复把游标拨回开头，重试恢复后重新可用的候选。
+ */
+export function getAssetRecoveryAction(
+  observedVersion: number,
+  currentVersion: number,
+  stuck: boolean,
+  recoveryPending: boolean
+): AssetRecoveryAction {
+  if (observedVersion === currentVersion) return "none";
+  if (!recoveryPending) return "observe";
+  return stuck ? "retry" : "defer";
+}
+
 // ─────────────────────────────────────────────────────────────
 // Session 级候选健康度
 //

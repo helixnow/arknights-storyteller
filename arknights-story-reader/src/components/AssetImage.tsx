@@ -9,6 +9,7 @@ import {
 import { cn } from "@/lib/utils";
 import { useAsset, useAssetHealthNonce } from "@/hooks/useAsset";
 import {
+  getAssetRecoveryAction,
   gradientFallbackBackground,
   hasRecoverableCandidate,
   isStaleOfflineAssetError,
@@ -226,21 +227,37 @@ export function AssetImage({
   // 健康事件到来时把游标拨回 0 重扫整条候选链：被撤销失败记录的 URL 可能
   // 排在游标之前；真正失败过的仍会被 deadUrls 跳过，不会原地打转。
   const healthNonceRef = useRef(healthNonce);
-  if (healthNonceRef.current !== healthNonce) {
+  const healthRecoveryAction = getAssetRecoveryAction(
+    healthNonceRef.current,
+    healthNonce,
+    stuck,
+    stuck ||
+      (currentUrl !== null &&
+        !(loaded && loadedUrlRef.current === currentUrl.url))
+  );
+  if (healthRecoveryAction === "retry") {
     healthNonceRef.current = healthNonce;
-    if (stuck) setCurrentIdx(0);
+    setCurrentIdx(0);
+  } else if (healthRecoveryAction === "observe") {
+    healthNonceRef.current = healthNonce;
   }
 
   // 网络恢复时重试离线窗口内失败过的候选。那些失败没有写进共享缓存
   // （见模块顶部说明），游标拨回 0 后会被原样重新请求。
   const onlineNonce = useOnlineRecoveryNonce(stuck && offlineFailedRef.current);
   const onlineNonceRef = useRef(onlineNonce);
-  if (onlineNonceRef.current !== onlineNonce) {
+  const onlineRecoveryAction = getAssetRecoveryAction(
+    onlineNonceRef.current,
+    onlineNonce,
+    stuck,
+    offlineFailedRef.current
+  );
+  if (onlineRecoveryAction === "retry") {
     onlineNonceRef.current = onlineNonce;
-    if (stuck && offlineFailedRef.current) {
-      offlineFailedRef.current = false;
-      setCurrentIdx(0);
-    }
+    offlineFailedRef.current = false;
+    setCurrentIdx(0);
+  } else if (onlineRecoveryAction === "observe") {
+    onlineNonceRef.current = onlineNonce;
   }
 
   // `loaded` 只对当初解码成功的那条 URL 有效。正在展示的 URL 可能被另一
