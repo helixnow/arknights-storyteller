@@ -74,14 +74,34 @@ export function useEdgeSwipeBack(
   const onBackRef = useRef(onBack);
   onBackRef.current = onBack;
 
+  /*
+   * 采样器与手势监听分开挂载，且不受 `enabled` 门控。调用方的 `enabled`
+   * 往往包含「⋯菜单没开」这类条件，而那个菜单恰好死在这根手指的
+   * pointerdown 上：按下 → 菜单关闭 → 同一次 discrete flush 里 `enabled`
+   * 翻真、手势监听在 touchstart 之前才挂上。若采样器也一起被门控，
+   * touchstart 只能退回现场采样，拿到的是菜单已出栈之后的数量——基线
+   * 与现值相等，下面的数量对比防线失明，一划连菜单带整个视图关掉两层。
+   * 采样器常驻后，按下那一刻（捕获期先于关闭器）的真实基线总在，中途
+   * 挂上的手势会看到「基线比现值多一层」，正确判定这一划已消费在关浮层上。
+   * 常驻的代价只是往 ref 写一次数字，禁用期间可以忽略。
+   */
   useEffect(() => {
-    if (!enabled) return;
-
     const onPointerDown = (ev: PointerEvent) => {
       if (!ev.isPrimary || ev.pointerType !== "touch") return;
       if (ev.clientX > edgeWidth) return;
       pressSampleRef.current = { count: getOverlayHandlerCount(), at: Date.now() };
     };
+
+    const opts = { passive: true, capture: true } as const;
+    document.addEventListener("pointerdown", onPointerDown, opts);
+    return () => {
+      pressSampleRef.current = null;
+      document.removeEventListener("pointerdown", onPointerDown, opts);
+    };
+  }, [edgeWidth]);
+
+  useEffect(() => {
+    if (!enabled) return;
 
     const onTouchStart = (ev: TouchEvent) => {
       // 同一次触点的 pointerdown 紧贴在 touchstart 之前，样本一次性领用；
@@ -147,16 +167,16 @@ export function useEdgeSwipeBack(
     };
 
     const opts = { passive: true, capture: true } as const;
-    document.addEventListener("pointerdown", onPointerDown, opts);
     document.addEventListener("touchstart", onTouchStart, opts);
     document.addEventListener("touchmove", onTouchMove, opts);
     document.addEventListener("touchend", onTouchEnd, opts);
     document.addEventListener("touchcancel", onTouchEnd, opts);
 
     return () => {
+      /* 只清手势状态，不清 pressSampleRef：样本属于常驻采样器的生命周期。
+         本 effect 在手势中途因 `enabled` 翻转重挂时（见上），touchstart
+         还等着领用按下时的那份基线。 */
       stateRef.current = null;
-      pressSampleRef.current = null;
-      document.removeEventListener("pointerdown", onPointerDown, opts);
       document.removeEventListener("touchstart", onTouchStart, opts);
       document.removeEventListener("touchmove", onTouchMove, opts);
       document.removeEventListener("touchend", onTouchEnd, opts);
