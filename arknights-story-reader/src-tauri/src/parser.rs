@@ -9,13 +9,11 @@ lazy_static! {
     /// `[name='麦哲伦']` 的单引号写法，不认单引号就会把引号一起当成名字。
     static ref ATTR_RE: Regex = Regex::new(r#"(?i)([a-z0-9_]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s,()\[\]"]+))"#)
         .expect("invalid attribute regex");
-    /// 只剥真正的富文本标签。语料里的标签全集是 `<i>`、`<b>`、`<color=#...>`、
-    /// `</color>`、`<p=1>`、`<size=40>`、`<br>`、教程强调 `<@tu.kw>`/`<@tu.imp>`
-    /// 与通用闭合 `</>`——全部以 ASCII 字母、`/` 或 `@` 开头。act1sandbox 的
-    /// `【获得了跨局信物<命运的水晶球>】` 这类道具名是拿尖括号当引号的正文
-    /// （全语料 10 处、全是纯 CJK），通配 `<[^>]+>` 会把道具名整个吃掉。
+    /// 只剥语料里实际存在的富文本标签。不能按「ASCII 开头」通配：
+    /// `<RI-8突袭>` 这类中英混排书名/关卡名同样是正文，不是标签。
     static ref GENERIC_TAG_RE: Regex =
-        Regex::new(r#"</?[A-Za-z@][^<>]*>|</>"#).expect("invalid generic tag regex");
+        Regex::new(r#"(?i)</?(?:i|b|color|size)(?:=[^<>]*)?>|<@[A-Za-z0-9_.-]+>|</>"#)
+            .expect("invalid generic tag regex");
     static ref PARAGRAPH_TAG_RE: Regex =
         Regex::new(r"(?i)<p[^>]*>").expect("invalid paragraph tag regex");
     static ref LINE_BREAK_TAG_RE: Regex =
@@ -60,9 +58,14 @@ fn normalize_char_id(raw: &str) -> String {
         .next()
         .unwrap_or(trimmed);
     let parts: Vec<&str> = base.split('_').filter(|p| !p.is_empty()).collect();
-    if parts.len() >= 3 && parts[0] == "char" {
-        // `char_002_amiya` 的三段是身份本体，再往后才是立绘变体。
-        return strip_art_variants(trimmed, 3).join("_");
+    if parts.len() >= 3
+        && parts[0].eq_ignore_ascii_case("char")
+        && parts[1].chars().all(|c| c.is_ascii_digit())
+    {
+        // charId 的身份本体固定为 `char_<数字>_<alias>` 三段；后面不只会有
+        // `_1` / `_ex`，还会出现 `_winter` / `_epoque` 等命名皮肤。只剥
+        // 数字后缀会把这些皮肤误当成另一个角色，头像仓库自然永远 404。
+        return parts[..3].join("_").to_ascii_lowercase();
     }
     base.to_string()
 }
@@ -288,8 +291,7 @@ fn parse_command_line(line: &str, current_char_id: Option<&str>) -> Option<Story
                 let mut numbered_values: HashMap<u64, String> = HashMap::new();
                 for caps in ATTR_RE.captures_iter(target_source) {
                     let Some(key) = caps.get(1) else { continue };
-                    let Some(value) =
-                        caps.get(2).or_else(|| caps.get(3)).or_else(|| caps.get(4))
+                    let Some(value) = caps.get(2).or_else(|| caps.get(3)).or_else(|| caps.get(4))
                     else {
                         continue;
                     };
@@ -835,8 +837,17 @@ fn resolve_speaker(attrs: &HashMap<String, String>) -> Option<String> {
 
 fn humanize_identifier(raw: &str) -> String {
     let trimmed = raw.trim().trim_matches('"').trim_start_matches('$');
-    // `char_130_doberm_ex` 不去掉 `_ex` 会显示成 "Doberm Ex"。
-    let stripped = strip_art_variants(trimmed, 1).join("_");
+    // charId 先走身份归一化，命名皮肤（`_winter` / `_epoque`）也不能泄漏
+    // 进显示名；NPC 等其它 id 仍沿用数字 / `_ex` 变体规则。
+    let normalized_char = normalize_char_id(trimmed);
+    let stripped = if normalized_char
+        .get(.."char_".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("char_"))
+    {
+        normalized_char
+    } else {
+        strip_art_variants(trimmed, 1).join("_")
+    };
     let mut value = stripped.as_str();
     for prefix in &[
         "char_", "npc_", "avg_", "avatar_", "trap_", "voice_", "item_", "act_", "story_",
@@ -906,11 +917,7 @@ mod tests {
     }
 
     fn texts(parsed: &ParsedStoryContent) -> Vec<&str> {
-        parsed
-            .segments
-            .iter()
-            .filter_map(|s| s.text())
-            .collect()
+        parsed.segments.iter().filter_map(|s| s.text()).collect()
     }
 
     fn only(content: &str) -> StorySegment {
@@ -1110,9 +1117,7 @@ mod tests {
         assert_eq!(result.segments.len(), 1);
         match &result.segments[0] {
             StorySegment::Dialogue {
-                character_id,
-                text,
-                ..
+                character_id, text, ..
             } => {
                 assert_eq!(character_id.as_deref(), Some("char_003_kalts"));
                 assert!(text.contains("凯尔希"));
@@ -1130,6 +1135,29 @@ mod tests {
         // 非 char_ 的 id 原样留着，前端只拿 char_ 拼头像。
         assert_eq!(normalize_char_id("npc_1028_texas2_1"), "npc_1028_texas2_1");
         assert_eq!(normalize_char_id(""), "");
+    }
+
+    /// 美术后缀不只有数字：皮肤名也会直接接在 charId 后。身份匹配必须只取
+    /// 固定的前三段，并把脚本偶发的大小写差异收敛到仓库使用的小写路径。
+    #[test]
+    fn test_named_art_suffixes_and_char_id_case_are_normalized() {
+        assert_eq!(
+            normalize_char_id("char_002_amiya_winter#1"),
+            "char_002_amiya"
+        );
+        assert_eq!(
+            normalize_char_id("CHAR_003_KALTS_EPOQUE#4$1"),
+            "char_003_kalts"
+        );
+
+        let content = r#"[charslot(slot="m", name="CHAR_002_AMIYA_WINTER#1")]
+[Dialog]博士，早上好。"#;
+        let segment = only(content);
+        assert_eq!(segment.character_id(), Some("char_002_amiya"));
+
+        let segment = only(r#"[Dialog(head="char_002_amiya_winter#1")]早上好。"#);
+        assert_eq!(segment.speaker(), Some("Amiya"));
+        assert_eq!(segment.character_id(), Some("char_002_amiya"));
     }
 
     /// 演出指令一条都不该落进正文；只要还有一条被当成旁白印出来，
@@ -1329,9 +1357,11 @@ mod tests {
         assert_eq!(segment.kind(), "sticker");
         assert_eq!(segment.text(), Some("“声音，归来。”\n“Звук вернись.”"));
 
-        assert!(parse_story_text(r#"[spellstickerclear(id="spell2", block=true)]"#)
-            .segments
-            .is_empty());
+        assert!(
+            parse_story_text(r#"[spellstickerclear(id="spell2", block=true)]"#)
+                .segments
+                .is_empty()
+        );
     }
 
     /// 行首 `//` 是编辑注释（tutorial/guide_01_b 的分节注、month_chat 的主题注、
@@ -1345,7 +1375,11 @@ mod tests {
         assert_eq!(texts(&result), vec!["MAIN_LOG_101_1", "Part.01"]);
 
         let result = parse_story_text("// anim part a\n// 介绍：敌人");
-        assert!(result.segments.is_empty(), "comments leaked: {:?}", result.segments);
+        assert!(
+            result.segments.is_empty(),
+            "comments leaked: {:?}",
+            result.segments
+        );
 
         let segment = only("当自然轮回更迭//当规则日趋圆满，");
         assert_eq!(segment.kind(), "narration");
@@ -1369,6 +1403,19 @@ mod tests {
         assert_eq!(clean_text("<b>加粗</b>与</>残余"), "加粗与残余");
     }
 
+    /// 书名号内容可能以 ASCII 关卡代号开头；按首字符猜标签会把整段书名吃掉。
+    #[test]
+    fn test_mixed_ascii_cjk_angle_bracket_prose_survives() {
+        assert_eq!(
+            clean_text("请阅读<RI-8突袭行动记录>后继续。"),
+            "请阅读<RI-8突袭行动记录>后继续。"
+        );
+        assert_eq!(
+            clean_text("<color=#d41f1f>警告</color>：<Chapter 8终局>"),
+            "警告：<Chapter 8终局>"
+        );
+    }
+
     #[test]
     fn test_decision_keeps_option_values_paired() {
         let segment = only(r#"[Decision(options="走;留", values="1;2")]"#);
@@ -1380,7 +1427,9 @@ mod tests {
             other => panic!("expected decision segment, got {:?}", other),
         }
         // 一个选项都解析不出来时不产出空的选择段。
-        assert!(parse_story_text(r#"[Decision(values="1;2")]"#).segments.is_empty());
+        assert!(parse_story_text(r#"[Decision(values="1;2")]"#)
+            .segments
+            .is_empty());
     }
 
     /// 前端按 `values[optionIndex]` 逐位取标签：option/value 必须按下标配对。
@@ -1600,11 +1649,11 @@ mod tests {
         )
         .segments
         .is_empty());
-        assert!(parse_story_text(
-            r#"[charslot(slot = "m", name = "avg_198_blackd_1#6$1")]我"#
-        )
-        .segments
-        .is_empty());
+        assert!(
+            parse_story_text(r#"[charslot(slot = "m", name = "avg_198_blackd_1#6$1")]我"#)
+                .segments
+                .is_empty()
+        );
     }
 
     /// 全角标点残渣同样不能漏成孤立段落：act18d3/act3d0 等 6 个文件有
@@ -1760,7 +1809,10 @@ mod tests {
         let segment = only(content);
         assert_eq!(segment.kind(), "system");
         assert_eq!(segment.speaker(), Some("Jesica"));
-        assert_eq!(segment.text(), Some("啊对了！这些障碍物可以封锁敌人的前进道路。"));
+        assert_eq!(
+            segment.text(),
+            Some("啊对了！这些障碍物可以封锁敌人的前进道路。")
+        );
     }
 
     /// 手势教程（training_28_f.txt）`[Tutorial(...)] \` 后面直接空行：没有

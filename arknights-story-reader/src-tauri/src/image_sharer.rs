@@ -22,8 +22,7 @@ const PLUGIN_CLASS: &str = "ImageSharerPlugin";
 
 /// 插件没注册成功时所有命令共用的提示。宁可让分享功能单独失败，也不能
 /// 让整个 app 因为一个可选能力起不来（见 [`init`]）。
-const NOT_READY_MESSAGE: &str =
-    "图片分享组件未就绪（Android 插件未加载），请重启应用后再试";
+const NOT_READY_MESSAGE: &str = "图片分享组件未就绪（Android 插件未加载），请重启应用后再试";
 
 /// base64 载荷的上下限。上限按"1080×16384 的 PNG"留足余量：再大的图
 /// Kotlin 侧 `Base64.decode` 出来的 ByteArray 也很可能直接 OOM，早点在
@@ -39,7 +38,11 @@ const MAX_TITLE_CHARS: usize = 120;
 
 pub fn init<R: Runtime>() -> TauriPlugin<R> {
     Builder::new("image-sharer")
-        .invoke_handler(tauri::generate_handler![save_image, share_image, open_storage_permission_settings])
+        .invoke_handler(tauri::generate_handler![
+            save_image,
+            share_image,
+            open_storage_permission_settings
+        ])
         .setup(|app, api| {
             // 注册失败时不要把错误往上抛：插件 setup 返回 Err 会让整个
             // Tauri 应用启动失败，用户连剧情都读不了。这里只是不 manage
@@ -109,13 +112,25 @@ fn normalize_base64_payload(raw: &str) -> Result<String, String> {
         return Err("图片数据为空，请重新生成后再试".to_string());
     }
 
-    let body = if let Some(rest) = trimmed.strip_prefix("data:") {
-        match rest.split_once("base64,") {
-            Some((_, payload)) => payload,
-            // `data:image/png,<urlencoded>` 之类的非 base64 变体：Kotlin
-            // 会照着逗号切一刀然后解出一堆乱码，不如直接拒绝。
-            None => return Err("图片数据不是 base64 编码的 PNG，请重新生成".to_string()),
+    let body = if trimmed
+        .get(.."data:".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
+    {
+        let rest = &trimmed["data:".len()..];
+        let Some((metadata, payload)) = rest.split_once(',') else {
+            return Err("图片数据不是 base64 编码的 PNG，请重新生成".to_string());
+        };
+        let mut parts = metadata.split(';').map(str::trim);
+        let is_png = parts
+            .next()
+            .is_some_and(|mime| mime.eq_ignore_ascii_case("image/png"));
+        let is_base64 = parts.any(|part| part.eq_ignore_ascii_case("base64"));
+        // 不能只看 `base64,`：data:image/jpeg;base64 也能解码，但随后会被
+        // 以 `.png` / image/png 写进 MediaStore，得到扩展名与内容不符的坏图。
+        if !is_png || !is_base64 {
+            return Err("图片数据不是 base64 编码的 PNG，请重新生成".to_string());
         }
+        payload
     } else {
         trimmed
     };
@@ -130,11 +145,25 @@ fn normalize_base64_payload(raw: &str) -> Result<String, String> {
             compact.len() / (1024 * 1024)
         ));
     }
-    // 合法的 base64 总是 4 的倍数；长度对不上说明传输过程中被截断了。
-    if compact.len() % 4 != 0 || !compact.chars().all(is_base64_symbol) {
+    // 合法的 base64 总是 4 的倍数，且 `=` 只能在末尾出现一到两次。旧校验
+    // 只看字符集合，会放过中间带 padding 的串，Kotlin 到解码时才失败。
+    if !has_valid_base64_shape(&compact) {
+        return Err("图片数据已损坏，请重新生成后再试".to_string());
+    }
+    // 所有 PNG 都以固定的 8 字节签名开头，其 base64 前缀恒为这一串。
+    // 不用引入整套解码依赖也能挡住 JPEG/SVG/任意字节冒充 PNG。
+    if !compact.starts_with("iVBORw0KGgo") {
         return Err("图片数据已损坏，请重新生成后再试".to_string());
     }
     Ok(compact)
+}
+
+fn has_valid_base64_shape(value: &str) -> bool {
+    if value.len() % 4 != 0 || !value.chars().all(is_base64_symbol) {
+        return false;
+    }
+    let padding = value.bytes().rev().take_while(|byte| *byte == b'=').count();
+    padding <= 2 && !value[..value.len() - padding].contains('=')
 }
 
 fn is_base64_symbol(c: char) -> bool {
@@ -329,9 +358,10 @@ impl<R: Runtime> AndroidImageSharer<R> {
 mod tests {
     use super::*;
 
-    /// 一段长度合法（4 的倍数、超过下限）的假 base64。
+    /// 一张 1×1 PNG 的合法 base64。
     fn valid_body() -> String {
-        "iVBORw0KGgo=".repeat(8)
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+            .to_string()
     }
 
     #[test]
@@ -362,6 +392,33 @@ mod tests {
         let input = format!("data:image/svg+xml,{}", valid_body());
         let err = normalize_base64_payload(&input).unwrap_err();
         assert!(err.contains("base64"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn normalize_requires_png_mime_and_signature() {
+        let body = valid_body();
+        assert_eq!(
+            normalize_base64_payload(&format!("DATA:IMAGE/PNG;BASE64,{body}")).unwrap(),
+            body
+        );
+        assert!(normalize_base64_payload(&format!("data:image/jpeg;base64,{body}")).is_err());
+
+        // 长度与字符集都合法，但内容不是 PNG。
+        let arbitrary = "A".repeat(88);
+        assert!(normalize_base64_payload(&arbitrary).is_err());
+    }
+
+    #[test]
+    fn normalize_rejects_padding_away_from_the_end() {
+        let mut body = valid_body();
+        body.replace_range(20..21, "=");
+        assert_eq!(body.len() % 4, 0);
+        assert!(normalize_base64_payload(&body).is_err());
+
+        assert!(!has_valid_base64_shape("AAAA=AAA"));
+        assert!(!has_valid_base64_shape("AAAA===="));
+        assert!(has_valid_base64_shape("AAAA"));
+        assert!(has_valid_base64_shape("AAA="));
     }
 
     #[test]
@@ -432,8 +489,14 @@ mod tests {
     /// 末尾是三字节汉字时 `len - 4` 落在字符中间，早期版本会在这里 panic。
     #[test]
     fn sanitize_file_name_does_not_panic_on_multibyte_tail() {
-        assert_eq!(sanitize_png_file_name(Some("a章")).as_deref(), Some("a章.png"));
-        assert_eq!(sanitize_png_file_name(Some("章")).as_deref(), Some("章.png"));
+        assert_eq!(
+            sanitize_png_file_name(Some("a章")).as_deref(),
+            Some("a章.png")
+        );
+        assert_eq!(
+            sanitize_png_file_name(Some("章")).as_deref(),
+            Some("章.png")
+        );
     }
 
     #[test]

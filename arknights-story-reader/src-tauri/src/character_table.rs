@@ -41,9 +41,21 @@ struct TableFingerprint {
     len: u64,
     /// mtime（UNIX 纳秒）；拿不到时为 -1，表示未知，不参与新旧比较。
     modified_nanos: i128,
+    /// 文件内容指纹。只看 size + mtime 会漏掉「同路径原子换包且归档保留
+    /// 时间戳、恰好等长」的情况，继续把上一包的角色表当成当前快照。
+    content_hash: u64,
 }
 
-fn fingerprint(path: &Path) -> Option<TableFingerprint> {
+fn content_hash(raw: &str) -> u64 {
+    // FNV-1a 足够用作进程内变更检测，且实现稳定、无额外依赖。
+    raw.as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        })
+}
+
+fn fingerprint(path: &Path, raw: &str) -> Option<TableFingerprint> {
     let meta = std::fs::metadata(path).ok()?;
     Some(TableFingerprint {
         path: path.to_path_buf(),
@@ -54,6 +66,7 @@ fn fingerprint(path: &Path) -> Option<TableFingerprint> {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_nanos() as i128)
             .unwrap_or(-1),
+        content_hash: content_hash(raw),
     })
 }
 
@@ -73,13 +86,79 @@ pub struct CharacterIndex {
     pub name_to_char_id: HashMap<String, String>,
 }
 
+fn canonical_char_id(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let prefix = trimmed.get(.."char_".len())?;
+    if !prefix.eq_ignore_ascii_case("char_") {
+        return None;
+    }
+    let without_art = trimmed
+        .split(|c| c == '#' || c == '$')
+        .next()
+        .unwrap_or(trimmed)
+        .trim();
+    (without_art.len() > "char_".len()).then(|| without_art.to_ascii_lowercase())
+}
+
+fn insert_name_mapping(index: &mut CharacterIndex, name: &str, char_id: &str) {
+    let name = name.trim();
+    if name.is_empty() {
+        return;
+    }
+    index
+        .name_to_char_id
+        .entry(name.to_string())
+        .or_insert_with(|| char_id.to_string());
+    let folded = name.to_ascii_lowercase();
+    index
+        .name_to_char_id
+        .entry(folded)
+        .or_insert_with(|| char_id.to_string());
+}
+
 impl CharacterIndex {
     fn from_embedded() -> Self {
         match serde_json::from_str::<EmbeddedPayload>(EMBEDDED_MAP) {
-            Ok(p) => Self {
-                char_id_to_name: p.ci2name,
-                name_to_char_id: p.name2ci,
-            },
+            Ok(p) => {
+                let mut index = Self::default();
+                let mut id_names: Vec<_> = p.ci2name.into_iter().collect();
+                id_names.sort_by(|a, b| a.0.cmp(&b.0));
+                for (raw_id, raw_name) in id_names {
+                    let Some(char_id) = canonical_char_id(&raw_id) else {
+                        continue;
+                    };
+                    let name = raw_name.trim();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    index.char_id_to_name.insert(char_id, name.to_string());
+                }
+
+                // 嵌入表的 name2ci 是同名分形的权威选择，先按稳定顺序落它；
+                // 目标不存在的悬空项不进入快照。
+                let mut aliases: Vec<_> = p.name2ci.into_iter().collect();
+                aliases.sort();
+                for (alias, raw_id) in aliases {
+                    let Some(char_id) = canonical_char_id(&raw_id) else {
+                        continue;
+                    };
+                    if index.char_id_to_name.contains_key(&char_id) {
+                        insert_name_mapping(&mut index, &alias, &char_id);
+                    }
+                }
+
+                // ci2name 也要能反查；重复显示名保持上面的权威映射或最小 id。
+                let mut display_names: Vec<_> = index
+                    .char_id_to_name
+                    .iter()
+                    .map(|(id, name)| (id.clone(), name.clone()))
+                    .collect();
+                display_names.sort();
+                for (char_id, name) in display_names {
+                    insert_name_mapping(&mut index, &name, &char_id);
+                }
+                index
+            }
             Err(err) => {
                 eprintln!("[char-table] failed to parse embedded map: {}", err);
                 Self::default()
@@ -109,9 +188,9 @@ fn parse_character_table(raw: &str) -> Option<Vec<ParsedEntry>> {
     let obj = json.as_object()?;
     let mut out = Vec::with_capacity(obj.len());
     for (cid, v) in obj {
-        if !cid.starts_with("char_") {
+        let Some(char_id) = canonical_char_id(cid) else {
             continue;
-        }
+        };
         let Some(name) = v
             .get("name")
             .and_then(|x| x.as_str())
@@ -127,7 +206,7 @@ fn parse_character_table(raw: &str) -> Option<Vec<ParsedEntry>> {
             .filter(|s| !s.is_empty())
             .map(str::to_string);
         out.push(ParsedEntry {
-            char_id: cid.clone(),
+            char_id,
             name: name.to_string(),
             appellation,
         });
@@ -142,18 +221,15 @@ fn parse_character_table(raw: &str) -> Option<Vec<ParsedEntry>> {
 ///   与同名分形干员的既有映射稳定）。
 fn apply_entries(index: &mut CharacterIndex, entries: &[ParsedEntry]) {
     for e in entries {
+        let Some(char_id) = canonical_char_id(&e.char_id) else {
+            continue;
+        };
         index
             .char_id_to_name
-            .insert(e.char_id.clone(), e.name.clone());
-        index
-            .name_to_char_id
-            .entry(e.name.clone())
-            .or_insert_with(|| e.char_id.clone());
+            .insert(char_id.clone(), e.name.clone());
+        insert_name_mapping(index, &e.name, &char_id);
         if let Some(alias) = &e.appellation {
-            index
-                .name_to_char_id
-                .entry(alias.clone())
-                .or_insert_with(|| e.char_id.clone());
+            insert_name_mapping(index, alias, &char_id);
         }
     }
 }
@@ -172,19 +248,19 @@ pub fn refresh_from_file(path: &Path) {
     // JSON，也保证去重判断与指纹更新是原子的。锁毒化就地恢复——
     // 指纹只是缓存优化，最坏情况多解析一次。
     let mut overlaid = OVERLAID.write().unwrap_or_else(PoisonError::into_inner);
-    // 在拿到串行锁后再 stat：排队期间数据目录可能已经被另一轮同步换掉，
-    // 不能拿进锁前捕获的旧 mtime 去决定当前路径是否该读。
-    let Some(current) = fingerprint(path) else {
+    // 读失败（权限、竞争删除等）视作瞬态错误：不记指纹，下次再试。
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return;
+    };
+    // 在读完后再取 metadata + 内容摘要：归档换包可能保留原 mtime，甚至新旧
+    // JSON 恰好等长；只比较 path/len/mtime 会静默复用上一包快照。重复调用
+    // 仍会省掉昂贵的 JSON parse，只多一次顺序读与线性摘要。
+    let Some(current) = fingerprint(path, &raw) else {
         return;
     };
     if is_duplicate_refresh(overlaid.as_ref(), &current) {
         return;
     }
-
-    // 读失败（权限、竞争删除等）视作瞬态错误：不记指纹，下次再试。
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return;
-    };
 
     let next = match parse_character_table(&raw) {
         Some(entries) => index_from_entries(&entries),
@@ -211,10 +287,9 @@ pub fn snapshot() -> CharacterIndex {
     let mut overlaid = OVERLAID.write().unwrap_or_else(PoisonError::into_inner);
     if overlaid
         .as_ref()
-        .is_some_and(|applied| fingerprint(&applied.path).is_none())
+        .is_some_and(|applied| std::fs::metadata(&applied.path).is_err())
     {
-        *RUNTIME.write().unwrap_or_else(PoisonError::into_inner) =
-            CharacterIndex::from_embedded();
+        *RUNTIME.write().unwrap_or_else(PoisonError::into_inner) = CharacterIndex::from_embedded();
         *overlaid = None;
     }
     drop(overlaid);
@@ -227,38 +302,52 @@ pub fn snapshot() -> CharacterIndex {
 /// 按中文名/别名找 charId。名字带精英皮肤后缀（如 `阿米娅#2`）时会
 /// 去掉 `#N` 再查一次。
 pub fn name_to_id(name: &str) -> Option<String> {
+    let index = RUNTIME.read().unwrap_or_else(PoisonError::into_inner);
+    lookup_name(&index, name)
+}
+
+fn lookup_name(index: &CharacterIndex, name: &str) -> Option<String> {
     let n = name.trim();
     if n.is_empty() {
         return None;
     }
-    let index = RUNTIME.read().unwrap_or_else(PoisonError::into_inner);
-    if let Some(id) = index.name_to_char_id.get(n) {
+    if let Some(id) = index
+        .name_to_char_id
+        .get(n)
+        .or_else(|| index.name_to_char_id.get(&n.to_ascii_lowercase()))
+    {
         return Some(id.clone());
     }
     let base = n.split('#').next().map(str::trim).unwrap_or("");
     if base.is_empty() || base == n {
         return None;
     }
-    index.name_to_char_id.get(base).cloned()
+    index
+        .name_to_char_id
+        .get(base)
+        .or_else(|| index.name_to_char_id.get(&base.to_ascii_lowercase()))
+        .cloned()
 }
 
 /// 按 charId 查中文显示名（用于 parser 回填 dialogue.character_name）。
 /// 容忍带皮肤后缀的 charId（`char_002_amiya#2`）。
 #[allow(dead_code)]
 pub fn id_to_name(char_id: &str) -> Option<String> {
-    let id = char_id.trim();
-    if id.is_empty() {
-        return None;
-    }
     let index = RUNTIME.read().unwrap_or_else(PoisonError::into_inner);
-    if let Some(name) = index.char_id_to_name.get(id) {
+    lookup_id(&index, char_id)
+}
+
+fn lookup_id(index: &CharacterIndex, char_id: &str) -> Option<String> {
+    let id = canonical_char_id(char_id)?;
+    if let Some(name) = index.char_id_to_name.get(&id) {
         return Some(name.clone());
     }
-    let base = id.split('#').next().map(str::trim).unwrap_or("");
-    if base.is_empty() || base == id {
-        return None;
+    // 立绘 token 的第四段起是 `_1` / `_winter` / `_epoque` 等美术后缀。
+    let parts: Vec<&str> = id.split('_').collect();
+    if parts.len() > 3 && parts[1].chars().all(|c| c.is_ascii_digit()) {
+        return index.char_id_to_name.get(&parts[..3].join("_")).cloned();
     }
-    index.char_id_to_name.get(base).cloned()
+    None
 }
 
 #[cfg(test)]
@@ -295,7 +384,10 @@ mod tests {
     fn embedded_map_contains_known_operators() {
         let index = CharacterIndex::from_embedded();
         assert_eq!(
-            index.char_id_to_name.get("char_285_medic2").map(String::as_str),
+            index
+                .char_id_to_name
+                .get("char_285_medic2")
+                .map(String::as_str),
             Some("Lancet-2")
         );
         assert_eq!(
@@ -305,6 +397,25 @@ mod tests {
         // 英文 appellation 也能作为 key。
         assert_eq!(
             index.name_to_char_id.get("Lancet-2").map(String::as_str),
+            Some("char_285_medic2")
+        );
+    }
+
+    #[test]
+    fn embedded_snapshot_is_bidirectionally_closed_and_case_folded() {
+        let index = CharacterIndex::from_embedded();
+        for (id, name) in &index.char_id_to_name {
+            let mapped = index
+                .name_to_char_id
+                .get(name)
+                .unwrap_or_else(|| panic!("display name {name:?} for {id:?} cannot map back"));
+            assert!(
+                index.char_id_to_name.contains_key(mapped),
+                "display name {name:?} maps to dangling id {mapped:?}"
+            );
+        }
+        assert_eq!(
+            index.name_to_char_id.get("lancet-2").map(String::as_str),
             Some("char_285_medic2")
         );
     }
@@ -387,6 +498,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parse_and_lookup_canonicalize_ascii_case() {
+        let entries = parse_character_table(
+            r#"{"CHAR_9998_CASETEST": {"name": "测试", "appellation": "CaseName"}}"#,
+        )
+        .expect("valid json");
+        assert_eq!(
+            entries,
+            vec![entry("char_9998_casetest", "测试", Some("CaseName"))]
+        );
+
+        let mut index = CharacterIndex::default();
+        apply_entries(&mut index, &entries);
+        assert_eq!(
+            lookup_name(&index, "casename").as_deref(),
+            Some("char_9998_casetest")
+        );
+        assert_eq!(
+            lookup_name(&index, "CASENAME#2").as_deref(),
+            Some("char_9998_casetest")
+        );
+        assert_eq!(
+            lookup_id(&index, " CHAR_9998_CASETEST_WINTER#4 ").as_deref(),
+            Some("测试")
+        );
+    }
+
     // ---------- overlay 合并 ----------
 
     #[test]
@@ -455,7 +593,10 @@ mod tests {
         );
         // 新 charId 仍然可以反查显示名。
         assert_eq!(
-            index.char_id_to_name.get("char_9999_fake").map(String::as_str),
+            index
+                .char_id_to_name
+                .get("char_9999_fake")
+                .map(String::as_str),
             Some("阿米娅")
         );
     }
@@ -504,6 +645,7 @@ mod tests {
             path: PathBuf::from(path),
             len,
             modified_nanos: mtime,
+            content_hash: len ^ (mtime as u64),
         }
     }
 
@@ -546,6 +688,22 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn duplicate_refresh_detection_includes_file_contents() {
+        let mut old = fp("/data/character_table.json", 100, 2_000);
+        let mut replacement = old.clone();
+        old.content_hash = content_hash(r#"{"char_a":{"name":"甲"}}"#);
+        replacement.content_hash = content_hash(r#"{"char_b":{"name":"乙"}}"#);
+
+        assert_eq!(old.path, replacement.path);
+        assert_eq!(old.len, replacement.len);
+        assert_eq!(old.modified_nanos, replacement.modified_nanos);
+        assert!(
+            !is_duplicate_refresh(Some(&old), &replacement),
+            "同路径、等长、同 mtime 的换包仍必须刷新"
+        );
+    }
+
     // ---------- 查询 ----------
 
     #[test]
@@ -554,7 +712,10 @@ mod tests {
         assert_eq!(name_to_id("  夜刀  ").as_deref(), Some("char_502_nblade"));
         // 精英皮肤后缀 `#N` 去掉后再查。
         assert_eq!(name_to_id("夜刀#2").as_deref(), Some("char_502_nblade"));
-        assert_eq!(name_to_id("夜刀#2#extra").as_deref(), Some("char_502_nblade"));
+        assert_eq!(
+            name_to_id("夜刀#2#extra").as_deref(),
+            Some("char_502_nblade")
+        );
         assert_eq!(name_to_id(""), None);
         assert_eq!(name_to_id("   "), None);
         assert_eq!(name_to_id("#2"), None);
@@ -625,16 +786,11 @@ mod tests {
         let _ = std::fs::remove_file(&good);
         let reset = snapshot();
         assert!(
-            !reset
-                .name_to_char_id
-                .contains_key("泽兹测试干员"),
+            !reset.name_to_char_id.contains_key("泽兹测试干员"),
             "运行时 character_table 消失后必须撤掉上一包 overlay"
         );
         assert_eq!(
-            reset
-                .name_to_char_id
-                .get("夜刀")
-                .map(String::as_str),
+            reset.name_to_char_id.get("夜刀").map(String::as_str),
             Some("char_502_nblade"),
             "撤掉 overlay 后仍应保留嵌入索引"
         );
