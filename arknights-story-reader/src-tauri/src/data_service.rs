@@ -516,10 +516,13 @@ fn split_query_terms(query: &str) -> QueryTerms {
         }
         // 归一化后为空的词（纯标点等）也要保留占位：FTS 侧这种词要到子句
         // 生成阶段才被丢弃，其前面的 `or`/`not` 已随之作废，这里必须同样
-        // 消费。
+        // 消费。消费必须无条件 take——写进 `||` 右侧会被短路：`not -X Y`
+        // 里 `-X` 自带减号，`not` 不被它吸收就漂到 Y 上，把正向词反转成
+        // 排除词（FTS 侧同一写法，两边一起改）。
+        let not_prefix = std::mem::take(pending_not);
         terms.push(Raw {
             text: normalize_for_fuzzy(content),
-            is_not: is_not || std::mem::take(pending_not),
+            is_not: is_not || not_prefix,
             is_quoted: false,
             is_or: false,
         });
@@ -560,9 +563,12 @@ fn split_query_terms(query: &str) -> QueryTerms {
                 } else {
                     // 与 FTS 侧同序：先记减号，再 flush（粘连写法
                     // `not"凯尔希"` 由 flush 转成悬挂标记后一并收下）。
+                    // take 同样不能进 `||` 右侧：`not -"X" Y` 里 dash_prefix
+                    // 为真会短路掉消费，`not` 漂到 Y 上反转其极性。
                     let dash_prefix = buf == "-";
                     flush_bare(&mut buf, &mut raw_terms, &mut pending_not);
-                    quote_is_not = dash_prefix || std::mem::take(&mut pending_not);
+                    let not_prefix = std::mem::take(&mut pending_not);
+                    quote_is_not = dash_prefix || not_prefix;
                     in_quotes = true;
                 }
             }
@@ -1441,11 +1447,15 @@ impl DataService {
             let is_not = t.starts_with('-');
             let content = if is_not { t.trim_start_matches('-').to_string() } else { t };
             if !content.is_empty() {
+                // 悬挂的 `not` 只被真正成词的 token 消费；纯减号串跟
+                // `or` 一样让它顺延给下一个词。消费必须无条件 take——
+                // 写进 `||` 右侧会被短路：`not -X Y` 里 `-X` 自带减号，
+                // `not` 不被它吸收就漂到 Y 上，把正向词反转成排除词
+                // （split_query_terms 同一写法，两边一起改）。
+                let not_prefix = std::mem::take(prev_was_not);
                 terms.push(UserTerm {
                     text: content,
-                    // 悬挂的 `not` 只被真正成词的 token 消费；纯减号串跟
-                    // `or` 一样让它顺延给下一个词。
-                    is_not: is_not || std::mem::take(prev_was_not),
+                    is_not: is_not || not_prefix,
                     is_or_before: *prev_was_or,
                     is_quoted: false,
                 });
@@ -1476,9 +1486,13 @@ impl DataService {
                     } else {
                         // 先记减号，再 flush（顺带处理粘连写法 `not"凯尔希"`
                         // ——flush 会把 buf 里的 `not` 变成悬挂标记）。
+                        // take 同样不能进 `||` 右侧：`not -"X" Y` 里
+                        // dash_prefix 为真会短路掉消费，`not` 漂到 Y 上
+                        // 反转其极性。
                         let dash_prefix = buf == "-";
                         flush_bare(&mut buf, &mut terms, &mut prev_was_or, &mut prev_was_not);
-                        quote_is_not = dash_prefix || std::mem::take(&mut prev_was_not);
+                        let not_prefix = std::mem::take(&mut prev_was_not);
+                        quote_is_not = dash_prefix || not_prefix;
                         in_quotes = true;
                     }
                 }

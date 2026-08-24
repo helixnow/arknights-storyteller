@@ -177,6 +177,9 @@ type Highlighter = (text: string | null | undefined) => React.ReactNode;
  * 把查询串拆成用于高亮的词：
  *   - `-排除词` 不该被高亮（它压根不该出现在结果里）；
  *   - `OR` / `AND` 是连接符不是词；
+ *   - 裸词 `NOT` 与减号同义（后端 `not X` ≡ `-X`），它后面那个词同样是
+ *     排除词。段落模式的排除只看段落文本，剧情标题里仍可能出现该词——
+ *     不跳过的话，用户明确排除的词会在标题里被标成"命中"；
  *   - `"短语"` 去掉引号整体高亮；
  *   - 纯中文长词后端按二元组匹配，顺带把单字也标出来，让用户看得出命中原因。
  */
@@ -185,10 +188,26 @@ function highlightTerms(query: string): string[] {
   if (!trimmed) return [];
   const tokens = trimmed.match(/"[^"]*"|\S+/g) ?? [];
   const terms: string[] = [];
+  let pendingNot = false;
   for (const token of tokens) {
-    if (token.startsWith("-")) continue;
+    if (token.startsWith("-")) {
+      // 后端里 `-词` 会消费掉悬挂的 not（`not -博士 凯尔希` 的凯尔希是正向词）。
+      pendingNot = false;
+      continue;
+    }
+    // 连接词判定必须在去引号之前、只认裸词——与后端一致：`"not"` 是要
+    // 整体匹配（并高亮）的字面短语，不是连接词。
+    if (/^not$/i.test(token)) {
+      pendingNot = true;
+      continue;
+    }
+    if (/^(or|and)$/i.test(token)) continue;
     const stripped = token.replace(/^["']+|["']+$/g, "").trim();
-    if (!stripped || /^(or|and|not)$/i.test(stripped)) continue;
+    if (!stripped) continue;
+    if (pendingNot) {
+      pendingNot = false;
+      continue;
+    }
     terms.push(stripped);
     if (stripped.length >= 4 && /^[\u4e00-\u9fff\u3400-\u4dbf]+$/.test(stripped)) {
       terms.push(...stripped.split(""));
@@ -2069,6 +2088,10 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
                     <div>
                       <span className="font-mono text-[hsl(var(--color-foreground))]">-排除词</span>
                       <span className="ml-2">在词前加减号排除，例如 <code>博士 -干员</code></span>
+                    </div>
+                    <div>
+                      <span className="font-mono text-[hsl(var(--color-foreground))]">NOT</span>
+                      <span className="ml-2">与减号等价，排除后面的词，例如 <code>博士 NOT 干员</code></span>
                     </div>
                     <div>
                       <span className="font-mono text-[hsl(var(--color-foreground))]">"短语"</span>
