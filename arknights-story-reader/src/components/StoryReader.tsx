@@ -739,6 +739,15 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
         return segment.speaker ? `${segment.speaker} ${segment.text}` : segment.text;
       case "decision":
         return segment.options.join(" ");
+      // 章节标题在后端是一等搜索目标：段级索引存了 title、全文索引的
+      // flatten 也拼进 title，搜索面板会把命中显示成「标题」结果。这里
+      // 落到 default 返回空串的话，点击命中后的漂移校正（findFocus-
+      // SegmentIndex 按 preview/snippet 文本重定位）永远匹配不到 header
+      // 本身——要么错落到恰好含相同字词的正文段，要么退回可能已随数据
+      // 同步漂移的后端段号；story 级搜索的 snippet 取自标题时更是直接
+      // 落空、被兜底送回旧进度。
+      case "header":
+        return segment.title;
       case "image":
         return segment.caption ?? "";
       case "music":
