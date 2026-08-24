@@ -198,6 +198,11 @@ export const CustomScrollArea = forwardRef<HTMLDivElement, CustomScrollAreaProps
         /* 只认主键：右键按下会弹上下文菜单，此后 pointerup 通常不再送达，
            拖动状态卡死，关掉菜单后滑块会粘着指针乱滚。 */
         if (event.button !== 0) return;
+        /* 拖动中第二根指针（混合设备上鼠标拖着、手指又碰到滑块）不许抢占：
+           轨道路径已有同款守卫，但事件先派发到滑块，不在这里挡的话
+           draggingRef 会被改成新 pointerId，原指针的 pointerup 从此对不上号，
+           正在进行的拖动被直接劫走。 */
+        if (draggingRef.current) return;
 
         const viewport = viewportInnerRef.current;
         const track = trackRef.current;
