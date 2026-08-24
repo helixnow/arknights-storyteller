@@ -4464,15 +4464,41 @@ impl DataService {
     }
 }
 
-/// 从 `obt/memory/char_002_amiya/...` 这类路径里抓出 `char_002_amiya`。
+/// 从密录 storyTxt 里抠出「属于哪位干员」的分组 key，判定与前端
+/// `extractCharTokenFromStoryTxt` 保持一致。历史格式
+/// `obt/memory/char_002_amiya/...` 直接取 `char_` 段；当前主流格式
+/// `obt/memory/story_{alias}_N_M`（alias 是 charId 尾段，如 kroos、amgoat）
+/// 取 `story_` 与下一个 `_` 之间的 alias。只认前一种的话，新格式全部落进
+/// 「按剧情标题排序」的兜底，同一位干员的几篇密录在列表里四散开。
 fn extract_char_token(story_txt: &str) -> Option<String> {
-    story_txt
-        .split(|c| c == '/' || c == '\\')
-        .find(|seg| seg.starts_with("char_"))
-        .map(|seg| seg.to_ascii_lowercase())
+    let segments: Vec<&str> = story_txt.split(|c| c == '/' || c == '\\').collect();
+    if let Some(seg) = segments.iter().find(|seg| seg.starts_with("char_")) {
+        return Some(seg.to_ascii_lowercase());
+    }
+    segments.windows(2).find_map(|pair| {
+        if !pair[0].eq_ignore_ascii_case("memory") {
+            return None;
+        }
+        let rest = pair[1]
+            .get(.."story_".len())
+            .filter(|head| head.eq_ignore_ascii_case("story_"))
+            .map(|_| &pair[1]["story_".len()..])?;
+        let alias_len = rest
+            .find(|c: char| !c.is_ascii_alphanumeric())
+            .unwrap_or(rest.len());
+        // 与前端正则一致：alias 后必须还跟着 `_篇号` 才算密录文件名。
+        if alias_len == 0 || !rest[alias_len..].starts_with('_') {
+            return None;
+        }
+        Some(rest[..alias_len].to_ascii_lowercase())
+    })
 }
 
-/// 扫描原始脚本里第一条 `[Background(image="bg_xxx"...)]` 的 image token。
+/// 扫描原始脚本里第一条 `[Background(...)]` 的 image token。属性提取必须与
+/// 解析器 `ATTR_RE` 同一套语义：`=` 两侧允许空白，值可以是双引号、单引号
+/// （act15mini 全篇用单引号写属性）或裸词，键必须是完整的 `image`
+/// （`fadeimage=` 不算）。不认单引号的话，token 会连引号一起被带回去，
+/// 前端拿它拼 URL 必然落空——比「没有缩略图」更糟。
 fn first_background_token(raw: &str) -> Option<String> {
     for line in raw.lines() {
         let trimmed = line.trim_start();
@@ -4484,19 +4510,65 @@ fn first_background_token(raw: &str) -> Option<String> {
         if !lowered.starts_with("[background") {
             continue;
         }
-        let Some(image_at) = lowered.find("image=") else {
-            continue;
-        };
-        // 用原始大小写切片取值，token 本身可能含大写（如 `bg_Rhodes`）。
-        let value = trimmed[image_at + "image=".len()..]
-            .trim_start()
-            .trim_start_matches('"');
-        let end = value
-            .find(|c: char| c == '"' || c == ',' || c == ')')
-            .unwrap_or(value.len());
-        let token = value[..end].trim().trim_start_matches('$').trim();
-        if !token.is_empty() {
+        if let Some(token) = extract_image_attr_value(trimmed, &lowered) {
             return Some(token.to_string());
+        }
+    }
+    None
+}
+
+/// 在一行指令原文里提取 `image` 属性值。`lowered` 是 `line` 的 ASCII 小写
+/// 副本（字节长度相同）：用它定位、用原串切值，token 的大小写才能保留
+/// （`bg_Rhodes`）。行尾 `\` 把指令拆成两半时（引号没闭合、或值只剩一个
+/// `\`），宁可返回 None 也不产出垃圾 token。
+fn extract_image_attr_value<'a>(line: &'a str, lowered: &str) -> Option<&'a str> {
+    let bytes = lowered.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = lowered[from..].find("image") {
+        let key_start = from + rel;
+        let mut idx = key_start + "image".len();
+        from = idx;
+        // 键要独立成词：`fadeimage=` 里的 image 是别的属性名的一部分。
+        if key_start > 0 {
+            let prev = bytes[key_start - 1];
+            if prev.is_ascii_alphanumeric() || prev == b'_' {
+                continue;
+            }
+        }
+        while bytes.get(idx).is_some_and(|b| *b == b' ' || *b == b'\t') {
+            idx += 1;
+        }
+        if bytes.get(idx) != Some(&b'=') {
+            // `imagegroup=` 之类更长的键，或没有赋值。
+            continue;
+        }
+        idx += 1;
+        while bytes.get(idx).is_some_and(|b| *b == b' ' || *b == b'\t') {
+            idx += 1;
+        }
+        // 到这里 idx 只跨过了 ASCII 字节，切原串是安全的。
+        let rest = &line[idx..];
+        let value = match rest.as_bytes().first().copied() {
+            Some(quote @ (b'"' | b'\'')) => {
+                let inner = &rest[1..];
+                // 引号没闭合＝指令被行尾 `\` 续行拆开了，这一行不算数。
+                let end = inner.find(quote as char)?;
+                &inner[..end]
+            }
+            Some(_) => {
+                let end = rest
+                    .find(|c: char| {
+                        c.is_whitespace()
+                            || matches!(c, ',' | '(' | ')' | '[' | ']' | '"' | '\'' | '\\')
+                    })
+                    .unwrap_or(rest.len());
+                &rest[..end]
+            }
+            None => continue,
+        };
+        let token = value.trim().trim_start_matches('$').trim();
+        if !token.is_empty() {
+            return Some(token);
         }
     }
     None
@@ -4617,6 +4689,94 @@ mod tests {
             Some("char_002_amiya".to_string())
         );
         assert_eq!(extract_char_token("obt/main/level_main_01-01_beg"), None);
+        // 当前主流格式：文件直接躺在 memory 目录下，alias 是 charId 尾段。
+        assert_eq!(
+            extract_char_token("obt/memory/story_kroos_1_1"),
+            Some("kroos".to_string())
+        );
+        assert_eq!(
+            extract_char_token("Obt/Memory/Story_Amgoat_2_1"),
+            Some("amgoat".to_string())
+        );
+        // alias 后没有 `_篇号` 尾巴、或不在 memory 目录下的都不算。
+        assert_eq!(extract_char_token("obt/memory/story_kroos"), None);
+        assert_eq!(extract_char_token("activities/act1/story_act1_01"), None);
+    }
+
+    /// 干员密录（storySort 全 0）必须按「干员 → 篇号数值」排，而不是退回
+    /// 按剧情标题排。`story_{alias}_N_M` 是当前数据的主流路径格式，认不出
+    /// alias 的话，同一位干员的密录会按各自标题散排在整张列表里。
+    #[test]
+    fn memory_stories_stay_grouped_by_operator_in_story_alias_format() {
+        let json = r#"{
+          "mem_kroos": {
+            "entryType": "NONE",
+            "infoUnlockDatas": [
+              {"storyId":"st_kroos_2","storyName":"黄昏","storyGroup":"mem_kroos","storySort":0,"storyTxt":"obt/memory/story_kroos_2_1","storyReviewType":"NORMAL","unLockType":"AUTO"},
+              {"storyId":"st_kroos_10","storyName":"重逢","storyGroup":"mem_kroos","storySort":0,"storyTxt":"obt/memory/story_kroos_10_1","storyReviewType":"NORMAL","unLockType":"AUTO"},
+              {"storyId":"st_kroos_1","storyName":"相遇","storyGroup":"mem_kroos","storySort":0,"storyTxt":"obt/memory/story_kroos_1_1","storyReviewType":"NORMAL","unLockType":"AUTO"}
+            ]
+          },
+          "mem_amgoat": {
+            "entryType": "NONE",
+            "infoUnlockDatas": [
+              {"storyId":"st_amgoat_2","storyName":"试炼","storyGroup":"mem_amgoat","storySort":0,"storyTxt":"obt/memory/story_amgoat_2_1","storyReviewType":"NORMAL","unLockType":"AUTO"},
+              {"storyId":"st_amgoat_1","storyName":"火焰","storyGroup":"mem_amgoat","storySort":0,"storyTxt":"obt/memory/story_amgoat_1_1","storyReviewType":"NORMAL","unLockType":"AUTO"}
+            ]
+          }
+        }"#;
+        let data: HashMap<String, Value> = serde_json::from_str(json).unwrap();
+        let stories = DataService::build_memory_stories(&data);
+        let ids: Vec<&str> = stories.iter().map(|s| s.story_id.as_str()).collect();
+        // 按标题排的话会得到 火焰、相遇、试炼、重逢、黄昏 的干员交错序；
+        // 篇号还必须按数值比（2 在 10 前面）。
+        assert_eq!(
+            ids,
+            vec![
+                "st_amgoat_1",
+                "st_amgoat_2",
+                "st_kroos_1",
+                "st_kroos_2",
+                "st_kroos_10"
+            ],
+            "同一位干员的密录必须连在一起，且按篇号数值序"
+        );
+    }
+
+    #[test]
+    fn background_token_follows_parser_attribute_syntax() {
+        // 单引号（act15mini 的属性写法）：引号绝不能混进 token。
+        assert_eq!(
+            first_background_token("[Background(image='bg_act15', fadetime=1)]").as_deref(),
+            Some("bg_act15")
+        );
+        // `=` 两侧的空白解析器认，这里也要认；token 保留原始大小写。
+        assert_eq!(
+            first_background_token("[background(image = \"bg_Camp\")]").as_deref(),
+            Some("bg_Camp")
+        );
+        // 裸词值 + `$` 前缀。
+        assert_eq!(
+            first_background_token("[Background(image=$bg_dollar)]").as_deref(),
+            Some("bg_dollar")
+        );
+        // `fadeimage=` 不是 `image` 键，不能把它的值当背景。
+        assert_eq!(
+            first_background_token(
+                "[Background(fadeimage=\"bg_wrong\")]\n[Background(image=\"bg_right\")]"
+            )
+            .as_deref(),
+            Some("bg_right")
+        );
+        // 行尾 `\` 把指令拆成两半时，宁可没有缩略图也不能返回垃圾 token。
+        assert_eq!(
+            first_background_token("[Background(image=\\\n\"bg_split\")]"),
+            None
+        );
+        assert_eq!(
+            first_background_token("[Background(image=\"bg_split\\\n\", fadetime=1)]"),
+            None
+        );
     }
 
     #[test]
