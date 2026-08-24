@@ -379,6 +379,17 @@ export function scrollTopFromAnchorGeometry(
   return Math.max(0, Math.min(Math.max(0, maxTop), target));
 }
 
+/** 合计分页视口外的实际 chrome，高度向上取整避免亚像素造成固定溢出。 */
+export function readerChromeHeightFromMeasurements(
+  heights: readonly number[]
+): number {
+  const total = heights.reduce(
+    (sum, height) => sum + (Number.isFinite(height) && height > 0 ? height : 0),
+    0
+  );
+  return Math.ceil(total);
+}
+
 /**
  * 把带换行的正文拆成 `<span>` + `<br />`。定义在模块级：它不依赖任何组件
  * 状态，放在组件里只会让每次渲染都产出一个新引用，白白破坏 memo。
@@ -516,6 +527,8 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const readerRootRef = useRef<HTMLDivElement | null>(null);
   const headerRef = useRef<HTMLElement | null>(null);
+  const footerRef = useRef<HTMLElement | null>(null);
+  const neighborBarRef = useRef<HTMLDivElement | null>(null);
   const loadTokenRef = useRef(0);
   const focusAppliedRef = useRef<number | null>(null);
   const characterAppliedRef = useRef<string | null>(null);
@@ -1639,18 +1652,51 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     scrollContainerRef.current?.scrollTo({ top: 0, behavior: "instant" });
   }, [active, currentPage, settings.readingMode]);
 
-  // 顶栏实际高度（带关卡编号/标签时会比 3.5rem 高），收起时按这个值上移。
+  // 顶栏实际高度用于沉浸收起；同时把分页视口外的顶栏、页脚、邻话栏实测
+  // 高度写进根节点，让 CSS 的每页 min-height 跟当前 chrome 同步。
   useLayoutEffect(() => {
-    if (!active) return;
-    const element = headerRef.current;
-    if (!element) return;
-    const measure = () => setHeaderHeight(element.offsetHeight || 56);
+    const root = readerRootRef.current;
+    if (!active || !root) {
+      root?.style.removeProperty("--reader-chrome");
+      return;
+    }
+    const header = headerRef.current;
+    if (!header) {
+      root.style.removeProperty("--reader-chrome");
+      return;
+    }
+    const measuredElements = [header, footerRef.current, neighborBarRef.current].filter(
+      (element): element is HTMLElement => element !== null
+    );
+    const measure = () => {
+      setHeaderHeight(header.offsetHeight || 56);
+      const chromeHeight = readerChromeHeightFromMeasurements(
+        measuredElements.map((element) => element.getBoundingClientRect().height)
+      );
+      root.style.setProperty("--reader-chrome", `${chromeHeight}px`);
+    };
     measure();
-    if (typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(measure);
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, [active, content, storyEntry]);
+    const observer =
+      typeof ResizeObserver === "undefined" ? null : new ResizeObserver(measure);
+    measuredElements.forEach((element) => observer?.observe(element));
+    return () => {
+      observer?.disconnect();
+      root.style.removeProperty("--reader-chrome");
+    };
+  }, [
+    active,
+    content,
+    error,
+    insightsOpen,
+    loading,
+    neighbors.next,
+    neighbors.prev,
+    selectMode,
+    settings.readingMode,
+    settingsOpen,
+    shareDialogOpen,
+    storyEntry,
+  ]);
 
   // 任一抽屉/选段工具栏打开、切到分页模式或换篇时，顶栏一律复位为可见。
   useEffect(() => {
@@ -2956,6 +3002,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
 
       {settings.readingMode === "paged" && !selectMode && (
         <footer
+          ref={footerRef}
           className="flex-shrink-0 backdrop-blur border-t px-4 pt-4 pb-4"
           style={{
             paddingBottom: `calc(${bottomSafeArea} + 1rem)`,
@@ -3008,6 +3055,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       {/* 上/下一话导航 —— 基于 storyGroup + storySort 推导（仅在阅读且无选段/无抽屉时展示）。 */}
       {showNeighborBar && (
         <div
+          ref={neighborBarRef}
           className="flex-shrink-0 border-t border-[hsl(var(--color-border))] bg-[hsl(var(--color-background)/0.92)] backdrop-blur px-4 py-2"
           style={{
             paddingBottom: "calc(env(safe-area-inset-bottom, 0px) + 0.5rem)",
@@ -3052,6 +3100,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
 
       {selectMode && (
         <footer
+          ref={footerRef}
           className="flex-shrink-0 backdrop-blur border-t px-4 py-3 space-y-2"
           style={{
             paddingBottom: "calc(env(safe-area-inset-bottom, 0px) + 0.75rem)",

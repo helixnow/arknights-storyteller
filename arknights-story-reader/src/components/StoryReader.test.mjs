@@ -16,6 +16,7 @@ async function loadPureReader() {
 const {
   createLruCache,
   postProcessSegments,
+  readerChromeHeightFromMeasurements,
   readerLocalDayKey,
   scrollTopFromAnchorGeometry,
   shouldResetReaderPositionForContent,
@@ -123,6 +124,30 @@ test("滚动恢复：锚段优先按 index + offset 还原并钳位", () => {
     scrollTopFromAnchorGeometry(Number.NaN, 100, 160, 10, 1000),
     null
   );
+});
+
+test("分页 chrome：顶栏、页脚、邻话栏高度求和并向上取整", () => {
+  assert.equal(readerChromeHeightFromMeasurements([56, 76, 64]), 196);
+  assert.equal(readerChromeHeightFromMeasurements([56.2, 76.1, 64.1]), 197);
+});
+
+test("分页 chrome：缺失、负值与非有限测量不会污染 CSS 变量", () => {
+  assert.equal(
+    readerChromeHeightFromMeasurements([56, 0, -20, Number.NaN, Number.POSITIVE_INFINITY]),
+    56
+  );
+});
+
+test("分页 chrome：ResizeObserver 写入变量，隐藏或卸载时清理", async () => {
+  const source = await readFile(new URL("./StoryReader.tsx", import.meta.url), "utf8");
+  assert.match(source, /new ResizeObserver\(measure\)/);
+  assert.match(source, /root\.style\.setProperty\("--reader-chrome", `\$\{chromeHeight\}px`\)/);
+  assert.match(source, /root\.style\.removeProperty\("--reader-chrome"\)/);
+  assert.match(source, /ref=\{footerRef\}/);
+  assert.match(source, /ref=\{neighborBarRef\}/);
+
+  const css = await readFile(new URL("../index.css", import.meta.url), "utf8");
+  assert.match(css, /calc\(100dvh - var\(--reader-chrome, 12rem\)\)/);
 });
 
 test("KeepAlive 隐藏：退出选段模式但不清空已选段落", async () => {
