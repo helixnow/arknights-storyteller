@@ -4472,7 +4472,13 @@ impl DataService {
 /// 「按剧情标题排序」的兜底，同一位干员的几篇密录在列表里四散开。
 fn extract_char_token(story_txt: &str) -> Option<String> {
     let segments: Vec<&str> = story_txt.split(|c| c == '/' || c == '\\').collect();
-    if let Some(seg) = segments.iter().find(|seg| seg.starts_with("char_")) {
+    // 前端正则带 `/i`，`story_` 分支和 `memory` 段在这里也都不区分大小写；
+    // `char_` 前缀不能独独区分——路径大小写从来不是数据侧的承诺，认不出
+    // 前缀的密录会静默跌进「按标题排序」的兜底。
+    if let Some(seg) = segments.iter().find(|seg| {
+        seg.get(.."char_".len())
+            .is_some_and(|head| head.eq_ignore_ascii_case("char_"))
+    }) {
         return Some(seg.to_ascii_lowercase());
     }
     segments.windows(2).find_map(|pair| {
@@ -4509,6 +4515,13 @@ fn first_background_token(raw: &str) -> Option<String> {
         let lowered = trimmed.to_ascii_lowercase();
         if !lowered.starts_with("[background") {
             continue;
+        }
+        // 指令名要整词匹配，和属性侧的 `fadeimage`≠`image` 是同一条规矩：
+        // 解析器在 `(`/空格/`=` 处截断指令名后**精确**比对，
+        // `[BackgroundTween(...)]` 是另一条指令，它的属性不能冒认成背景图。
+        match lowered.as_bytes().get("[background".len()) {
+            None | Some(b'(') | Some(b' ') | Some(b'=') | Some(b']') => {}
+            _ => continue,
         }
         if let Some(token) = extract_image_attr_value(trimmed, &lowered) {
             return Some(token.to_string());
@@ -4688,6 +4701,11 @@ mod tests {
             extract_char_token("obt/memory/char_002_amiya/char_002_amiya_1"),
             Some("char_002_amiya".to_string())
         );
+        // 前端正则带 `/i`：历史 `char_` 格式同样不看路径大小写。
+        assert_eq!(
+            extract_char_token("Obt/Memory/CHAR_002_AMIYA/CHAR_002_AMIYA_1"),
+            Some("char_002_amiya".to_string())
+        );
         assert_eq!(extract_char_token("obt/main/level_main_01-01_beg"), None);
         // 当前主流格式：文件直接躺在 memory 目录下，alias 是 charId 尾段。
         assert_eq!(
@@ -4767,6 +4785,25 @@ mod tests {
             )
             .as_deref(),
             Some("bg_right")
+        );
+        // 指令名同样要整词匹配：`[BackgroundTween]` 是另一条指令，
+        // 解析器按截断后的指令名精确比对，这里不能靠前缀冒领。
+        assert_eq!(
+            first_background_token(
+                "[BackgroundTween(image=\"bg_tween\", duration=1)]\n[Background(image=\"bg_scene\")]"
+            )
+            .as_deref(),
+            Some("bg_scene")
+        );
+        // 但整词判定不能收得过紧：指令名后跟空格、或裸 `[Background]`
+        // 在解析器里都还是 background。
+        assert_eq!(
+            first_background_token("[background (image='bg_spaced')]").as_deref(),
+            Some("bg_spaced")
+        );
+        assert_eq!(
+            first_background_token("[Background]\n[Background(image=\"bg_bare\")]").as_deref(),
+            Some("bg_bare")
         );
         // 行尾 `\` 把指令拆成两半时，宁可没有缩略图也不能返回垃圾 token。
         assert_eq!(
