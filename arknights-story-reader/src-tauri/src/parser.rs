@@ -221,12 +221,19 @@ fn parse_command_line(line: &str, current_char_id: Option<&str>) -> Option<Story
             // `[name="xxx"]` 是对话显示名，权威来源。不要继承上一条
             // `[Character(name="char_...")]` 的 charId——脚本常常在同一
             // `[Character]` 还没翻页的情况下切换说话人（尤其罗德岛多人同场）。
-            // 让前端通过 `character_table` 用 `character_name` 反查 charId。
+            // 但战斗内剧情会直接在同一条 name 指令里给出 avatarId /
+            // isAvatarRight；这是当前台词的显式身份与位置，不能一起丢掉。
+            // 没有显式 avatarId 时再让前端按 character_name 反查。
+            let character_id = attrs
+                .get("avatarid")
+                .map(|s| normalize_char_id(s))
+                .filter(|s| s.starts_with("char_"));
+            let position = dialogue_position(&attrs);
             Some(StorySegment::Dialogue {
                 character_name,
                 text,
-                position: None,
-                character_id: None,
+                position,
+                character_id,
             })
         }
         "multiline" => {
@@ -788,13 +795,7 @@ fn parse_dialog_like(
     };
 
     if let Some(name) = character_name {
-        let position = attrs.get("isavatarright").and_then(|v| {
-            if is_truthy(v) {
-                Some("right".to_string())
-            } else {
-                None
-            }
-        });
+        let position = dialogue_position(attrs);
         Some(StorySegment::Dialogue {
             character_name: name,
             text,
@@ -873,6 +874,13 @@ fn humanize_identifier(raw: &str) -> String {
 fn is_truthy(val: &str) -> bool {
     let v = val.trim().to_ascii_lowercase();
     matches!(v.as_str(), "1" | "true" | "yes" | "y")
+}
+
+fn dialogue_position(attrs: &HashMap<String, String>) -> Option<String> {
+    attrs
+        .get("isavatarright")
+        .filter(|v| is_truthy(v))
+        .map(|_| "right".to_string())
 }
 
 trait IfEmpty {
@@ -1487,6 +1495,46 @@ mod tests {
         let segment = only(content);
         assert_eq!(segment.speaker(), Some("阿米娅"));
         assert_eq!(segment.character_id(), None);
+    }
+
+    /// 战斗内剧情把当前台词的头像和左右位置直接写在 `[name]` 上（全语料
+    /// 1173 行，其中 815 行是可渲染的 `char_` 身份）。显示名可能故意是
+    /// `？？？`，此时无法靠名字反查；丢掉 avatarId 就只剩问号占位头像。
+    #[test]
+    fn test_name_command_keeps_explicit_avatar_identity_and_side() {
+        let content = r#"[Character(name="char_003_kalts_1")]
+[name="？？？", avatarId="char_4023_rfalcn_1", isAvatarRight="TRUE"]谢谢你们。
+[name="矿工", avatarId="npc_3010_mcreepa", isAvatarRight="FALSE"]快撤退！"#;
+        let result = parse_story_text(content);
+        assert_eq!(result.segments.len(), 2);
+
+        match &result.segments[0] {
+            StorySegment::Dialogue {
+                character_name,
+                position,
+                character_id,
+                ..
+            } => {
+                assert_eq!(character_name, "？？？");
+                assert_eq!(position.as_deref(), Some("right"));
+                assert_eq!(character_id.as_deref(), Some("char_4023_rfalcn"));
+            }
+            other => panic!("expected dialogue segment, got {:?}", other),
+        }
+
+        // 非 char_ 的显式身份目前没有头像素材候选，但也绝不能因此回退继承
+        // 前一条 Character 的凯尔希头像；FALSE 仍是默认左侧。
+        match &result.segments[1] {
+            StorySegment::Dialogue {
+                position,
+                character_id,
+                ..
+            } => {
+                assert_eq!(position, &None);
+                assert_eq!(character_id, &None);
+            }
+            other => panic!("expected dialogue segment, got {:?}", other),
+        }
     }
 
     /// 引号里的 `]` 是属性值不是指令结束（真实数据 story_cetsyr_1_1.txt）：
