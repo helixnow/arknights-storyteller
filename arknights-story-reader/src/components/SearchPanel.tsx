@@ -577,6 +577,17 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
       const token = ++versionSeqRef.current;
       setCache({});
       setSegmentCache({});
+      // 索引状态也要立刻掰成未就绪，不能等 useAutoIndex 约 3 秒后的广播：
+      // 后端 sync_data / import_zip 在换完数据的同一步就把索引库整个删了
+      // （clear_story_index 在命令返回前执行），事件到达时 ready 事实上已是
+      // false。残留的 ready=true 会在这个窗口里放行两条明确禁止的路径：
+      // 自动搜打在无索引的退化路径上（段落＝空页、整篇＝逐篇扫描），以及
+      // indexTrusted 误判可信——此时补取到的 version 已是新 commit，段落
+      // 空页按它进缓存就把查询钉死在"零命中改搜整篇"，整篇残缺页还会落盘，
+      // 而就绪上升沿只补 lastQuery 一条，窗口里搜过的其他词永久毒化。
+      // 置 false 后由重建收场的 app:story-index-updated / index-progress
+      // 终态照常把状态刷回来。
+      setIndexStatus((prev) => (prev && prev.ready ? { ...prev, ready: false } : prev));
       // version 必须立刻清空，不能等 getCurrentVersion 回来再改：事件到达时
       // 数据已经换成新 commit，等待期间（以及取失败后的无限期）旧 commit 若
       // 继续留在 state 里，此时发起的搜索查的是新库、落缓存却按旧版本记账
