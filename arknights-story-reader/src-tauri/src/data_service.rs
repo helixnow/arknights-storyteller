@@ -61,7 +61,9 @@ const HTTP_OP_TIMEOUT: Duration = Duration::from_secs(60);
 ///      speaker), and a lone full-width punctuation mark left after a command
 ///      (`[Character(...)]。`) is dropped like its ASCII counterpart; both
 ///      change stored text and shift stored segment indices.
-const INDEX_VERSION: i32 = 9;
+/// v10 = 富文本标签白名单化保留混排尖括号正文；charId/说话人按三段本体
+///       归一。两项都会改变入库的 searchable_text / character_name。
+const INDEX_VERSION: i32 = 10;
 
 const META_TOTAL_COUNT: &str = "total_count";
 const META_SEGMENT_TOTAL: &str = "segment_total";
@@ -1886,7 +1888,7 @@ impl DataService {
     }
 
     /// 把数据集身份与目录篇数压成一行文本存进索引元数据。任一项对不上都
-    /// 必须重建。格式保持不变；`INDEX_VERSION` 仍为 9。
+    /// 必须重建。格式保持不变；`INDEX_VERSION` 现为 10。
     fn index_dataset_fingerprint(&self, story_count: usize) -> String {
         format!("{}|{}", self.index_dataset_identity(), story_count)
     }
@@ -7065,6 +7067,38 @@ mod tests {
         let status = fx.service.get_story_index_status().unwrap();
         assert!(status.ready);
         assert_eq!(status.total, 6);
+    }
+
+    #[test]
+    fn parser_v9_index_is_recreated_for_v10_semantics() {
+        assert_eq!(INDEX_VERSION, 10, "parser corpus changes require index v10");
+        let conn = Connection::open_in_memory().unwrap();
+        DataService::init_index_tables(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO story_index (
+                story_id, story_name, category, tokenized_content, story_code, raw_content
+             ) VALUES ('v9-row', 'legacy', '', 'legacy', '', 'legacy')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE story_index_meta SET value = '9' WHERE key = 'index_version'",
+            [],
+        )
+        .unwrap();
+
+        DataService::init_index_tables(&conn).unwrap();
+        let version = DataService::extract_meta_value(&conn, "index_version")
+            .unwrap()
+            .unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM story_index", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, "10");
+        assert_eq!(
+            rows, 0,
+            "v9 rows encode the old parser corpus and must not be reused"
+        );
     }
 
     #[test]
