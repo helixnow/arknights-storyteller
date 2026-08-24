@@ -44,12 +44,25 @@ interface CharacterAggregate {
 
 interface CharacterQuote {
   text: string;
+  /** 收集时的说话人（＝当时的 selected）。跳转匹配要用它锚定正确的段。 */
+  speaker: string;
   storyName: string;
   story: StoryEntry;
   segmentIndex: number;
 }
 
 type GroupCategory = "main" | "activity" | "memory" | "other";
+
+// 详情页「出场章节」的分类展示顺序：主线 → 活动 → 密录 → 其他。
+// groupOrder 只是各分类内部的序号（主线第 0 章和活动第 0 期都叫 0），
+// 直接拿它跨分类比较会让主线章节和活动条目按各自序号交错排布，
+// 每个角色看到的顺序都不一样。先比分类，再比组内序号。
+const CATEGORY_RANK: Record<GroupCategory, number> = {
+  main: 0,
+  activity: 1,
+  memory: 2,
+  other: 3,
+};
 
 // 统计阶段的剧情读取并发。
 const STATS_POOL_SIZE = 6;
@@ -496,11 +509,15 @@ export function CharactersPanel({
         }
       }
 
-      // 整理每个角色的 perStory 排序（默认先按章节内排序）
+      // 整理每个角色的 perStory 排序（先分类，再章节序，最后组内序）
       aggMap.forEach((agg) => {
         agg.perStory.sort((a, b) => {
           const ga = groupInfo.get(a.story.storyId);
           const gb = groupInfo.get(b.story.storyId);
+          const cOrder =
+            (ga ? CATEGORY_RANK[ga.category] : CATEGORY_RANK.other) -
+            (gb ? CATEGORY_RANK[gb.category] : CATEGORY_RANK.other);
+          if (cOrder !== 0) return cOrder;
           const gOrder = (ga?.groupOrder ?? 9999) - (gb?.groupOrder ?? 9999);
           if (gOrder !== 0) return gOrder;
           const sOrder = (ga?.storyOrder ?? a.story.storySort) - (gb?.storyOrder ?? b.story.storySort);
@@ -691,11 +708,18 @@ export function CharactersPanel({
         key: string;
         groupName: string;
         items: CharacterStatsPerStory[];
+        rank: number;
         order: number;
       }>;
     const buckets = new Map<
       string,
-      { key: string; groupName: string; order: number; items: CharacterStatsPerStory[] }
+      {
+        key: string;
+        groupName: string;
+        rank: number;
+        order: number;
+        items: CharacterStatsPerStory[];
+      }
     >();
     selectedAgg.perStory.forEach((ps) => {
       const info = groupInfoByStoryId.get(ps.story.storyId);
@@ -708,12 +732,17 @@ export function CharactersPanel({
         buckets.set(key, {
           key,
           groupName: info?.groupName ?? "其他",
+          // 与 perStory 相同的比较键：分类在前，组内序号在后。groupOrder
+          // 是分类内序号，跨分类裸比会把主线章节和活动条目交错排开。
+          rank: info ? CATEGORY_RANK[info.category] : CATEGORY_RANK.other,
           order: info?.groupOrder ?? 9999,
           items: [ps],
         });
       }
     });
-    return Array.from(buckets.values()).sort((a, b) => a.order - b.order);
+    return Array.from(buckets.values()).sort(
+      (a, b) => a.rank - b.rank || a.order - b.order
+    );
   }, [groupInfoByStoryId, selectedAgg]);
 
   // 组内搜索按章节名存。换个角色还留着上一位的关键词，展开章节就会莫名
@@ -768,7 +797,13 @@ export function CharactersPanel({
             if (text.length < QUOTE_MIN_LEN || text.length > QUOTE_MAX_LEN) return;
             if (seenText.has(text)) return;
             seenText.add(text);
-            collected.push({ text, storyName: story.storyName, story, segmentIndex });
+            collected.push({
+              text,
+              speaker: seg.characterName,
+              storyName: story.storyName,
+              story,
+              segmentIndex,
+            });
           });
         } catch {
           // 单篇读不到就跳过，不影响其他金句。
@@ -821,7 +856,11 @@ export function CharactersPanel({
       if (onOpenStoryJump) {
         onOpenStoryJump(quote.story, {
           segmentIndex: quote.segmentIndex,
-          preview: quote.text,
+          // 阅读器以 preview 文本匹配为准（防数据同步后段号漂移），而它对
+          // 对话段的匹配语料是「说话人 + 正文」。只传正文时，同一句台词若
+          // 更早出现在别人嘴里（或旁白复述），会命中更早那段——带上说话人
+          // 才锚定到本角色的这一句。文本匹配不到时阅读器仍回退到段号。
+          preview: `${quote.speaker} ${quote.text}`,
         });
       } else {
         onOpenStory(quote.story, selectedAgg?.name ?? "");

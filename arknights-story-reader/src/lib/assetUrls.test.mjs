@@ -188,6 +188,97 @@ test("activity_logo：brand / camplogo 双路径，附带剥前缀兜底", () =>
   ]);
 });
 
+test("stripActPrefix 削空：mini 后缀与纯数字活动号都不产生 core 兜底", () => {
+  // `act13mini` → 剥 act → 剥数字 → 剩 "mini" → 剥 mini 后缀 → 空串。
+  assert.deepEqual(resolveAssetCandidatesLocal("activity_kv", "act13mini", null), [
+    `${FEXLI}/kvimg/act13mini.png`,
+    `${FEXLI}/kvimg/default_kv_act13mini.png`,
+    `${FEXLI}/kvimg/kv_act13mini.png`,
+  ]);
+  assert.deepEqual(resolveAssetCandidatesLocal("activity_logo", "act13mini", null), [
+    `${FEXLI}/kvimg/brand_act13mini.png`,
+    `${FEXLI}/camplogo/logo_act13mini.png`,
+  ]);
+  // `act17` → 剥 act → 剥数字 → 空串。
+  assert.deepEqual(resolveAssetCandidatesLocal("activity_kv", "act17", null), [
+    `${FEXLI}/kvimg/act17.png`,
+    `${FEXLI}/kvimg/default_kv_act17.png`,
+    `${FEXLI}/kvimg/kv_act17.png`,
+  ]);
+});
+
+test("stripActPrefix：act_ 下划线前缀走 4 位剥除，削空时同样只留原始候选", () => {
+  // `act_10side` → 剥 "act_" → 剥数字 → 剩 "side" → 剥 side 后缀 → 空串。
+  assert.deepEqual(resolveAssetCandidatesLocal("activity_kv", "act_10side", null), [
+    `${FEXLI}/kvimg/act_10side.png`,
+    `${FEXLI}/kvimg/default_kv_act_10side.png`,
+    `${FEXLI}/kvimg/kv_act_10side.png`,
+  ]);
+  // 剥完仍有内容时照常追加 core 兜底。
+  assert.deepEqual(resolveAssetCandidatesLocal("activity_logo", "act_fun2024", null), [
+    `${FEXLI}/kvimg/brand_act_fun2024.png`,
+    `${FEXLI}/camplogo/logo_act_fun2024.png`,
+    `${FEXLI}/kvimg/brand_fun2024.png`,
+    `${FEXLI}/camplogo/logo_fun2024.png`,
+  ]);
+});
+
+test("非 act 开头但带数字前缀的活动 id（如 1stact）：数字剥除无条件生效", () => {
+  // `replace(/^\d+/)` 不以 act 前缀为前提：`1stact` → `stact`，core 兜底
+  // 跟在原始候选后面。这是既有启发式的真实形态（多两条 404 兜底，原始
+  // token 仍然最优先），钉住它防止误改。
+  assert.deepEqual(resolveAssetCandidatesLocal("activity_kv", "1stact", null), [
+    `${FEXLI}/kvimg/1stact.png`,
+    `${FEXLI}/kvimg/default_kv_1stact.png`,
+    `${FEXLI}/kvimg/kv_1stact.png`,
+    `${FEXLI}/kvimg/default_kv_stact.png`,
+    `${FEXLI}/kvimg/kv_stact1.png`,
+    `${FEXLI}/kvimg/kv_stact.png`,
+  ]);
+  // 完全不含可剥内容的 token（无 act 前缀、无数字、无 side/mini 后缀）
+  // 才是「猜不出 core」，只出原始候选。
+  assert.deepEqual(resolveAssetCandidatesLocal("activity_logo", "storyMainPic", null), [
+    `${FEXLI}/kvimg/brand_storyMainPic.png`,
+    `${FEXLI}/camplogo/logo_storyMainPic.png`,
+  ]);
+});
+
+test("activity_kv / activity_logo：jpg/jpeg/webp 扩展名大小写不敏感地剥掉", () => {
+  const fromJpg = resolveAssetCandidatesLocal("activity_kv", "act17side_entrypic.JPG", null);
+  assert.deepEqual(
+    fromJpg,
+    resolveAssetCandidatesLocal("activity_kv", "act17side_entrypic.png", null)
+  );
+  assert.equal(fromJpg[0], `${FEXLI}/kvimg/act17side_entrypic.png`);
+  assert.deepEqual(
+    resolveAssetCandidatesLocal("activity_kv", "act17side_entrypic.jpeg", null),
+    fromJpg
+  );
+  assert.deepEqual(resolveAssetCandidatesLocal("activity_logo", "act10side_logo.webp", null), [
+    `${FEXLI}/kvimg/brand_act10side_logo.png`,
+    `${FEXLI}/camplogo/logo_act10side_logo.png`,
+    `${FEXLI}/kvimg/brand_side_logo.png`,
+    `${FEXLI}/camplogo/logo_side_logo.png`,
+  ]);
+});
+
+test("portrait：中文名经 index 解析，与直接传 charId 产出相同候选", () => {
+  const index = { nameToCharId: { 阿米娅: "char_002_amiya" }, charIdToName: {} };
+  assert.deepEqual(
+    resolveAssetCandidatesLocal("portrait", "阿米娅", index),
+    resolveAssetCandidatesLocal("portrait", "char_002_amiya", null)
+  );
+});
+
+test("NPC 覆盖表：token 两侧空白剥掉后仍命中", () => {
+  assert.deepEqual(resolveAssetCandidatesLocal("avatar", "  普瑞赛斯  ", null), [
+    "/avatars/npc/priestess.png",
+  ]);
+  assert.deepEqual(resolveAssetCandidatesLocal("portrait", " 希尔达 ", null), [
+    "/avatars/npc/hierda.png",
+  ]);
+});
+
 test("空白 token 与未知 kind 都返回空数组", () => {
   assert.deepEqual(resolveAssetCandidatesLocal("avatar", "   ", null), []);
   assert.deepEqual(resolveAssetCandidatesLocal("image", "", null), []);
