@@ -199,10 +199,30 @@ function facetKeyOf(category: string): string {
 
 /**
  * get_current_version 返回 `abc1234 (3天前)` 这种带相对时间的串，隔天整串就变了。
- * 缓存版本只取 commit 部分（与 CharactersPanel 的做法一致），数据没变缓存就一直有效。
+ * 缓存版本只取 commit 部分，数据没变缓存就一直有效。
+ *
+ * 但取出来的头部必须真的能区分两份不同的数据，做不到就返回空串、走各调用点
+ * 已有的"无版本→缓存整体停用"路径（见 activeVersion 判空处的注释）。后端有
+ * 三种形态的版本串头部不具备数据身份，全是跨数据集的常量：
+ *   - 哨兵文案：数据在而 version.json 读不出来（断电截断、换入后写失败）时
+ *     返回"本地数据（版本未知）"，未安装时返回"未安装"。整串没有空格，旧实现
+ *     的 `|| v` 会把它原样放行成 truthy 版本，把"版本未知窗口期停用缓存"的
+ *     机制整个绕开；
+ *   - `manual-`：手动导入存的 commit 是 `manual-<导入时间戳>`，但后端
+ *     short_commit 只留前 7 个字符，时间戳恰好整个被截掉——所有手动导入的
+ *     数据包都报同一个头。导入 A 包搜过的结果落了盘，换导 B 包再重启，
+ *     版本对得上号，A 包的旧结果就会当作有效缓存直接端给用户；
+ *   - `unknown`：同步时拿不到 remote commit（GitHub API 限流是常态）仍会
+ *     下载默认分支并把 commit 记成 "unknown"，两次限流窗口里同步到的数据
+ *     不同、版本却相同。
+ * 真实 commit 头（hex 短串）全是可见 ASCII，哨兵文案全是 CJK，按形状分流比
+ * 枚举文案措辞更稳。loadCacheMap 复用同一判定：按这些假版本落盘的历史条目
+ * 在读入时经空版本守卫一并丢弃。
  */
 function stableVersionOf(v: string): string {
-  return v.split(" ")[0] || v;
+  const head = v.split(" ")[0] || "";
+  if (head === "unknown" || head === "manual-") return "";
+  return /^[!-~]+$/.test(head) ? head : "";
 }
 
 function prune<T extends { updatedAt: number }>(map: Record<string, T>): Record<string, T> {
@@ -233,6 +253,8 @@ function loadCacheMap<T extends { page: unknown; updatedAt: number; version: str
       const entryVersion = stableVersionOf(entry.version);
       // 空版本条目是旧版本在 get_current_version 返回前就落盘的产物：
       // 它会在下个会话同样的空版本窗口期被误判为有效缓存，直接丢弃。
+      // stableVersionOf 折叠掉的假身份版本（"manual-"、"unknown"、哨兵
+      // 文案，见其注释）也在这里归零被丢：那些条目无法证明对应哪份数据。
       if (!entryVersion) continue;
       out[cacheKey] = { ...entry, version: entryVersion } as T;
     }
