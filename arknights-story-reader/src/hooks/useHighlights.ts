@@ -103,6 +103,9 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
   // storage 事件值。用来抑制回声写入（跟随外部状态之后不必再写一遍），
   // 也用来识别 storage 事件是不是本窗口自己的写入触发的。
   const lastRawRef = useRef<string | null>(null);
+  // 本实例真正改过的 story key。冲刷时只把这些 key 并到盘上最新状态里，
+  // 其余 key 一律以盘为准——见 flushPendingStore 里的换章竞态说明。
+  const dirtyKeysRef = useRef<Set<string>>(new Set());
 
   // 冲刷跑在 setTimeout 回调和卸载清理里，通过 ref 取最新的 toast 句柄。
   const toast = useToast();
@@ -121,11 +124,24 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
   const flushPendingStore = useCallback(() => {
     const pending = pendingStoreRef.current;
     if (pending === null) return;
-    const raw = JSON.stringify(pending);
+    // 不能把内存里的整表直接覆写上盘。阅读器按 storyId 重挂，换章时新实例
+    // 的 useState 初始化在 render 阶段就读了盘，而旧实例的卸载冲刷要到
+    // commit 的 passive 清理阶段才落盘——新实例的整表快照因此天然落后一笔
+    //（quota 失败后 pending 长期滞留重试时，落后的窗口更是无限大）。之后
+    // 新实例任何一次整表覆写都会把旧实例刚救回来的划线无声抹掉。这里改成
+    // 和阅读进度 hook 同一口径：写盘时现读最新整表，只把本实例真正改过的
+    // key 并进去，别的 key（上一章的划线、别的窗口的写入）以盘为准。
+    const merged: HighlightStore = { ...readStorage() };
+    for (const key of dirtyKeysRef.current) {
+      if (key in pending) merged[key] = pending[key];
+      else delete merged[key];
+    }
+    const raw = JSON.stringify(merged);
     if (raw === lastRawRef.current) {
       // 内容与盘上完全一致（典型场景：跟随 storage 事件之后的回写），
       // 再写一遍只会在别的窗口触发一轮多余的事件。
       pendingStoreRef.current = null;
+      dirtyKeysRef.current.clear();
       return;
     }
     try {
@@ -133,6 +149,7 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
       lastRawRef.current = raw;
       persistFailureNotified = false;
       pendingStoreRef.current = null;
+      dirtyKeysRef.current.clear();
       return;
     } catch {
       // Quota / private mode: the write fails atomically, the previously
@@ -210,8 +227,10 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
       if (event.key === STORAGE_KEY && raw === lastRawRef.current) return;
       lastRawRef.current = raw;
       // 本窗口还压在防抖里的快照基于的是过期整表，冲出去会把对方刚写的
-      // 内容盖掉；外部写入以后到为准，把它丢弃（卸载冲刷随之变成 no-op）。
+      // 内容盖掉；外部写入以后到为准，把它丢弃（卸载冲刷随之变成 no-op，
+      // 记着的脏键也一并作废）。
       pendingStoreRef.current = null;
+      dirtyKeysRef.current.clear();
       setStore(readStorage());
     };
     window.addEventListener("storage", onStorage);
@@ -321,6 +340,7 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
       // `segmentDigestMap` uses "" for unrecognised segment types — never
       // persist that as a fingerprint.
       const digest = segmentDigests?.[segmentIndex] || undefined;
+      dirtyKeysRef.current.add(storyPath);
       setStore((prev) => {
         const rawList = prev[storyPath] ?? [];
         const current: HighlightEntry[] = [];
@@ -357,6 +377,7 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
   );
 
   const clearHighlights = useCallback(() => {
+    dirtyKeysRef.current.add(storyPath);
     setStore((prev) => {
       if (!(storyPath in prev)) {
         return prev;

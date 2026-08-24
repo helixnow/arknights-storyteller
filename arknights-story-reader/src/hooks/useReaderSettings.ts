@@ -238,6 +238,24 @@ export function useReaderSettings() {
   // 最终值写掉，而不是悄悄丢弃。
   useEffect(() => () => flushPendingSettings(), [flushPendingSettings]);
 
+  // 挂载后对账一次盘上内容。阅读器按 storyId 重挂，换章时新实例的 useState
+  // 初始化在 render 阶段读盘，而旧实例的卸载冲刷要到 commit 的 passive 清理
+  // 阶段才落盘（React 先跑被删子树的 passive 清理、再跑新子树的 passive
+  // effect，所以这里必然读得到那笔写入）——初始快照因此可能落后一笔：旧实例
+  // 防抖窗口里、或 quota 失败后滞留重试成功的那次调整。设置是单对象整体
+  // 覆写，不对账的话新章里随手改个主题就会从过期基线出发，把那笔调整打回
+  // 旧样。逐键比较：值全一致时保留原引用，别惊动排版，也别触发回写。
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    setSettings((prev) => {
+      const disk = loadSettings();
+      const changed = (Object.keys(disk) as Array<keyof ReaderSettings>).some(
+        (key) => disk[key] !== prev[key]
+      );
+      return changed ? disk : prev;
+    });
+  }, []);
+
   // 切后台 / 关标签页冲刷：移动端杀掉 app、桌面端直接关窗口都不会走
   // unmount（阅读器被 KeepAlive 常驻挂载，settings hook 跟着常驻）。
   // 调完字号 200ms 内锁屏或关掉 app，防抖窗口里的最终值以前会静默丢失，

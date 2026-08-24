@@ -534,7 +534,10 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     // Disable edge-swipe while any drawer or the multi-select toolbar is
     // open — otherwise a stray swipe could tear down a half-captured
     // selection / share preview.
-    enabled: active && !settingsOpen && !insightsOpen && !shareDialogOpen && !selectMode,
+    // 浮层菜单同理：返回栈里它是最上层（硬返回键先关菜单再关阅读器），
+    // 边缘手势模拟的是同一个「返回」，不该越过菜单直接把整个阅读器关掉。
+    enabled:
+      active && !settingsOpen && !insightsOpen && !shareDialogOpen && !selectMode && !moreMenuOpen,
     onBack,
   });
 
@@ -1226,6 +1229,14 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     const handleScroll = () => {
       if (frame) cancelAnimationFrame(frame);
       frame = requestAnimationFrame(() => {
+        // 跳转落点还挂起时既不记进度也不抓锚点：此刻的 scrollTop 是过渡态。
+        // 典型动线是搜索进篇——restore 让位后视口停在 0，本监听挂上时的
+        // 首帧回调若照常记账，pending 里就压着一份 ~0%；用户点进来发现不是
+        // 想要的那篇、立刻返回，closeReader 的强制冲刷会把这份 0% 写成真实
+        // 进度，真实位置就此丢失。落点成功（jumpToSegment 同步清 pending，
+        // 平滑滚动的后续 scroll 事件照常记账）或放弃（兜底快照把视口摆正、
+        // 滚动事件随之恢复记账）之后，这里自然解除。
+        if (pendingScrollIndexRef.current !== null) return;
         const { scrollTop, scrollHeight, clientHeight } = container;
         // 容器还没量出高度（隐藏 / 尚未布局）时别算：denominator<=0 会被
         // 当成「读完了」，把进度直接写成 100%。

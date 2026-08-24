@@ -136,6 +136,12 @@ function blobToBase64(blob: Blob): Promise<string> {
 
 /** 终态进度多留一会儿让用户看清「完成」，之后自动收起。 */
 const PROGRESS_DONE_LINGER_MS = 2200;
+/**
+ * 带失败字样的终态（后台索引重建失败走 sync-progress 报「索引重建失败，
+ * 可稍后在设置中手动重试」）要留得更久：它是那次失败在本流程里唯一的
+ * 主动提示，2.2 秒就收起等于把失败演成了成功，用户根本来不及读完。
+ */
+const PROGRESS_FAIL_LINGER_MS = 15_000;
 /** 后端长时间没有新进度时的兜底，避免进度条永远卡在中间。 */
 const PROGRESS_STALL_TIMEOUT_MS = 30_000;
 
@@ -181,9 +187,19 @@ const BACKEND_ERROR_RULES: Array<[RegExp, string]> = [
 
 /** 把后端错误翻成中文；识别不了的英文原文加上中文前缀，中文原文原样透出。 */
 export function localizeBackendError(error: unknown, fallback = "操作失败"): string {
-  const raw = error instanceof Error ? error.message : typeof error === "string" ? error : String(error ?? "");
+  // Tauri 插件的 invoke 失败可能抛出带 message 字段的普通对象（不是 Error
+  // 实例）；不掏出来就会被 String() 压成 "[object Object]"，规则一条都
+  // 匹配不上，最后端给用户看一句「操作失败：[object Object]」。
+  const raw =
+    error instanceof Error
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : error && typeof error === "object" && typeof (error as { message?: unknown }).message === "string"
+          ? (error as { message: string }).message
+          : String(error ?? "");
   const text = raw.trim();
-  if (!text) return fallback;
+  if (!text || text === "[object Object]") return fallback;
 
   for (const [pattern, template] of BACKEND_ERROR_RULES) {
     const match = text.match(pattern);
@@ -204,6 +220,21 @@ function isTerminalProgress(progress: SyncProgress): boolean {
   return progress.phase === "完成" || (progress.total > 0 && progress.current >= progress.total);
 }
 
+/**
+ * 终态是不是失败通知。sync-progress 通道上唯一带「失败」的消息就是
+ * 后台索引重建的失败终态（其余失败都走 Promise reject / 错误卡片）；
+ * 万一将来误伤别的消息，代价也只是多留几秒，绝不会把失败提前收掉。
+ */
+function isFailureNotice(progress: SyncProgress): boolean {
+  return progress.message.includes("失败");
+}
+
+/** 终态按成败给不同的停留时长；非终态走停更兜底。 */
+function lingerFor(progress: SyncProgress): number {
+  if (!isTerminalProgress(progress)) return PROGRESS_STALL_TIMEOUT_MS;
+  return isFailureNotice(progress) ? PROGRESS_FAIL_LINGER_MS : PROGRESS_DONE_LINGER_MS;
+}
+
 export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOptions) {
   const [syncing, setSyncing] = useState(false);
   const [importing, setImporting] = useState(false);
@@ -218,6 +249,15 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
   /** 同步/导入是否在途；用 ref 是因为按钮的防抖判断等不到 state 落地。 */
   const busyRef = useRef(false);
   const clearTimerRef = useRef<number | null>(null);
+  /**
+   * 当前展示的进度是不是失败终态。收尾的 scheduleAutoClear 在 finally 里
+   * 拿不到最新 state（闭包里是旧值），失败通知不能按「完成」的 2.2s 收起，
+   * 只能用 ref 镜像一份。事件监听里跟着每条进度刷新；本地写进度（起步、
+   * 分块传输）都是非终态，写的同时清掉。
+   */
+  const progressIsFailureRef = useRef(false);
+  /** loadVersionInfo 的代际号：慢的旧请求不许覆盖新请求已写入的结果。 */
+  const loadSeqRef = useRef(0);
   const onSuccessRef = useRef(onSuccess);
 
   useEffect(() => {
@@ -236,7 +276,10 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
       cancelAutoClear();
       clearTimerRef.current = window.setTimeout(() => {
         clearTimerRef.current = null;
-        if (mountedRef.current && !busyRef.current) setProgress(null);
+        if (mountedRef.current && !busyRef.current) {
+          setProgress(null);
+          progressIsFailureRef.current = false;
+        }
       }, delay);
     },
     [cancelAutoClear]
@@ -255,6 +298,13 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
 
   const loadVersionInfo = useCallback(async (options: { silent?: boolean } = {}) => {
     const { silent = false } = options;
+    // 入口不止一个（挂载、app:data-updated 广播、同步/导入收尾、手动刷新），
+    // 并发调用的三段 await 会交错：慢的旧请求晚到，会把新请求刚写好的版本
+    // 信息盖回过期值（同步刚完成又显示回「未安装」）；旧请求先收尾还会把
+    // loadingInfo 提前关掉，「读取中...」闪成「未知」再跳回。带上代际号，
+    // 只允许最新一代落状态，旧代一律整段作废。
+    const seq = ++loadSeqRef.current;
+    const isStale = () => !mountedRef.current || seq !== loadSeqRef.current;
     setLoadingInfo(true);
     let failure: unknown = null;
     try {
@@ -262,21 +312,21 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
         failure ??= err;
         return "";
       });
-      if (!mountedRef.current) return;
+      if (isStale()) return;
       setCurrentVersion(current);
 
       const remote = await api.getRemoteVersion().catch((err) => {
         failure ??= err;
         return "";
       });
-      if (!mountedRef.current) return;
+      if (isStale()) return;
       setRemoteVersion(remote);
 
       const needUpdate = await api.checkUpdate().catch((err) => {
         failure ??= err;
         return false;
       });
-      if (!mountedRef.current) return;
+      if (isStale()) return;
       setHasUpdate(needUpdate);
 
       if (failure) {
@@ -288,7 +338,9 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
         }
       }
     } finally {
-      if (mountedRef.current) setLoadingInfo(false);
+      // 已被新一代接管时不许动 loadingInfo：新一代正在路上，这里关掉会让
+      // 界面在它写回结果前先闪一帧「未知」。收尾交给最新一代自己。
+      if (!isStale()) setLoadingInfo(false);
     }
   }, []);
 
@@ -301,12 +353,13 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
     const unlistenPromise = api.onSyncProgress((p) => {
       if (!mountedRef.current) return;
       setProgress(p);
+      progressIsFailureRef.current = isTerminalProgress(p) && isFailureNotice(p);
       // 后端的索引重建是异步线程，会在 sync_data 返回之后继续发进度；
       // 这里跟着刷新收起计时，既能显示后续阶段，也不会永远挂在 100%。
       if (busyRef.current) {
         cancelAutoClear();
       } else {
-        scheduleAutoClear(isTerminalProgress(p) ? PROGRESS_DONE_LINGER_MS : PROGRESS_STALL_TIMEOUT_MS);
+        scheduleAutoClear(lingerFor(p));
       }
     });
 
@@ -329,6 +382,7 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
     setSyncing(true);
     setError(null);
     setProgress({ phase: "准备", current: 0, total: 1, message: "准备开始..." });
+    progressIsFailureRef.current = false;
     try {
       await api.syncData();
       window.dispatchEvent(new Event("app:data-updated"));
@@ -352,6 +406,7 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
       if (mountedRef.current) {
         // 失败时收掉进度条，只留错误卡片，免得半截进度和报错互相打架。
         setProgress(null);
+        progressIsFailureRef.current = false;
         setError(localizeBackendError(err, "同步失败"));
       }
     } finally {
@@ -359,7 +414,11 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
       busyRef.current = false;
       if (mountedRef.current) {
         setSyncing(false);
-        scheduleAutoClear(PROGRESS_DONE_LINGER_MS);
+        // 忙期间到达的失败终态（后台索引重建快速失败）不能按「完成」的
+        // 2.2s 收起；state 在闭包里是旧值，成败看 ref 镜像。
+        scheduleAutoClear(
+          progressIsFailureRef.current ? PROGRESS_FAIL_LINGER_MS : PROGRESS_DONE_LINGER_MS
+        );
       }
     }
   }, [cancelAutoClear, loadVersionInfo, scheduleAutoClear]);
@@ -390,6 +449,7 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
       setImporting(true);
       setError(null);
       setProgress({ phase: "导入", current: 0, total: 100, message: label });
+      progressIsFailureRef.current = false;
       try {
         await run();
         window.dispatchEvent(new Event("app:data-updated"));
@@ -409,6 +469,7 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
         devWarn("[useDataSyncManager] 导入失败:", err);
         if (mountedRef.current) {
           setProgress(null);
+          progressIsFailureRef.current = false;
           setError(localizeBackendError(err, "导入失败"));
         }
       } finally {
@@ -416,7 +477,10 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
         busyRef.current = false;
         if (mountedRef.current) {
           setImporting(false);
-          scheduleAutoClear(PROGRESS_DONE_LINGER_MS);
+          // 同 handleSync：失败终态按 ref 镜像给更长的停留。
+          scheduleAutoClear(
+            progressIsFailureRef.current ? PROGRESS_FAIL_LINGER_MS : PROGRESS_DONE_LINGER_MS
+          );
         }
       }
     },
@@ -458,6 +522,10 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
                 total: 100,
                 message: `正在传输 ZIP 数据…（${Math.round(ratio * 100)}%）`,
               });
+              // 传输进度是非终态：上一次同步遗留的后台索引失败通知若恰好
+              // 在传输中途到达又被这里盖掉，失败镜像也要跟着清，免得收尾
+              // 给一条成功提示配上失败的停留时长。
+              progressIsFailureRef.current = false;
             }
           } while (offset < total);
         } catch (err) {
@@ -497,6 +565,7 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
   const resetProgress = useCallback(() => {
     cancelAutoClear();
     setProgress(null);
+    progressIsFailureRef.current = false;
   }, [cancelAutoClear]);
 
   const status = useMemo(() => {

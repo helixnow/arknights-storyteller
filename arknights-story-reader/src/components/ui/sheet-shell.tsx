@@ -120,10 +120,12 @@ function focusableWithin(panel: HTMLElement): HTMLElement[] {
 /*
  * 背景滚动锁。计数是模块级的：同时开两个 sheet 时后关的那个才真正解锁。
  *
- * `useSidePanel` 里还有一份同样的锁（它比 sheet 早一步存在，不能直接拆），
- * 两边的清理在同一次提交里同步执行且先后顺序没有保证 —— 谁最后落笔谁说了
- * 算，先解锁再被对方按原值写回 `hidden` 就永久锁死了。所以这里把解锁推到
- * 微任务：提交跑完才轮到我们，最后写进 body 的一定是开锁前记下的原值。
+ * 解锁刻意推迟到微任务：React 在同一次提交里先跑完所有清理再跑所有挂载
+ * 效果（关 A 开 B 的交接、严格模式的卸载重挂都是这个形态），若清理阶段
+ * 就把 body 样式写回原值，交接期间会出现一帧「锁被放开又立刻重上」的
+ * 中间态。等提交结束再看计数：还有人持锁就什么也不写，最后落到 body 的
+ * 一定是第一次上锁前记下的原值。（历史上 `useSidePanel` 曾持有第二份
+ * 同样的锁、两边清理互相覆盖，那份锁已经拆掉了——见该 hook 的注释。）
  */
 let scrollLockCount = 0;
 let scrollLockRestore: { overflow: string; paddingRight: string } | null = null;
@@ -269,12 +271,20 @@ export function SheetShell({
 
   return (
     <div className="fixed inset-0 z-50 flex">
+      {/*
+       * 退场动画的 300ms 里 sheet 仍然挂载（useSidePanel 两阶段卸载），但
+       * 它对用户来说已经关掉了：透明的 scrim 若继续参与命中测试，整屏点击
+       * 都会被一块看不见的玻璃吃掉（还会把 onClose 重复触发一遍），滑出中
+       * 的面板按钮也仍可点到。closed 态一律 pointer-events-none，输入立刻
+       * 落回下层内容——与返回栈的语义一致（关闭中的 sheet 已不占返回栈）。
+       */}
       <div
         data-state={state}
         aria-hidden="true"
         className={cn(
           "absolute inset-0 glass-scrim transition-opacity duration-300",
-          "data-[state=closed]:opacity-0 data-[state=open]:opacity-100"
+          "data-[state=closed]:opacity-0 data-[state=open]:opacity-100",
+          "data-[state=closed]:pointer-events-none"
         )}
         onClick={onClose}
       />
@@ -300,7 +310,10 @@ export function SheetShell({
           aria-label={ariaLabel}
           tabIndex={-1}
           className={cn(
-            "pointer-events-auto h-full flex flex-col overflow-hidden",
+            // 同 scrim：退场中的面板不再接收输入，避免用户点中一个正在
+            // 滑出、状态即将被卸载的控件。
+            state === "open" ? "pointer-events-auto" : "pointer-events-none",
+            "h-full flex flex-col overflow-hidden",
             "focus:outline-none",
             "glass glass-thick"
           )}
