@@ -48,10 +48,13 @@ test("digestToHex64：固定 16 位小写十六进制、零填充", () => {
 });
 
 test("segmentDigest：黄金值 pin 住，跨数据版本不能漂移", () => {
-  // 这两个值由当前实现计算并固化。若实现变动导致输出变化，
+  // 这些值由当前实现计算并固化。若实现变动导致输出变化，
   // 用户已存的划线/跳转目标将全部失配——必须显式评审。
   assert.equal(segmentDigest("博士，你好！"), "7804feb0f797fd2e");
   assert.equal(segmentDigest(""), "cbf29ce484222325");
+  // 全角字母/数字样本端到端 pin 住 NFKC 折叠环节：纯中文样本盖不到
+  // 这条路径，normalize 规则漂移同样会让已存划线失配。
+  assert.equal(segmentDigest("Ｄｏｃｔｏｒ４２，行动开始！"), "540d53f5eade81be");
 });
 
 test("segmentDigest：标点/空白/全半角变体归一到同一摘要", () => {

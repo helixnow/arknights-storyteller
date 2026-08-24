@@ -1,13 +1,18 @@
 // 剧情条目
+//
+// 注意：Rust 侧（models.rs `StoryEntry`）的 Option 字段都没有
+// skip_serializing_if，缺失值在 IPC 里恒为 `null` 而不是字段缺席，
+// 所以这里的可选字段必须带 `| null`——只写 `?: string` 会让
+// `=== undefined` 之类的精确比较悄悄失真。
 export interface StoryEntry {
   storyId: string;
   storyName: string;
-  storyCode?: string;
+  storyCode?: string | null;
   storyGroup: string;
   storySort: number;
-  avgTag?: string; // 行动前/行动后
+  avgTag?: string | null; // 行动前/行动后
   storyTxt: string; // 剧情文本文件路径
-  storyInfo?: string; // 剧情简介文件路径
+  storyInfo?: string | null; // 剧情简介文件路径
   /** 封面图 token；条目自身缺失时后端会用所在活动/章节组的 storyPic 回填。 */
   storyPic?: string | null;
   storyReviewType: string;
@@ -21,7 +26,7 @@ export interface StoryEntry {
     stageId: string;
     minState: string;
     maxState: string;
-  }>; 
+  }> | null;
   costItemType?: string | null;
   costItemId?: string | null;
   costItemCount?: number | null;
@@ -33,7 +38,8 @@ export interface Chapter {
   chapterName: string;
   chapterName2: string;
   chapterIndex: number;
-  preposedChapterId?: string;
+  /** Rust 侧为 Option 且总是序列化：缺失时收到 null 而非字段缺席。 */
+  preposedChapterId?: string | null;
   startZoneId: string;
   endZoneId: string;
   chapterEndStageId: string;

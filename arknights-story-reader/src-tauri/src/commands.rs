@@ -880,6 +880,27 @@ mod tests {
         }
     }
 
+    /// 拒绝逻辑的另一半边界：段里含点但整段不是 `..` 的路径必须放行。
+    /// 校验器按整段与 `..` 精确比对；若有人日后把它改成「包含 ..」或
+    /// 「以 . 开头」的宽松匹配，看似更严，实际会把这类 join 之后仍在
+    /// 数据目录内的合法相对路径误拒——阅读直接坏掉且没有任何安全收益。
+    #[test]
+    fn story_relative_path_keeps_dotty_but_safe_segments() {
+        for path in [
+            "..a/story",
+            "a../story",
+            "a..b/story",
+            "a/.../b",
+            "obt/main/level_main_10..5",
+            ".hidden/story",
+            "info/act.rep.1/level_x",
+        ] {
+            ensure_story_relative_path(path).unwrap_or_else(|err| {
+                panic!("含点但安全的路径 {path} 不该被误拒: {err}");
+            });
+        }
+    }
+
     /// 测试专用的参照编码器：手写解码器的正确性用「任意字节 → 编码 →
     /// 解码 → 原样还原」来钉住，不依赖记忆中的向量表。
     fn encode_base64(data: &[u8]) -> String {
@@ -986,6 +1007,46 @@ mod tests {
         std::fs::remove_file(&staging).unwrap();
         let err = append_import_chunk(&staging, 4, b"tail").expect_err("暂存缺失必须报错");
         assert!(err.contains("不连续"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 空 chunk 的边界：文件大小恰为块大小整数倍时，前端可能发出零字节
+    /// 的块（读到文件尾的空 slice）。空块必须走完整协议——base64 解出
+    /// 空字节而不是报错、offset==长度 时是合法 no-op、offset 对不上时
+    /// 照样被偏移校验拒掉（绝不能因为「反正没写东西」而放行乱序块）。
+    #[test]
+    fn empty_chunk_respects_offsets_and_preserves_bytes() {
+        assert_eq!(
+            decode_base64("").as_deref(),
+            Ok(&[][..]),
+            "空 base64 必须解出空字节而不是被当坏块"
+        );
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("askr_import_empty_{nanos}"));
+        let staging = dir.join("staging.part");
+        let dest = dir.join("promoted.zip");
+
+        // offset 0 的空块是合法开局：落成 0 字节暂存文件。
+        append_import_chunk(&staging, 0, b"").expect("空首块必须成功");
+        assert_eq!(std::fs::read(&staging).unwrap(), b"");
+
+        // 空块不得绕过偏移校验：长度 0 的暂存收到 offset 3 必须报「中断」。
+        let err = append_import_chunk(&staging, 3, b"").expect_err("乱序空块必须被拒绝");
+        assert!(err.contains("不连续"), "{err}");
+
+        // 真实场景：有效字节之后跟一个 offset==长度 的零字节收尾块，
+        // 内容必须原样保留，转正带走的也必须是这些字节。
+        append_import_chunk(&staging, 0, b"zip bytes").expect("重开一轮必须成功");
+        append_import_chunk(&staging, 9, b"").expect("offset==长度的空块必须是合法 no-op");
+        assert_eq!(std::fs::read(&staging).unwrap(), b"zip bytes");
+
+        promote_import_staging(&staging, &dest).expect("转正必须成功");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"zip bytes");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1313,6 +1374,43 @@ mod tests {
         // 暂存本就不存在时同样静默成功（幂等），锁照样回到空闲。
         abort_import_transfer(&staging).expect("暂存缺失且锁空闲时中止必须成功");
         drop(acquire_install_lock("sync_data").expect("锁必须仍然空闲"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// cancel 导入之后的迟到块：用户显式中止（cancel=true 分支删掉
+    /// `.part` 并放锁）后，滞留在阻塞线程池里的迟到块必须秒拿统一的
+    /// 「传输中断」——既不能复活幽灵 `.part` 抵消中止的清理，也不能
+    /// 干扰已经空闲的安装互斥。与 late_chunk_after_promotion_gets_
+    /// stream_broken 互补：那边钉「收尾转正后」，这边钉「主动取消后」。
+    #[test]
+    fn late_chunk_after_abort_gets_stream_broken() {
+        let _serial = serialize_global_lock_tests();
+        // 防御：清掉可能的残留寄存，保证从空闲态开始。
+        drop(take_transfer_hold());
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("askr_import_abort_late_{nanos}"));
+        let staging = dir.join("staging.part");
+
+        // 传输在途（持有已寄存、半截暂存在盘上）时用户点了取消。
+        append_import_chunk(&staging, 0, b"half transfer").expect("首块必须成功");
+        let guard = acquire_install_lock("import_from_zip_bytes").expect("空闲时必须拿到锁");
+        stow_transfer_hold(guard);
+        abort_import_transfer(&staging).expect("中止必须成功");
+        assert!(!staging.exists(), "中止后暂存文件必须已被清理");
+
+        // 最像真的迟到块：offset 恰好等于中止前的暂存长度。
+        let err =
+            append_import_chunk(&staging, 13, b" late bytes").expect_err("中止后的迟到块必须失败");
+        assert!(err.contains("不连续"), "迟到块应得到「中断」话术: {err}");
+        assert!(!staging.exists(), "迟到块不得复活幽灵 .part");
+
+        // 迟到块的快速失败不得把锁搞脏：sync 必须能立刻拿到。
+        drop(acquire_install_lock("sync_data").expect("中止后安装互斥必须保持空闲"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
