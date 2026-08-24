@@ -21,6 +21,10 @@ import { CharacterAvatar } from "@/components/CharacterAvatar";
 import { useCharacterResolver } from "@/hooks/useCharacterResolver";
 import { postProcessSegments } from "@/components/StoryReader";
 import { BACK_PRIORITY, useBackHandler } from "@/hooks/useBackHandler";
+import {
+  isCharacterStatsEpochCurrent,
+  planCharacterStatsDataUpdate,
+} from "@/lib/characterStatsRefresh";
 
 interface CharactersPanelProps {
   active?: boolean;
@@ -422,7 +426,8 @@ export function CharactersPanel({
     }
     loadingRef.current = true;
     const runId = statsRunRef.current;
-    const isCurrent = () => aliveRef.current && runId === statsRunRef.current;
+    const isCurrent = () =>
+      aliveRef.current && isCharacterStatsEpochCurrent(runId, statsRunRef.current);
     setLoading(true);
     setError(null);
     try {
@@ -743,9 +748,20 @@ export function CharactersPanel({
       // 面板不可见时只打个标记，等用户切回来再重算——后台重扫几千篇
       // 剧情会把正在阅读的页面拖卡。
       if (!activeRef.current) {
+        const plan = planCharacterStatsDataUpdate(
+          statsRunRef.current,
+          loadingRef.current,
+          false
+        );
+        // 不可见不代表没有在途任务：先把 force 记到账上，再切 epoch。
+        // 旧扫描即使已经读到部分新包内容，也无法通过 isCurrent，因而既不
+        // 发布 mixed aggregate，也不可能用扫描开始时的旧 commit 写缓存。
+        if (plan.queueForcedRefresh) pendingForceRef.current = true;
+        statsRunRef.current = plan.nextEpoch;
+        loadedOnceRef.current = false;
         // KeepAlive 面板虽然不可见，下一帧切回来前也必须先撤下旧包快照，
         // 不能等可见后的 effect 才清（那会闪一帧旧人物/旧金句）。
-        invalidateCharacterResults();
+        clearCharacterResults();
         staleRef.current = true;
         return;
       }
@@ -757,7 +773,7 @@ export function CharactersPanel({
       window.removeEventListener("app:refresh-character-stats", handler);
       window.removeEventListener("app:data-updated", handler);
     };
-  }, [invalidateCharacterResults, loadAll]);
+  }, [clearCharacterResults, loadAll]);
 
   const allCharacters = useMemo(() => {
     return Array.from(aggregates.values())
