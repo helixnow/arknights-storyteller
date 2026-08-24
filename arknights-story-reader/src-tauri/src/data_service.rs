@@ -34,8 +34,9 @@ const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// 一分钟内报错，而不是永远挂着。
 const HTTP_OP_TIMEOUT: Duration = Duration::from_secs(60);
 /// Bump when any of: FTS schema, tokenizer rules, `searchable_text` format,
-/// or the set of stories that gets indexed. A bump drops both FTS tables at
-/// open time, so the next `rebuild_story_index_*` starts from scratch.
+/// or the set of stories that gets indexed. A bump makes readers report the
+/// index as unavailable; the next `rebuild_story_index_*` drops both FTS
+/// tables and starts from scratch.
 ///
 /// v4 = added the segment-level FTS table `story_segment_index`, so hits can
 ///      carry a `(story_id, segment_index)` pair instead of story-only.
