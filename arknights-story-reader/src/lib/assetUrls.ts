@@ -46,6 +46,19 @@ function npcOverride(token: string): string[] | null {
   return Array.isArray(urls) && urls.length > 0 ? urls : null;
 }
 
+/**
+ * 这个名字（修剪空白后）是否命中 NPC 头像覆盖表。
+ *
+ * 给 `<CharacterAvatar>` 用：覆盖表里的名字不在干员表中（character_table
+ * 的测试钉死了这一点），所以随台词一起传来的 `char_` id 只可能是解析器
+ * 「只写显示名就继承上一条 [Character] 立绘」的启发式带来的别人的 id。
+ * 命中覆盖表时显示名才是权威身份，charId 必须让位。
+ */
+export function hasNpcAvatarOverride(name: string | null | undefined): boolean {
+  if (!name) return false;
+  return npcOverride(name.trim()) !== null;
+}
+
 function resolveCharId(token: string, index: CharacterIndex | null): string | null {
   if (token.startsWith("char_")) {
     return token.split("#")[0] ?? token;

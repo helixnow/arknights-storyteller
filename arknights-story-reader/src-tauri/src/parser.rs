@@ -1327,6 +1327,21 @@ mod tests {
         }
     }
 
+    /// values 比 options 多（level_main_15-18_end 等 10 个文件的
+    /// `options="时间应该快到了。", values="1;2"`）：多余的 value 直接忽略，
+    /// 仅剩的选项仍按自己的下标拿 value，不能错位也不能产出多余项。
+    #[test]
+    fn test_decision_extra_values_are_ignored() {
+        let segment = only(r#"[Decision(options="时间应该快到了。", values="1;2")]"#);
+        match segment {
+            StorySegment::Decision { options, values } => {
+                assert_eq!(options, vec!["时间应该快到了。".to_string()]);
+                assert_eq!(values, vec!["1".to_string()]);
+            }
+            other => panic!("expected decision segment, got {:?}", other),
+        }
+    }
+
     /// 场景切换后 `[Character]` 状态要跟着走；清空后不能把上一位的头像
     /// 继续挂到无主对白上。
     #[test]
@@ -1518,6 +1533,25 @@ mod tests {
                 parse_story_text(junk).segments
             );
         }
+    }
+
+    /// `[PopupDialog(...)] 呵。` 这类 ≤2 字符的短正文是有意的台词（真实数据
+    /// main_08-05 的「呵。」、training_18_a 的「呃。」、training_act18d3_01_e
+    /// 的「是！」，全语料共 4 处、无一是渣）：popupdialog/tutorial 分支只做
+    /// 非空检查，绝不能套用状态指令那套「≤2 字符当残渣丢弃」的门槛。
+    #[test]
+    fn test_popupdialog_short_dialogue_is_kept() {
+        let segment = only(r#"[PopupDialog(dialogHead="$avatar_frstar")] 呵。"#);
+        assert_eq!(segment.kind(), "system");
+        assert_eq!(segment.speaker(), Some("Frstar"));
+        assert_eq!(segment.text(), Some("呵。"));
+
+        let segment = only(r#"[PopupDialog(dialogHead="system_100_mys")] 是！"#);
+        assert_eq!(segment.kind(), "system");
+        assert_eq!(segment.text(), Some("是！"));
+
+        // 空 `[]`（story_cement_1_1 的手滑行）走兜底分支安静消失，不产段。
+        assert!(parse_story_text("[]").segments.is_empty());
     }
 
     /// 教程/训练脚本把一条指令用行尾 `\` 折成多行（真实数据 training_8_b.txt、

@@ -390,7 +390,13 @@ export function CharactersPanel({
             groupInfo.set(s.storyId, {
               category: "activity",
               groupName: name,
-              groupOrder,
+              // 支线与活动同归 "activity" 分类，但两边的 groupOrder 都是
+              // 各自列表的下标，裸用必然撞号（活动第 3 期和支线第 3 组都
+              // 是 3）。撞号的桶排序打平后，先后就由 perStory 里 storySort
+              // 的交错决定——每个角色详情页看到的活动/支线相对顺序都不一
+              // 样。按剧情页的分类顺序（活动在前、支线在后）给支线整体加
+              // 偏移，两边序号空间不再重叠。
+              groupOrder: activityGrouped.length + groupOrder,
               storyOrder: s.storySort,
             });
           }

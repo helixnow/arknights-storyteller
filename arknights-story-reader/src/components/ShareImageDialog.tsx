@@ -311,6 +311,18 @@ if (typeof window !== "undefined") {
   window.addEventListener("online", purgeNegativeAvatarCaches);
 }
 
+/**
+ * 单张头像的加载时限。头像源偶尔会「连上了但不回包」（移动网切换、镜像
+ * 半死），这种挂起既不触发 onload 也不触发 onerror，`Promise.all` 会把
+ * 整次渲染钉死在「正在生成图片」上——加载态下重试按钮根本不渲染，用户
+ * 只能关掉抽屉重开。熔断器（isAssetUrlDead）只认「确定失败」，拦不住
+ * 挂起的连接，必须在这里自己兜底。
+ */
+const AVATAR_LOAD_TIMEOUT_MS = 8_000;
+
+/** 用类型区分「超时」与「确定失败」：前者不能写进任何否定性缓存。 */
+class ImageLoadTimeoutError extends Error {}
+
 function loadImage(url: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -320,8 +332,22 @@ function loadImage(url: string): Promise<HTMLImageElement> {
     img.crossOrigin = "anonymous";
     img.referrerPolicy = "no-referrer";
     img.decoding = "async";
-    img.onload = () => resolve(img);
-    img.onerror = () => reject(new Error(`Failed to load image: ${url}`));
+    const timer = window.setTimeout(() => {
+      // 先摘回调再断开 src：置空 src 中止底层请求时可能同步触发
+      // onerror，不能让它把「超时」改判成「确定失败」。
+      img.onload = null;
+      img.onerror = null;
+      img.src = "";
+      reject(new ImageLoadTimeoutError(`Image load timed out: ${url}`));
+    }, AVATAR_LOAD_TIMEOUT_MS);
+    img.onload = () => {
+      window.clearTimeout(timer);
+      resolve(img);
+    };
+    img.onerror = () => {
+      window.clearTimeout(timer);
+      reject(new Error(`Failed to load image: ${url}`));
+    };
     img.src = url;
   });
 }
@@ -368,8 +394,13 @@ async function loadAvatarImage(
     return null;
   }
 
+  let sawTimeout = false;
   for (const url of candidates) {
-    const img = await loadImage(url).catch(() => null);
+    let timedOut = false;
+    const img = await loadImage(url).catch((err: unknown) => {
+      timedOut = err instanceof ImageLoadTimeoutError;
+      return null;
+    });
     if (img) {
       markAssetUrlAlive(url);
       rememberAvatar(key, img);
@@ -378,9 +409,16 @@ async function loadAvatarImage(
     // 离线时的失败与真 404 无法区分，不能记进任何一本永久账；本次直接
     // 放弃，网络恢复后重试（与 AssetImage 展示路径的离线纪律一致）。
     if (isBrowserOffline()) return null;
+    // 超时同理：慢源 ≠ 死源。跳过这一条继续试下一张镜像，但不记失败账。
+    if (timedOut) {
+      sawTimeout = true;
+      continue;
+    }
     canvasFailedUrls.add(url);
   }
-  rememberAvatar(key, null);
+  // 有候选因超时被跳过时不能盖「无头像」章——那只说明此刻网络慢，缓存
+  // null 会让这个角色在整个会话里都缺头像，下次打开弹窗理应重试。
+  if (!sawTimeout) rememberAvatar(key, null);
   return null;
 }
 

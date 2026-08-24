@@ -14,6 +14,7 @@ import assert from "node:assert/strict";
 
 import {
   resolveAssetCandidatesLocal,
+  hasNpcAvatarOverride,
   isAssetUrlDead,
   markAssetUrlDead,
   markAssetUrlAlive,
@@ -277,6 +278,21 @@ test("NPC 覆盖表：token 两侧空白剥掉后仍命中", () => {
   assert.deepEqual(resolveAssetCandidatesLocal("portrait", " 希尔达 ", null), [
     "/avatars/npc/hierda.png",
   ]);
+});
+
+test("hasNpcAvatarOverride：覆盖名（含两侧空白）命中，干员名/原型链 key/空值不命中", () => {
+  // CharacterAvatar 用它决定「显示名是否压过随行 charId」：命中面必须
+  // 恰好等于覆盖表本身，多一分就会把干员头像错换成 NPC 图。
+  assert.equal(hasNpcAvatarOverride("普瑞赛斯"), true);
+  assert.equal(hasNpcAvatarOverride("  希尔达  "), true);
+  assert.equal(hasNpcAvatarOverride("阿米娅"), false);
+  assert.equal(hasNpcAvatarOverride("char_002_amiya"), false);
+  assert.equal(hasNpcAvatarOverride("constructor"), false);
+  assert.equal(hasNpcAvatarOverride("toString"), false);
+  assert.equal(hasNpcAvatarOverride(""), false);
+  assert.equal(hasNpcAvatarOverride("   "), false);
+  assert.equal(hasNpcAvatarOverride(null), false);
+  assert.equal(hasNpcAvatarOverride(undefined), false);
 });
 
 test("空白 token 与未知 kind 都返回空数组", () => {

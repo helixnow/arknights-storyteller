@@ -210,7 +210,11 @@ class ImageSharerPlugin(private val activity: Activity) : Plugin(activity) {
     // 注意上限按字节算：Linux 文件名最长 255 字节，中文每字 3 字节，Rust
     // 侧截到 80 字符（可达 244 字节）后再叠加分享缓存的时间戳前缀（14 字
     // 节）就会超限。76 个 UTF-16 单元 ≤228 字节，加 .png 与前缀 ≤246 字节。
+    // take 按 UTF-16 单元数刀：Rust 侧按码点截断，扩展平面字符占两个单元，
+    // 截口落在代理对中间会留下半个非法字符——补一刀去掉孤立的高位代理
+    // （孤立低位代理不可能出现：上游是 Rust 的合法 UTF-8 字符串）。
     val cleaned = trimmed.replace(Regex("[\\\\/:*?\"<>|\\u0000]+"), "_").take(76)
+      .let { if (it.isNotEmpty() && it.last().isHighSurrogate()) it.dropLast(1) else it }
     if (cleaned.all { it == '.' }) return null
     return if (cleaned.endsWith(".png", ignoreCase = true)) cleaned else "$cleaned.png"
   }

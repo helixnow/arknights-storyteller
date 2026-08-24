@@ -1,6 +1,7 @@
 import { memo, type CSSProperties } from "react";
 import { AssetImage } from "@/components/AssetImage";
 import { useCharacterResolver } from "@/hooks/useCharacterResolver";
+import { hasNpcAvatarOverride } from "@/lib/assetUrls";
 import { cn } from "@/lib/utils";
 
 interface CharacterAvatarProps {
@@ -39,7 +40,12 @@ function CharacterAvatarImpl({
     null;
   const resolvedName = name ?? (resolvedId ? resolver.resolveName(resolvedId) : null);
 
-  const token = resolvedId ?? name ?? null;
+  // NPC 覆盖名（普瑞赛斯等）不在干员表里，随台词传来的 charId 只可能是
+  // 解析器「[Dialog(name=...)] 只写显示名就继承上一条 [Character] 立绘」
+  // 的启发式误配的别人的 id。charId 是 char_ 前缀时总能解析成功，若不在
+  // 这里让覆盖名优先，NPC 的台词就会顶着上一位干员的头像。
+  const npcName = name && hasNpcAvatarOverride(name) ? name.trim() : null;
+  const token = npcName ?? resolvedId ?? name ?? null;
   // 名字里可能出现增补平面字符（生僻汉字等），`String#slice` 按 UTF-16
   // 单元切会把代理对劈成两半、渲染成 "�"。先清洗掉标点再按码点取前两个。
   const initials =

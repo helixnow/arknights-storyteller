@@ -62,6 +62,21 @@ class ApkUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
    */
   private val downloadInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
 
+  /** 最近一次完整落盘的 APK 及其来源 URL（见 [reusableApk]）。 */
+  private data class CompletedDownload(val url: String, val file: File)
+
+  /**
+   * needs-permission 闭环的关键补丁：下载完成但缺"安装未知应用"权限时，
+   * 前端只能提示用户去系统设置授权、回来后**重新发起安装**——而重新发起
+   * 走的还是这条命令。之前每次都从零重下整个 APK，几十 MB 的包在弱网 /
+   * 计费网络上等于把授权流程变成走不通的死循环（在系统安装器里点了取消
+   * 再重试同理）。这里记住最近一次**完整**落盘的文件：同一 URL 重来时
+   * 直接复用，授权后的重试瞬间弹出安装界面。只在下载成功后写入记录，
+   * 半截文件（失败路径会 delete）永远不会被复用。
+   */
+  @Volatile
+  private var completedDownload: CompletedDownload? = null
+
   @Command
   fun downloadAndInstall(invoke: Invoke) {
     val args = invoke.parseArgs(DownloadArgs::class.java)
@@ -81,7 +96,7 @@ class ApkUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
 
     scope.launch {
       try {
-        val apkFile = downloadApk(httpUrl, args.fileName)
+        val apkFile = reusableApk(httpUrl) ?: downloadApk(httpUrl, args.fileName)
 
         if (!canRequestPackageInstalls()) {
           val result = JSObject()
@@ -148,6 +163,22 @@ class ApkUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
   }
 
   /**
+   * 同一 URL 且缓存文件仍完整存在时返回可直接安装的 APK，否则返回 null
+   * 交给 [downloadApk] 重下。只认 24 小时内的文件——与 [purgeStaleApks]
+   * 的保鲜窗口一致，也避免长驻进程里复用一份服务端早已替换的旧包。
+   */
+  private fun reusableApk(url: HttpUrl): File? {
+    val record = completedDownload ?: return null
+    if (record.url != url.toString()) return null
+    val freshCutoff = System.currentTimeMillis() - TimeUnit.HOURS.toMillis(24)
+    if (!record.file.isFile || record.file.length() == 0L || record.file.lastModified() < freshCutoff) {
+      completedDownload = null
+      return null
+    }
+    return record.file
+  }
+
+  /**
    * Streams the APK body to disk emitting periodic `apk-progress` events so
    * the web UI can render a download bar. Replaces the previous one-shot
    * `copyTo` which left the user staring at a spinner on large (>30MB) APKs.
@@ -156,6 +187,8 @@ class ApkUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
     withContext(Dispatchers.IO) {
       val name = sanitizeApkFileName(fileName)
         ?: "update-${System.currentTimeMillis()}.apk"
+      // 即将截断重写缓存文件，旧的"已完成"记录从此刻起不可信。
+      completedDownload = null
       purgeStaleApks(keep = name)
       val outputFile = File(activity.cacheDir, name)
       val call = httpClient.newCall(Request.Builder().url(url).build())
@@ -189,6 +222,7 @@ class ApkUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
             }
           }
           emitProgress(downloaded, total, "下载完成")
+          completedDownload = CompletedDownload(url.toString(), outputFile)
           outputFile
         }
       } catch (error: Exception) {
@@ -232,7 +266,12 @@ class ApkUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
     // Linux 文件名上限是 255 字节而非字符：Rust 侧对长度没有兜底，中文
     // 每字占 3 字节，按 80 个 UTF-16 单元截断（≤240 字节，加 .apk 后缀
     // 仍 ≤244 字节）才能保证落盘不因 ENAMETOOLONG 失败。
+    // take 按 UTF-16 单元数刀：扩展平面字符（生僻字/emoji）占两个单元，
+    // 截口落在代理对中间会留下半个非法字符（编码成 UTF-8 时变 U+FFFD），
+    // 把孤立的高位代理补掉一刀。低位代理不用管——上游是 Rust 的合法
+    // UTF-8 字符串，孤立低位代理只能由我们自己的截断制造。
     val cleaned = trimmed.replace(Regex("[\\\\/:*?\"<>|\\u0000]+"), "_").take(80)
+      .let { if (it.isNotEmpty() && it.last().isHighSurrogate()) it.dropLast(1) else it }
     if (cleaned.all { it == '.' }) return null
     return if (cleaned.endsWith(".apk", ignoreCase = true)) cleaned else "$cleaned.apk"
   }
