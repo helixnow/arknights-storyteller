@@ -1,7 +1,9 @@
 import { useEffect, useRef } from "react";
 import {
+  createBackDispatcher,
   INITIAL_HISTORY_GUARD_STATE,
   reduceHistoryGuard,
+  type BackDispatchEntry,
   type HistoryGuardEvent,
   type HistoryGuardState,
 } from "@/lib/appShellLogic";
@@ -40,15 +42,14 @@ export const BACK_PRIORITY = {
   tab: 10,
 } as const;
 
-interface BackEntry {
-  handler: BackHandler;
-  priority: number;
-  seq: number;
-}
+interface BackEntry extends BackDispatchEntry {}
 
 const entries: BackEntry[] = [];
 let seqCounter = 0;
-let dispatching = false;
+
+function hasAvailableHandlers(): boolean {
+  return entries.some((entry) => !entry.consumed);
+}
 
 /**
  * 当前注册的 overlay 级处理器数量（只读探针）。
@@ -62,7 +63,7 @@ let dispatching = false;
 export function getOverlayHandlerCount(): number {
   let count = 0;
   for (const entry of entries) {
-    if (entry.priority >= BACK_PRIORITY.overlay) count += 1;
+    if (!entry.consumed && entry.priority >= BACK_PRIORITY.overlay) count += 1;
   }
   return count;
 }
@@ -107,6 +108,13 @@ function dismissPresentedModal(): boolean {
   return false;
 }
 
+const dispatchRegisteredBack = createBackDispatcher<BackEntry>({
+  getEntries: () => entries,
+  overlayPriority: BACK_PRIORITY.overlay,
+  dismissFallback: dismissPresentedModal,
+  onError: (error) => console.warn("[useBackHandler] handler threw", error),
+});
+
 /**
  * Ask the registered handlers to consume a back intent. Returns `true` when
  * one of them did.
@@ -116,40 +124,7 @@ function dismissPresentedModal(): boolean {
  * itself to one particular dismiss callback.
  */
 export function requestBack({ minPriority = 0 }: RequestBackOptions = {}): boolean {
-  // 处理器内部再次触发返回（比如关闭抽屉时又派发了一次 app-back）不应该
-  // 连锁关掉整条导航栈。
-  if (dispatching) return false;
-  dispatching = true;
-  try {
-    const ordered = entries
-      .filter((entry) => entry.priority >= minPriority)
-      .sort((a, b) => b.priority - a.priority || b.seq - a.seq);
-    const ask = (entry: BackEntry): boolean => {
-      // 上一个处理器可能已经把它卸载了（快照是询问开始时拍的）。
-      if (!entries.includes(entry)) return false;
-      try {
-        return entry.handler();
-      } catch (err) {
-        console.warn("[useBackHandler] handler threw", err);
-        return false;
-      }
-    };
-    // overlay 及以上先问：注册过的浮层永远比 DOM 兜底更清楚怎么关掉自己。
-    for (const entry of ordered) {
-      if (entry.priority < BACK_PRIORITY.overlay) break;
-      if (ask(entry)) return true;
-    }
-    // 未注册的模态框排在 overlay 之后、view/tab 之前：它盖在视图之上，
-    // 返回不该越过它去关阅读器或切 tab。
-    if (minPriority <= BACK_PRIORITY.overlay && dismissPresentedModal()) return true;
-    for (const entry of ordered) {
-      if (entry.priority >= BACK_PRIORITY.overlay) continue;
-      if (ask(entry)) return true;
-    }
-    return false;
-  } finally {
-    dispatching = false;
-  }
+  return dispatchRegisteredBack(minPriority);
 }
 
 /*
@@ -194,7 +169,7 @@ function transitionHistoryGuard(event: HistoryGuardEvent) {
     transitionHistoryGuard({
       type: "back-dispatched",
       consumed,
-      hasHandlers: entries.length > 0,
+      hasHandlers: hasAvailableHandlers(),
     });
   }
 }
@@ -219,7 +194,7 @@ function installGlobalListener() {
   window.addEventListener("popstate", () => {
     transitionHistoryGuard({
       type: "popstate",
-      hasHandlers: entries.length > 0,
+      hasHandlers: hasAvailableHandlers(),
     });
   });
 }
@@ -227,13 +202,16 @@ function installGlobalListener() {
 function registerBackHandler(entry: BackEntry): () => void {
   installGlobalListener();
   entries.push(entry);
-  transitionHistoryGuard({ type: "handlers-changed", hasHandlers: true });
+  transitionHistoryGuard({
+    type: "handlers-changed",
+    hasHandlers: hasAvailableHandlers(),
+  });
   return () => {
     const idx = entries.indexOf(entry);
     if (idx >= 0) entries.splice(idx, 1);
     transitionHistoryGuard({
       type: "handlers-changed",
-      hasHandlers: entries.length > 0,
+      hasHandlers: hasAvailableHandlers(),
     });
   };
 }
@@ -262,6 +240,7 @@ export function useBackHandler(
       handler: () => ref.current(),
       priority,
       seq: (seqCounter += 1),
+      consumed: false,
     });
   }, [active, priority]);
 }

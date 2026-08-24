@@ -20,7 +20,8 @@ args.push(
   path.join("src", "lib", "assetUrls.test.mjs"),
   path.join("src", "lib", "segmentDigest.test.mjs"),
   path.join("src", "lib", "searchTerms.test.mjs"),
-  path.join("src", "lib", "appShellLogic.test.mjs")
+  path.join("src", "lib", "appShellLogic.test.mjs"),
+  path.join("src", "hooks", "useBackHandler.test.mjs")
 );
 
 const result = spawnSync(process.execPath, args, {

@@ -215,6 +215,90 @@ export function calculateBottomNavInset(offsetHeight: number, computedBottom: nu
   return Math.ceil(Math.max(0, height + bottom));
 }
 
+/** Hidden readers retain warm state for the same five-minute window as prefetch data. */
+export const READER_RETENTION_MS = 5 * 60 * 1000;
+
+export interface BackDispatchEntry {
+  handler: () => boolean;
+  priority: number;
+  seq: number;
+  /**
+   * A successful handler is retired synchronously, before React's passive
+   * effect cleanup runs. This keeps a second hardware-back event from asking
+   * an already-closed overlay to consume the next navigation step.
+   */
+  consumed: boolean;
+}
+
+interface BackDispatcherOptions<T extends BackDispatchEntry> {
+  getEntries: () => readonly T[];
+  overlayPriority: number;
+  dismissFallback?: () => boolean;
+  onError?: (error: unknown) => void;
+}
+
+/**
+ * Build the priority/LIFO back dispatcher used by useBackHandler.
+ *
+ * The closure owns the reentrancy guard, while each entry owns its consumed
+ * bit. Entries remain retired until their hook unregisters and a future open
+ * state creates a fresh registration.
+ */
+export function createBackDispatcher<T extends BackDispatchEntry>({
+  getEntries,
+  overlayPriority,
+  dismissFallback = () => false,
+  onError = () => undefined,
+}: BackDispatcherOptions<T>): (minPriority?: number) => boolean {
+  let dispatching = false;
+
+  return (minPriority = 0): boolean => {
+    if (dispatching) return false;
+    dispatching = true;
+    try {
+      const ordered = getEntries()
+        .filter((entry) => !entry.consumed && entry.priority >= minPriority)
+        .slice()
+        .sort((a, b) => b.priority - a.priority || b.seq - a.seq);
+
+      const ask = (entry: T): boolean => {
+        // An earlier handler may synchronously unregister another entry after
+        // the snapshot was taken.
+        if (entry.consumed || !getEntries().includes(entry)) return false;
+        try {
+          if (!entry.handler()) return false;
+          entry.consumed = true;
+          return true;
+        } catch (error) {
+          onError(error);
+          return false;
+        }
+      };
+
+      for (const entry of ordered) {
+        if (entry.priority < overlayPriority) break;
+        if (ask(entry)) return true;
+      }
+
+      if (minPriority <= overlayPriority) {
+        try {
+          if (dismissFallback()) return true;
+        } catch (error) {
+          onError(error);
+        }
+      }
+
+      for (const entry of ordered) {
+        if (entry.priority >= overlayPriority) continue;
+        if (ask(entry)) return true;
+      }
+      return false;
+    } finally {
+      dispatching = false;
+    }
+  };
+}
+
 export type HistoryGuardPhase = "idle" | "armed" | "disarming" | "continuing";
 
 export interface HistoryGuardState {
