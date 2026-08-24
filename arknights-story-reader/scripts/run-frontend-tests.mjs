@@ -19,7 +19,11 @@ args.push(
   "--test",
   path.join("src", "lib", "assetUrls.test.mjs"),
   path.join("src", "lib", "segmentDigest.test.mjs"),
-  path.join("src", "lib", "searchTerms.test.mjs")
+  path.join("src", "lib", "searchTerms.test.mjs"),
+  path.join("src", "hooks", "dataSyncUtils.test.mjs"),
+  path.join("src", "hooks", "appUpdaterUtils.test.mjs"),
+  path.join("src", "hooks", "favoritesUtils.test.mjs"),
+  path.join("src", "hooks", "dataJobLock.test.mjs")
 );
 
 const result = spawnSync(process.execPath, args, {
