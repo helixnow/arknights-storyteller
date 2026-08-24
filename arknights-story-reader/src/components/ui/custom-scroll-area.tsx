@@ -182,6 +182,14 @@ export const CustomScrollArea = forwardRef<HTMLDivElement, CustomScrollAreaProps
         "--scroll-area-track-offset-top": formatOffset(trackOffsetTop),
         "--scroll-area-track-offset-bottom": formatOffset(trackOffsetBottom),
         "--scroll-area-track-offset-right": formatOffset(trackOffsetRight),
+        /* 轨道点击会建立和滑块一样的拖动（draggingRef + 指针捕获），所以
+           也要同一份 touch-action: none：鼠标为主的触屏设备（pointer: fine，
+           轨道保持可点）上手指按轨道拖动时，浏览器会把触摸判定成平移接管
+           并派发 pointercancel，拖动刚建立就被掐断——捕获拦不住这个接管，
+           只有 touch-action 能。纯触屏设备不受影响：那里轨道本来就是
+           pointer-events: none（见 index.css 的 pointer: coarse 分支），
+           命中不到它，这条声明不会吃掉正常的页面平移。 */
+        touchAction: "none",
       } as CSSProperties;
     }, [formatOffset, trackOffsetBottom, trackOffsetRight, trackOffsetTop]);
 
