@@ -270,7 +270,15 @@ export function SheetShell({
   }, []);
 
   return (
-    <div className="fixed inset-0 z-50 flex">
+    /*
+     * 包装层自身必须 pointer-events-none：它是 fixed inset-0 的全屏盒子，
+     * 透明不影响命中测试——scrim 和面板在 closed 态双双关掉命中后，点击
+     * 会落到这个包装 div 上原地消失，退场 300ms 里整屏输入照样被吞。改成
+     * 包装层常年 none，开启态由 scrim（下面的 data-[state=open] 变体）和
+     * 面板（pointer-events-auto）各自显式接回；pointer-events 是继承属性，
+     * 不显式接回的话子元素会一起跟着 none。
+     */
+    <div className="pointer-events-none fixed inset-0 z-50 flex">
       {/*
        * 退场动画的 300ms 里 sheet 仍然挂载（useSidePanel 两阶段卸载），但
        * 它对用户来说已经关掉了：透明的 scrim 若继续参与命中测试，整屏点击
@@ -284,7 +292,7 @@ export function SheetShell({
         className={cn(
           "absolute inset-0 glass-scrim transition-opacity duration-300",
           "data-[state=closed]:opacity-0 data-[state=open]:opacity-100",
-          "data-[state=closed]:pointer-events-none"
+          "data-[state=closed]:pointer-events-none data-[state=open]:pointer-events-auto"
         )}
         onClick={onClose}
       />
