@@ -13,7 +13,8 @@ async function loadPureReader() {
   return import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
 }
 
-const { createLruCache, postProcessSegments } = await loadPureReader();
+const { createLruCache, postProcessSegments, stableReaderIntentToken } =
+  await loadPureReader();
 
 function withClock(run) {
   const original = Date.now;
@@ -68,6 +69,16 @@ test("预取缓存：clear 在数据换包后整体失效", () => {
   cache.clear();
   assert.equal(cache.get("a"), null);
   assert.equal(cache.get("b"), null);
+});
+
+test("跳转意图：缺少 issuedAt 时使用稳定 token，不随重渲染变化", () => {
+  assert.equal(stableReaderIntentToken(undefined), 0);
+  assert.equal(stableReaderIntentToken(undefined), 0);
+});
+
+test("跳转意图：合法 issuedAt 保留，非有限值回落稳定 token", () => {
+  assert.equal(stableReaderIntentToken(123456), 123456);
+  assert.equal(stableReaderIntentToken(Number.NaN), 0);
 });
 
 test("正文后处理：清理空白并合并连续同角色台词", () => {

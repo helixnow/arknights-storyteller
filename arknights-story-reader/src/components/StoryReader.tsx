@@ -282,6 +282,14 @@ export function postProcessSegments(segments: readonly StorySegment[]): StorySeg
 }
 
 /**
+ * issuedAt 缺失的旧调用方也需要稳定的一次性 token。直接在 effect 里
+ * `?? Date.now()` 会让每次重渲染都生成新 token，把读者反复拽回旧命中。
+ */
+export function stableReaderIntentToken(issuedAt?: number): number {
+  return typeof issuedAt === "number" && Number.isFinite(issuedAt) ? issuedAt : 0;
+}
+
+/**
  * 把带换行的正文拆成 `<span>` + `<br />`。定义在模块级：它不依赖任何组件
  * 状态，放在组件里只会让每次渲染都产出一个新引用，白白破坏 memo。
  */
@@ -1900,7 +1908,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       !processedSegments.length
     )
       return;
-    const token = initialJump.issuedAt ?? Date.now();
+    const token = stableReaderIntentToken(initialJump.issuedAt);
     if (jumpAppliedRef.current === token) return;
 
     let target = initialJump.segmentIndex;
@@ -2034,7 +2042,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       !processedSegments.length
     )
       return;
-    const token = initialFocus.issuedAt ?? Date.now();
+    const token = stableReaderIntentToken(initialFocus.issuedAt);
     // 只按 token 判重。曾经这里还要求 highlightSegmentIndex 非空才算“已应用”，
     // 结果高亮一被清掉（导览里跳章节、清除人物高亮都会把它置回 null），
     // 这个 effect 就重新触发，把读者拽回搜索命中段、盖掉用户刚刚的跳转。
