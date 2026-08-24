@@ -190,12 +190,15 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
       if (!stale()) setRefreshing(true);
     }, REFRESH_HINT_DELAY_MS);
 
+    // isInstalled 的结果先记在局部变量而不是立刻写 state：成功路径要等
+    // 内容全齐后一批亮相（见下），catch 里也要靠它把错误文案选对。
+    let installedNow: boolean | null = null;
     try {
-      const ok = await storyCatalog.isInstalled();
+      installedNow = await storyCatalog.isInstalled();
       if (stale()) return;
-      setInstalled(ok);
-      setLoadFailed(false);
-      if (!ok) {
+      if (!installedNow) {
+        setInstalled(false);
+        setLoadFailed(false);
         setRecentStories((prev) => (prev.length === 0 ? prev : []));
         setHighlight(null);
         loadedFromRef.current = snapshot;
@@ -213,10 +216,6 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
       let hash = 0;
       for (let i = 0; i < t.length; i += 1) hash = (hash * 31 + t.charCodeAt(i)) >>> 0;
       const pick = allMain[hash % Math.max(allMain.length, 1)] ?? null;
-      // 直接 set：缓存命中时 pick 与上一次是同一个对象，React 自动 bail out；
-      // 数据重新同步后是新对象，才应该重渲染。以前按 storyId 相同就保留旧
-      // 对象，同步后推荐卡会一直显示旧目录里的书名，点开走的也是旧路径。
-      setHighlight(pick);
 
       // 2) 最近阅读：progress 的 key 就是 storyTxt，反查成 StoryEntry。
       // 快照和剧情列表的进度徽标同源，两边不可能显示成不一样的百分比。
@@ -257,6 +256,18 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
           return entry ? { entry, meta: item } : null;
         })
         .filter((x): x is RecentStory => x !== null);
+
+      // 到这里已无 await，下面这批 setState 会合并成一次渲染、一次亮相。
+      // 以前 isInstalled 一返回就把 installed 翻成 true：骨架屏提前退场，
+      // 冷启动（目录 IPC 要几十到几百毫秒才回来）会先闪出「打开任意一章
+      // 剧情」的空占位卡和「最近阅读 0 章」，目录到了才换成真实内容。
+      setInstalled(true);
+      setLoadFailed(false);
+      // highlight 直接 set：缓存命中时 pick 与上一次是同一个对象，React
+      // 自动 bail out；数据重新同步后是新对象，才应该重渲染。以前按 storyId
+      // 相同就保留旧对象，同步后推荐卡会一直显示旧目录里的书名，点开走的
+      // 也是旧路径。
+      setHighlight(pick);
       setRecentStories((prev) => (sameRecentStories(prev, matched) ? prev : matched));
       // 有次级目录读失败时结果不完整，不能记成「已按此快照加载」——否则
       // 进度快照没变的话，后续聚焦刷新全被顶部跳过逻辑拦下，瞬时失败里
@@ -270,7 +281,10 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
       if (stale()) return;
       console.warn("[Home] load failed", err);
       // 读取失败 ≠ 没装数据。把两者混为一谈会让用户去做一次根本没必要的
-      // 同步，所以这里只标记失败，由界面给出「重试 / 去设置」。
+      // 同步，所以这里只标记失败，由界面给出「重试 / 去设置」。isInstalled
+      // 已经有答案的话要落下去：错误卡的文案靠它区分「数据在但这次没读
+      // 出来」和「目录可能损坏」。
+      if (installedNow !== null) setInstalled(installedNow);
       setLoadFailed(true);
       // 这一轮没产出结果，得把「已按此快照加载」的标记作废。不然强制刷新
       // （如同步后重建索引时）恰好失败、而进度快照又没变时，后续聚焦刷新

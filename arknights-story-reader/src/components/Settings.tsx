@@ -1090,8 +1090,12 @@ export function Settings() {
                   </div>
                 ) : null}
 
-                {/* 禁用态的按钮吃不到 hover，占用原因必须直接写出来。 */}
-                {installBlocked && activeJob ? (
+                {/* 禁用态的按钮吃不到 hover，占用原因必须直接写出来。只在
+                    「立即更新」按钮真的在场（已检出可装更新）时解释：这行的
+                    前身就是那颗按钮上的 title。没有可装更新时凭空一句
+                    「完成后即可安装更新」，像是有安装在排队，还会和刚显示的
+                    「当前已是最新版本」互相打架。 */}
+                {availableUpdate && installBlocked && activeJob ? (
                   <p role="status" className="text-sm text-[hsl(var(--color-muted-foreground))]">
                     正在{describeDataJob(activeJob)}，完成后即可安装更新。
                   </p>
@@ -1143,7 +1147,7 @@ export function Settings() {
                   <Toggle
                     on={minimalMode}
                     onChange={(v) => setMinimalMode(v)}
-                    label={minimalMode ? "已开启" : "未开启"}
+                    label="极简模式"
                   />
                 }
               />
@@ -1154,7 +1158,7 @@ export function Settings() {
                   <Toggle
                     on={inlineImages}
                     onChange={(v) => setInlineImages(v)}
-                    label={inlineImages ? "已启用" : "已关闭"}
+                    label="阅读器内插画"
                   />
                 }
               />
@@ -1281,6 +1285,11 @@ function Toggle({
 }: {
   on: boolean;
   onChange: (v: boolean) => void;
+  /**
+   * 无障碍名称，必须写开关「管什么」（如「极简模式」）。开关状态由
+   * aria-checked 传达，名称里再写「已开启」这类状态词只会让读屏用户
+   * 听到两个分不清是谁的开关。
+   */
   label?: string;
 }) {
   return (
