@@ -40,7 +40,12 @@ import {
 import { useFavorites } from "@/hooks/useFavorites";
 import { trimHighlightPreview, useHighlights } from "@/hooks/useHighlights";
 import { useBackHandler } from "@/hooks/useBackHandler";
-import { isUnambiguousPageTap, useEdgeSwipeBack } from "@/hooks/useEdgeSwipeBack";
+import {
+  isUnambiguousPageTap,
+  shouldSuppressRejectedTouchClick,
+  useEdgeSwipeBack,
+  type TouchClickOutcome,
+} from "@/hooks/useEdgeSwipeBack";
 import { cn } from "@/lib/utils";
 import { segmentDigest } from "@/lib/segmentDigest";
 import { CustomScrollArea } from "@/components/ui/custom-scroll-area";
@@ -289,6 +294,91 @@ export function stableReaderIntentToken(issuedAt?: number): number {
   return typeof issuedAt === "number" && Number.isFinite(issuedAt) ? issuedAt : 0;
 }
 
+export function readerLocalDayKey(date: Date): string {
+  return `${date.getFullYear()}-${date.getMonth() + 1}-${date.getDate()}`;
+}
+
+export interface ReaderContentSignature {
+  segmentCount: number;
+  firstDigest: string;
+  lastDigest: string;
+}
+
+/** 与划线重定位共用同一段落指纹口径。 */
+function readerSegmentIdentity(segment: StorySegment): string {
+  switch (segment.type) {
+    case "dialogue":
+      return segmentDigest(`${segment.characterName}\u0001${segment.text}`);
+    case "narration":
+    case "subtitle":
+    case "sticker":
+      return segmentDigest(segment.text);
+    case "system":
+      return segmentDigest(`${segment.speaker ?? ""}\u0001${segment.text}`);
+    case "decision":
+      return segmentDigest(segment.options.join("\u0001"));
+    case "header":
+      return segmentDigest(segment.title);
+    case "image":
+      return segmentDigest(`image\u0001${segment.token}`);
+    case "music":
+      return segmentDigest(`music\u0001${segment.key}`);
+    default:
+      return "";
+  }
+}
+
+function readerContentSignature(
+  content: ParsedStoryContent | null
+): ReaderContentSignature | null {
+  if (!content) return null;
+  const segments = content.segments;
+  return {
+    segmentCount: segments.length,
+    firstDigest: segments.length > 0 ? readerSegmentIdentity(segments[0]) : "",
+    lastDigest:
+      segments.length > 0 ? readerSegmentIdentity(segments[segments.length - 1]) : "",
+  };
+}
+
+/**
+ * 普通 TTL 重验拿回等价正文时保留页码与 restoredKey；换包、空态重试或正文
+ * 首尾/段数变化时重置，让进度恢复在新布局上重新跑一遍。
+ */
+export function shouldResetReaderPositionForContent(
+  previous: ReaderContentSignature | null,
+  next: ReaderContentSignature | null,
+  forceReset = false
+): boolean {
+  if (forceReset || !previous || !next) return true;
+  return (
+    previous.segmentCount !== next.segmentCount ||
+    previous.firstDigest !== next.firstDigest ||
+    previous.lastDigest !== next.lastDigest
+  );
+}
+
+/** 把“锚段当前几何位置”换成让它回到记录偏移所需的 scrollTop。 */
+export function scrollTopFromAnchorGeometry(
+  currentScrollTop: number,
+  containerTop: number,
+  anchorTop: number,
+  savedOffset: number,
+  maxTop: number
+): number | null {
+  if (
+    !Number.isFinite(currentScrollTop) ||
+    !Number.isFinite(containerTop) ||
+    !Number.isFinite(anchorTop) ||
+    !Number.isFinite(savedOffset) ||
+    !Number.isFinite(maxTop)
+  ) {
+    return null;
+  }
+  const target = currentScrollTop + (anchorTop - containerTop) - savedOffset;
+  return Math.max(0, Math.min(Math.max(0, maxTop), target));
+}
+
 /**
  * 把带换行的正文拆成 `<span>` + `<br />`。定义在模块级：它不依赖任何组件
  * 状态，放在组件里只会让每次渲染都产出一个新引用，白白破坏 memo。
@@ -450,8 +540,36 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   activeRef.current = active;
   const [dataEpoch, setDataEpoch] = useState(storyDataEpoch);
   const seenDataEpochRef = useRef(storyDataEpoch);
+  const recordedReadingDayRef = useRef("");
 
-  const { settings, updateSettings, resetSettings } = useReaderSettings();
+  const recordReadingDay = useCallback(() => {
+    const day = readerLocalDayKey(new Date());
+    if (recordedReadingDayRef.current === day) return;
+    recordedReadingDayRef.current = day;
+    try {
+      bumpReadingStreak();
+    } catch {}
+  }, []);
+
+  const installLoadedContent = useCallback(
+    (next: ParsedStoryContent, forceReset = false) => {
+      const resetPosition = shouldResetReaderPositionForContent(
+        readerContentSignature(contentRef.current),
+        readerContentSignature(next),
+        forceReset
+      );
+      if (resetPosition) {
+        // 清 restoredKey 才会让 layout 恢复在新内容上重跑；只把页码设 0
+        // 会被随后的分页进度 effect 当成真实阅读位置落盘。
+        restoredKeyRef.current = null;
+        setCurrentPage(0);
+      }
+      setContent(next);
+    },
+    []
+  );
+
+  const { settings, updateSettings, resetSettings } = useReaderSettings(active);
   const { showSummaries, minimalMode, inlineImages } = useAppPreferences();
   // `trackState: false`：阅读器只在挂载时要一次初始值，之后一律走
   // `getProgress()`。让每 1.2s 一次的落盘去驱动 state，只会白白把整棵
@@ -477,7 +595,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   const moreMenuTriggerRef = useRef<HTMLButtonElement | null>(null);
   const moreMenuPanelRef = useRef<HTMLDivElement | null>(null);
   const pageTouchRef = useRef<PageTouchState | null>(null);
-  const lastTouchOutcomeRef = useRef<{ at: number; accepted: boolean } | null>(null);
+  const lastTouchOutcomeRef = useRef<TouchClickOutcome | null>(null);
 
   // 抽屉 / 选段工具栏是否占据了界面。滚动监听里用 ref 读取，避免因为这些
   // 状态变化而反复重建 scroll listener。
@@ -565,9 +683,8 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     };
   }, [active, moreMenuOpen]);
 
-  // 阅读器退到后台（列表页盖在上面）时停止所有会话型 UI。滚动位置和页码
-  // 保留；抽屉、分享、选段与脉冲都是一次性操作，不应在 KeepAlive 背后继续
-  // 挂副作用，也不应恢复前台时突然盖回一层过期界面。
+  // 阅读器退到后台（列表页盖在上面）时停止所有会话型 UI。滚动位置、页码
+  // 与已经选中的段落保留；只退出 selectMode，回来后再次进入选段仍能继续。
   useEffect(() => {
     if (active) return;
     setMoreMenuOpen(false);
@@ -575,50 +692,12 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     setInsightsOpen(false);
     setShareDialogOpen(false);
     setSelectMode(false);
-    setSelectedSegments([]);
     setSearchPulseToken(0);
     setHeaderHidden(false);
     // 角色意图的「已应用」记号一并清掉：同一个角色字符串没有 issuedAt 可
     // 判重，只能把「退到后台再回来」当作一次新意图的边界——用户再次从
     // 人物面板点「在剧情中查看」时才能重新定位到该角色。
     characterAppliedRef.current = null;
-  }, [active]);
-
-  // 打开阅读器、跨本地日期、跨时区或从后台恢复时重新记一次阅读日。
-  // 最长一小时重新对账一次，且延迟有上限：墙钟回拨不会排出“几年后”的 timer。
-  useEffect(() => {
-    if (!active) return;
-    let timer = 0;
-    let lastDay = "";
-    const checkDay = () => {
-      const now = new Date();
-      const day = `${now.getFullYear()}-${now.getMonth() + 1}-${now.getDate()}`;
-      if (day !== lastDay) {
-        lastDay = day;
-        try {
-          bumpReadingStreak();
-        } catch {}
-      }
-      const nextMidnight = new Date(
-        now.getFullYear(),
-        now.getMonth(),
-        now.getDate() + 1
-      ).getTime();
-      const delay = Math.min(60 * 60 * 1000, Math.max(1000, nextMidnight - Date.now() + 50));
-      timer = window.setTimeout(checkDay, delay);
-    };
-    const onVisibility = () => {
-      if (document.visibilityState === "visible") {
-        window.clearTimeout(timer);
-        checkDay();
-      }
-    };
-    checkDay();
-    document.addEventListener("visibilitychange", onVisibility);
-    return () => {
-      window.clearTimeout(timer);
-      document.removeEventListener("visibilitychange", onVisibility);
-    };
   }, [active]);
 
   // iOS-style edge swipe back — close the reader when the user swipes from
@@ -650,33 +729,13 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
    */
   const segmentDigestMap = useMemo<string[]>(() => {
     if (!processedSegments.length) return [];
-    return processedSegments.map((segment) => {
-      switch (segment.type) {
-        case "dialogue":
-          return segmentDigest(`${segment.characterName}\u0001${segment.text}`);
-        case "narration":
-        case "subtitle":
-        case "sticker":
-          return segmentDigest(segment.text);
-        case "system":
-          return segmentDigest(`${segment.speaker ?? ""}\u0001${segment.text}`);
-        case "decision":
-          return segmentDigest(segment.options.join("\u0001"));
-        case "header":
-          return segmentDigest(segment.title);
-        case "image":
-          return segmentDigest(`image\u0001${segment.token}`);
-        case "music":
-          return segmentDigest(`music\u0001${segment.key}`);
-        default:
-          return "";
-      }
-    });
+    return processedSegments.map(readerSegmentIdentity);
   }, [processedSegments]);
 
   const { highlights, toggleHighlight, isHighlighted, clearHighlights } = useHighlights(
     storyPath,
-    segmentDigestMap
+    segmentDigestMap,
+    active
   );
 
   const highlightEntries = useMemo(
@@ -1012,14 +1071,11 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       // 进度落盘还会把第 0 页写回存储——真实的阅读进度就此丢失。只有
       // 内容真的变化（错误/空态重试后命中新缓存）才需要重置页码。
       if (contentRef.current !== cached) {
-        setContent(cached);
-        setCurrentPage(0);
+        installLoadedContent(cached);
       }
       setError(null);
       setLoading(false);
-      try {
-        bumpReadingStreak();
-      } catch {}
+      recordReadingDay();
       return;
     }
 
@@ -1030,19 +1086,15 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       if (token !== loadTokenRef.current || !activeRef.current) return;
       // 空结果不进缓存，否则「重新加载」永远只会拿回同一份空正文。
       if (data.segments.length > 0) storyContentCache.set(storyPath, data);
-      setContent(data);
-      setCurrentPage(0);
-      // Bump reading streak when user actually opens a story.
-      try {
-        bumpReadingStreak();
-      } catch {}
+      installLoadedContent(data);
+      recordReadingDay();
     } catch (err) {
       if (token !== loadTokenRef.current) return;
       setError(err instanceof Error ? err.message : "加载失败");
     } finally {
       if (token === loadTokenRef.current) setLoading(false);
     }
-  }, [storyPath]);
+  }, [installLoadedContent, recordReadingDay, storyPath]);
 
   useEffect(() => {
     if (!active) return;
@@ -1260,10 +1312,36 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       const container = scrollContainerRef.current;
       if (!container) return false;
       const maxTop = Math.max(container.scrollHeight - container.clientHeight, 0);
-      let storedTop =
-        stored?.readingMode === "scroll" && typeof stored.scrollTop === "number"
-          ? stored.scrollTop
-          : storedPercentage * maxTop;
+      let restoredAnchor: { index: number; offset: number } | null = null;
+      let storedTop: number | null = null;
+      if (
+        stored?.readingMode === "scroll" &&
+        typeof stored.anchorIndex === "number" &&
+        typeof stored.anchorOffset === "number"
+      ) {
+        const anchor = container.querySelector<HTMLElement>(
+          `[data-segment-index="${stored.anchorIndex}"]`
+        );
+        if (anchor) {
+          const containerRect = container.getBoundingClientRect();
+          storedTop = scrollTopFromAnchorGeometry(
+            container.scrollTop,
+            containerRect.top,
+            anchor.getBoundingClientRect().top,
+            stored.anchorOffset,
+            maxTop
+          );
+          if (storedTop !== null) {
+            restoredAnchor = { index: stored.anchorIndex, offset: stored.anchorOffset };
+          }
+        }
+      }
+      if (storedTop === null) {
+        storedTop =
+          stored?.readingMode === "scroll" && typeof stored.scrollTop === "number"
+            ? stored.scrollTop
+            : storedPercentage * maxTop;
+      }
       // 布局比记录进度时矮（旋转 / 缩放视口、插画被隐藏）会让绝对 scrollTop
       // 失真：直接 scrollTo 会被夹到文末，按 storedTop 反推的 ratio 还会算出
       // >1、把进度直接标成 100%。此时退回按百分比换算。
@@ -1274,13 +1352,9 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       // 还是起点附近的位置，会先把一份 ~0% 的进度落盘，短暂盖掉真实记录。
       container.scrollTo({ top: storedTop, behavior: "instant" });
       lastScrollTopRef.current = storedTop;
-      // 视口已被程序化挪到新位置，此前捕获的顶部锚点随之过期。不清掉的话，
-      // 「切到分页读了很久 → 切回滚动（此时设置抽屉还开着，滚动监听因
-      // textObscuredRef 不会刷新锚点）→ 顺手调字号」这条动线会让排版重排
-      // 效果按旧锚点把读者拽回上一次滚动会话的段落，随后进度落盘再把错误
-      // 位置写成真实进度。清空后重排走 scrollRatioRef 的百分比兜底，位置
-      // 与本次恢复一致；用户一旦真正滚动，锚点会照常重新捕获。
-      topAnchorRef.current = null;
+      // 锚点恢复成功就继续保留它供字号/视口重排；旧记录或失效索引走几何
+      // 兜底时清掉上个滚动会话的锚点，避免随后重排把人拽回旧段落。
+      topAnchorRef.current = restoredAnchor;
       const ratio = maxTop <= 0 ? 1 : storedTop / maxTop;
       const clamped = Number.isFinite(ratio) ? Math.max(0, Math.min(1, ratio)) : 0;
       scrollRatioRef.current = clamped;
@@ -1308,23 +1382,15 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     // 这两个 prop 在整个阅读会话里都不会消失，只看 prop 是否存在的话，
     // 搜索进来的读者之后每次切换阅读模式都会被跳过恢复、直接甩回开头，
     // 随后的进度落盘还会把 ~0% 写回存储，真实进度就此丢失。
-    // issuedAt 缺失时的判重必须与应用侧的记账口径一致：应用 effect 记的是
-    // `issuedAt ?? Date.now()`，这里若仍与 null 比较，「已应用」会被永远当成
-    // 挂起——之后每次切换阅读模式都跳过恢复，读者被留在原地、进度再被
-    // ~0% 覆盖。App 目前总是带 issuedAt，此处是对齐两侧口径的加固：缺失
-    // 时只在「从未应用过任何意图」时才算挂起。
+    // issuedAt 缺失时也与应用侧共用稳定 token；两侧判重口径不能分叉。
     const focusPending =
       initialFocus &&
       initialFocus.storyId === storyId &&
-      (initialFocus.issuedAt != null
-        ? focusAppliedRef.current !== initialFocus.issuedAt
-        : focusAppliedRef.current === null);
+      focusAppliedRef.current !== stableReaderIntentToken(initialFocus.issuedAt);
     const jumpPending =
       initialJump &&
       initialJump.storyId === storyId &&
-      (initialJump.issuedAt != null
-        ? jumpAppliedRef.current !== initialJump.issuedAt
-        : jumpAppliedRef.current === null);
+      jumpAppliedRef.current !== stableReaderIntentToken(initialJump.issuedAt);
     const shouldSkipRestore =
       pendingScrollIndexRef.current !== null || focusPending || jumpPending;
     if (shouldSkipRestore) {
@@ -1383,18 +1449,20 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
         const clamped = Number.isFinite(ratio) ? Math.max(0, Math.min(1, ratio)) : 0;
         scrollRatioRef.current = clamped;
         progressStore.set(clamped);
-        updateProgress({
-          readingMode: "scroll",
-          scrollTop,
-          percentage: clamped,
-          updatedAt: Date.now(),
-        });
-
         // 抽屉盖住正文时命中测试会打在遮罩上，这时保留上一次的锚点。
         if (!textObscuredRef.current) {
           const anchor = captureTopAnchor(container);
           if (anchor) topAnchorRef.current = anchor;
         }
+        const anchor = topAnchorRef.current;
+        updateProgress({
+          readingMode: "scroll",
+          scrollTop,
+          anchorIndex: anchor?.index,
+          anchorOffset: anchor?.offset,
+          percentage: clamped,
+          updatedAt: Date.now(),
+        });
 
         // 沉浸阅读：向下滚动收起顶栏腾出屏幕，向上滚动或靠近顶部时复原。
         // 抽屉/选段工具栏打开时保持顶栏可见，避免操作路径消失。
@@ -1611,12 +1679,14 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   }, [storyPath]);
 
   const goToPrevPage = useCallback(() => {
+    recordReadingDay();
     setCurrentPage((prev) => Math.max(0, prev - 1));
-  }, []);
+  }, [recordReadingDay]);
 
   const goToNextPage = useCallback(() => {
+    recordReadingDay();
     setCurrentPage((prev) => Math.min(Math.max(totalPages - 1, 0), prev + 1));
-  }, [totalPages]);
+  }, [recordReadingDay, totalPages]);
 
   // 分页模式的触控翻页：点正文左侧 20% 上一页、右侧 20% 下一页。
   // 选段模式和任何抽屉打开时都关掉，避免抢走点击。
@@ -1693,25 +1763,39 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     const accepted =
       event.touches.length === 0 &&
       isUnambiguousPageTap(state.maxTouchCount, state.maxDistance, 0);
-    lastTouchOutcomeRef.current = { at: Date.now(), accepted };
+    lastTouchOutcomeRef.current = {
+      at: Date.now(),
+      accepted,
+      clientX: ended?.clientX ?? state.startX,
+      clientY: ended?.clientY ?? state.startY,
+    };
     pageTouchRef.current = null;
   }, []);
 
   const handlePageTouchCancel = useCallback(() => {
     pageTouchRef.current = null;
-    lastTouchOutcomeRef.current = { at: Date.now(), accepted: false };
+    lastTouchOutcomeRef.current = null;
   }, []);
 
   const handleReaderTap = useCallback(
     (event: ReactMouseEvent<HTMLElement>) => {
       if (!pageTapEnabled) return;
 
-      // 触摸结束后浏览器会再合成 click。只有明确的一指轻点可以进入翻页；
-      // 捏合、第二指、纵向拖动和 touchcancel 产生的 click 全部吞掉。
+      // 触摸结束后浏览器会再合成 click。拒绝的触摸只吞同一落点附近的合成
+      // click；用户 800ms 内移鼠标点到远处时不能被上一轮捏合误伤。
       const touchOutcome = lastTouchOutcomeRef.current;
-      if (touchOutcome && Date.now() - touchOutcome.at < 800) {
+      if (touchOutcome) {
         lastTouchOutcomeRef.current = null;
-        if (!touchOutcome.accepted) return;
+        if (
+          shouldSuppressRejectedTouchClick(
+            touchOutcome,
+            event.clientX,
+            event.clientY,
+            Date.now()
+          )
+        ) {
+          return;
+        }
       }
 
       // 书签按钮、上一话/下一话、插图里的链接以及滚动条本身优先。
@@ -1786,9 +1870,11 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
           goToNextPage();
         } else if (event.key === "Home") {
           event.preventDefault();
+          recordReadingDay();
           setCurrentPage(0);
         } else if (event.key === "End") {
           event.preventDefault();
+          recordReadingDay();
           setCurrentPage(Math.max(totalPages - 1, 0));
         }
         return;
@@ -1801,15 +1887,19 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
 
       if (event.key === "PageDown" || (isSpace && !event.shiftKey)) {
         event.preventDefault();
+        recordReadingDay();
         container.scrollBy({ top: step, behavior: "smooth" });
       } else if (event.key === "PageUp" || (isSpace && event.shiftKey)) {
         event.preventDefault();
+        recordReadingDay();
         container.scrollBy({ top: -step, behavior: "smooth" });
       } else if (event.key === "Home") {
         event.preventDefault();
+        recordReadingDay();
         container.scrollTo({ top: 0, behavior: "smooth" });
       } else if (event.key === "End") {
         event.preventDefault();
+        recordReadingDay();
         container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
       }
     };
@@ -1825,6 +1915,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     shareDialogOpen,
     moreMenuOpen,
     selectMode,
+    recordReadingDay,
     goToPrevPage,
     goToNextPage,
   ]);

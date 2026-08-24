@@ -14,7 +14,12 @@ async function loadPureGestures() {
   return import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
 }
 
-const { evaluateEdgeSwipe, isUnambiguousPageTap } = await loadPureGestures();
+const {
+  evaluateEdgeSwipe,
+  isUnambiguousPageTap,
+  isWithinVisualViewportEdge,
+  shouldSuppressRejectedTouchClick,
+} = await loadPureGestures();
 
 test("边缘手势：达到水平阈值且水平占优时触发", () => {
   assert.equal(evaluateEdgeSwipe(60, 10, 300, 60, 40), "trigger");
@@ -59,4 +64,37 @@ test("分页轻点：纵向滚动后的合成 click 不翻页", () => {
 test("分页轻点：阈值边界可接受，自定义阈值生效", () => {
   assert.equal(isUnambiguousPageTap(1, 12, 0), true);
   assert.equal(isUnambiguousPageTap(1, 5, 0, 4), false);
+});
+
+test("边缘手势：以 visualViewport.offsetLeft 为可视左边缘", () => {
+  assert.equal(isWithinVisualViewportEdge(120, 100, 24), true);
+  assert.equal(isWithinVisualViewportEdge(124, 100, 24), true);
+  assert.equal(isWithinVisualViewportEdge(125, 100, 24), false);
+  assert.equal(isWithinVisualViewportEdge(99, 100, 24), false);
+});
+
+test("触摸拒绝：只吞同落点附近的合成 click", () => {
+  const outcome = {
+    at: 1_000,
+    accepted: false,
+    clientX: 20,
+    clientY: 40,
+  };
+  assert.equal(shouldSuppressRejectedTouchClick(outcome, 30, 45, 1_500), true);
+  assert.equal(shouldSuppressRejectedTouchClick(outcome, 200, 300, 1_500), false);
+});
+
+test("触摸拒绝：超时、时钟回拨和已接受轻点都不吞鼠标 click", () => {
+  const rejected = {
+    at: 1_000,
+    accepted: false,
+    clientX: 20,
+    clientY: 40,
+  };
+  assert.equal(shouldSuppressRejectedTouchClick(rejected, 20, 40, 1_800), false);
+  assert.equal(shouldSuppressRejectedTouchClick(rejected, 20, 40, 999), false);
+  assert.equal(
+    shouldSuppressRejectedTouchClick({ ...rejected, accepted: true }, 20, 40, 1_100),
+    false
+  );
 });

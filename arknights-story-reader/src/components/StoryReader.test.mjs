@@ -13,8 +13,14 @@ async function loadPureReader() {
   return import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
 }
 
-const { createLruCache, postProcessSegments, stableReaderIntentToken } =
-  await loadPureReader();
+const {
+  createLruCache,
+  postProcessSegments,
+  readerLocalDayKey,
+  scrollTopFromAnchorGeometry,
+  shouldResetReaderPositionForContent,
+  stableReaderIntentToken,
+} = await loadPureReader();
 
 function withClock(run) {
   const original = Date.now;
@@ -79,6 +85,53 @@ test("跳转意图：缺少 issuedAt 时使用稳定 token，不随重渲染变�
 test("跳转意图：合法 issuedAt 保留，非有限值回落稳定 token", () => {
   assert.equal(stableReaderIntentToken(123456), 123456);
   assert.equal(stableReaderIntentToken(Number.NaN), 0);
+});
+
+test("正文替换：TTL 重验得到等价首尾与段数时保留页码", () => {
+  const signature = { segmentCount: 80, firstDigest: "first", lastDigest: "last" };
+  assert.equal(
+    shouldResetReaderPositionForContent(signature, { ...signature }),
+    false
+  );
+});
+
+test("正文替换：换包或首尾/段数变化时重置并重新恢复", () => {
+  const base = { segmentCount: 80, firstDigest: "first", lastDigest: "last" };
+  assert.equal(
+    shouldResetReaderPositionForContent(base, { ...base, segmentCount: 81 }),
+    true
+  );
+  assert.equal(
+    shouldResetReaderPositionForContent(base, { ...base, lastDigest: "new-last" }),
+    true
+  );
+  assert.equal(shouldResetReaderPositionForContent(base, base, true), true);
+  assert.equal(shouldResetReaderPositionForContent(null, base), true);
+});
+
+test("阅读 streak：本地日期键跨日变化，同日翻页保持一致", () => {
+  assert.equal(readerLocalDayKey(new Date(2026, 7, 24, 1)), "2026-8-24");
+  assert.equal(readerLocalDayKey(new Date(2026, 7, 24, 23)), "2026-8-24");
+  assert.equal(readerLocalDayKey(new Date(2026, 7, 25, 0)), "2026-8-25");
+});
+
+test("滚动恢复：锚段优先按 index + offset 还原并钳位", () => {
+  assert.equal(scrollTopFromAnchorGeometry(400, 100, 160, 10, 1000), 450);
+  assert.equal(scrollTopFromAnchorGeometry(900, 100, 400, 0, 1000), 1000);
+  assert.equal(scrollTopFromAnchorGeometry(10, 100, 20, 0, 1000), 0);
+  assert.equal(
+    scrollTopFromAnchorGeometry(Number.NaN, 100, 160, 10, 1000),
+    null
+  );
+});
+
+test("KeepAlive 隐藏：退出选段模式但不清空已选段落", async () => {
+  const source = await readFile(new URL("./StoryReader.tsx", import.meta.url), "utf8");
+  const start = source.indexOf("if (active) return;", source.indexOf("停止所有会话型 UI"));
+  const end = source.indexOf("}, [active]);", start);
+  const effect = source.slice(start, end);
+  assert.match(effect, /setSelectMode\(false\)/);
+  assert.doesNotMatch(effect, /setSelectedSegments/);
 });
 
 test("正文后处理：清理空白并合并连续同角色台词", () => {

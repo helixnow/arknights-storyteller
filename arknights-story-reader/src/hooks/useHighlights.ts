@@ -208,7 +208,11 @@ export function resolveHighlightEntryIndex(
  *   write, not one per toggle. A still-pending write is flushed on
  *   unmount so navigating away right after a toggle never drops it.
  */
-export function useHighlights(storyPath: string, segmentDigests?: readonly string[]) {
+export function useHighlights(
+  storyPath: string,
+  segmentDigests?: readonly string[],
+  active = true
+) {
   // 初始状态也要叠上遗留的失败重试：quota 失败后换章重挂，新实例只读盘的
   // 话，用户刚画的线会先「消失」再随重试成功回来——直接从合并结果起步。
   const [store, setStore] = useState<HighlightStore>(() => overlayLocalChanges(readStorage(), null));
@@ -229,6 +233,8 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
   // 每个 key 第一次本地编辑时看到的基线。冲刷 / storage 事件用它做三方
   // 合并，而不是让本窗口的整列表覆盖另一个窗口刚加的划线。
   const dirtyBasesRef = useRef<Map<string, HighlightLike[] | null>>(new Map());
+  const activeRef = useRef(active);
+  activeRef.current = active;
 
   // 冲刷跑在 setTimeout 回调和卸载清理里，通过 ref 取最新的 toast 句柄。
   const toast = useToast();
@@ -339,7 +345,7 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
   const storeRef = useRef(store);
   useLayoutEffect(() => {
     storeRef.current = store;
-    if (typeof window === "undefined") return;
+    if (typeof window === "undefined" || !active) return;
     if (store === initialStoreRef.current) {
       return;
     }
@@ -359,12 +365,41 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
         persistTimerRef.current = null;
       }
     };
-  }, [store, flushPendingStore]);
+  }, [active, store, flushPendingStore]);
 
   // Unmount flush: if a debounced write is still pending when the reader
   // unmounts (toggle a highlight, immediately navigate back), write it now
   // instead of silently dropping the annotation.
   useEffect(() => () => flushPendingStore(), [flushPendingStore]);
+
+  // KeepAlive 隐藏时冲刷并停掉定时器；重新激活时现读盘，把隐藏期间其它
+  // 窗口的改动与仍未落盘的本地 dirty 三方合并后再恢复监听。
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!active) {
+      if (persistTimerRef.current !== null) {
+        window.clearTimeout(persistTimerRef.current);
+        persistTimerRef.current = null;
+      }
+      flushPendingStore();
+      return;
+    }
+    flushPendingStore();
+    const disk = readStorage();
+    const hasLocalChanges =
+      dirtyKeysRef.current.size > 0 || failedHighlightWrites.size > 0;
+    const next = hasLocalChanges
+      ? overlayLocalChanges(
+          disk,
+          pendingStoreRef.current ?? storeRef.current,
+          dirtyKeysRef.current,
+          dirtyBasesRef.current
+        )
+      : disk;
+    initialStoreRef.current = next;
+    storeRef.current = next;
+    setStore(next);
+  }, [active, flushPendingStore]);
 
   // 切后台 / 关标签页冲刷：移动端杀掉 app、桌面端直接关窗口都不会走
   // unmount（阅读器被 KeepAlive 常驻挂载）。划线的防抖只有一个宏任务，
@@ -372,7 +407,7 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
   // 失败后留着重试的 pending 更是只能靠这里兜底落盘。与阅读进度 hook 的
   // 同名兜底对齐。
   useEffect(() => {
-    if (typeof window === "undefined") return;
+    if (typeof window === "undefined" || !active) return;
     const handleHide = () => {
       if (document.visibilityState === "hidden") flushPendingStore();
     };
@@ -383,14 +418,14 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
       document.removeEventListener("visibilitychange", handleHide);
       window.removeEventListener("pagehide", handlePageHide);
     };
-  }, [flushPendingStore]);
+  }, [active, flushPendingStore]);
 
   // 多窗口（桌面端可以开多个）时跟随其它窗口的修改。划线和收藏一样是
   // 「整表读进内存 → 任意改动整表回写」，不跟随的话：A 窗口刚画的线会在
   // B 窗口的下一次回写里被 B 的旧内存快照整体覆盖，无声丢失（收藏 hook
   // 修过同一个坑）。
   useEffect(() => {
-    if (typeof window === "undefined") return;
+    if (typeof window === "undefined" || !active) return;
     const onStorage = (event: StorageEvent) => {
       // key 为 null 表示外部 storage.clear()，也要跟随。
       if (event.key !== null && event.key !== STORAGE_KEY) return;
@@ -409,6 +444,8 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
         // 快照，直接作废、整表跟盘。
         pendingStoreRef.current = null;
         dirtyBasesRef.current.clear();
+        initialStoreRef.current = disk;
+        storeRef.current = disk;
         setStore(disk);
         return;
       }
@@ -429,13 +466,20 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
       const dirtyAtEvent = new Set(dirtyKeysRef.current);
       const basesAtEvent = new Map(dirtyBasesRef.current);
       const stashAtEvent = new Map(failedHighlightWrites);
-      setStore((prev) =>
-        overlayLocalChanges(disk, prev, dirtyAtEvent, basesAtEvent, stashAtEvent)
+      const next = overlayLocalChanges(
+        disk,
+        storeRef.current,
+        dirtyAtEvent,
+        basesAtEvent,
+        stashAtEvent
       );
+      initialStoreRef.current = next;
+      storeRef.current = next;
+      setStore(next);
     };
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);
-  }, []);
+  }, [active]);
 
   // The raw entries as persisted. Always an array of (upgraded) objects.
   const entries = useMemo<HighlightEntry[]>(
@@ -533,7 +577,7 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
    */
   const toggleHighlight = useCallback(
     (segmentIndex: number) => {
-      if (!Number.isFinite(segmentIndex) || segmentIndex < 0) return;
+      if (!activeRef.current || !Number.isFinite(segmentIndex) || segmentIndex < 0) return;
       // `segmentDigestMap` uses "" for unrecognised segment types — never
       // persist that as a fingerprint.
       const digest = segmentDigests?.[segmentIndex] || undefined;
@@ -577,6 +621,7 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
   );
 
   const clearHighlights = useCallback(() => {
+    if (!activeRef.current) return;
     // 对不存在的 key 不能先记脏键再靠 setStore 原样 bail-out 兜底：bail-out
     // 后 layout effect 不跑、冲刷不会被调度，这个脏键会一直挂着没人消费。
     // 之后任何一次外部 storage 事件都会把它重放成「本地要删掉这个 key」

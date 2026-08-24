@@ -7,6 +7,9 @@ export interface ReadingProgress {
   percentage: number;
   currentPage?: number;
   scrollTop?: number;
+  /** 连续滚动恢复的稳定锚点；旧记录没有时仍按 scrollTop / percentage 恢复。 */
+  anchorIndex?: number;
+  anchorOffset?: number;
   readingMode: ReaderSettings["readingMode"];
   updatedAt: number;
   /**
@@ -61,6 +64,14 @@ export function sanitizeReadingProgress(
     typeof source.scrollTop === "number" && Number.isFinite(source.scrollTop)
       ? Math.max(0, source.scrollTop)
       : undefined;
+  const anchorIndex =
+    typeof source.anchorIndex === "number" && Number.isFinite(source.anchorIndex)
+      ? Math.max(0, Math.trunc(source.anchorIndex))
+      : undefined;
+  const anchorOffset =
+    typeof source.anchorOffset === "number" && Number.isFinite(source.anchorOffset)
+      ? source.anchorOffset
+      : undefined;
   return {
     // map 的 key 才是记录归属；损坏数据里的内嵌 storyPath 不能把 A 篇恢复
     // 到 B 篇，更不能让后续 flush 写错 key。
@@ -68,6 +79,8 @@ export function sanitizeReadingProgress(
     percentage,
     currentPage,
     scrollTop,
+    anchorIndex,
+    anchorOffset,
     readingMode: source.readingMode === "paged" ? "paged" : "scroll",
     updatedAt,
     storyName:
@@ -131,29 +144,67 @@ let persistFailureNotified = false;
  * quota 满时没写进盘的进度，按 storyPath 暂存。pending 是实例级 ref，而
  * 换篇 effect 会无条件把它重置——失败后滞留重试的那份进度以前就死在这一步，
  * 「将自动重试」的提示成了空话。折进模块级暂存后，之后任何一次成功落盘都
- * 会把它们带上并清空；叠加时按 `updatedAt` 对账，绝不拿旧进度盖掉盘上更新
- * 的记录（配额腾出来后别的窗口可能已经写过更新的）。
+ * 会把它们带上并清空。每份暂存同时保留写失败前读到的盘上基线；若其它窗口
+ * 已改过该记录，重试必须丢弃暂存，不能靠可能回拨的墙钟猜新旧。
  */
-const failedProgressWrites = new Map<string, ReadingProgress>();
+interface FailedProgressWrite {
+  entry: ReadingProgress;
+  baseline: ReadingProgress | null;
+}
 
-/** 把暂存的失败重试叠到刚读出的整表上（盘上更新的记录优先保留）。 */
+const failedProgressWrites = new Map<string, FailedProgressWrite>();
+
+/** 比较“盘上基线是否仍未改变”；不依赖可能回拨或碰撞的 updatedAt。 */
+export function sameProgressSnapshot(
+  left: ReadingProgress | null,
+  right: ReadingProgress | null
+): boolean {
+  if (left === right) return true;
+  if (!left || !right) return false;
+  return (
+    left.storyPath === right.storyPath &&
+    left.percentage === right.percentage &&
+    left.currentPage === right.currentPage &&
+    left.scrollTop === right.scrollTop &&
+    left.anchorIndex === right.anchorIndex &&
+    left.anchorOffset === right.anchorOffset &&
+    left.readingMode === right.readingMode &&
+    left.updatedAt === right.updatedAt &&
+    left.storyName === right.storyName &&
+    left.storyCode === right.storyCode
+  );
+}
+
+export function shouldRetryFailedProgress(
+  baseline: ReadingProgress | null,
+  currentDisk: ReadingProgress | null
+): boolean {
+  return sameProgressSnapshot(baseline, currentDisk);
+}
+
+/** 仅当盘上仍等于失败时基线，才把暂存重试叠到整表上。 */
 function overlayFailedWrites(map: ProgressMap): ProgressMap {
   if (failedProgressWrites.size === 0) return map;
   const next = { ...map };
-  for (const [key, entry] of failedProgressWrites) {
-    // 这是本会话明确“尚未落盘”的最新操作，不能拿墙钟大小判新旧。用户手动
-    // 回拨时间后 entry.updatedAt 会小于盘上的旧记录；按时间比较会把真正
-    // 最新的位置永久丢掉，且后续每次重试都继续选旧盘。
-    next[key] = entry;
+  for (const [key, failed] of failedProgressWrites) {
+    const disk = map[key] ?? null;
+    if (!shouldRetryFailedProgress(failed.baseline, disk)) {
+      failedProgressWrites.delete(key);
+      continue;
+    }
+    next[key] = failed.entry;
   }
   return next;
 }
 
-/** 读某篇的最新已知进度：盘上记录和暂存的失败重试里取更新的那份。 */
+/** 读某篇的最新已知进度；盘上偏离失败基线时以跨窗口更新为准。 */
 function readLatestKnown(path: string): ReadingProgress | null {
   const disk = readProgressMap()[path] ?? null;
   const stashed = failedProgressWrites.get(path);
-  if (stashed) return stashed;
+  if (stashed) {
+    if (shouldRetryFailedProgress(stashed.baseline, disk)) return stashed.entry;
+    failedProgressWrites.delete(path);
+  }
   return disk;
 }
 
@@ -183,6 +234,7 @@ export function isWorthPersisting(
   if (!last || last.storyPath !== next.storyPath) return true;
   if (last.readingMode !== next.readingMode) return true;
   if (last.currentPage !== next.currentPage) return true;
+  if (last.anchorIndex !== next.anchorIndex) return true;
   if (last.storyName !== next.storyName || last.storyCode !== next.storyCode) return true;
   // 读到结尾 / 回到开头是有意义的状态跃迁，必须记下来。
   if ((next.percentage >= 0.999) !== (last.percentage >= 0.999)) return true;
@@ -326,17 +378,25 @@ export function useReadingProgress(
       }
       // 成败都推进节流窗口：quota 满时不能退化成「每次滚动都重写整张表」。
       lastWriteRef.current = Date.now();
-      const map = overlayFailedWrites(readProgressMap());
+      const diskMap = readProgressMap();
+      const map = overlayFailedWrites(diskMap);
       if (!writeProgressMap({ ...map, [pending.storyPath]: pending })) {
-        // 写失败（quota 满 / 隐私模式）时必须留着 pending，且不能把
+        // 写失败（quota 满 / 隐私模式）时不能把
         // lastPersistedRef 推进到一个从没上过盘的值——否则这份进度就被
         // 无声丢弃：closeReader / pagehide / 切篇的强制冲刷全都会 no-op，
         // 哪怕之后配额被清理腾出来（启动期就会清历史搜索缓存）也救不回。
         // 静默失败还等于骗用户「进度已记住」：阅读照常、重启后却回到旧
         // 位置。收藏 / 划线 / 阅读设置的同类失败都会提示，这里补齐。
-        // 同时折进模块级暂存：pending 是实例级的，换篇 effect 会把它重置、
+        // 折进模块级暂存：pending 是实例级的，换篇 effect 会把它重置、
         // 卸载会把它连实例一起回收，暂存才是「自动重试」真正的载体。
-        failedProgressWrites.set(pending.storyPath, pending);
+        const previousFailure = failedProgressWrites.get(pending.storyPath);
+        failedProgressWrites.set(pending.storyPath, {
+          entry: pending,
+          baseline: previousFailure?.baseline ?? diskMap[pending.storyPath] ?? null,
+        });
+        // 模块级 stash 已经接管重试。若继续把同一快照留在 pending，别的窗口
+        // 改盘后即使 overlay 丢掉 stash，下面这份 pending 仍会把旧位置写回去。
+        pendingRef.current = null;
         if (!persistFailureNotified) {
           persistFailureNotified = true;
           toastRef.current.warn("阅读进度未能保存到本地存储（空间可能已满），将自动重试");
@@ -356,13 +416,27 @@ export function useReadingProgress(
   const updateProgress = useCallback(
     (partial: Partial<ReadingProgress>) => {
       if (!storyPath || !activeRef.current) return;
-      const prev =
+      let prev =
         latestRef.current && latestRef.current.storyPath === storyPath ? latestRef.current : null;
+      const failed = failedProgressWrites.get(storyPath);
+      if (failed) {
+        const disk = readProgressMap()[storyPath] ?? null;
+        if (!shouldRetryFailedProgress(failed.baseline, disk)) {
+          // 失败以后别的窗口推进过这篇：先采用外部基线，再叠加本次真实交互。
+          // 这样用户继续翻页可以获胜，但单纯的旧 stash 重试绝不会回滚外部进度。
+          failedProgressWrites.delete(storyPath);
+          prev = disk;
+          latestRef.current = disk;
+          lastPersistedRef.current = disk;
+        }
+      }
       const merged: ReadingProgress = {
         storyPath,
         percentage: partial.percentage ?? prev?.percentage ?? 0,
         currentPage: partial.currentPage ?? prev?.currentPage,
         scrollTop: partial.scrollTop ?? prev?.scrollTop,
+        anchorIndex: partial.anchorIndex ?? prev?.anchorIndex,
+        anchorOffset: partial.anchorOffset ?? prev?.anchorOffset,
         readingMode: partial.readingMode ?? prev?.readingMode ?? "scroll",
         updatedAt: partial.updatedAt ?? Date.now(),
         storyName: partial.storyName ?? prev?.storyName,

@@ -104,3 +104,21 @@ test("设置比较：相同字段忽略对象身份，真实字段变化可见",
     false
   );
 });
+
+test("设置 storage：事件任务内同步 settingsRef，后续局部合并不回滚外部值", async () => {
+  const source = await readFile(new URL("./useReaderSettings.ts", import.meta.url), "utf8");
+  const storageStart = source.indexOf("const onStorage = (event: StorageEvent)");
+  const storageEnd = source.indexOf('window.addEventListener("storage"', storageStart);
+  const handler = source.slice(storageStart, storageEnd);
+  assert.match(handler, /settingsRef\.current = next;\s+setSettings/);
+});
+
+test("设置 KeepAlive：隐藏时摘监听并冲刷，重新激活再对账", async () => {
+  const source = await readFile(new URL("./useReaderSettings.ts", import.meta.url), "utf8");
+  assert.match(source, /export function useReaderSettings\(active = true\)/);
+  assert.match(source, /if \(!active\) \{[\s\S]*?flushPendingSettings\(\);[\s\S]*?return;/);
+  assert.match(
+    source,
+    /if \(typeof window === "undefined" \|\| !active\) return;[\s\S]*?addEventListener\("storage"/
+  );
+});

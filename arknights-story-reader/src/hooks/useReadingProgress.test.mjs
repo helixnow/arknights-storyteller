@@ -20,7 +20,9 @@ const {
   isWorthPersisting,
   pageIndexFromPercentage,
   progressPersistDelay,
+  sameProgressSnapshot,
   sanitizeReadingProgress,
+  shouldRetryFailedProgress,
 } = progressModule;
 
 function progress(overrides = {}) {
@@ -59,6 +61,8 @@ test("进度序列化：非有限数字不会进入恢复计算", () => {
       percentage: Number.NaN,
       currentPage: Number.POSITIVE_INFINITY,
       scrollTop: Number.NaN,
+      anchorIndex: Number.POSITIVE_INFINITY,
+      anchorOffset: Number.NaN,
       updatedAt: Number.NEGATIVE_INFINITY,
     }),
     "story/a.txt"
@@ -66,7 +70,22 @@ test("进度序列化：非有限数字不会进入恢复计算", () => {
   assert.equal(value.percentage, 0);
   assert.equal(value.currentPage, undefined);
   assert.equal(value.scrollTop, undefined);
+  assert.equal(value.anchorIndex, undefined);
+  assert.equal(value.anchorOffset, undefined);
   assert.equal(value.updatedAt, 0);
+});
+
+test("进度序列化：顶部锚段 index + offset 向后兼容并收敛", () => {
+  const legacy = sanitizeReadingProgress(progress(), "story/a.txt");
+  assert.equal(legacy.anchorIndex, undefined);
+  assert.equal(legacy.anchorOffset, undefined);
+
+  const anchored = sanitizeReadingProgress(
+    progress({ anchorIndex: 7.9, anchorOffset: -12.5 }),
+    "story/a.txt"
+  );
+  assert.equal(anchored.anchorIndex, 7);
+  assert.equal(anchored.anchorOffset, -12.5);
 });
 
 test("进度序列化：未知阅读模式回落滚动，null storyCode 原样保留", () => {
@@ -123,6 +142,7 @@ test("进度 dirty：页码、模式、首尾跃迁始终值得落盘", () => {
   assert.equal(isWorthPersisting(progress({ readingMode: "paged" }), base), true);
   assert.equal(isWorthPersisting(progress({ percentage: 1 }), base), true);
   assert.equal(isWorthPersisting(progress({ percentage: 0 }), base), true);
+  assert.equal(isWorthPersisting(progress({ anchorIndex: 9 }), base), true);
 });
 
 test("进度 dirty：微小滚动不刷盘，离开时仍由 force 冲刷", () => {
@@ -135,4 +155,19 @@ test("进度 dirty：微小滚动不刷盘，离开时仍由 force 冲刷", () =
     isWorthPersisting(progress({ percentage: 0.401, scrollTop: 430 }), base),
     true
   );
+});
+
+test("进度失败重试：盘上仍等于失败基线时允许重试，不受墙钟回拨影响", () => {
+  const baseline = progress({ updatedAt: 9_000 });
+  assert.equal(shouldRetryFailedProgress(baseline, { ...baseline }), true);
+  const rolledBack = progress({ percentage: 0.8, updatedAt: 1_000 });
+  assert.equal(shouldRetryFailedProgress(baseline, rolledBack), false);
+});
+
+test("进度失败重试：外部窗口即使复用 updatedAt，只要内容变化就丢弃旧 stash", () => {
+  const baseline = progress({ updatedAt: 1_000 });
+  const external = progress({ percentage: 0.75, scrollTop: 750, updatedAt: 1_000 });
+  assert.equal(sameProgressSnapshot(baseline, external), false);
+  assert.equal(shouldRetryFailedProgress(baseline, external), false);
+  assert.equal(shouldRetryFailedProgress(null, external), false);
 });

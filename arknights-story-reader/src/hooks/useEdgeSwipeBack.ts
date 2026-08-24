@@ -75,6 +75,58 @@ export function isUnambiguousPageTap(
   );
 }
 
+export function isWithinVisualViewportEdge(
+  clientX: number,
+  viewportOffsetLeft: number,
+  edgeWidth: number
+): boolean {
+  if (
+    !Number.isFinite(clientX) ||
+    !Number.isFinite(viewportOffsetLeft) ||
+    !Number.isFinite(edgeWidth)
+  ) {
+    return false;
+  }
+  const distance = clientX - viewportOffsetLeft;
+  return distance >= 0 && distance <= Math.max(0, edgeWidth);
+}
+
+export interface TouchClickOutcome {
+  at: number;
+  accepted: boolean;
+  clientX: number;
+  clientY: number;
+}
+
+/**
+ * 拒绝过的触摸只吞掉同一落点附近的合成 click；800ms 内来自鼠标的远处点击
+ * 必须放行，否则一次捏合会让用户紧接着点的按钮/翻页区看似失灵。
+ */
+export function shouldSuppressRejectedTouchClick(
+  outcome: TouchClickOutcome | null,
+  clientX: number,
+  clientY: number,
+  now: number,
+  maxAge = 800,
+  maxDistance = 32
+): boolean {
+  if (!outcome || outcome.accepted) return false;
+  const age = now - outcome.at;
+  if (
+    !Number.isFinite(age) ||
+    age < 0 ||
+    age >= maxAge ||
+    !Number.isFinite(clientX) ||
+    !Number.isFinite(clientY)
+  ) {
+    return false;
+  }
+  return (
+    Math.hypot(clientX - outcome.clientX, clientY - outcome.clientY) <=
+    Math.max(0, maxDistance)
+  );
+}
+
 /**
  * iOS-style edge swipe back for any scrollable container. Pass a ref to the
  * element you want to monitor (usually the reader root). The gesture only
@@ -140,7 +192,15 @@ export function useEdgeSwipeBack(
     }
     const onPointerDown = (ev: PointerEvent) => {
       if (!ev.isPrimary || ev.pointerType !== "touch") return;
-      if (ev.clientX > edgeWidth) return;
+      if (
+        !isWithinVisualViewportEdge(
+          ev.clientX,
+          window.visualViewport?.offsetLeft ?? 0,
+          edgeWidth
+        )
+      ) {
+        return;
+      }
       pressSampleRef.current = { count: getOverlayHandlerCount(), at: Date.now() };
     };
 
@@ -168,7 +228,15 @@ export function useEdgeSwipeBack(
         return;
       }
       const touch = ev.touches[0];
-      if (touch.clientX > edgeWidth) return;
+      if (
+        !isWithinVisualViewportEdge(
+          touch.clientX,
+          window.visualViewport?.offsetLeft ?? 0,
+          edgeWidth
+        )
+      ) {
+        return;
+      }
       const root = targetRef.current;
       const target = ev.target as HTMLElement | null;
       if (!root || !target || !root.contains(target)) return;

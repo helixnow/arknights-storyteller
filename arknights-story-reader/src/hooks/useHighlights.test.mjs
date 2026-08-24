@@ -113,3 +113,16 @@ test("划线预览：短句与内部标点保持原样，空白折叠", () => {
   assert.equal(trimHighlightPreview("  凯尔希：\n  博士，回来。  "), "凯尔希： 博士，回来。");
   assert.equal(trimHighlightPreview("   "), "");
 });
+
+test("划线 KeepAlive：隐藏时冲刷并摘监听，激活后以盘上状态对账", async () => {
+  const source = await readFile(new URL("./useHighlights.ts", import.meta.url), "utf8");
+  assert.match(
+    source,
+    /export function useHighlights\([\s\S]*?active = true[\s\S]*?\) \{/
+  );
+  assert.match(source, /if \(!active\) \{[\s\S]*?flushPendingStore\(\);[\s\S]*?return;/);
+  assert.match(
+    source,
+    /if \(typeof window === "undefined" \|\| !active\) return;[\s\S]*?addEventListener\("storage"/
+  );
+});

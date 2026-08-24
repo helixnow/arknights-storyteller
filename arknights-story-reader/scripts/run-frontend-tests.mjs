@@ -24,7 +24,8 @@ args.push(
   path.join("src", "hooks", "useReaderSettings.test.mjs"),
   path.join("src", "hooks", "useReadingProgress.test.mjs"),
   path.join("src", "hooks", "useHighlights.test.mjs"),
-  path.join("src", "hooks", "useEdgeSwipeBack.test.mjs")
+  path.join("src", "hooks", "useEdgeSwipeBack.test.mjs"),
+  path.join("src", "components", "StoryInsightsPanel.test.mjs")
 );
 
 const result = spawnSync(process.execPath, args, {
