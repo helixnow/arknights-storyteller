@@ -33,7 +33,7 @@ export function getStoryThumbnailSources(
 
   if (preview) push(preview.kind, preview.token);
 
-  const storyTxt = (story.storyTxt ?? "").replaceAll("\\", "/").toLowerCase();
+  const storyTxt = (story.storyTxt ?? "").replace(/\\/g, "/").toLowerCase();
   const group = story.storyGroup ?? "";
   if (storyTxt.startsWith("obt/main/")) {
     push("chapter_cover", group);
