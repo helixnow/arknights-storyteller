@@ -52,6 +52,21 @@ export function isSearchIndexTrusted(
 }
 
 /**
+ * 零命中播报必须和可见空态共用同一套三分法。尤其 `status == null` 只表示
+ * 状态尚未确认，不能借 `!indexReady` 把它说成“索引还没建好”。
+ */
+export function searchEmptyAnnouncement(
+  status: { ready: boolean } | null,
+  buildingIndex: boolean
+): string {
+  if (status == null && !buildingIndex) return "正在确认索引状态";
+  if (!isSearchIndexTrusted(status, buildingIndex)) {
+    return "暂时没有结果：全文索引还没建好";
+  }
+  return "没有找到匹配结果";
+}
+
+/**
  * 半截的查询串先别发出去：引号还没配对、停在 `-` / `OR` 上，或者整句
  * 没有任何正向词（`""`、`-排除词`、`not 词`）时，后端只会返回一堆噪音
  * ——最后一类在后端是静态空集（FTS 串构造成 None 直接短路成空页），

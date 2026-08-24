@@ -14,6 +14,7 @@ import {
   isAutoSearchable,
   isSearchIndexTrusted,
   MAX_HIGHLIGHT_TERMS,
+  searchEmptyAnnouncement,
   stableVersionOf,
 } from "./searchTerms.ts";
 
@@ -47,6 +48,20 @@ test("isSearchIndexTrusted：只信明确就绪且不在重建的状态", () => 
   assert.equal(isSearchIndexTrusted({ ready: true }, true), false);
   // 状态尚未返回或查询失败时没有“索引完整”的证据，空页必须走待就绪分流。
   assert.equal(isSearchIndexTrusted(null, false), false);
+});
+
+test("searchEmptyAnnouncement：未确认、未就绪、已就绪的零命中播报严格分流", () => {
+  // null 不是“没有索引”的证据；这条必须与 SearchPanel 的可见空态同口径。
+  assert.equal(searchEmptyAnnouncement(null, false), "正在确认索引状态");
+  assert.equal(
+    searchEmptyAnnouncement({ ready: false }, false),
+    "暂时没有结果：全文索引还没建好"
+  );
+  assert.equal(
+    searchEmptyAnnouncement({ ready: true }, true),
+    "暂时没有结果：全文索引还没建好"
+  );
+  assert.equal(searchEmptyAnnouncement({ ready: true }, false), "没有找到匹配结果");
 });
 
 // ─────────────────────────────────────────────────────────

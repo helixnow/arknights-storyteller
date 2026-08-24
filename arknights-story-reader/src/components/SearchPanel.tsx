@@ -28,6 +28,7 @@ import {
   highlightTerms,
   isAutoSearchable,
   isSearchIndexTrusted,
+  searchEmptyAnnouncement,
   stableVersionOf,
 } from "@/lib/searchTerms";
 import { useToast } from "@/components/ui/toast";
@@ -1327,12 +1328,21 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     if (hitCount > 0) {
       const unit = mode === "segment" ? "段" : "条";
       setAnnouncement(`${scope}找到 ${hitCount} ${unit}结果，可用上下方向键浏览，回车打开`);
-    } else if (indexPending) {
-      setAnnouncement(`${scope}暂时没有结果：全文索引还没建好`);
     } else {
-      setAnnouncement(`${scope}没有找到匹配结果`);
+      // `indexPending` 在 status == null 时也为 true，但这只说明尚未确认；
+      // 播报必须与可见空态一样先分出“正在确认”，不能暗中宣称索引缺失。
+      setAnnouncement(`${scope}${searchEmptyAnnouncement(indexStatus, buildingIndex)}`);
     }
-  }, [searching, searched, searchError, hitCount, lastQuery, mode, indexPending]);
+  }, [
+    searching,
+    searched,
+    searchError,
+    hitCount,
+    lastQuery,
+    mode,
+    indexStatus,
+    buildingIndex,
+  ]);
 
   // 搜索进度：挂载时注册一次，卸载时解绑；只在真的在搜的时候写状态，
   // 免得上一次搜索的迟到事件把 spinner 又点亮。
