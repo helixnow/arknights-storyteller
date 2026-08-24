@@ -2,7 +2,8 @@
  * assetUrls 单元测试（node:test + node:assert，无额外依赖）。
  *
  * 覆盖：各镜像源 URL 拼接、`$` 前缀只剥一次、NPC 头像覆盖表、
- * 别名/原型链安全解析，以及 host 熔断 + 唤醒调度（用 mock timers，
+ * 别名/原型链安全解析，以及 host 熔断 + 唤醒调度（含多 host 到期续排、
+ * 首次证明可达的撤销广播、deadUrls 容量淘汰；用 mock timers，
  * 不真实等待，保持快速且确定）。
  *
  * 注意：熔断相关的模块级状态（deadUrls / hostStrikes / provenHosts）在
@@ -432,5 +433,75 @@ test("失败计数窗口：超过 15s 的旧账不参与熔断判定", (t) => {
     isAssetUrlDead(`${host}/fresh.png`),
     false,
     "窗口外的 7 次旧失败被清零，第 8 次不该触发熔断"
+  );
+});
+
+test("多 host 熔断：共享定时器只记最早到期，唤醒后为较晚的 host 续排闹钟", (t) => {
+  // scheduleHealthNotice 的去重会丢掉较晚 host 的唤醒计划，全靠
+  // scheduleNextHostWake 在每次唤醒后重扫 strike 表续排。这条链断了的话，
+  // 候选全落在较晚 host 上的组件会订阅健康事件却永远等不到通知。
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+  const hostX = "https://mirror-h.invalid";
+  const hostY = "https://mirror-i.invalid";
+  let notices = 0;
+  const unsub = subscribeAssetHealth(() => {
+    notices += 1;
+  });
+
+  // t0：host X 攒满 8 次失败，熔断 30s，定时器排在 t0+30s（+50ms 余量）。
+  for (let i = 0; i < 8; i += 1) markAssetUrlDead(`${hostX}/x${i}.png`);
+  assert.equal(isAssetUrlDead(`${hostX}/fresh.png`), true);
+  assert.equal(isAssetUrlDead(`${hostY}/fresh.png`), false);
+
+  // t0+5s：host Y 也熔断（到期 t0+35s）。更晚的唤醒计划被去重丢掉，
+  // 此刻共享定时器仍指向 X 的 t0+30s。
+  t.mock.timers.tick(5_000);
+  for (let i = 0; i < 8; i += 1) markAssetUrlDead(`${hostY}/y${i}.png`);
+  assert.equal(isAssetUrlDead(`${hostY}/fresh.png`), true);
+  assert.equal(hasRecoverableCandidate([`${hostY}/fresh.png`]), true);
+  assert.equal(pickLiveCandidate([`${hostY}/fresh.png`]), null);
+
+  // t0+30s+51ms：X 到期，广播第一次；Y 还在窗口内，且闹钟被续排到 t0+35s。
+  t.mock.timers.tick(25_051);
+  assert.equal(notices, 1, "X 到期应广播一次");
+  assert.equal(isAssetUrlDead(`${hostX}/fresh.png`), false, "X 解封");
+  assert.equal(isAssetUrlDead(`${hostY}/fresh.png`), true, "Y 仍在熔断窗口内");
+
+  // t0+35s+51ms：Y 到期，续排的闹钟必须打响第二次广播。
+  t.mock.timers.tick(5_000);
+  assert.equal(notices, 2, "续排的闹钟应叫醒等 Y 的订阅者");
+  assert.equal(isAssetUrlDead(`${hostY}/fresh.png`), false, "Y 解封");
+  assert.deepEqual(pickLiveCandidate([`${hostY}/fresh.png`]), {
+    url: `${hostY}/fresh.png`,
+    index: 0,
+  });
+
+  unsub();
+});
+
+test("首次证明可达：撤销存疑失败的同时广播健康事件，候选立即恢复可选", () => {
+  const host = "https://mirror-j.invalid";
+  const suspect = `${host}/suspect.png`;
+  markAssetUrlDead(suspect);
+  assert.equal(pickLiveCandidate([suspect]), null);
+
+  const before = getAssetHealthVersion();
+  markAssetUrlAlive(`${host}/proof.png`);
+  // 撤销与广播必须是同一次动作：只撤销不广播的话，已经退化成兜底的
+  // 组件不会被叫醒，撤销了也没人重试。
+  assert.equal(getAssetHealthVersion(), before + 1);
+  assert.deepEqual(pickLiveCandidate([suspect]), { url: suspect, index: 0 });
+  assert.equal(hasRecoverableCandidate([suspect]), false, "解封后不再是「等窗口」状态");
+});
+
+test("deadUrls 容量：到顶按插入序淘汰最老一批，最新记录保留", () => {
+  // 用相对路径（无 host）避免触发熔断计数；上限 8000 / 每次淘汰 2000。
+  const total = 8_100;
+  for (let i = 0; i < total; i += 1) markAssetUrlDead(`/evict/${i}.png`);
+  assert.equal(isAssetUrlDead("/evict/0.png"), false, "最早的记录应已被淘汰");
+  assert.equal(
+    isAssetUrlDead(`/evict/${total - 1}.png`),
+    true,
+    "最新的记录必须还在（淘汰只动最老的一批）"
   );
 });
