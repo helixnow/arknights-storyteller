@@ -306,6 +306,13 @@ export function markAssetUrlDead(url: string): void {
     blockedUntil: 0,
     strikes: 0,
   };
+  // 熔断窗口内到达的失败只可能来自窗口开启前就已在途的请求——熔断一旦
+  // 生效，pickLiveCandidate 不会再放新请求出门。这些 onerror 是同一次
+  // 断网的余波，不是新一轮证据：URL 级的账（上面）照记，host 级计数就此
+  // 打住。否则一屏在途图片的失败会把同一次故障连升好几档退避（每 8 条
+  // 余波 strikes +1），首次 30s 的熔断瞬间膨胀成几分钟，而真正的升档
+  // 本该留给「窗口到期重试后仍然全灭」的下一轮。
+  if (strike.blockedUntil > now) return;
   // 窗口外的旧账不参与判定，零散 404 攒不出熔断。
   if (now - strike.lastFailureAt > HOST_FAILURE_WINDOW_MS) strike.failures = 0;
   if (strike.blockedUntil && now - strike.blockedUntil > HOST_STRIKE_DECAY_MS) strike.strikes = 0;

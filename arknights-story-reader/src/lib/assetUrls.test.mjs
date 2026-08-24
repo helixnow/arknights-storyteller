@@ -436,6 +436,39 @@ test("失败计数窗口：超过 15s 的旧账不参与熔断判定", (t) => {
   );
 });
 
+test("熔断窗口内的在途失败只记 URL 账，不升级退避档位", (t) => {
+  // 熔断生效后 pickLiveCandidate 不再放新请求出门，窗口内到达的 onerror
+  // 全部来自窗口开启前已在途的请求——同一次断网的余波。若它们继续参与
+  // host 级计数，每 8 条就把 strikes 抬一档，一屏 20+ 张在途图片能把
+  // 首次 30s 的熔断当场膨胀成几分钟。
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+  const host = "https://mirror-k.invalid";
+  const fresh = `${host}/fresh.png`;
+
+  // t0：8 次失败触发首次熔断（30s，strikes=1）。
+  for (let i = 0; i < 8; i += 1) markAssetUrlDead(`${host}/f${i}.png`);
+  assert.equal(isAssetUrlDead(fresh), true);
+
+  // t0+200ms：16 条在途请求的 onerror 陆续到达。被重复计账的话
+  // strikes 会连升到 3（blockedUntil ≈ t0+120s）。
+  t.mock.timers.tick(200);
+  for (let i = 0; i < 16; i += 1) markAssetUrlDead(`${host}/straggler-${i}.png`);
+
+  // 首次窗口 30s 到期后 host 必须解封。
+  t.mock.timers.tick(30_000 - 200 + 51);
+  assert.equal(isAssetUrlDead(fresh), false, "在途余波不该延长首次熔断窗口");
+  // 余波的 URL 级失败照记（host 未 proven，之后首个成功会撤销）。
+  assert.equal(isAssetUrlDead(`${host}/straggler-0.png`), true);
+
+  // 真正的升档留给「解封重试后仍然全灭」：再攒满阈值才进第二档（60s）。
+  for (let i = 0; i < 8; i += 1) markAssetUrlDead(`${host}/g${i}.png`);
+  assert.equal(isAssetUrlDead(fresh), true, "解封后重试全灭才二次熔断");
+  t.mock.timers.tick(30_000 + 51);
+  assert.equal(isAssetUrlDead(fresh), true, "二次熔断按退避翻倍，30s 时仍在窗口内");
+  t.mock.timers.tick(30_000);
+  assert.equal(isAssetUrlDead(fresh), false);
+});
+
 test("多 host 熔断：共享定时器只记最早到期，唤醒后为较晚的 host 续排闹钟", (t) => {
   // scheduleHealthNotice 的去重会丢掉较晚 host 的唤醒计划，全靠
   // scheduleNextHostWake 在每次唤醒后重扫 strike 表续排。这条链断了的话，
