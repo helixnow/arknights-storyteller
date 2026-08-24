@@ -867,25 +867,9 @@ export function StoryList({ onSelectStory }: StoryListProps) {
     return () => window.removeEventListener("app:data-updated", handler);
   }, [activeCategory, loadCategory, loadSection]);
 
-  // 首页统计格 / 其他入口要求直接跳到收藏分类
-  useEffect(() => {
-    const handler = () => {
-      setActiveCategory("favorites");
-      // 入口语义是「去看收藏」而不是「回到上次在收藏里停的位置」。分类
-      // 真的变化时下面的归顶 effect 也会跑一次；这里显式回顶是为了覆盖
-      // 「本来就停在收藏分类、只是滚到了半截」的跳转。
-      const viewport = scrollRootRef.current;
-      if (viewport) viewport.scrollTop = 0;
-    };
-    window.addEventListener("app:open-favorites", handler);
-    return () => window.removeEventListener("app:open-favorites", handler);
-  }, []);
-
-  // 选中的分类 pill 必须留在横向滚动区的可视范围里。用户把 pill 行划到
-  // 最右边看密录、再从首页统计格跳「收藏」时，高亮落在最左端的收藏 pill
-  // 上——不滚回来的话 pill 行看起来毫无变化，像是点了没反应。KeepAlive
-  // 用 visibility 隐藏面板、布局盒还在，所以隐藏时切换也能量到真实几何。
-  useEffect(() => {
+  /** 把当前选中的分类 pill 滚回横向可视区。按 DOM 里的 aria-pressed 找
+   *  目标，所以只能在选中态已经落进 DOM 之后调用。 */
+  const revealActivePill = useCallback(() => {
     const row = pillRowRef.current;
     if (!row) return;
     const active = row.querySelector<HTMLElement>('[aria-pressed="true"]');
@@ -900,7 +884,38 @@ export function StoryList({ onSelectStory }: StoryListProps) {
     } else if (rect.right > rowRect.right - margin) {
       row.scrollLeft += rect.right - (rowRect.right - margin);
     }
-  }, [activeCategory]);
+  }, []);
+
+  // 首页统计格 / 其他入口要求直接跳到收藏分类
+  useEffect(() => {
+    const handler = () => {
+      setActiveCategory("favorites");
+      // 入口语义是「去看收藏」而不是「回到上次在收藏里停的位置」。分类
+      // 真的变化时下面的归顶 effect 也会跑一次；这里显式回顶是为了覆盖
+      // 「本来就停在收藏分类、只是滚到了半截」的跳转。
+      const viewport = scrollRootRef.current;
+      if (viewport) viewport.scrollTop = 0;
+      // pill 行同理：本来就停在收藏分类时 activeCategory 不变，按分类
+      // 变化触发的 pill 归位 effect 不会重跑，而 pill 行可能还停在用户
+      // 上次划到的最右端——选中的收藏 pill 整个在可视区外，跳过来后
+      // pill 行看起来毫无变化。此刻 DOM 里 aria-pressed 就挂在收藏 pill
+      // 上，直接归位；分类真的变化时不在这里滚（此刻查到的还是旧 pill），
+      // 交给下面的归位 effect。
+      if (activeCategoryRef.current === "favorites") revealActivePill();
+    };
+    window.addEventListener("app:open-favorites", handler);
+    return () => window.removeEventListener("app:open-favorites", handler);
+  }, [revealActivePill]);
+
+  // 选中的分类 pill 必须留在横向滚动区的可视范围里。用户把 pill 行划到
+  // 最右边看密录、再从首页统计格跳「收藏」时，高亮落在最左端的收藏 pill
+  // 上——不滚回来的话 pill 行看起来毫无变化，像是点了没反应。KeepAlive
+  // 用 visibility 隐藏面板、布局盒还在，所以隐藏时切换也能量到真实几何。
+  // activeCategory 刻意留在依赖里：effect 体不读它，选中 pill 从 DOM 查，
+  // 它只负责在分类变化、新的 aria-pressed 落进 DOM 之后触发归位。
+  useEffect(() => {
+    revealActivePill();
+  }, [activeCategory, revealActivePill]);
 
   // 阅读进度刷新时机：窗口重新聚焦、页面重新可见、数据更新，以及
   // `app:home-refresh` —— 打开剧情和从阅读器返回都会广播它，这正是进度
