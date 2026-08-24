@@ -84,13 +84,6 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
     return () => window.removeEventListener("app:data-updated", handler);
   }, [open, loadVersionInfo]);
 
-  const handleClose = useCallback(() => {
-    if (busy || preparingSync || preparingImport) return;
-    resetProgress();
-    setError(null);
-    onClose();
-  }, [busy, onClose, preparingImport, preparingSync, resetProgress, setError]);
-
   const cardRef = useRef<HTMLDivElement | null>(null);
 
   // 打开期间锁住背景滚动：iOS/Android 上手指落在遮罩外仍会把列表滑走，
@@ -116,57 +109,6 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
       }
     };
   }, [open]);
-
-  // Esc 关闭 + Tab 焦点环。同步/导入期间 handleClose 自己会拦住关闭动作，
-  // 避免用户以为任务被取消了。
-  useEffect(() => {
-    if (!open) return;
-    const onKeyDown = (event: KeyboardEvent) => {
-      const card = cardRef.current;
-      // 对话框挂在 StoryList 里，数据未安装时会在后台自动打开；此时所在的
-      // KeepAlive 面板是 inert 的，对话框并没有呈现在用户面前，不能再吃
-      // Esc/Tab——否则 Tab 被 preventDefault 而焦点又进不了 inert 子树，
-      // 整个应用的 Tab 键就失灵了（同 SheetShell 的 isPresented 守卫）。
-      if (!card || card.closest("[inert]")) return;
-      if (event.key === "Escape" || event.key === "BrowserBack" || event.key === "GoBack") {
-        // safeConfirm 的 DOM 兜底会作为更上层的 aria-modal sibling 挂到 body。
-        // 它拿到焦点时，返回应先交给它作「取消」，不能被底下的同步框截走。
-        if (event.target instanceof Node && !card.contains(event.target)) return;
-        // A modal owns the back intent even while it refuses to close. Without
-        // consuming the key, another view-level listener can navigate behind
-        // a still-running sync/import and hide the dialog in an inert panel.
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        handleClose();
-        return;
-      }
-      if (event.key !== "Tab") return;
-      const focusable = Array.from(card.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
-        (element) => element.getClientRects().length > 0
-      );
-      if (focusable.length === 0) {
-        event.preventDefault();
-        card.focus();
-        return;
-      }
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      const active = document.activeElement as HTMLElement | null;
-      // 焦点跑到对话框外面（背景里的按钮）时也要拽回来，否则「模态」名不副实。
-      const outside = !active || !card.contains(active);
-      if (event.shiftKey) {
-        if (outside || active === first || active === card) {
-          event.preventDefault();
-          last.focus();
-        }
-      } else if (outside || active === last) {
-        event.preventDefault();
-        first.focus();
-      }
-    };
-    window.addEventListener("keydown", onKeyDown, true);
-    return () => window.removeEventListener("keydown", onKeyDown, true);
-  }, [open, handleClose]);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   /** 点击是否始于遮罩本身：从卡片里拖选文字松手落在遮罩上不该关掉对话框。 */
@@ -275,10 +217,80 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
     setPreparingImport(false);
   }, []);
 
+  const handleClose = useCallback(() => {
+    // 真正的同步/导入不能伪装成已取消；仅处于导入准备态、尚未开始导入时
+    // 则允许关闭，并同步释放寄存锁，不能让无失焦平台一直卡到兜底超时。
+    if (busy || preparingSync || (preparingImport && importing)) return;
+    settleParkedImport();
+    resetProgress();
+    setError(null);
+    onClose();
+  }, [
+    busy,
+    importing,
+    onClose,
+    preparingImport,
+    preparingSync,
+    resetProgress,
+    setError,
+    settleParkedImport,
+  ]);
+
+  // Esc / 返回关闭 + Tab 焦点环。真实同步/导入期间 handleClose 会拦住关闭，
+  // 只等待系统文件选择器时则会收尾寄存锁后退出。
+  useEffect(() => {
+    if (!open) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      const card = cardRef.current;
+      // 对话框挂在 StoryList 里，数据未安装时会在后台自动打开；此时所在的
+      // KeepAlive 面板是 inert 的，对话框并没有呈现在用户面前，不能再吃
+      // Esc/Tab——否则 Tab 被 preventDefault 而焦点又进不了 inert 子树，
+      // 整个应用的 Tab 键就失灵了（同 SheetShell 的 isPresented 守卫）。
+      if (!card || card.closest("[inert]")) return;
+      if (event.key === "Escape" || event.key === "BrowserBack" || event.key === "GoBack") {
+        // safeConfirm 的 DOM 兜底会作为更上层的 aria-modal sibling 挂到 body。
+        // 它拿到焦点时，返回应先交给它作「取消」，不能被底下的同步框截走。
+        if (event.target instanceof Node && !card.contains(event.target)) return;
+        // A modal owns the back intent even while it refuses to close. Without
+        // consuming the key, another view-level listener can navigate behind
+        // a still-running sync/import and hide the dialog in an inert panel.
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        handleClose();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = Array.from(card.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
+        (element) => element.getClientRects().length > 0
+      );
+      if (focusable.length === 0) {
+        event.preventDefault();
+        card.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      const active = document.activeElement as HTMLElement | null;
+      // 焦点跑到对话框外面（背景里的按钮）时也要拽回来，否则「模态」名不副实。
+      const outside = !active || !card.contains(active);
+      if (event.shiftKey) {
+        if (outside || active === first || active === card) {
+          event.preventDefault();
+          last.focus();
+        }
+      } else if (outside || active === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [open, handleClose]);
+
   // 对话框关掉后 <input type="file"> 随之卸载，change 再也不会来：寄存中的
   // 锁必须就地释放，否则得干等 5 分钟兜底，期间设置页的同步/导入入口全被
-  // 这把幽灵锁禁用。（寄存期间 busy 为 false，handleClose 不拦关闭——比如
-  // Android 返回键的 Escape 兜底，所以这条路真的走得到。）组件卸载同理。
+  // 这把幽灵锁禁用。等待选择文件期间 handleClose 会先调用 settleParkedImport
+  // 再关闭，外部直接切 open 或组件卸载时则由下面两个 effect 兜底。
   useEffect(() => {
     if (!open) settleParkedImport();
   }, [open, settleParkedImport]);
@@ -621,6 +633,10 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
               className="hidden"
               tabIndex={-1}
               onChange={handleFileSelected}
+              onCancel={() => {
+                takePendingImportJob()?.();
+                setPreparingImport(false);
+              }}
             />
           </div>
         </CardContent>

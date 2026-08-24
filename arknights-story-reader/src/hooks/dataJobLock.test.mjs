@@ -1,7 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import { createDataJobLockStore } from "./dataJobLock.ts";
+
+const syncDialogSource = readFileSync(
+  new URL("../components/SyncDialog.tsx", import.meta.url),
+  "utf8"
+);
 
 test("同步、导入、索引和更新共用一把互斥锁", () => {
   const store = createDataJobLockStore();
@@ -83,4 +89,19 @@ test("多个等待者被同一次释放唤醒时只有一个拿到锁", async ()
   assert.equal(await second, null);
   firstRelease();
   assert.equal(store.getSnapshot(), null);
+});
+
+test("文件选择器 cancel 事件立即释放寄存导入锁与准备态", () => {
+  assert.match(
+    syncDialogSource,
+    /onCancel=\{\(\) => \{\s*takePendingImportJob\(\)\?\.\(\);\s*setPreparingImport\(false\);/
+  );
+});
+
+test("等待文件期间关闭会收尾寄存锁，真实导入仍禁止关闭", () => {
+  assert.match(
+    syncDialogSource,
+    /if \(busy \|\| preparingSync \|\| \(preparingImport && importing\)\) return;/
+  );
+  assert.match(syncDialogSource, /settleParkedImport\(\);\s*resetProgress\(\);/);
 });
