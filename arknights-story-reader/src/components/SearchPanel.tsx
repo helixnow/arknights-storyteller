@@ -64,6 +64,19 @@ interface ProgressState {
   message: string;
 }
 
+/**
+ * PR #5 起搜索响应会直接说明本次是否真正使用了 FTS。兼容尚未合入该字段的
+ * 后端时才退回发起请求时的可信状态快照；显式 false 绝不能被 ready 快照盖掉。
+ */
+function responseUsedIndex(
+  response: { indexUsed?: boolean; index_used?: boolean },
+  legacyFallback: boolean
+): boolean {
+  if (typeof response.indexUsed === "boolean") return response.indexUsed;
+  if (typeof response.index_used === "boolean") return response.index_used;
+  return legacyFallback;
+}
+
 interface CachedPage {
   page: SearchResultsPage;
   updatedAt: number;
@@ -573,7 +586,8 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
    */
   const indexPending = !indexReady;
 
-  const hitCount = mode === "segment" ? segmentHits.length : page?.results.length ?? 0;
+  // story 模式播报的是用户此刻实际能浏览的 facet 结果，不拿筛选前总页数撒谎。
+  const hitCount = mode === "segment" ? segmentHits.length : visibleResults.length;
   // 边打边搜时旧结果留在原地（只压暗），不然每敲一个字整页都要闪一次白。
   const listRendered = !searchError && hitCount > 0;
   const navRows = mode === "segment" ? segmentHits : visibleResults;
@@ -677,6 +691,22 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     });
   }, []);
 
+  /**
+   * 只在组合已经结束时收起输入框。触摸滚动直接调用；手动提交还会额外检查
+   * coarse pointer，保证桌面 Enter/鼠标提交后焦点仍留在输入框供方向键导航。
+   */
+  const blurSearchInput = useCallback(() => {
+    if (composingRef.current) return;
+    const input = inputRef.current;
+    if (!input || document.activeElement !== input) return;
+    input.blur();
+    setKeyboardOpen(false);
+  }, []);
+
+  const blurSearchInputForCoarsePointer = useCallback(() => {
+    if (window.matchMedia?.("(pointer: coarse)").matches) blurSearchInput();
+  }, [blurSearchInput]);
+
   /** 段级搜索零命中时自动改搜整篇，避免用户卡在空结果页。 */
   const fallbackToStory = async (raw: string) => {
     toast.warn("段级索引暂无命中，已自动改搜整篇", 2500);
@@ -720,10 +750,8 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
       setLastQuery(raw);
       if (!auto && !opts?.skipHistory) saveHistory(raw);
     };
-    // 发起这一刻索引是否可信。重建中 / 未建好时后端走的是退化路径（整篇＝
-    // 线性扫描、段落＝直接返回空页），这种结果不能按版本写缓存：重建不改
-    // 数据版本，一旦落进缓存，索引建好后同一查询仍会永远命中这份残缺结果
-    // ——段落模式表现为永远"零命中自动改搜整篇"。
+    // 兼容尚未返回 indexUsed 的旧后端：发起这一刻索引是否可信仍作为快照
+    // 兜底。新后端的显式字段优先，避免 ready 状态与实际 MATCH 路径竞态。
     const indexTrusted = indexReady;
     const indexTrustToken = indexTrustSeqRef.current;
     const indexStillTrusted = () =>
@@ -814,6 +842,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
         // 空串没法证明缓存对应的是当前这份数据。
         const cached = opts?.forceRefresh || !activeVersion ? undefined : segmentCache[raw];
         if (cached && cached.version === activeVersion) {
+          const cachedIndexUsed = responseUsedIndex(cached.page, indexStillTrusted());
           setSegmentPage(cached.page);
           setPage(null);
           setSearched(true);
@@ -825,7 +854,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
           settle();
           // 旧版本可能把"零命中"写进了 localStorage；命中缓存也要照样回退，
           // 否则这条查询会永远停在空结果。
-          if (cached.page.hits.length === 0 && allowFallback) {
+          if (cached.page.hits.length === 0 && allowFallback && cachedIndexUsed) {
             await fallbackToStory(raw);
           }
           return;
@@ -838,6 +867,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
         );
         const data = await api.searchSegments(raw);
         if (isStale()) return;
+        const responseIndexUsed = responseUsedIndex(data, indexStillTrusted());
         setSegmentPage(data);
         setPage(null);
         setFromCache({ used: false });
@@ -846,9 +876,9 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
 
         // version 没就绪前一律不写缓存：记在空版本下的条目在真实版本落地后
         // 永远不再命中，落盘后还会污染下个会话的空版本窗口期。
-        // 索引不可信（重建中 / 未建好）时同样不写：此时后端返回的空页不是
-        // "真的没有"，缓存住它等于把这条查询永久钉死在回退路径上。
-        if (activeVersion && indexStillTrusted()) {
+        // 新后端以本次响应的 indexUsed 决定能否写缓存；旧后端才退回请求
+        // 发起时的 indexReady + 在途信任代际。
+        if (activeVersion && responseIndexUsed) {
           const nextCache = prune({
             ...segmentCache,
             [raw]: { page: data, updatedAt: Date.now(), version: activeVersion },
@@ -860,16 +890,15 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
         }
         settle();
 
-        // 回退门槛与写缓存同一把尺（indexTrusted）：索引不可信时这个空页
-        // 是退化路径伪造的"零命中"，不是真的没有。拿它触发回退，等于弹一条
+        // 回退门槛与写缓存同一把尺（响应 indexUsed，旧后端回退可信快照）：
+        // 未使用索引时这个空页是退化路径伪造的"零命中"，不是真的没有。拿它触发回退，等于弹一条
         // "段级索引暂无命中"的错话、擅自把用户刚选的段落模式掰回整篇，再
         // 发起一次数秒级的整篇线性扫描——而专为此场景准备的空状态
         // （renderEmptyState 的 indexPending 分支：说明索引没建好 + 建立
         // 入口）反而永远轮不到展示。不回退时索引就绪的上升沿会按原模式把
         // 这条查询补搜完整，真零命中再交给空状态里的"改搜整篇"按钮。
-        // 上面缓存命中分支的回退不受此限：能进缓存的零命中都是索引可信时
-        // 写下的，是真零命中。
-        if (data.hits.length === 0 && allowFallback && indexStillTrusted()) {
+        // 缓存命中分支也读取同一字段；旧条目缺字段时才用当前可信快照。
+        if (data.hits.length === 0 && allowFallback && responseIndexUsed) {
           await fallbackToStory(raw);
         }
         return;
@@ -915,14 +944,15 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
         );
         const data = await api.searchStoriesEx(raw);
         if (isStale()) return;
+        const responseIndexUsed = responseUsedIndex(data, indexStillTrusted());
         setPage(data);
         setSegmentPage(null);
         reconcileFacet(data.facets);
         setDebugLogs([]);
         setDebugExpanded(false);
-        // 索引不可信时这是线性扫描的结果（总数不准、可能不完整），只展示
-        // 不缓存，等索引建好后重搜才能拿到并缓存完整结果。
-        if (activeVersion && indexStillTrusted()) {
+        // 只有响应确认本次真正走过索引才缓存；旧后端缺字段时退回请求发起
+        // 时的可信状态与在途代际。
+        if (activeVersion && responseIndexUsed) {
           const nextCache = prune({
             ...cache,
             [raw]: { page: data, updatedAt: Date.now(), version: activeVersion },
@@ -958,6 +988,14 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     } finally {
       settle();
     }
+  };
+
+  const submitManualSearch = (opts?: Parameters<typeof handleSearch>[0]) => {
+    // 点击搜索按钮时 pointerdown 已被拦下，组合态不会被浏览器先行 blur；
+    // 这里继续拒绝提交，等 compositionend 后由用户再次确认。
+    if (composingRef.current) return;
+    blurSearchInputForCoarsePointer();
+    void handleSearch(opts);
   };
 
   // handleSearch 依赖了一大票 state（cache / version / mode / debugMode…），
@@ -1139,7 +1177,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     if (composingNow) return;
     e.preventDefault();
     if (openActiveRow()) return;
-    void handleSearch();
+    submitManualSearch();
   };
 
   const refreshIndexStatus = useCallback(async (): Promise<StoryIndexStatus | null> => {
@@ -1455,7 +1493,12 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     const scope = lastQuery ? `「${lastQuery}」` : "";
     if (hitCount > 0) {
       const unit = mode === "segment" ? "段" : "条";
-      setAnnouncement(`${scope}找到 ${hitCount} ${unit}结果，可用上下方向键浏览，回车打开`);
+      const facetScope = mode === "story" && activeFacet ? `，当前“${activeFacet}”分类` : "";
+      setAnnouncement(
+        `${scope}找到 ${hitCount} ${unit}结果${facetScope}，可用上下方向键浏览，回车打开`
+      );
+    } else if (mode === "story" && activeFacet) {
+      setAnnouncement(`${scope}当前“${activeFacet}”分类没有可见结果，可清除或更换筛选`);
     } else {
       // `indexPending` 在 status == null 时也为 true，但这只说明尚未确认；
       // 播报必须与可见空态一样先分出“正在确认”，不能暗中宣称索引缺失。
@@ -1473,6 +1516,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     hitCount,
     lastQuery,
     mode,
+    activeFacet,
     indexStatus,
     indexError,
     indexBusy,
@@ -1527,6 +1571,41 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
       .onIndexProgress((p) => {
         if (cancelled) return;
         const epoch = indexProgressEpochRef.current;
+        // 新后端把失败作为明确终态发出。它不走旧的收集→构建→完成单调序列，
+        // 所以要在 advanceIndexProgress 前单独收下；状态以补刷结果为准。
+        if (p.phase === "失败") {
+          const failedCursor = indexProgressCursorRef.current;
+          const belongsToCurrentBuild =
+            failedCursor !== null &&
+            failedCursor.epoch === epoch &&
+            !failedCursor.terminal &&
+            (failedCursor.started || failedCursor.allowTerminalWithoutStart);
+          // 即使没有可归属的当前游标也补刷状态，但不能让上一轮迟到的失败
+          // 清掉当前构建的进度/忙碌态。
+          if (!belongsToCurrentBuild) {
+            void refreshIndexStatus();
+            return;
+          }
+          if (indexProgressStaleTimerRef.current !== null) {
+            window.clearTimeout(indexProgressStaleTimerRef.current);
+            indexProgressStaleTimerRef.current = null;
+          }
+          indexProgressCursorRef.current = null;
+          indexTrustSeqRef.current += 1;
+          setIndexStatus(null);
+          setIndexProgress(p);
+          setIndexProgressActive(false);
+          void refreshIndexStatus().finally(() => {
+            if (
+              indexProgressEpochRef.current === epoch &&
+              indexProgressCursorRef.current === null &&
+              !buildingIndexRef.current
+            ) {
+              setIndexProgress(null);
+            }
+          });
+          return;
+        }
         const cursor =
           indexProgressCursorRef.current ?? beginIndexProgress(epoch, false);
         const next = advanceIndexProgress(cursor, p, epoch);
@@ -1826,7 +1905,10 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
         <Button
           variant="outline"
           className="min-h-[44px]"
-          onClick={() => void handleSearch({ queryOverride: failure.query, forceRefresh: true })}
+          onPointerDown={(event) => event.preventDefault()}
+          onClick={() =>
+            submitManualSearch({ queryOverride: failure.query, forceRefresh: true })
+          }
         >
           <Search className="mr-2 h-4 w-4" aria-hidden="true" />
           重试
@@ -1942,7 +2024,12 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
               )}
             </div>
             <Button
-              onClick={() => (searching ? cancelActiveSearch() : void handleSearch())}
+              // 阻止按钮在 click 前抢走焦点：桌面保持输入框持焦；粗指针会在
+              // submitManualSearch 中显式 blur，组合态则两边都不 blur。
+              onPointerDown={(event) => {
+                if (!searching) event.preventDefault();
+              }}
+              onClick={() => (searching ? cancelActiveSearch() : submitManualSearch())}
               disabled={!searching && !trimSearchQuery(query)}
               aria-busy={searching}
               className="min-h-[44px]"
@@ -2058,9 +2145,10 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
                     <button
                       type="button"
                       className="min-h-[44px] text-xs text-[hsl(var(--color-foreground))]"
+                      onPointerDown={(event) => event.preventDefault()}
                       onClick={() => {
                         setQuery(h);
-                        void handleSearch({ queryOverride: h });
+                        submitManualSearch({ queryOverride: h });
                       }}
                     >
                       {h}
@@ -2124,7 +2212,10 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
                 className="inline-flex min-h-[44px] items-center px-2 underline hover:text-[hsl(var(--color-foreground))]"
                 // 刷新的必须是横幅指向的那次搜索（lastQuery），而不是输入框里
                 // 可能已经改到一半的词。
-                onClick={() => void handleSearch({ queryOverride: lastQuery, forceRefresh: true })}
+                onPointerDown={(event) => event.preventDefault()}
+                onClick={() =>
+                  submitManualSearch({ queryOverride: lastQuery, forceRefresh: true })
+                }
               >
                 刷新缓存
               </button>
@@ -2220,6 +2311,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
           className="h-full"
           viewportClassName="reader-scroll"
           viewportRef={resultsViewportRef}
+          onTouchMove={blurSearchInput}
           trackOffsetTop="calc(3.5rem + 10px)"
           trackOffsetBottom="calc(4.5rem + env(safe-area-inset-bottom, 0px))"
         >

@@ -210,15 +210,33 @@ export function useAutoIndex() {
     let disposeProgress: (() => void) | null = null;
     void api
       .onIndexProgress((p) => {
+        // 新后端会用“失败”明确结束本轮。它和“完成”一样是终态，但不符合
+        // 收集→构建的成功单调序列，必须先收下，否则 backendBuilding 会一直
+        // 卡到 60s 停更窗；后续 ensureIndex 探针仍会广播真实 ready 状态。
+        if (p.phase === "失败") {
+          const cursor = progressCursor;
+          // 与成功终态保持同一归属门槛：没有当前代起点、或已经终止的游标
+          // 收到的失败只能是挂载前/上一轮的迟到事件，不能掐掉当前忙碌态。
+          if (
+            !cursor ||
+            cursor.epoch !== progressEpoch ||
+            cursor.terminal ||
+            (!cursor.started && !cursor.allowTerminalWithoutStart)
+          ) {
+            return;
+          }
+          progressCursor = null;
+          lastIndexProgressAt = Date.now();
+          backendBuilding = false;
+          return;
+        }
         const cursor = progressCursor ?? beginIndexProgress(progressEpoch, false);
         const next = advanceIndexProgress(cursor, p, progressEpoch);
         if (!next) return;
         progressCursor = next;
         lastIndexProgressAt = Date.now();
-        // 终态判定要对齐后端契约：正常收尾发 ("完成", total, total)，但
-        // 空数据集与「索引已是最新（0 篇）」的快速返回发的是 ("完成", 0, 0)。
-        // 只看 current >= total 会漏掉后者，backendBuilding 卡在 true，
-        // 兜底检查得白等满 60s 停更窗才恢复。
+        // 成功终态由纯函数覆盖 ("完成", total, total)、("完成", 0, 0)
+        // 与满刻度；失败终态已在上面单独收下。
         backendBuilding = !next.terminal;
       })
       .then((unlisten) => {
