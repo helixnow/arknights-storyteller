@@ -55,6 +55,13 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
 
   /** 「重新同步」确认框弹着的忙态；此时 "sync" 任务锁已被下面的点击流程预占。 */
   const [preparingSync, setPreparingSync] = useState(false);
+  /**
+   * 文件选择器 / 覆盖确认框弹着的忙态；此时 "import" 任务锁已被本对话框
+   * 预占（寄存或已交到 handleFileSelected 手里）。与 preparingSync 同一
+   * 用途：blockedBy 分不清「别处真在导入」和「自己预占」，靠它把那行
+   * 「正在导入 ZIP」压下去。
+   */
+  const [preparingImport, setPreparingImport] = useState(false);
 
   useEffect(() => {
     if (!open) {
@@ -194,7 +201,10 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
       pendingImportWatchCleanupRef.current?.();
       const job = pendingImportJobRef.current;
       pendingImportJobRef.current = null;
-      job?.();
+      if (job) {
+        job();
+        setPreparingImport(false);
+      }
     };
 
     const startGrace = () => {
@@ -251,6 +261,7 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
     pendingImportWatchCleanupRef.current?.();
     pendingImportJobRef.current?.();
     pendingImportJobRef.current = null;
+    setPreparingImport(false);
   }, []);
 
   // 对话框关掉后 <input type="file"> 随之卸载，change 再也不会来：寄存中的
@@ -270,6 +281,7 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
     const transferredJob = takePendingImportJob();
     if (!file) {
       transferredJob?.();
+      setPreparingImport(false);
       return;
     }
     // 选完再确认：先弹确认框会丢掉用户手势，部分 WebView 就打不开文件选择器了。
@@ -280,6 +292,7 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
     );
     if (!confirmed) {
       transferredJob?.();
+      setPreparingImport(false);
       return;
     }
     try {
@@ -291,12 +304,13 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
     } finally {
       // 释放函数幂等，这里兜底再放一次无害（正常已由导入流程释放）。
       transferredJob?.();
+      setPreparingImport(false);
     }
   };
 
   if (!open) return null;
 
-  const actionsDisabled = busy || preparingSync || blockedBy !== null;
+  const actionsDisabled = busy || preparingSync || preparingImport || blockedBy !== null;
   const percent =
     progress && progress.total > 0
       ? Math.min(Math.round((progress.current / progress.total) * 100), 100)
@@ -315,6 +329,7 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
     }
     setError(null);
     armPendingImportWatch(releaseJob);
+    setPreparingImport(true);
     fileInputRef.current?.click();
   };
 
@@ -386,9 +401,11 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
           </div>
 
           {/* 别处（设置页 / 自动索引 / 更新安装）占着任务锁时，说清在等谁。
-              确认框期间锁被本对话框自己预占（preparingSync），这行不该出来
-              说「正在同步剧情数据」——那会和还没点头的确认框自相矛盾。 */}
-          {blockedBy && !preparingSync && (
+              锁被本对话框自己预占时这行不该出来：重新同步确认框期间
+              （preparingSync）说「正在同步剧情数据」、文件选择器 / 覆盖确认
+              期间（preparingImport）说「正在导入 ZIP」，都会和用户还没点头
+              的事实自相矛盾——导入根本没开始，也不存在「完成」可等。 */}
+          {blockedBy && !preparingSync && !preparingImport && (
             <div className="flex items-center gap-2 text-xs text-[hsl(var(--color-muted-foreground))]" role="status">
               <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
               <span>正在{describeDataJob(blockedBy)}，完成后即可继续操作。</span>
