@@ -795,28 +795,52 @@ impl DataService {
         // setup 里跑一次，任何命令（包括同步换入）都还没机会启动，此时
         // 动这些目录没有并发之忧。
         service.restore_data_dir_from_aside();
-        // 分块导入半途而废，或已经把 `.part` 转正却在 finalize 校验/解压
-        // 前崩溃，都会留下与数据集同量级的临时文件。重启后协议从 offset 0
-        // 重开，不会续用任何一个；开机统一清掉。同上，此刻不可能有传输在途。
+        // 导入或同步在下载、转正、校验、解压途中崩溃，都会留下与数据集
+        // 同量级的临时文件/目录。重启后协议不会续用任何一个；开机统一
+        // 清掉。同上，此刻不可能有传输在途。
         service.discard_stale_import_artifacts();
         service
     }
 
-    /// 删除上一次运行遗留的分块暂存和已转正临时 ZIP。后者会出现在
-    /// `promote_import_staging` 成功、`finalize_manual_import` 尚未接手时
-    /// 进程崩溃的窄窗口；旧实现只清 `.part`，这份几百 MB 的弃单会永久
-    /// 占盘，直到用户再次导入。删不掉只记日志，下一轮仍会安全地截断/替换。
+    /// 删除上一次运行遗留的导入/同步临时产物。除分块 `.part` 与已转正
+    /// 导入 ZIP 外，同步可能在下载完 `ArknightsGameData.zip` 后、或解压到
+    /// `ArknightsGameData_extract` 途中被杀；这两份残骸没有启动续传协议，
+    /// 若只等下一次同步覆盖会永久占盘。这里只在 `DataService::new` 调用，
+    /// 尚无任务并发；删不掉只记日志，下一轮仍会安全地截断/替换。
     fn discard_stale_import_artifacts(&self) {
-        let paths = [self.import_staging_path(), self.import_temp_zip_path()];
-        for path in paths.into_iter().flatten() {
+        let parent = self.data_dir.parent();
+        let files = [
+            self.import_staging_path().ok().map(|path| ("IMPORT", path)),
+            self.import_temp_zip_path()
+                .ok()
+                .map(|path| ("IMPORT", path)),
+            parent.map(|dir| ("SYNC", dir.join("ArknightsGameData.zip"))),
+        ];
+        for (kind, path) in files.into_iter().flatten() {
             match fs::remove_file(&path) {
                 Ok(()) => {
-                    eprintln!("[IMPORT] 已清理上次中断的导入临时文件 {:?}", path);
+                    eprintln!("[{}] 已清理上次中断的临时文件 {:?}", kind, path);
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                 Err(err) => {
-                    eprintln!("[IMPORT] 清理导入临时文件 {:?} 失败（忽略）: {}", path, err);
+                    eprintln!("[{}] 清理临时文件 {:?} 失败（忽略）: {}", kind, path, err);
                 }
+            }
+        }
+
+        let Some(extract_root) = parent.map(|dir| dir.join("ArknightsGameData_extract")) else {
+            return;
+        };
+        match fs::remove_dir_all(&extract_root) {
+            Ok(()) => {
+                eprintln!("[SYNC] 已清理上次中断的解压目录 {:?}", extract_root);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                eprintln!(
+                    "[SYNC] 清理解压目录 {:?} 失败（忽略）: {}",
+                    extract_root, err
+                );
             }
         }
     }
@@ -8280,6 +8304,30 @@ mod tests {
             "finalize 前崩溃留下的已转正临时 ZIP 也必须清理"
         );
         assert!(relaunched.is_installed(), "清理暂存不得伤及数据目录");
+    }
+
+    /// 同步下载完 ZIP 或解压到一半时进程被杀，固定路径的文件和目录会跨
+    /// 启动残留；它们没有续传价值，且各自都可能占用一整份数据包的空间。
+    #[test]
+    fn new_discards_leftover_sync_download_and_extract_artifacts() {
+        let fx = Fixture::new("sync_artifact_cleanup");
+        let sync_zip = fx.root.join("ArknightsGameData.zip");
+        let extract_root = fx.root.join("ArknightsGameData_extract");
+        fs::write(&sync_zip, b"download completed just before a crash").unwrap();
+        fs::create_dir_all(extract_root.join("partial/tree")).unwrap();
+        fs::write(
+            extract_root.join("partial/tree/story_review_table.json"),
+            b"half extracted",
+        )
+        .unwrap();
+
+        let relaunched = DataService::new(fx.root.clone());
+        assert!(!sync_zip.exists(), "启动必须清理同步下载留下的临时 ZIP");
+        assert!(
+            !extract_root.exists(),
+            "启动必须递归清理同步留下的半截解压目录"
+        );
+        assert!(relaunched.is_installed(), "清理同步残骸不得伤及已安装数据");
     }
 
     /// 手动导入的临时 ZIP 在解压失败后也必须删掉——它和数据集一个量级，

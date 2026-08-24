@@ -479,13 +479,14 @@ static IMPORT_CHUNK_LOCK: Mutex<()> = Mutex::new(());
 /// （持锁期间新一轮传输的首块拿不到锁，不存在被误删的活暂存）；
 /// 抢不到说明 sync / 导入收尾正占着这组路径，严格 no-op——此时删
 /// 文件反而可能误伤它们正在处理的暂存。清理失败不影响放锁：guard
-/// 在返回前无条件 Drop，INSTALL_LOCK 一定回到空闲。
-fn abort_import_transfer(staging: &std::path::Path) -> Result<(), String> {
+/// 在返回前无条件 Drop，INSTALL_LOCK 一定回到空闲。返回值只表示本次
+/// 是否真的删除了暂存文件；让路 no-op 和文件本就不存在都返回 false。
+fn abort_import_transfer(staging: &std::path::Path) -> Result<bool, String> {
     let guard = match take_transfer_hold() {
         Some(guard) => guard,
         None => match acquire_install_lock("import_from_zip_bytes") {
             Ok(guard) => guard,
-            Err(_) => return Ok(()),
+            Err(_) => return Ok(false),
         },
     };
     // 删除与追加共用 IMPORT_CHUNK_LOCK：滞留在阻塞线程池里的迟到块
@@ -496,9 +497,9 @@ fn abort_import_transfer(staging: &std::path::Path) -> Result<(), String> {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match std::fs::remove_file(staging) {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(true),
             // 暂存本就不存在（首块还没落盘就失败了）不算错。
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(err) => Err(format!("清理导入暂存文件失败: {}", err)),
         }
     };
@@ -647,7 +648,9 @@ pub async fn import_from_zip_bytes(
         let service = clone_service(&state);
         return run_blocking("import_from_zip_bytes", move || {
             match service.import_staging_path() {
-                Ok(staging) => abort_import_transfer(&staging),
+                // 保持既有 IPC 返回形状 `null`；内部 bool 供后端区分
+                // 真删除与并发任务占锁时的安全让路。
+                Ok(staging) => abort_import_transfer(&staging).map(|_| ()),
                 Err(err) => {
                     // 放锁优先于清理：暂存路径都推导不出也不能把寄存
                     // 持有留到弃单超时。
@@ -1392,7 +1395,10 @@ mod tests {
         append_import_chunk(&staging, 0, b"half transfer").expect("首块必须成功");
         let guard = acquire_install_lock("import_from_zip_bytes").expect("空闲时必须拿到锁");
         stow_transfer_hold(guard);
-        abort_import_transfer(&staging).expect("中止必须成功");
+        assert!(
+            abort_import_transfer(&staging).expect("中止必须成功"),
+            "实际删除暂存时应返回 true"
+        );
         assert!(!staging.exists(), "中止后半截暂存文件必须被删掉");
         assert!(take_transfer_hold().is_none(), "中止后寄存处必须为空");
         drop(acquire_install_lock("sync_data").expect("中止后 sync 必须立刻拿到锁"));
@@ -1401,7 +1407,10 @@ mod tests {
         // 不得放掉别人的锁。
         append_import_chunk(&staging, 0, b"someone else's bytes").expect("重建暂存必须成功");
         let others = acquire_install_lock("sync_data").expect("锁应空闲");
-        abort_import_transfer(&staging).expect("空寄存时中止必须静默成功");
+        assert!(
+            !abort_import_transfer(&staging).expect("空寄存时中止必须静默成功"),
+            "为在途任务让路时应返回 false"
+        );
         assert!(staging.exists(), "没有取到持有就不得删暂存文件");
         acquire_install_lock("import_from_zip").expect_err("别人持有的锁不能被中止放掉");
         drop(others);
@@ -1410,7 +1419,10 @@ mod tests {
         let guard = acquire_install_lock("import_from_zip_bytes").expect("锁应空闲");
         stow_transfer_hold(guard);
         std::fs::remove_file(&staging).unwrap();
-        abort_import_transfer(&staging).expect("暂存缺失时中止必须成功");
+        assert!(
+            !abort_import_transfer(&staging).expect("暂存缺失时中止必须成功"),
+            "没有文件可删时应返回 false"
+        );
         drop(acquire_install_lock("sync_data").expect("锁必须已被释放"));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1438,13 +1450,16 @@ mod tests {
         append_import_chunk(&staging, 0, b"chunk landed, next one failed").expect("首块必须成功");
         drop(acquire_install_lock("import_from_zip_bytes").expect("空闲时必须拿到锁"));
 
-        abort_import_transfer(&staging).expect("锁空闲时中止必须成功");
+        assert!(
+            abort_import_transfer(&staging).expect("锁空闲时中止必须成功"),
+            "抢到锁并删除残留时应返回 true"
+        );
         assert!(!staging.exists(), "锁空闲时中止必须删掉遗留的半截暂存");
         assert!(take_transfer_hold().is_none(), "中止不得凭空造出寄存持有");
         drop(acquire_install_lock("sync_data").expect("中止后锁必须回到空闲"));
 
         // 暂存本就不存在时同样静默成功（幂等），锁照样回到空闲。
-        abort_import_transfer(&staging).expect("暂存缺失且锁空闲时中止必须成功");
+        assert!(!abort_import_transfer(&staging).expect("暂存缺失且锁空闲时中止必须成功"));
         drop(acquire_install_lock("sync_data").expect("锁必须仍然空闲"));
 
         let _ = std::fs::remove_dir_all(&dir);
