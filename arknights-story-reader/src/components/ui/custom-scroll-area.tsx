@@ -171,14 +171,19 @@ export const CustomScrollArea = forwardRef<HTMLDivElement, CustomScrollAreaProps
       return typeof value === "number" ? `${value}px` : value;
     }, []);
 
-    const mergedStyle = useMemo<CSSProperties>(() => {
+    /* 偏移变量必须内联在轨道元素自身上，而不是根容器上：index.css 的
+       `.scroll-area__track` 规则给这三个变量声明了 0px 默认值，CSS 级联里
+       「元素自身的声明」永远盖过「从祖先继承的值」——写在根上时轨道读到的
+       永远是 0px，调用方为避开工具栏/底栏传的 trackOffset* 全部失效：轨道
+       全高铺满，滑块行程冲进底栏后面，桌面端可点击的轨道还会盖住右缘的
+       工具栏按钮。同一元素上内联样式优先级高于类选择器，稳赢。 */
+    const trackStyle = useMemo<CSSProperties>(() => {
       return {
-        ...(style as CSSProperties),
-        ["--scroll-area-track-offset-top" as const]: formatOffset(trackOffsetTop),
-        ["--scroll-area-track-offset-bottom" as const]: formatOffset(trackOffsetBottom),
-        ["--scroll-area-track-offset-right" as const]: formatOffset(trackOffsetRight),
-      };
-    }, [formatOffset, style, trackOffsetBottom, trackOffsetRight, trackOffsetTop]);
+        "--scroll-area-track-offset-top": formatOffset(trackOffsetTop),
+        "--scroll-area-track-offset-bottom": formatOffset(trackOffsetBottom),
+        "--scroll-area-track-offset-right": formatOffset(trackOffsetRight),
+      } as CSSProperties;
+    }, [formatOffset, trackOffsetBottom, trackOffsetRight, trackOffsetTop]);
 
     const handleThumbPointerDown = useCallback(
       (event: ReactPointerEvent<HTMLDivElement>) => {
@@ -319,7 +324,7 @@ export const CustomScrollArea = forwardRef<HTMLDivElement, CustomScrollAreaProps
         className={cn("scroll-area", className)}
         onPointerEnter={handlePointerEnter}
         onPointerLeave={handlePointerLeave}
-        style={mergedStyle}
+        style={style}
         {...rest}
       >
         <div
@@ -337,6 +342,7 @@ export const CustomScrollArea = forwardRef<HTMLDivElement, CustomScrollAreaProps
           className="scroll-area__track"
           data-visible={shouldShowTrack}
           aria-hidden="true"
+          style={trackStyle}
           onPointerDown={handleTrackPointerDown}
         >
           <div
