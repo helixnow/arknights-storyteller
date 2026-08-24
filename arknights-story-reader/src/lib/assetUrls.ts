@@ -491,6 +491,7 @@ export function markAssetUrlAlive(url: string): void {
   if (!host) return;
   if (provenHosts.has(host)) return;
   provenHosts.add(host);
+  const previousStrike = hostStrikes.get(host);
   hostStrikes.delete(host);
   // 撤销这个 host 在「尚未证明可达」期间记下的 URL 级失败：断网/被墙时
   // img.onerror 与真 404 无法区分，那些判决不可靠。不撤销的话，断网期间
@@ -502,7 +503,18 @@ export function markAssetUrlAlive(url: string): void {
   // 若这个 host 原本正占着共享闹钟，证明可达后旧闹钟已经没有意义；立即按
   // 剩余 host 重排。否则 30 秒后还会多广播一次“恢复”，几百张兜底图会被
   // 无缘无故叫醒重扫。
-  rescheduleNextHostWake();
+  //
+  // 只在它确实是“当前最早闹钟”的目标时重排。普通 first-alive（host 从未
+  // 熔断）若也全表重扫，系统时钟回拨后可能把历史 blockedUntil 当成未来
+  // 窗口、凭空复活一只长定时器。
+  if (
+    previousStrike &&
+    previousStrike.blockedUntil > Date.now() &&
+    healthTimer !== null &&
+    healthTimerAt === previousStrike.blockedUntil
+  ) {
+    rescheduleNextHostWake();
+  }
   // 这个源刚被证明可达：之前因它熔断而放弃的候选现在值得重试。
   notifyAssetHealth();
 }

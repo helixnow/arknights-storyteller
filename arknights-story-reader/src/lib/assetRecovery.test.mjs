@@ -41,6 +41,24 @@ test("recovery action keeps an event pending until the whole chain is stuck", ()
   assert.equal(getAssetRecoveryAction(7, 8, true, true), "retry");
 });
 
+test("first alive cancels the obsolete fuse-expiry wakeup", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+  const host = "https://cancel-wake.invalid";
+  let notices = 0;
+  const unsubscribe = subscribeAssetHealth(() => {
+    notices += 1;
+  });
+  for (let i = 0; i < 8; i += 1) markAssetUrlDead(`${host}/${i}.png`);
+  assert.equal(isAssetUrlDead(`${host}/fresh.png`), true);
+
+  markAssetUrlAlive(`${host}/proof.png`);
+  assert.equal(notices, 1, "首次成功立即广播");
+  assert.equal(isAssetUrlDead(`${host}/fresh.png`), false);
+  t.mock.timers.tick(30_051);
+  assert.equal(notices, 1, "已证明可达的 host 不应在旧到期点重复广播");
+  unsubscribe();
+});
+
 test("a duplicate URL failure counts only once toward the host fuse", (t) => {
   t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
   const host = "https://dedupe-fuse.invalid";
@@ -109,24 +127,6 @@ test("first alive only purges failures from its own host", () => {
   markAssetUrlAlive(`${hostA}/ok.png`);
   assert.equal(isAssetUrlDead(`${hostA}/missing.png`), false);
   assert.equal(isAssetUrlDead(`${hostB}/missing.png`), true);
-});
-
-test("first alive cancels the obsolete fuse-expiry wakeup", (t) => {
-  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
-  const host = "https://cancel-wake.invalid";
-  let notices = 0;
-  const unsubscribe = subscribeAssetHealth(() => {
-    notices += 1;
-  });
-  for (let i = 0; i < 8; i += 1) markAssetUrlDead(`${host}/${i}.png`);
-  assert.equal(isAssetUrlDead(`${host}/fresh.png`), true);
-
-  markAssetUrlAlive(`${host}/proof.png`);
-  assert.equal(notices, 1, "首次成功立即广播");
-  assert.equal(isAssetUrlDead(`${host}/fresh.png`), false);
-  t.mock.timers.tick(30_051);
-  assert.equal(notices, 1, "已证明可达的 host 不应在旧到期点重复广播");
-  unsubscribe();
 });
 
 test("in-flight failures during an open fuse do not extend its host backoff", (t) => {
