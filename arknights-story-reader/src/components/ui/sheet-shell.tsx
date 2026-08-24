@@ -77,6 +77,38 @@ function isPresented(panel: HTMLElement | null): panel is HTMLElement {
   return Boolean(panel && !panel.closest("[inert]"));
 }
 
+/*
+ * 键盘（Escape / Tab 圈禁）和焦点回收只该由「最顶层呈现的模态」消费。
+ * 每个 SheetShell 都往 document 捕获阶段挂 keydown，多个实例并存时按
+ * 「谁先打开谁先执行」排队——没有这层判定，一次 Escape 会关掉最底下的
+ * sheet 并用 preventDefault 把真正在顶上的那个挡住；useBackHandler 里
+ * dismissPresentedModal 专门派发给最顶层对话框的合成 Escape 同样会被
+ * 底层实例截走，返回手势于是关错层。判定规则：事件目标落在哪个 dialog
+ * 里就归谁；不在任何 dialog 里时，按 DOM 顺序取最后一个仍在呈现的
+ * aria-modal 对话框当顶层（后开的 sheet 挂载在后，与视觉层叠一致）。
+ */
+function isTopmostPresentedDialog(
+  panel: HTMLElement,
+  target: EventTarget | null
+): boolean {
+  const targetEl = target instanceof Element ? target : null;
+  const targetDialog = targetEl?.closest?.('[role="dialog"]');
+  if (targetDialog) return targetDialog === panel;
+  const dialogs = document.querySelectorAll<HTMLElement>(
+    '[role="dialog"][aria-modal="true"]'
+  );
+  for (let i = dialogs.length - 1; i >= 0; i -= 1) {
+    const dialog = dialogs[i];
+    if (dialog === panel) return true;
+    if (dialog.closest("[inert]")) continue;
+    if (dialog.closest('[data-state="closed"]')) continue;
+    if (dialog.getClientRects().length === 0) continue;
+    return false;
+  }
+  // 查询里找不到自己（理论上不会发生）：按单一模态的旧行为处理。
+  return true;
+}
+
 function focusableWithin(panel: HTMLElement): HTMLElement[] {
   return Array.from(panel.querySelectorAll<HTMLElement>(FOCUSABLE)).filter((el) => {
     if (el.closest("[inert]") || el.closest('[aria-hidden="true"]')) return false;
@@ -154,6 +186,7 @@ export function SheetShell({
     const handleKeyDown = (event: KeyboardEvent) => {
       const panel = panelRef.current;
       if (!isPresented(panel)) return;
+      if (!isTopmostPresentedDialog(panel, event.target)) return;
 
       if (event.key === "Escape") {
         if (event.defaultPrevented || isTextEntry(event.target)) return;
@@ -199,6 +232,9 @@ export function SheetShell({
       const target = event.target as HTMLElement | null;
       if (!isPresented(panel) || !target || panel.contains(target)) return;
       if (target.closest?.('[role="dialog"]')) return;
+      // 焦点跌到所有模态之外（body 等）时，只有最顶层的 sheet 有资格把它
+      // 请回来；底下那层抢的话焦点会穿到被遮住的面板里。
+      if (!isTopmostPresentedDialog(panel, null)) return;
       panel.focus({ preventScroll: true });
     };
     document.addEventListener("focusin", handleFocusIn);
