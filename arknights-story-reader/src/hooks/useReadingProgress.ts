@@ -280,7 +280,15 @@ export function useReadingProgress(
       pendingRef.current = merged;
 
       if (writeTimerRef.current !== null) return;
-      const delay = Math.max(0, PERSIST_THROTTLE_MS - (Date.now() - lastWriteRef.current));
+      // Date.now() 是墙钟，NTP 校时 / 手动改时间会往回跳：elapsed 为负时
+      // 「窗口 - elapsed」会算出远超一个节流窗口的延时，而定时器一旦挂上，
+      // 后续 updateProgress 都在上面提前返回、不会重排——周期性落盘就此
+      // 停摆，只剩强制冲刷兜底，进程被杀就丢掉回拨后的全部进度。把延时
+      // 钳回一个节流窗口；时钟单调时 elapsed ≥ 0，这个钳位恒为 no-op。
+      const delay = Math.min(
+        PERSIST_THROTTLE_MS,
+        Math.max(0, PERSIST_THROTTLE_MS - (Date.now() - lastWriteRef.current))
+      );
       if (!isBrowser) {
         flushPending();
         return;
