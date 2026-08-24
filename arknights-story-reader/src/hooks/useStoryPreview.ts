@@ -5,12 +5,13 @@ import {
   PREVIEW_CACHE_PREFIX,
   PREVIEW_DATA_VERSION_KEY,
   PREVIEW_FAILURE_TTL_MS,
+  PreviewLruCache,
   isPreviewCacheEntryExpired,
   isPreviewTaskCurrent,
-  parsePreviewCacheEntry,
   previewCacheKey,
   previewCachePrefix,
   previewRequestKey,
+  readPreviewStorageEntry,
   type PreviewCacheEntry,
 } from "@/hooks/storyPreviewCache";
 
@@ -36,21 +37,13 @@ import {
 
 type CacheEntry = PreviewCacheEntry;
 
-const MEMO = new Map<string, CacheEntry>();
-/** 全量剧情几千条，条目本身只有两个短字符串；到顶后淘汰最早写入的一批。 */
+/** 全量剧情几千条，条目本身只有两个短字符串；到顶后批量淘汰真正的 LRU。 */
 const MEMO_LIMIT = 4000;
 const MEMO_EVICT = 1000;
+const MEMO = new PreviewLruCache<string, CacheEntry>(MEMO_LIMIT, MEMO_EVICT);
 const MAX_INFLIGHT = 2;
 
 function writeMemo(path: string, entry: CacheEntry) {
-  if (MEMO.size >= MEMO_LIMIT && !MEMO.has(path)) {
-    let removed = 0;
-    for (const key of MEMO.keys()) {
-      MEMO.delete(key);
-      removed += 1;
-      if (removed >= MEMO_EVICT) break;
-    }
-  }
   MEMO.set(path, entry);
 }
 
@@ -111,13 +104,12 @@ function isExpired(entry: CacheEntry): boolean {
 }
 
 function readLsCache(path: string): CacheEntry | null {
-  try {
-    const raw = window.localStorage.getItem(lsKey(path));
-    if (!raw) return null;
-    const entry = parsePreviewCacheEntry(JSON.parse(raw));
-    if (entry && !isExpired(entry)) return entry;
-  } catch {}
-  return null;
+  return readPreviewStorageEntry(
+    window.localStorage,
+    lsKey(path),
+    Date.now(),
+    PREVIEW_FAILURE_TTL_MS
+  );
 }
 
 function writeLsCache(path: string, entry: CacheEntry) {
