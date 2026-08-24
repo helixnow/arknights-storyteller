@@ -1,4 +1,9 @@
 import { useEffect } from "react";
+import {
+  cleanupVersionFrom,
+  pendingCleanupKeys,
+  type CleanupStep,
+} from "@/lib/appShellLogic";
 
 /**
  * One-shot migration that purges localStorage keys left over from features
@@ -14,7 +19,7 @@ import { useEffect } from "react";
  */
 const CLEANUP_SENTINEL_KEY = "arknights-legacy-cleanup-version";
 
-const CLEANUP_STEPS: Array<{ version: number; keys: string[] }> = [
+const CLEANUP_STEPS: CleanupStep[] = [
   {
     version: 1,
     keys: [
@@ -78,27 +83,26 @@ function runCleanup(): void {
   if (ranThisSession) return;
   ranThisSession = true;
   try {
-    const stored = Number.parseInt(window.localStorage.getItem(CLEANUP_SENTINEL_KEY) ?? "", 10);
-    const ranVersion = Number.isFinite(stored) ? stored : 0;
+    const ranVersion = cleanupVersionFrom(
+      window.localStorage.getItem(CLEANUP_SENTINEL_KEY)
+    );
     if (ranVersion >= CLEANUP_VERSION) return;
 
     let allRemoved = true;
-    for (const step of CLEANUP_STEPS) {
-      if (step.version <= ranVersion) continue;
-      for (const key of step.keys) {
-        // Belt-and-braces: a step must never be able to delete the sentinel
-        // itself, or cleanup would re-run on every boot.
-        if (key === CLEANUP_SENTINEL_KEY) continue;
-        try {
-          window.localStorage.removeItem(key);
-        } catch {
-          // Individual failures are harmless in themselves (the key is dead
-          // either way), but they must hold the sentinel back — advancing it
-          // anyway would mark the failed step as done and the leftover key
-          // would squat on quota forever. Removals are idempotent, so the
-          // next boot simply re-runs the whole batch.
-          allRemoved = false;
-        }
+    for (const key of pendingCleanupKeys(
+      ranVersion,
+      CLEANUP_STEPS,
+      CLEANUP_SENTINEL_KEY
+    )) {
+      try {
+        window.localStorage.removeItem(key);
+      } catch {
+        // Individual failures are harmless in themselves (the key is dead
+        // either way), but they must hold the sentinel back — advancing it
+        // anyway would mark the failed step as done and the leftover key
+        // would squat on quota forever. Removals are idempotent, so the
+        // next boot simply re-runs the whole batch.
+        allRemoved = false;
       }
     }
     if (allRemoved) {

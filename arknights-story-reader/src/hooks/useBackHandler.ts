@@ -1,4 +1,14 @@
 import { useEffect, useRef } from "react";
+import {
+  createBackDispatcher,
+  createHistoryBackWatchdog,
+  INITIAL_HISTORY_GUARD_STATE,
+  reduceHistoryGuard,
+  type BackDispatchEntry,
+  type HistoryBackWatchdog,
+  type HistoryGuardEvent,
+  type HistoryGuardState,
+} from "@/lib/appShellLogic";
 
 /**
  * Register a handler for Android hardware back button and browser popstate.
@@ -34,15 +44,14 @@ export const BACK_PRIORITY = {
   tab: 10,
 } as const;
 
-interface BackEntry {
-  handler: BackHandler;
-  priority: number;
-  seq: number;
-}
+interface BackEntry extends BackDispatchEntry {}
 
 const entries: BackEntry[] = [];
 let seqCounter = 0;
-let dispatching = false;
+
+function hasAvailableHandlers(): boolean {
+  return entries.some((entry) => !entry.consumed);
+}
 
 /**
  * 当前注册的 overlay 级处理器数量（只读探针）。
@@ -56,7 +65,7 @@ let dispatching = false;
 export function getOverlayHandlerCount(): number {
   let count = 0;
   for (const entry of entries) {
-    if (entry.priority >= BACK_PRIORITY.overlay) count += 1;
+    if (!entry.consumed && entry.priority >= BACK_PRIORITY.overlay) count += 1;
   }
   return count;
 }
@@ -101,6 +110,13 @@ function dismissPresentedModal(): boolean {
   return false;
 }
 
+const dispatchRegisteredBack = createBackDispatcher<BackEntry>({
+  getEntries: () => entries,
+  overlayPriority: BACK_PRIORITY.overlay,
+  dismissFallback: dismissPresentedModal,
+  onError: (error) => console.warn("[useBackHandler] handler threw", error),
+});
+
 /**
  * Ask the registered handlers to consume a back intent. Returns `true` when
  * one of them did.
@@ -110,40 +126,7 @@ function dismissPresentedModal(): boolean {
  * itself to one particular dismiss callback.
  */
 export function requestBack({ minPriority = 0 }: RequestBackOptions = {}): boolean {
-  // 处理器内部再次触发返回（比如关闭抽屉时又派发了一次 app-back）不应该
-  // 连锁关掉整条导航栈。
-  if (dispatching) return false;
-  dispatching = true;
-  try {
-    const ordered = entries
-      .filter((entry) => entry.priority >= minPriority)
-      .sort((a, b) => b.priority - a.priority || b.seq - a.seq);
-    const ask = (entry: BackEntry): boolean => {
-      // 上一个处理器可能已经把它卸载了（快照是询问开始时拍的）。
-      if (!entries.includes(entry)) return false;
-      try {
-        return entry.handler();
-      } catch (err) {
-        console.warn("[useBackHandler] handler threw", err);
-        return false;
-      }
-    };
-    // overlay 及以上先问：注册过的浮层永远比 DOM 兜底更清楚怎么关掉自己。
-    for (const entry of ordered) {
-      if (entry.priority < BACK_PRIORITY.overlay) break;
-      if (ask(entry)) return true;
-    }
-    // 未注册的模态框排在 overlay 之后、view/tab 之前：它盖在视图之上，
-    // 返回不该越过它去关阅读器或切 tab。
-    if (minPriority <= BACK_PRIORITY.overlay && dismissPresentedModal()) return true;
-    for (const entry of ordered) {
-      if (entry.priority >= BACK_PRIORITY.overlay) continue;
-      if (ask(entry)) return true;
-    }
-    return false;
-  } finally {
-    dispatching = false;
-  }
+  return dispatchRegisteredBack(minPriority);
 }
 
 /*
@@ -151,24 +134,64 @@ export function requestBack({ minPriority = 0 }: RequestBackOptions = {}): boole
  * 东西可弹。只 replaceState 的话第一次返回会直接离开页面，处理器根本没机会
  * 跑，所以要垫一层哨兵条目。
  *
- * 哨兵是「按需」上的：只有存在处理器时才 push，而且一次只留一个。这样在
- * 首页（没有任何处理器注册）按返回会原样落到系统，不会被我们吞掉。哨兵被
- * 弹掉后如果没人消费这次返回，就不再补回去 —— 那次返回本来就该退出。
+ * 哨兵是「按需」上的：只有存在处理器时才 push，而且一次只留一个。最后一个
+ * 处理器注销时主动把哨兵弹掉，首页稳定态没有多余历史项。若某个残留处理器
+ * 抛错或明确返回 false，哨兵被用户弹掉后会继续执行原本那次 history.back，
+ * 而不是让用户在首页再按一次。
  *
- * 代价是浏览器里可能多按一次：上一次消费返回时补的哨兵会一直留到下一次
- * 返回。真正的退出路径在 Android，那边走的是原生 `app-back` 通道，不经过
- * history，所以「该退出的那一下」永远是一按即出。history 里不做补偿性的
- * `history.back()`：在提交期间反向导航很容易和正在进行的返回撞车。
+ * 主动弹哨兵和继续默认导航都会再产生一次 popstate；状态机用 disarming /
+ * continuing 标记压住这次回声。React 同一提交里「关阅读器、注册 tab 返回」
+ * 会短暂经过零处理器，rearmAfterNavigation 会在回声到达后重新补一层，不会
+ * 因 effect 清理/挂载顺序丢掉返回栈。
  */
-let guardArmed = false;
+let historyGuardState: HistoryGuardState = { ...INITIAL_HISTORY_GUARD_STATE };
+let historyBackWatchdog: HistoryBackWatchdog | null = null;
 
-function armHistoryGuard() {
-  if (guardArmed || typeof window === "undefined") return;
-  try {
-    window.history.pushState({ __appBack: true }, "");
-    guardArmed = true;
-  } catch {
-    // 某些 WebView 会限制 pushState 次数，失败就退回默认返回行为。
+function getHistoryBackWatchdog(): HistoryBackWatchdog {
+  if (historyBackWatchdog) return historyBackWatchdog;
+  historyBackWatchdog = createHistoryBackWatchdog<number>({
+    setTimer: (callback, delay) => window.setTimeout(callback, delay),
+    clearTimer: (handle) => window.clearTimeout(handle),
+    onTimeout: () => {
+      transitionHistoryGuard({ type: "history-back-failed" });
+    },
+  });
+  return historyBackWatchdog;
+}
+
+function transitionHistoryGuard(event: HistoryGuardEvent) {
+  if (typeof window === "undefined") return;
+  const transition = reduceHistoryGuard(historyGuardState, event);
+  historyGuardState = transition.state;
+  for (const effect of transition.effects) {
+    if (effect === "push-guard") {
+      try {
+        window.history.pushState({ __appBack: true }, "");
+      } catch {
+        transitionHistoryGuard({ type: "push-failed" });
+      }
+      continue;
+    }
+    if (effect === "history-back") {
+      // history.back() 在根条目上无声 no-op，既不抛错也不派发 popstate。
+      // 先上 watchdog；正常 popstate 会取消，250ms 内没回声就把状态机从
+      // continuing/disarming 中释放出来。
+      const watchdog = getHistoryBackWatchdog();
+      watchdog.arm();
+      try {
+        window.history.back();
+      } catch {
+        watchdog.cancel();
+        transitionHistoryGuard({ type: "history-back-failed" });
+      }
+      continue;
+    }
+    const consumed = requestBack();
+    transitionHistoryGuard({
+      type: "back-dispatched",
+      consumed,
+      hasHandlers: hasAvailableHandlers(),
+    });
   }
 }
 
@@ -190,20 +213,28 @@ function installGlobalListener() {
   }
 
   window.addEventListener("popstate", () => {
-    // 走到这里哨兵已经被浏览器弹掉了。
-    guardArmed = false;
-    if (requestBack()) armHistoryGuard();
+    historyBackWatchdog?.cancel();
+    transitionHistoryGuard({
+      type: "popstate",
+      hasHandlers: hasAvailableHandlers(),
+    });
   });
 }
 
 function registerBackHandler(entry: BackEntry): () => void {
   installGlobalListener();
   entries.push(entry);
-  // 有人能消费返回了，才值得垫哨兵。
-  armHistoryGuard();
+  transitionHistoryGuard({
+    type: "handlers-changed",
+    hasHandlers: hasAvailableHandlers(),
+  });
   return () => {
     const idx = entries.indexOf(entry);
     if (idx >= 0) entries.splice(idx, 1);
+    transitionHistoryGuard({
+      type: "handlers-changed",
+      hasHandlers: hasAvailableHandlers(),
+    });
   };
 }
 
@@ -231,6 +262,7 @@ export function useBackHandler(
       handler: () => ref.current(),
       priority,
       seq: (seqCounter += 1),
+      consumed: false,
     });
   }, [active, priority]);
 }

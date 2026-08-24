@@ -18,6 +18,7 @@ import { useAutoIndex } from "@/hooks/useAutoIndex";
 import { flushReadingProgressWrites } from "@/hooks/useReadingProgress";
 import { useLegacyStorageCleanup } from "@/hooks/useLegacyStorageCleanup";
 import { ToastProvider } from "@/components/ui/toast";
+import { READER_RETENTION_MS } from "@/lib/appShellLogic";
 
 const TABS = ["home", "stories", "characters", "search", "settings"] as const;
 type Tab = (typeof TABS)[number];
@@ -54,22 +55,46 @@ function App() {
   const [readerInitialCharacter, setReaderInitialCharacter] = useState<string | null>(null);
   const [readerInitialJump, setReaderInitialJump] = useState<ReaderJump | null>(null);
   const readerActive = readerVisible && readerStory !== null;
+  const activeTabRef = useRef<Tab>(activeTab);
 
   // 关闭阅读器时要不要广播 `app:home-refresh`，取决于它当时是不是真的开着。
   // 用 ref 而不是把 `readerVisible` 写进 useCallback 依赖：那样每次开合阅读器
   // 都会换掉 `handleGoToTab` 的引用，连带把 memo 过的首页视图重算一遍。
   const readerVisibleRef = useRef(readerVisible);
+  const readerEvictionTimerRef = useRef<number | null>(null);
   useEffect(() => {
     readerVisibleRef.current = readerVisible;
   }, [readerVisible]);
+
+  const cancelReaderEviction = useCallback(() => {
+    if (readerEvictionTimerRef.current === null) return;
+    window.clearTimeout(readerEvictionTimerRef.current);
+    readerEvictionTimerRef.current = null;
+  }, []);
+
+  const scheduleReaderEviction = useCallback(() => {
+    cancelReaderEviction();
+    readerEvictionTimerRef.current = window.setTimeout(() => {
+      readerEvictionTimerRef.current = null;
+      if (readerVisibleRef.current) return;
+      // KeepAlive 只负责短期返回时保住位置。超过预取缓存同样的 TTL 后真正
+      // 卸载阅读器，释放整篇段落、图片与观察器持有的实例内存。
+      setReaderStory(null);
+      setReaderFocus(null);
+      setReaderInitialCharacter(null);
+      setReaderInitialJump(null);
+    }, READER_RETENTION_MS);
+  }, [cancelReaderEviction]);
+
+  useEffect(() => cancelReaderEviction, [cancelReaderEviction]);
 
   /**
    * 收起阅读器并（仅在它确实开着时）广播一次进度刷新。首页的「继续阅读」和
    * 剧情列表的进度条都靠这个事件回读 localStorage —— 不管用户是按返回、点
    * 返回箭头还是被 `app:go-tab` 带走，都要走这里，否则列表会停在旧进度。
    */
-  const closeReader = useCallback(() => {
-    if (!readerVisibleRef.current) return;
+  const closeReader = useCallback((): boolean => {
+    if (!readerVisibleRef.current) return false;
     readerVisibleRef.current = false;
     setReaderVisible(false);
     // 进度是节流落盘的（≤1.2s），而下面的事件会让列表同步回读
@@ -77,17 +102,20 @@ function App() {
     // 再冲刷已经晚了。先在这里强制冲刷，列表读到的才是最终进度。
     flushReadingProgressWrites();
     window.dispatchEvent(new Event("app:home-refresh"));
-  }, []);
+    scheduleReaderEviction();
+    return true;
+  }, [scheduleReaderEviction]);
 
   /** 打开阅读器的唯一入口：意图之间互斥，没带的一律清空。 */
   const openReader = useCallback((story: StoryEntry, intent: ReaderIntent = {}) => {
+    cancelReaderEviction();
     setReaderStory(story);
     setReaderFocus(intent.focus ?? null);
     setReaderInitialCharacter(intent.character ?? null);
     setReaderInitialJump(intent.jump ?? null);
     readerVisibleRef.current = true;
     setReaderVisible(true);
-  }, []);
+  }, [cancelReaderEviction]);
 
   const handleSelectStory = useCallback(
     (story: StoryEntry) => {
@@ -97,7 +125,7 @@ function App() {
   );
 
   const handleBackToList = useCallback(() => {
-    closeReader();
+    void closeReader();
   }, [closeReader]);
 
   const handleSearchResult = useCallback(
@@ -136,15 +164,16 @@ function App() {
   );
 
   const handleTabChange = useCallback((tab: Tab) => {
+    activeTabRef.current = tab;
     setActiveTab(tab);
   }, []);
 
   const handleGoToTab = useCallback(
     (tab: Tab) => {
-      setActiveTab(tab);
+      handleTabChange(tab);
       closeReader();
     },
-    [closeReader]
+    [closeReader, handleTabChange]
   );
 
   useEffect(() => {
@@ -175,15 +204,18 @@ function App() {
   useBackHandler(
     readerActive,
     () => {
-      handleBackToList();
-      return true;
+      // React 的 effect 注销要等提交；ref 已在第一次返回里同步置 false，
+      // 连按时这层明确放行，不能再吞掉下一层 tab/退出返回。
+      return closeReader();
     },
     BACK_PRIORITY.view
   );
 
   useBackHandler(
-    !readerActive && activeTab !== "home",
+    activeTab !== "home",
     () => {
+      if (activeTabRef.current === "home") return false;
+      activeTabRef.current = "home";
       setActiveTab("home");
       return true;
     },
