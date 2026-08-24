@@ -2539,7 +2539,11 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
         >
           <div className="container py-8 pb-24 motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-700">
             <div className="reader-content motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-700" style={readerContentStyles}>
-              {showSummaries && storyInfoText && (
+              {/* 概述是正文的前言，只属于第一页。它放在分页切片列表之外，
+                  若不按页码门控，翻到后续每一页都会在页首重复一遍。 */}
+              {showSummaries &&
+                storyInfoText &&
+                (settings.readingMode !== "paged" || currentPage === 0) && (
                 <div className="reader-summary motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-700">
                   {/* 概述块的字号同样用 em，随阅读器字号一起缩放。 */}
                   <div className="reader-summary-label" style={{ fontSize: "0.75em" }}>
