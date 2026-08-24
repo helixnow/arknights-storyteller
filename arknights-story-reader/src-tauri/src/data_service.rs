@@ -1807,9 +1807,9 @@ impl DataService {
         )
     }
 
-    /// 把数据集身份压成一行文本存进索引元数据。带上 `INDEX_VERSION` 和篇数，
-    /// 任何一项对不上都必须重建。
-    fn index_dataset_fingerprint(&self, story_count: usize) -> String {
+    /// 当前数据集的低成本身份：索引版本、包版本及三张目录表的大小/mtime。
+    /// 不读数 MB 的 JSON，更不遍历脚本文件，因此可用于每次检索前的陈旧检查。
+    fn index_dataset_identity(&self) -> String {
         let fp = self.catalog_fingerprint();
         let files = fp
             .files
@@ -1818,9 +1818,15 @@ impl DataService {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            "v{}|{}|{}|{}|{}",
-            INDEX_VERSION, fp.commit, fp.fetched_at, files, story_count
+            "v{}|{}|{}|{}",
+            INDEX_VERSION, fp.commit, fp.fetched_at, files
         )
+    }
+
+    /// 把数据集身份与目录篇数压成一行文本存进索引元数据。任一项对不上都
+    /// 必须重建。格式保持不变；`INDEX_VERSION` 仍为 9。
+    fn index_dataset_fingerprint(&self, story_count: usize) -> String {
+        format!("{}|{}", self.index_dataset_identity(), story_count)
     }
 
     /// 索引是否已经对应当前数据集。除了比指纹，还要求两张表里实际的行数与
@@ -1854,6 +1860,19 @@ impl DataService {
             return None;
         }
         Some((stories as usize, segments as usize))
+    }
+
+    /// 读路径使用的完整可用性判定。重建路径手里有解析后的篇数，可以直接
+    /// 用完整 fingerprint；搜索/状态不该为此冷启动解析整张目录表，故拆掉
+    /// fingerprint 最后一个 `|篇数`，用其余身份与当前包精确比较，再复用
+    /// `index_current_totals` 校验元数据行数、实际行数及失忆探针。
+    fn current_dataset_index_totals(&self, conn: &Connection) -> Option<(usize, usize)> {
+        let stored = Self::extract_meta_value(conn, META_DATASET_FINGERPRINT).ok()??;
+        let (stored_identity, _) = stored.rsplit_once('|')?;
+        if stored_identity != self.index_dataset_identity() {
+            return None;
+        }
+        Self::index_current_totals(conn, &stored)
     }
 
     /// 下载并解压最新数据包
@@ -2395,12 +2414,15 @@ impl DataService {
             match fs::rename(&self.data_dir, &aside) {
                 Ok(()) => Some(aside),
                 Err(err) => {
-                    // 挪不开（Windows 上目录被占用等）只能退回原地删除。
-                    // 这条退化路径没有崩溃保护，但也不比旧行为更差。
-                    eprintln!("[SYNC] 旧数据目录改名失败，退回原地替换: {}", err);
-                    fs::remove_dir_all(&self.data_dir)
-                        .map_err(|e| format!("Failed to remove old data: {}", e))?;
-                    None
+                    // 挪不开（Windows 上目录被占用、父目录临时只读等）时
+                    // 绝不能退回递归删除：remove_dir_all 可能先删光目录里的
+                    // 大部分文件，最后才因某个占用文件或根目录权限报错。此
+                    // 时既没有 `_old` 可回滚，原数据也已被掏空。新树尚未动，
+                    // 直接失败让用户重试，旧数据一个字节都不碰。
+                    return Err(format!(
+                        "Failed to preserve old data directory before replacement: {}",
+                        err
+                    ));
                 }
             }
         } else {
@@ -3194,19 +3216,17 @@ impl DataService {
             .query_row("SELECT COUNT(*) FROM story_index", [], |row| row.get(0))
             .unwrap_or(0);
 
-        // 查不到自己内容的库不算 ready，两种病同一个探针：坏块落在段落表
-        // 上让查询直接报错（vtable constructor failed），或坏块把 `*_data`
-        // 抹成零让 MATCH 静默空集（COUNT 走 `*_content` 照常）。这里若照报
-        // ready，前端的 useAutoIndex 就永远不会来触发重建，检索从此一直
-        // 静默返回空页。空表不算病——那是重建还没跑完的正常中间态，
-        // ready 与否由剧情表的行数说话。
-        let index_recalls = Self::index_recalls_its_content(&conn);
+        // ready 必须同时回答三件事：索引属于当前数据包、两表行数与建库
+        // 元数据一致、倒排索引仍认识自己的内容。只看 COUNT + 失忆探针会
+        // 把「换包后尚未来得及清掉的旧库」和被截断的库都误报成可用，
+        // useAutoIndex 便永远不会触发重建。
+        let index_is_current = self.current_dataset_index_totals(&conn).is_some();
 
         let last_built_at = Self::extract_meta_value(&conn, "last_built_at")?
             .and_then(|value| value.parse::<i64>().ok());
 
         Ok(StoryIndexStatus {
-            ready: total > 0 && index_recalls,
+            ready: index_is_current,
             total: total.max(0) as usize,
             last_built_at,
         })
@@ -3219,18 +3239,10 @@ impl DataService {
 
         Self::init_index_tables(&conn)?;
 
-        let total: i64 = conn
-            .query_row("SELECT COUNT(*) FROM story_index", [], |row| row.get(0))
-            .unwrap_or(0);
-        if total == 0 {
-            return Ok(None);
-        }
-
-        // 失忆的索引（坏块抹零 `*_data`，MATCH 静默空集）不能把空集当权威
-        // 结果返回——那会让所有查询「命中 0 篇」还不回退扫描。状态探针与
-        // 重建自愈要等下一轮广播才跑到，这中间的每次搜索也必须给出真结果。
-        if !Self::fts_index_recalls_its_content(&conn, "story_index", "tokenized_content") {
-            eprintln!("[INDEX] 索引查不到自己的内容（疑似坏块致失忆），回退线性扫描");
+        // 空表、失忆、行数截断或数据集已换：都不能把 FTS 结果当成当前
+        // 语料的权威答案。剧情检索有扫描兜底，明确交回 None。
+        if self.current_dataset_index_totals(&conn).is_none() {
+            eprintln!("[INDEX] 索引未就绪、损坏或不属于当前数据集，回退线性扫描");
             return Ok(None);
         }
 
@@ -3569,18 +3581,10 @@ impl DataService {
         let Some(conn) = self.try_open_index_connection()? else {
             return Ok(None);
         };
-        // 与 `search_stories_with_index` 同一把尺子：表为空（版本升级后重建
-        // 还没跑完）时检索走的是扫描，这里的 0 不代表「0 条匹配」。
-        let indexed: i64 = conn
-            .query_row("SELECT COUNT(*) FROM story_index", [], |row| row.get(0))
-            .unwrap_or(0);
-        if indexed == 0 {
-            return Ok(None);
-        }
-        // 失忆索引的 MATCH COUNT 是权威口吻的 0：检索此刻走的是扫描，报 0
-        // 会被 `max(results.len())` 抹平成「恰好没截断」，扫描在命中上限
-        // 提前收针时就谎报成一条不少。与检索路径同一把尺子：拒答。
-        if !Self::fts_index_recalls_its_content(&conn, "story_index", "tokenized_content") {
+        // 与 `search_stories_with_index` 同一把尺子：空表、失忆、行数截断或
+        // 数据集已换时检索走的是扫描，这里的 MATCH COUNT 没有权威性。
+        // 尤其旧索引报出的 0 会被 `max(results.len())` 抹成「恰好没截断」。
+        if self.current_dataset_index_totals(&conn).is_none() {
             return Ok(None);
         }
         let Some(fts_query) = Self::build_fts_query_advanced(query) else {
@@ -3656,28 +3660,22 @@ impl DataService {
         };
         Self::init_index_tables(&conn)?;
 
-        // Bail out if the segment table exists but is empty (e.g. after
-        // schema bump while rebuild is still running in the background).
-        let seg_total: i64 = conn
-            .query_row("SELECT COUNT(*) FROM story_segment_index", [], |row| {
-                row.get(0)
-            })
-            .unwrap_or(0);
-        if seg_total == 0 {
-            progress("完成", 1, 1, "段落索引为空".to_string());
+        // 段落检索没有线性扫描兜底，因此只能接受属于当前数据集、两表行数
+        // 完整且倒排索引仍能反查自身内容的索引。换包后残留的旧库尤其危险：
+        // 它会返回看似正常、实际已经不属于当前语料的旧段落。
+        let Some((_, seg_total)) = self.current_dataset_index_totals(&conn) else {
+            eprintln!("[SEG-INDEX] 段落索引未就绪、损坏或不属于当前数据集");
+            progress("完成", 1, 1, "段落索引不可用".to_string());
             return Ok(SegmentSearchPage {
                 hits: Vec::new(),
                 total_matched: 0,
                 truncated: false,
             });
-        }
+        };
 
-        // 段落检索没有线性扫描兜底，失忆的段落表（坏块抹零 `*_data`，
-        // MATCH 静默空集）会把每个查询都伪装成「真的没有命中」。宁可
-        // 明说不可用——状态探针同一时刻也在报未就绪，自动重建会来接手。
-        if !Self::fts_index_recalls_its_content(&conn, "story_segment_index", "tokenized_text") {
-            eprintln!("[SEG-INDEX] 段落索引查不到自己的内容（疑似坏块致失忆）");
-            progress("完成", 1, 1, "段落索引不可用".to_string());
+        // Bail out if this valid index genuinely has no searchable segments.
+        if seg_total == 0 {
+            progress("完成", 1, 1, "段落索引为空".to_string());
             return Ok(SegmentSearchPage {
                 hits: Vec::new(),
                 total_matched: 0,
@@ -6532,6 +6530,63 @@ mod tests {
         assert_eq!(status.total, 6);
     }
 
+    /// 换包与清库不是一个原子操作：若进程恰好在新数据目录换入后、旧索引
+    /// 删除前退出，磁盘上会留下「新语料 + 旧索引」。索引指纹已经能识别
+    /// 这种状态，所有读路径都必须真的使用它：剧情检索回退扫描、COUNT
+    /// 拒答、段落检索拒绝旧命中，状态则触发自动重建。
+    #[test]
+    fn stale_index_is_rejected_after_dataset_swap() {
+        let fx = Fixture::new("index_stale_after_swap");
+        fx.service.rebuild_story_index().expect("first build");
+
+        // 模拟新包已经换入而 clear_story_index 尚未执行：版本与脚本都已更新，
+        // 索引仍是 commit-1 的「凯尔希：博士，你醒了」。
+        fx.set_version("commit-2");
+        fx.write_story(
+            "obt/main/level_main_00-01",
+            "[name=\"华法琳\"]这是新数据包。\n",
+        );
+
+        let status = fx.service.get_story_index_status().unwrap();
+        assert!(!status.ready, "旧数据集的索引不该被报成 ready");
+        assert_eq!(
+            fx.service.count_fts_matches("华法琳").unwrap(),
+            None,
+            "旧索引给不出当前数据集的权威总数"
+        );
+        assert!(
+            fx.service
+                .search_stories_with_index("华法琳")
+                .unwrap()
+                .is_none(),
+            "剧情检索必须拒绝旧数据集的索引"
+        );
+        let scanned = fx.service.search_stories("华法琳").unwrap();
+        assert!(
+            scanned.iter().any(|hit| hit.story_id == "main_00-01"),
+            "拒绝旧索引后必须回退扫描当前数据集"
+        );
+        let stale_segments = fx.service.search_segments("博士，你醒了").unwrap();
+        assert!(
+            stale_segments.hits.is_empty(),
+            "段落检索不得泄漏旧数据集的命中"
+        );
+
+        fx.service
+            .rebuild_story_index()
+            .expect("current dataset rebuilds");
+        assert!(fx.service.get_story_index_status().unwrap().ready);
+        assert_eq!(fx.service.count_fts_matches("华法琳").unwrap(), Some(1));
+        let current_segments = fx.service.search_segments("华法琳").unwrap();
+        assert!(
+            current_segments
+                .hits
+                .iter()
+                .any(|hit| hit.story_id == "main_00-01"),
+            "重建后段落检索必须命中新数据集"
+        );
+    }
+
     /// 索引库文件损坏（半截写入、坏块——open 时 PRAGMA 就报 "file is
     /// not a database"）：搜索路径静默回退扫描没问题，但重建以前直接把
     /// 打开错误抛出去——除了整包重新同步没有任何路径会清掉坏库，
@@ -7208,6 +7263,47 @@ mod tests {
         assert!(
             !parent.join("ArknightsGameData_old").exists(),
             "回滚之后不应留下暂存目录"
+        );
+    }
+
+    /// 旧数据连 `_old` 都挪不动时必须原地不动、直接失败。旧实现会退回
+    /// remove_dir_all；父目录只读时它能先删除 data_dir 内全部文件，最后
+    /// 删除 data_dir 自身才报 PermissionDenied，形成「命令报错 + 旧数据
+    /// 已被掏空 + 没有 `_old`」的不可恢复状态。
+    #[cfg(unix)]
+    #[test]
+    fn swap_never_deletes_old_data_when_it_cannot_be_moved_aside() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fx = Fixture::new("swap_aside_denied");
+        let parent = fx.service.data_dir.parent().unwrap().to_path_buf();
+        let old_marker = fx.service.data_dir.join("old-data-must-survive.txt");
+        Fixture::write_file(&old_marker, "old");
+
+        let replacement = parent.join("replacement");
+        Fixture::write_file(&replacement.join(REVIEW_TABLE_REL), REVIEW_TABLE_JSON);
+
+        let original_mode = fs::metadata(&parent).unwrap().permissions().mode();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o555)).unwrap();
+        let result = fx.service.swap_in_extracted(&replacement);
+        // 先恢复权限，确保断言失败时测试夹具仍可清理，也避免污染后续测试。
+        fs::set_permissions(&parent, fs::Permissions::from_mode(original_mode)).unwrap();
+
+        let err = result.expect_err("旧目录挪不开时换入必须安全失败");
+        assert!(
+            err.contains("Failed to preserve old data directory"),
+            "{}",
+            err
+        );
+        assert!(fx.service.is_installed(), "失败后旧数据集必须仍然完整");
+        assert!(old_marker.exists(), "旧目录里的文件一个都不能删");
+        assert!(
+            replacement.exists(),
+            "换入尚未开始，验收完的新树也应原样保留"
+        );
+        assert!(
+            !parent.join("ArknightsGameData_old").exists(),
+            "旧目录改名失败时不应伪造出可回滚副本"
         );
     }
 
