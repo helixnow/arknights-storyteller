@@ -466,9 +466,10 @@ fn overlay_text(attrs: &HashMap<String, String>, remainder: &str) -> Option<Stri
 
 /// `[Subtitle]` / `[Sticker]` 的 `alignment`。语料取值全集是 left/center/
 /// right/middle（Subtitle 的 `middle` 共 11 处：story_horn_1_1 的日记日期行、
-/// story_ceylon_1_1 的信件引文、act16side/act21side 的定位浮层——同文件正文
-/// 用 `left`，`middle` 就是水平居中）。下游只认 left/center/right，`middle`
-/// 原样透传会被丢弃、退回左对齐，日期行就跟正文糊在一起，这里归一成 center。
+/// story_ceylon_1_1 的信件引文、story_fang_1_1 的战斗提示、act16side/
+/// act21side 的氛围浮层——这些文件的其余字幕用 `left`/`center`，`middle`
+/// 就是水平居中）。下游只认 left/center/right，`middle` 原样透传会被丢弃、
+/// 退回左对齐，日期行就跟正文糊在一起，这里归一成 center。
 fn overlay_alignment(attrs: &HashMap<String, String>) -> Option<String> {
     attrs.get("alignment").map(|s| {
         let trimmed = s.trim();

@@ -186,8 +186,10 @@ fn strip_image_ext(token: &str) -> &str {
     token
 }
 
-/// 从活动 id 里猜 KV 素材名的核心部分：`act17side` → `side` 之类。
+/// 从活动 id 里猜 KV 素材名的核心部分：`act9d0` → `d0` 之类。
 /// 猜错（削成空串，或压根没削掉东西）时返回 None，调用方只用原始 token。
+/// 注意 `act17side` 这类 id 剥掉 `side` 后缀就削成了空串，返回 None
+/// （下方测试钉死），不要误以为它能猜出 `side`。
 ///
 /// 每个后缀只削一次——`trim_end_matches` 会把 `sideside` 一路削光，
 /// assetUrls.ts 那边用的是单次 `slice`，这里必须一致。
