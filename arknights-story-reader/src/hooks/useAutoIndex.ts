@@ -79,6 +79,8 @@ export function useAutoIndex() {
     const ensureIndex = async (reason: string) => {
       if (cancelled || running) return;
       running = true;
+      /** 已把重建交给后端跑：这之后的失败是构建本身失败，不该盲目重跑。 */
+      let buildStarted = false;
       try {
         const installed = await api.isInstalled();
         if (cancelled || !installed) return;
@@ -102,7 +104,7 @@ export function useAutoIndex() {
           // 兜底重建从此整个会话不再发生。改为定到停更判定刚好过期的
           // 时刻回来：活着的重建会用新进度把下次检查继续往后推（约每
           // 60s 读一次状态），死掉的则在判定过期后立刻接手；索引一就绪
-          // 就停，不会无限轮询。让路预算只留给下面的锁竞争分支。
+          // 就停，不会无限轮询。让路预算留给锁竞争与前置检查失败的重试。
           devLog(`索引未就绪，但后端已在重建，等它结束或停更再看（${reason}）`);
           later(
             () => void ensureIndex(reason),
@@ -121,6 +123,7 @@ export function useAutoIndex() {
         }
         try {
           devLog(`检测到索引未就绪，自动后台重建…（${reason}）`);
+          buildStarted = true;
           await api.buildStoryIndex();
         } finally {
           release();
@@ -137,8 +140,22 @@ export function useAutoIndex() {
         // 会把那次还在跑的重建的锁提前放掉，同步/导入就能趁虚而入。
         broadcast(rebuilt, "auto-rebuilt");
       } catch (err) {
-        // 失败不影响可用性：后端搜索会退回线性扫描，UI 也有"刷新索引"入口。
-        devLog("自动索引任务失败，搜索将回退到线性扫描", err);
+        if (!buildStarted && !cancelled) {
+          // 前置检查抛错 ≠ 构建失败：isInstalled 的 IPC 在启动初期可能未就绪，
+          // 索引状态查询更会撞上后端自动重建正握着 story_index.db 写入——
+          // 本检查恰好安排在 data-updated 后 3 秒，正是重建热身的窗口，而
+          // 状态查询里的建表 DDL 没配 busy_timeout，撞锁直接返回 BUSY。这类
+          // 暂时性失败若就此放弃，兜底重建与状态广播就整个会话哑火：那次
+          // 重建随后死掉（磁盘满、IO 错）也没人接手，只剩用户自己去点手动
+          // 重建。按「让路」同等对待：用让路预算安排有限次重试，预算耗尽
+          // 才交给手动入口，不会无限轮询。
+          devLog(`索引前置检查失败，稍后重试（${reason}）`, err);
+          deferRetry(reason);
+        } else {
+          // 构建本身失败不重试：磁盘满、IO 错重跑一遍只会再失败一次。
+          // 不影响可用性：后端搜索会退回线性扫描，UI 也有"刷新索引"入口。
+          devLog("自动索引任务失败，搜索将回退到线性扫描", err);
+        }
       } finally {
         running = false;
       }
