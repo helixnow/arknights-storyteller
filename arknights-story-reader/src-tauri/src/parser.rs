@@ -9,7 +9,13 @@ lazy_static! {
     /// `[name='麦哲伦']` 的单引号写法，不认单引号就会把引号一起当成名字。
     static ref ATTR_RE: Regex = Regex::new(r#"(?i)([a-z0-9_]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s,()\[\]"]+))"#)
         .expect("invalid attribute regex");
-    static ref GENERIC_TAG_RE: Regex = Regex::new(r#"<[^>]+>"#).expect("invalid generic tag regex");
+    /// 只剥真正的富文本标签。语料里的标签全集是 `<i>`、`<b>`、`<color=#...>`、
+    /// `</color>`、`<p=1>`、`<size=40>`、`<br>`、教程强调 `<@tu.kw>`/`<@tu.imp>`
+    /// 与通用闭合 `</>`——全部以 ASCII 字母、`/` 或 `@` 开头。act1sandbox 的
+    /// `【获得了跨局信物<命运的水晶球>】` 这类道具名是拿尖括号当引号的正文
+    /// （全语料 10 处、全是纯 CJK），通配 `<[^>]+>` 会把道具名整个吃掉。
+    static ref GENERIC_TAG_RE: Regex =
+        Regex::new(r#"</?[A-Za-z@][^<>]*>|</>"#).expect("invalid generic tag regex");
     static ref PARAGRAPH_TAG_RE: Regex =
         Regex::new(r"(?i)<p[^>]*>").expect("invalid paragraph tag regex");
     static ref LINE_BREAK_TAG_RE: Regex =
@@ -122,6 +128,15 @@ pub fn parse_story_text(content: &str) -> ParsedStoryContent {
 
     for raw_line in logical_lines(content) {
         let mut line = raw_line.trim();
+
+        // 行首 `//` 是编辑注释，不是正文：guide_01_b 的 `// 介绍：敌人`、
+        // 月度闲聊的 `//年长与新生`、act49side 的 `// anim part a`，全语料
+        // 共 7 处，不跳过就会当旁白印给读者。只认行首——正文中间的 `//`
+        // 是诗歌断句（rogue_5 endbook 的「当自然轮回更迭//当规则日趋圆满」），
+        // 一个字都不能动。
+        if line.starts_with("//") {
+            continue;
+        }
 
         // Update the current speaker's charId without emitting a segment.
         // Newer scripts use `[charslot(name="char_xxx")]` instead of
@@ -341,7 +356,11 @@ fn parse_command_line(line: &str, current_char_id: Option<&str>) -> Option<Story
             let alignment = attrs.get("alignment").map(|s| s.trim().to_string());
             Some(StorySegment::Subtitle { text, alignment })
         }
-        "sticker" => {
+        // `spellsticker` 是主线 17 章的咒语浮层（`[spellsticker(...)]<p=1>“声音，
+        // 归来。”</><p=2>“Звук вернись.”</>`，全语料 15 处、全带正文），和
+        // Sticker 同族；走兜底会把屏幕浮层降级成旁白混进正文流。裸的
+        // `spellstickerclear` 清屏信号不匹配这个分支，照旧安静消失。
+        "sticker" | "spellsticker" => {
             let text = overlay_text(&attrs, remainder)?;
             let alignment = attrs.get("alignment").map(|s| s.trim().to_string());
             Some(StorySegment::Sticker { text, alignment })
@@ -1273,6 +1292,56 @@ mod tests {
         assert_eq!(clean_text("Ave{@NBS}Mujica"), "Ave Mujica");
         // 空行会被折掉，段落之间只留一个换行。
         assert_eq!(clean_text(r"上\n\n\n下"), "上\n下");
+    }
+
+    /// `[spellsticker]` 是咒语浮层（主线 17 章，双语 `<p=1>/<p=2>` 形态），
+    /// 要以贴纸而不是旁白呈现；`[spellstickerclear]` 清屏信号不产段。
+    #[test]
+    fn test_spellsticker_renders_as_sticker() {
+        let segment = only(
+            r#"[spellsticker(id="spell2", action="show", style="fire", x=-255, y=283, xScale=1, yScale=1, angle=0, alpha=1, block=true)]<p=1>“声音，归来。”</><p=2>“Звук вернись.”</>"#,
+        );
+        assert_eq!(segment.kind(), "sticker");
+        assert_eq!(segment.text(), Some("“声音，归来。”\n“Звук вернись.”"));
+
+        assert!(parse_story_text(r#"[spellstickerclear(id="spell2", block=true)]"#)
+            .segments
+            .is_empty());
+    }
+
+    /// 行首 `//` 是编辑注释（tutorial/guide_01_b 的分节注、month_chat 的主题注、
+    /// act49side 的动画分段注，全语料 7 处），必须跳过；正文中间的 `//`
+    /// （rogue_5 endbook 的诗歌断句）必须原样保留。
+    #[test]
+    fn test_leading_comment_lines_are_skipped_but_inline_slashes_survive() {
+        let content = "[Title] MAIN_LOG_101_1\n//年长与新生\n[Div] Part.01";
+        let result = parse_story_text(content);
+        assert_eq!(kinds(&result), vec!["header", "subtitle"]);
+        assert_eq!(texts(&result), vec!["MAIN_LOG_101_1", "Part.01"]);
+
+        let result = parse_story_text("// anim part a\n// 介绍：敌人");
+        assert!(result.segments.is_empty(), "comments leaked: {:?}", result.segments);
+
+        let segment = only("当自然轮回更迭//当规则日趋圆满，");
+        assert_eq!(segment.kind(), "narration");
+        assert_eq!(segment.text(), Some("当自然轮回更迭//当规则日趋圆满，"));
+    }
+
+    /// 尖括号只在「标签形态」（字母 / `/` / `@` 开头）时才剥：act1sandbox 的
+    /// `[name=""]【获得了跨局信物<命运的水晶球>】` 拿尖括号当道具名引号
+    /// （全语料 10 处、全为纯 CJK），通配剥除会把道具名整个吃掉，显示成
+    /// 「【获得了跨局信物】」。
+    #[test]
+    fn test_cjk_angle_bracket_prose_is_not_stripped_as_tag() {
+        let segment = only(r#"[name=""]【获得了跨局信物<命运的水晶球>】"#);
+        assert_eq!(segment.kind(), "subtitle");
+        assert_eq!(segment.text(), Some("【获得了跨局信物<命运的水晶球>】"));
+
+        // 真正的标签照剥：教程强调、颜色、斜体、通用闭合。
+        assert_eq!(clean_text("点击<@tu.kw>商店</>购买"), "点击商店购买");
+        assert_eq!(clean_text("<color=#d41f1f>警告</color>解除"), "警告解除");
+        assert_eq!(clean_text("<i>低语</i>"), "低语");
+        assert_eq!(clean_text("<b>加粗</b>与</>残余"), "加粗与残余");
     }
 
     #[test]
