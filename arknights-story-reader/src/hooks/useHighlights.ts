@@ -276,12 +276,16 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
       if (event.key === STORAGE_KEY && raw === lastRawRef.current) return;
       lastRawRef.current = raw;
       const disk = readStorage();
-      const pending = pendingStoreRef.current;
-      const hasLocalChanges =
-        (pending !== null && dirtyKeysRef.current.size > 0) || failedHighlightWrites.size > 0;
+      // 本地改动的判据不能要求 pending 已物化：toggle 是先同步记脏键、等
+      // persist effect（passive 宏任务）才把 store 快照写进 pending 的，而
+      // 这个监听器是原生事件，完全可能插在两者之间。那一刻若按「无本地改
+      // 动」处理，清脏键 + 整表跟盘会把用户刚点的划线从 UI 和持久化管线里
+      // 同时抹掉——冲刷里的回声路径为同一中间态特意保过脏键，这里对齐。
+      const hasLocalChanges = dirtyKeysRef.current.size > 0 || failedHighlightWrites.size > 0;
       if (!hasLocalChanges) {
+        // 脏键此刻必为空；pending 若非空也只是跟随上一次外部状态的回声
+        // 快照，直接作废、整表跟盘。
         pendingStoreRef.current = null;
-        dirtyKeysRef.current.clear();
         setStore(disk);
         return;
       }
@@ -291,7 +295,9 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
       // 改动无声丢掉，UI 还会跟着 setStore 缩回去。改为把本地改动重放到外部
       // 新状态上：两边都不丢，随后的防抖冲刷把合并结果落盘（若合并后与盘上
       // 一致，冲刷里的回声抑制会直接清账，不产生多余写入）。
-      setStore(overlayLocalChanges(disk, pending, dirtyKeysRef.current));
+      // 脏键的值从函数式更新的 prev 里取而不是 pending：prev 一定含有刚
+      // 提交还没物化进 pending 的 toggle，只新不旧；非脏键仍以盘为准。
+      setStore((prev) => overlayLocalChanges(disk, prev, dirtyKeysRef.current));
     };
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);
