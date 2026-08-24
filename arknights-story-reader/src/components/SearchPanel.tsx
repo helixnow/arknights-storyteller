@@ -526,6 +526,8 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
   /** 上一次落定失败的 `${mode}:${query}`（手动/自动都记），避免防抖 effect 反复重试同一个错误。 */
   const autoFailedRef = useRef<string | null>(null);
   const rowRefs = useRef(new Map<number, HTMLButtonElement>());
+  /** 结果列表的滚动视口；换查询/换模式后要把它归顶。 */
+  const resultsViewportRef = useRef<HTMLDivElement | null>(null);
   /** 本面板发起/承接的重建在途；state 落地前就要能拦住重复触发。 */
   const buildingIndexRef = useRef(false);
 
@@ -1212,6 +1214,21 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     setActiveIndex(-1);
   }, [page, segmentPage, activeFacet, mode]);
 
+  // 换了查询或模式就把结果列表滚回顶部：视口是常驻的，沿用旧结果的滚动
+  // 偏移，新列表会直接从半腰、甚至被浏览器夹到的末尾开始看，且没有任何
+  // "你不在顶部"的提示（StoryList / CharactersPanel 在同类场景都归顶）。
+  // 只按「模式 + 已落定查询」的签名判断：同一条查询的补搜 / 刷新缓存是
+  // 原地换数据，签名不变，KeepAlive 保住的阅读位置不动。lastQuery 在结果
+  // 落地时才更新，所以归顶发生在新内容渲染之后，不会被旧高度夹住。
+  // instant 覆盖视口上的 CSS smooth，免得新结果先渲染再慢慢滚回顶。
+  const resultsScrollKey = `${mode}\n${lastQuery}`;
+  const prevResultsScrollKeyRef = useRef(resultsScrollKey);
+  useEffect(() => {
+    if (prevResultsScrollKeyRef.current === resultsScrollKey) return;
+    prevResultsScrollKeyRef.current = resultsScrollKey;
+    resultsViewportRef.current?.scrollTo({ top: 0, behavior: "instant" });
+  }, [resultsScrollKey]);
+
   // 选中行滚进可视区。`nearest` 只在真的看不见时才动，键盘浏览不会一路乱跳。
   useEffect(() => {
     if (activeIndex < 0) return;
@@ -1886,6 +1903,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
         <CustomScrollArea
           className="h-full"
           viewportClassName="reader-scroll"
+          viewportRef={resultsViewportRef}
           trackOffsetTop="calc(3.5rem + 10px)"
           trackOffsetBottom="calc(4.5rem + env(safe-area-inset-bottom, 0px))"
         >

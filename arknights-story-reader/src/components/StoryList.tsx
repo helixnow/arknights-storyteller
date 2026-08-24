@@ -867,11 +867,19 @@ export function StoryList({ onSelectStory }: StoryListProps) {
     setOpenGroups((prev) => ({ ...prev, [key]: open }));
   }, []);
 
+  /**
+   * 「展开全部」按钮的有效状态。搜索中分组默认全部展开（isGroupOpen 的
+   * 兜底就是 hasSearch），按钮必须如实反映这一点：否则搜索时明明全都
+   * 开着，按钮却写着「展开全部」、aria-pressed 还是 false，第一下点击
+   * 毫无反应。
+   */
+  const bulkExpanded = bulkOpen ?? hasSearch;
+
   /** 批量展开 / 收起。逐条覆盖也要清掉，否则单独点过的分组不跟随。 */
   const toggleBulkOpen = useCallback(() => {
-    setBulkOpen((prev) => !prev);
+    setBulkOpen(!bulkExpanded);
     setOpenGroups({});
-  }, []);
+  }, [bulkExpanded]);
 
   /**
    * 分组标题的键盘增强。Enter / Space 由 Collapsible 里的原生 `<button>`
@@ -1287,7 +1295,15 @@ export function StoryList({ onSelectStory }: StoryListProps) {
 
   /** 四类分组的渲染完全同构，只有文案和收藏语义不同。 */
   const renderGroupedCategory = (key: GroupedKey) => {
-    if (isSectionPending(key)) return <ListSkeleton />;
+    // 等齐该分类声明的所有分块再画列表。活动分类的去重依赖支线数据：
+    // 只等 activity 自己的话，activity 先落地（常见：首页预取已把它灌进
+    // 缓存、支线还在途）会先画出一版混着全部支线分组的列表，支线落地后
+    // 这些分组又整块消失——内容闪现即蒸发，期间还能把支线误收藏成
+    // 「活动」类型。失败的分块不算 pending（error 非空时 isSectionPending
+    // 返回 false），所以坏掉的分块不会把整个分类卡在骨架屏上。
+    if (CATEGORY_SECTIONS[key].some((section) => isSectionPending(section))) {
+      return <ListSkeleton />;
+    }
 
     const meta = GROUPED_CATEGORY_META[key];
     const list = filteredGroups[key];
@@ -1407,7 +1423,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
                 </span>
                 <div className="flex flex-shrink-0 items-center gap-2">
                   {showBulkToggle && (
-                    <BulkToggleButton expanded={bulkOpen === true} onToggle={toggleBulkOpen} />
+                    <BulkToggleButton expanded={bulkExpanded} onToggle={toggleBulkOpen} />
                   )}
                   <SummaryToggleButton
                     enabled={showSummaries}

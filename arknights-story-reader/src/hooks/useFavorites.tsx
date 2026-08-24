@@ -9,6 +9,7 @@ import {
   useState,
 } from "react";
 import type { StoryEntry } from "@/types/story";
+import { useToast } from "@/components/ui/toast";
 
 export type FavoriteGroupType = "chapter" | "activity" | "memory" | "other";
 
@@ -145,6 +146,9 @@ function collectGroupStoryIds(groups: Record<string, FavoriteGroup>): Set<string
   return ids;
 }
 
+/** 失败提示的会话级闩锁：同一轮连续失败只打扰用户一次，写成功后复位。 */
+let persistFailureNotified = false;
+
 export function FavoritesProvider({ children }: { children: ReactNode }) {
   const [favorites, setFavorites] = useState<FavoritesState>(() => readFromStorage());
 
@@ -164,6 +168,13 @@ export function FavoritesProvider({ children }: { children: ReactNode }) {
     return ids.size;
   }, [favorites.stories, groupedStoryIds]);
 
+  // 写失败提示跑在事件回调里，通过 ref 取最新的 toast 句柄。
+  const toast = useToast();
+  const toastRef = useRef(toast);
+  useEffect(() => {
+    toastRef.current = toast;
+  }, [toast]);
+
   // 首帧的值就是刚从 localStorage 读出来的，回写没有意义；更糟的是：如果
   // 读取因数据损坏回落到了空状态，这次回写会立刻用 `{}` 覆盖掉原始数据，
   // 连恢复的机会都不留。守卫不能用「跳过第一次 effect」计数：StrictMode
@@ -173,22 +184,61 @@ export function FavoritesProvider({ children }: { children: ReactNode }) {
   // 「当前 state 对应的存储串」。storage 事件把别的窗口写的状态灌进来时，
   // 存储里已经是这份内容了，据此跳过回写，免得两个窗口互相触发写入。
   const lastRawRef = useRef<string | null>(null);
-  useEffect(() => {
-    if (favorites === initialFavoritesRef.current) {
-      return;
-    }
+  // 最新状态的 ref 快照，供 pagehide / 切后台等事件回调里的兜底重试读取。
+  const favoritesRef = useRef(favorites);
+  favoritesRef.current = favorites;
+  // 上一次写入失败后置位：等下一次改动或切后台 / 关页面时带最新状态重试。
+  const persistFailedRef = useRef(false);
+
+  const persistFavorites = useCallback(() => {
     try {
-      const raw = JSON.stringify(favorites);
+      const raw = JSON.stringify(favoritesRef.current);
       if (raw === lastRawRef.current) {
+        persistFailedRef.current = false;
         return;
       }
       window.localStorage.setItem(STORAGE_KEY, raw);
       lastRawRef.current = raw;
+      persistFailedRef.current = false;
+      persistFailureNotified = false;
     } catch (error) {
-      // setItem 失败是原子的：旧数据原样保留，本次改动只在会话内生效。
+      // setItem 失败（quota 满 / 隐私模式）是原子的：旧数据原样保留。
+      // 星标在界面上已经点亮，静默失败等于骗用户「已收藏」，重启后收藏
+      // 全没了——提示一次，并留待重试（划线 / 阅读设置 / 进度同款处理）。
+      persistFailedRef.current = true;
       console.warn("[Favorites] 写入本地收藏失败:", error);
+      if (!persistFailureNotified) {
+        persistFailureNotified = true;
+        toastRef.current.error("收藏未能保存到本地存储（空间可能已满），将自动重试");
+      }
     }
-  }, [favorites]);
+  }, []);
+
+  useEffect(() => {
+    if (favorites === initialFavoritesRef.current) {
+      return;
+    }
+    persistFavorites();
+  }, [favorites, persistFavorites]);
+
+  // 写失败后的兜底重试：下一次任何收藏改动都会带全量状态重跑上面的
+  // effect；若用户不再改动，就在切后台 / 关页面前再试一次——那时配额
+  // 可能已被其它清理（如启动期清历史缓存）腾出来。
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const retry = () => {
+      if (persistFailedRef.current) persistFavorites();
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") retry();
+    };
+    window.addEventListener("pagehide", retry);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.removeEventListener("pagehide", retry);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [persistFavorites]);
 
   // 多窗口（桌面端可以开多个）时跟随其它窗口的修改。收藏是「整表读进
   // 内存 → 任意改动整表回写」，不同步的话：A 窗口刚收藏的条目会在 B 窗口
@@ -202,6 +252,9 @@ export function FavoritesProvider({ children }: { children: ReactNode }) {
       const raw = event.key === STORAGE_KEY ? event.newValue : null;
       if (event.key === STORAGE_KEY && raw === lastRawRef.current) return;
       lastRawRef.current = raw;
+      // 外部写入以后到为准：本窗口没写进去的旧状态即将被整体替换，
+      // 失败重试标记一并清掉，免得兜底重试把对方刚写的内容盖掉。
+      persistFailedRef.current = false;
       setFavorites(readFromStorage());
     };
     window.addEventListener("storage", onStorage);

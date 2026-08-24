@@ -150,18 +150,6 @@ function loadSettings(): ReaderSettings {
 /** 失败提示的会话级闩锁：滑杆连拖会连发写入，同一轮失败只提醒一次。 */
 let persistFailureNotified = false;
 
-function persistSettings(settings: ReaderSettings): boolean {
-  try {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
-    persistFailureNotified = false;
-    return true;
-  } catch {
-    // 隐私模式 / 配额不足时写入失败是原子的：旧数据原样保留，本次改动只在
-    // 会话内生效。成败要交给调用方——静默失败等于骗用户「已保存」。
-    return false;
-  }
-}
-
 export function useReaderSettings() {
   const [settings, setSettings] = useState<ReaderSettings>(loadSettings);
 
@@ -172,6 +160,10 @@ export function useReaderSettings() {
   const persistTimerRef = useRef<number | null>(null);
   // 等待防抖写入的最新快照；已落盘时为 null。
   const pendingSettingsRef = useRef<ReaderSettings | null>(null);
+  // 「盘上当前内容」的序列化串：最后一次成功写入、或最后一次收到的外部
+  // storage 事件值。用来抑制回声写入，也用来识别 storage 事件是否源于
+  // 本窗口自己的写入。
+  const lastRawRef = useRef<string | null>(null);
 
   // 冲刷跑在 setTimeout 回调和卸载清理里，通过 ref 取最新的 toast 句柄。
   const toast = useToast();
@@ -187,10 +179,24 @@ export function useReaderSettings() {
    * 改动 / 卸载冲刷会带着它重试。只有真正写成功才清空 pending。
    */
   const flushPendingSettings = useCallback(() => {
-    if (pendingSettingsRef.current === null) return;
-    if (persistSettings(pendingSettingsRef.current)) {
+    const pending = pendingSettingsRef.current;
+    if (pending === null) return;
+    const raw = JSON.stringify(pending);
+    if (raw === lastRawRef.current) {
+      // 内容与盘上完全一致（典型场景：跟随 storage 事件之后的回写），
+      // 再写一遍只会在别的窗口触发一轮多余的事件。
       pendingSettingsRef.current = null;
       return;
+    }
+    try {
+      window.localStorage.setItem(STORAGE_KEY, raw);
+      lastRawRef.current = raw;
+      persistFailureNotified = false;
+      pendingSettingsRef.current = null;
+      return;
+    } catch {
+      // 隐私模式 / 配额不足时写入失败是原子的：旧数据原样保留，本次改动
+      // 只在会话内生效。
     }
     if (!persistFailureNotified) {
       persistFailureNotified = true;
@@ -231,6 +237,32 @@ export function useReaderSettings() {
   // 卸载冲刷：拖着滑杆直接关掉抽屉/离开阅读器时，把还在防抖窗口里的
   // 最终值写掉，而不是悄悄丢弃。
   useEffect(() => () => flushPendingSettings(), [flushPendingSettings]);
+
+  // 多窗口（桌面端可以开多个）时跟随其它窗口的修改。设置是整对象回写：
+  // 不跟随的话，A 窗口刚调好的字号会在 B 窗口下一次改主题的回写里被 B 的
+  // 旧内存快照打回（收藏 / 偏好 hook 修过同一个坑）。
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onStorage = (event: StorageEvent) => {
+      // key 为 null 表示外部 storage.clear()，也要跟随。
+      if (event.key !== null && event.key !== STORAGE_KEY) return;
+      const raw = event.key === STORAGE_KEY ? event.newValue : null;
+      if (event.key === STORAGE_KEY && raw === lastRawRef.current) return;
+      lastRawRef.current = raw;
+      // 本窗口还压在防抖里的快照已经过期，冲出去会盖掉对方刚写的内容；
+      // 外部写入以后到为准，把它丢弃。
+      pendingSettingsRef.current = null;
+      setSettings((prev) => {
+        const next = loadSettings();
+        const changed = (Object.keys(next) as Array<keyof ReaderSettings>).some(
+          (key) => next[key] !== prev[key]
+        );
+        return changed ? next : prev;
+      });
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, []);
 
   const updateSettings = useCallback((partial: Partial<ReaderSettings>) => {
     setSettings((prev) => {

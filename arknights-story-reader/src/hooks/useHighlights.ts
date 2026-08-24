@@ -50,19 +50,6 @@ function readStorage(): HighlightStore {
 /** 失败提示的会话级闩锁：同一轮连续失败只打扰用户一次，写成功后复位。 */
 let persistFailureNotified = false;
 
-function persistStore(store: HighlightStore): boolean {
-  try {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
-    persistFailureNotified = false;
-    return true;
-  } catch {
-    // Quota / private mode: the write fails atomically, the previously
-    // stored value stays intact. Never write partial data. 成败必须让调用方
-    // 知道——书签在界面上已经点亮，写失败还不吭声等于骗用户「已保存」。
-    return false;
-  }
-}
-
 function normalizeEntry(item: HighlightLike): HighlightEntry | null {
   if (typeof item === "number") {
     if (!Number.isFinite(item) || item < 0) return null;
@@ -112,6 +99,10 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
   const persistTimerRef = useRef<number | null>(null);
   // Latest store snapshot awaiting the debounced write; null when clean.
   const pendingStoreRef = useRef<HighlightStore | null>(null);
+  // 「盘上当前内容」的序列化串：最后一次成功写入、或最后一次收到的外部
+  // storage 事件值。用来抑制回声写入（跟随外部状态之后不必再写一遍），
+  // 也用来识别 storage 事件是不是本窗口自己的写入触发的。
+  const lastRawRef = useRef<string | null>(null);
 
   // 冲刷跑在 setTimeout 回调和卸载清理里，通过 ref 取最新的 toast 句柄。
   const toast = useToast();
@@ -128,10 +119,24 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
    * 腾出来后还能救回。只有真正写成功才清空 pending。
    */
   const flushPendingStore = useCallback(() => {
-    if (pendingStoreRef.current === null) return;
-    if (persistStore(pendingStoreRef.current)) {
+    const pending = pendingStoreRef.current;
+    if (pending === null) return;
+    const raw = JSON.stringify(pending);
+    if (raw === lastRawRef.current) {
+      // 内容与盘上完全一致（典型场景：跟随 storage 事件之后的回写），
+      // 再写一遍只会在别的窗口触发一轮多余的事件。
       pendingStoreRef.current = null;
       return;
+    }
+    try {
+      window.localStorage.setItem(STORAGE_KEY, raw);
+      lastRawRef.current = raw;
+      persistFailureNotified = false;
+      pendingStoreRef.current = null;
+      return;
+    } catch {
+      // Quota / private mode: the write fails atomically, the previously
+      // stored value stays intact. Never write partial data.
     }
     if (!persistFailureNotified) {
       persistFailureNotified = true;
@@ -172,6 +177,27 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
   // unmounts (toggle a highlight, immediately navigate back), write it now
   // instead of silently dropping the annotation.
   useEffect(() => () => flushPendingStore(), [flushPendingStore]);
+
+  // 多窗口（桌面端可以开多个）时跟随其它窗口的修改。划线和收藏一样是
+  // 「整表读进内存 → 任意改动整表回写」，不跟随的话：A 窗口刚画的线会在
+  // B 窗口的下一次回写里被 B 的旧内存快照整体覆盖，无声丢失（收藏 hook
+  // 修过同一个坑）。
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onStorage = (event: StorageEvent) => {
+      // key 为 null 表示外部 storage.clear()，也要跟随。
+      if (event.key !== null && event.key !== STORAGE_KEY) return;
+      const raw = event.key === STORAGE_KEY ? event.newValue : null;
+      if (event.key === STORAGE_KEY && raw === lastRawRef.current) return;
+      lastRawRef.current = raw;
+      // 本窗口还压在防抖里的快照基于的是过期整表，冲出去会把对方刚写的
+      // 内容盖掉；外部写入以后到为准，把它丢弃（卸载冲刷随之变成 no-op）。
+      pendingStoreRef.current = null;
+      setStore(readStorage());
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, []);
 
   // The raw entries as persisted. Always an array of (upgraded) objects.
   const entries = useMemo<HighlightEntry[]>(

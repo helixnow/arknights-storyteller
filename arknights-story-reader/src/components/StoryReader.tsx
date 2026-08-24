@@ -1119,6 +1119,13 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       // 还是起点附近的位置，会先把一份 ~0% 的进度落盘，短暂盖掉真实记录。
       container.scrollTo({ top: storedTop, behavior: "instant" });
       lastScrollTopRef.current = storedTop;
+      // 视口已被程序化挪到新位置，此前捕获的顶部锚点随之过期。不清掉的话，
+      // 「切到分页读了很久 → 切回滚动（此时设置抽屉还开着，滚动监听因
+      // overlayOpenRef 不会刷新锚点）→ 顺手调字号」这条动线会让排版重排
+      // 效果按旧锚点把读者拽回上一次滚动会话的段落，随后进度落盘再把错误
+      // 位置写成真实进度。清空后重排走 scrollRatioRef 的百分比兜底，位置
+      // 与本次恢复一致；用户一旦真正滚动，锚点会照常重新捕获。
+      topAnchorRef.current = null;
       const ratio = maxTop <= 0 ? 1 : storedTop / maxTop;
       const clamped = Number.isFinite(ratio) ? Math.max(0, Math.min(1, ratio)) : 0;
       scrollRatioRef.current = clamped;
