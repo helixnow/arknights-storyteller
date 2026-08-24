@@ -63,6 +63,42 @@ async function invokeReporting<T>(
   }
 }
 
+/**
+ * 后端 search-progress 是进程级事件，没有 requestId。Tauri invoke 又不能
+ * abort：输入变化后旧搜索仍会跑，若直接并发，新旧进度无法可靠归属。
+ *
+ * 搜索命令在前端串行；一旦有更新请求排队，旧请求后续进度立即静默。这样
+ * onSearchProgress 只转发“当前最新且已经真正开始”的命令，SearchPanel 再用
+ * 查询起点/阶段/数据代际做第二层门禁。被更新请求越过、尚未开始的中间查询
+ * 不再白跑后端。
+ */
+let latestSearchRequest = 0;
+let activeSearchRequest = 0;
+let searchQueue: Promise<void> = Promise.resolve();
+
+async function invokeSearchReporting<T>(
+  command: string,
+  args: Record<string, unknown>
+): Promise<T> {
+  const request = ++latestSearchRequest;
+  const run = searchQueue.then(async () => {
+    // 等待期间又来了更新意图：调用方已有自己的 stale generation，这条无需
+    // 再进后端。抛错只负责结束 Promise，旧 SearchPanel catch 会按代际丢弃。
+    if (request !== latestSearchRequest) throw new Error("SEARCH_SUPERSEDED");
+    activeSearchRequest = request;
+    try {
+      return await invokeReporting<T>(command, args);
+    } finally {
+      if (activeSearchRequest === request) activeSearchRequest = 0;
+    }
+  });
+  searchQueue = run.then(
+    () => undefined,
+    () => undefined
+  );
+  return run;
+}
+
 export const api = {
   // 是否已安装数据。IPC 失败必须原样抛给调用方，绝不能吞成 false：
   // 「读不到安装状态」≠「未安装」。消费方全都按「会抛错」的契约写了
@@ -165,7 +201,7 @@ export const api = {
 
   // 获取全文索引状态
   getStoryIndexStatus: async (): Promise<StoryIndexStatus> => {
-    return invoke("get_story_index_status");
+    return invokeReporting<StoryIndexStatus>("get_story_index_status");
   },
 
   // 重建全文索引。也是生命周期命令：失败后搜索会静默退化成线性扫描，
@@ -177,27 +213,31 @@ export const api = {
 
   // 搜索剧情
   searchStories: async (query: string): Promise<SearchResult[]> => {
-    return invoke("search_stories", { query });
+    return invokeSearchReporting<SearchResult[]>("search_stories", { query });
   },
 
   /** 扩展搜索：返回总数 + facet */
   searchStoriesEx: async (query: string): Promise<SearchResultsPage> => {
-    return invoke("search_stories_ex", { query });
+    return invokeSearchReporting<SearchResultsPage>("search_stories_ex", { query });
   },
 
   /** 段级搜索：返回精确段落位置 */
   searchSegments: async (query: string): Promise<SegmentSearchPage> => {
-    return invoke("search_segments", { query });
+    return invokeSearchReporting<SegmentSearchPage>("search_segments", { query });
   },
 
   // 搜索剧情（带进度事件）
   searchStoriesWithProgress: async (query: string): Promise<SearchResult[]> => {
-    return invoke("search_stories_with_progress", { query });
+    return invokeSearchReporting<SearchResult[]>("search_stories_with_progress", { query });
   },
 
   // 监听搜索进度
   onSearchProgress: (callback: (progress: ProgressPayload) => void) => {
-    return onProgress("search-progress", callback);
+    return onProgress("search-progress", (progress) => {
+      if (activeSearchRequest !== 0 && activeSearchRequest === latestSearchRequest) {
+        callback(progress);
+      }
+    });
   },
 
   // 监听索引重建进度
@@ -207,7 +247,7 @@ export const api = {
 
   // 调试模式搜索剧情
   searchStoriesDebug: async (query: string): Promise<SearchDebugResponse> => {
-    return invoke("search_stories_debug", { query });
+    return invokeSearchReporting<SearchDebugResponse>("search_stories_debug", { query });
   },
 
   // 获取主线剧情（按章节分组）

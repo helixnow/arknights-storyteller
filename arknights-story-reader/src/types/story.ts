@@ -154,6 +154,9 @@ export interface SearchResultsPage {
   totalMatched: number;
   truncated: boolean;
   facets: Record<string, number>;
+  /** 新后端返回 camelCase；snake_case 兼容开发期/旧桥接载荷。缺失表示旧后端。 */
+  indexUsed?: boolean;
+  index_used?: boolean;
 }
 
 /** 段级搜索命中——对应 Rust `SegmentHit`。 */
@@ -187,6 +190,9 @@ export interface SegmentSearchPage {
   hits: SegmentHit[];
   totalMatched: number;
   truncated: boolean;
+  /** 新后端返回 camelCase；snake_case 兼容开发期/旧桥接载荷。缺失表示旧后端。 */
+  indexUsed?: boolean;
+  index_used?: boolean;
 }
 
 export interface SearchDebugResponse {
