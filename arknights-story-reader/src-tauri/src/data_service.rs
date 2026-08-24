@@ -338,8 +338,9 @@ fn normalize_nfkc_lower_strip_marks(text: &str) -> String {
 
 /// Aggressive normalization for fuzzy matching: NFKC + lowercase + strip marks
 /// + replace `{@nickname}` → `博士` + drop all whitespace / common punctuation.
-/// Used by the linear-scan fallback and by context extraction to keep index and
-/// raw-file search paths consistent (bug A3 / A2).
+/// Used to locate preview snippets in raw text (`extract_context*`) and for
+/// the segment-search speaker/body badges. 命中判定不走这份文本——它丢掉了
+/// token 边界，见 `fts_token_stream`。
 fn normalize_for_fuzzy(text: &str) -> String {
     let replaced = text.replace("{@nickname}", "博士");
     normalize_nfkc_lower_strip_marks(&replaced)
@@ -376,17 +377,36 @@ fn split_match_atoms(text: &str) -> Vec<String> {
     atoms
 }
 
-/// 一个查询词。`atoms` 里的每一项都必须出现，命中方式与 FTS 侧一一对应：
+/// 线性扫描的 haystack：与索引里 `tokenized_content` 完全相同的 token 流，
+/// 首尾各垫一个空格，token 之间单空格相隔。匹配判定必须发生在这份文本上
+/// 而不是 `normalize_for_fuzzy` 的压平文本上——压平文本丢掉了 token 边界，
+/// `contains("prts")` 会命中 `superprts` 的腹部、`contains("0")` 会命中
+/// `10` 的个位，而 FTS 的 `prts*`/`0*` 只认「以它开头的 token」；反过来，
+/// 压平文本保留假名而分词器丢假名，短语 `"凯尔"` 在 `凯あ尔` 上索引能命
+/// 中、压平文本却断开。任何一边独有的命中都是「索引建好前后结果集分叉」。
+fn fts_token_stream(text: &str) -> String {
+    format!(" {} ", DataService::build_tokenized_content(text))
+}
+
+/// 一个查询词。命中方式与它在 FTS 查询里生成的子句一一对应，判定发生在
+/// `fts_token_stream` 产出的 token 流上：
 ///
-/// * 普通词 `凯尔希` → FTS `("凯" AND "尔" AND "希")`，原子 = 逐字，
-///   出现在文中任意位置即可（不要求相邻）。
-/// * 引号短语 `"凯尔希"` → FTS `"凯 尔 希"`，原子只有一个 = 整串，
-///   因为 `normalize_for_fuzzy` 已经把空白和标点去掉了，`contains` 恰好
-///   等价于 FTS 短语要求的「token 连续」。
+/// * 普通词 `凯尔希` → FTS `("凯" AND "尔" AND "希")`：每个 CJK 原子必须
+///   作为完整 token 出现（任意位置、不要求相邻）；ASCII 原子对应 `run*`，
+///   要求存在**以它开头**的 token。
+/// * 引号短语 `"凯尔希"` → FTS `"凯 尔 希"`：原子序列必须作为连续 token
+///   原样出现（ASCII 原子此时也是精确 token，FTS 短语里没有前缀星号）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TermKind {
+    Word,
+    Phrase,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Term {
     /// 归一化后的完整词，用来给预览片段定位。
     text: String,
+    kind: TermKind,
     atoms: Vec<String>,
 }
 
@@ -404,31 +424,48 @@ impl Term {
     /// 等），两边一起当它不存在。
     fn word(source: &str, text: String) -> Option<Self> {
         let atoms = split_match_atoms(source);
-        (!atoms.is_empty()).then(|| Self { text, atoms })
-    }
-
-    /// 短语只有一个原子 = 各原子拼接：`normalize_for_fuzzy` 已把 haystack
-    /// 里的空白和标点去掉，`contains` 恰好等价于 FTS 短语要求的「token
-    /// 连续」。原子来源与 `word` 同理取 `source`，拼接后与旧行为一致，但
-    /// `{@nickname}` 之类只在 fuzzy 侧被改写的串不会再偏离 FTS 子句。
-    fn phrase(source: &str, text: String) -> Option<Self> {
-        let atoms = split_match_atoms(source);
-        if atoms.is_empty() {
-            return None;
-        }
-        let joined = atoms.concat();
-        Some(Self {
+        (!atoms.is_empty()).then(|| Self {
             text,
-            atoms: vec![joined],
+            kind: TermKind::Word,
+            atoms,
         })
     }
 
-    /// FTS 的 `MATCH` 判定是行级的：`A AND B` 允许 A 命中一列、B 命中另一列。
-    /// 这里同样允许不同原子落在不同的 haystack 上。
+    /// 短语保留原子**序列**：FTS 侧 `quoted_to_clause` 生成的就是这串
+    /// token 的按序短语，匹配时要求它们作为连续 token 原样出现。原子来源
+    /// 与 `word` 同理取 `source`，`{@nickname}` 之类只在 fuzzy 侧被改写的
+    /// 串不会偏离 FTS 子句。
+    fn phrase(source: &str, text: String) -> Option<Self> {
+        let atoms = split_match_atoms(source);
+        (!atoms.is_empty()).then(|| Self {
+            text,
+            kind: TermKind::Phrase,
+            atoms,
+        })
+    }
+
+    /// `haystacks` 是若干 `fts_token_stream`。FTS 的 `MATCH` 判定是行级的：
+    /// `A AND B` 允许 A 命中一列、B 命中另一列，所以普通词的不同原子可以
+    /// 落在不同的 haystack 上；短语在 FTS 里必须落在同一列内，这里同样要求
+    /// 整个序列出现在同一个 haystack 里。
     fn matches(&self, haystacks: &[&str]) -> bool {
-        self.atoms
-            .iter()
-            .all(|atom| haystacks.iter().any(|hay| hay.contains(atom.as_str())))
+        match self.kind {
+            TermKind::Word => self.atoms.iter().all(|atom| {
+                // token 流里每个 token 前面都有空格：` atom` 命中「以原子
+                // 开头的 token」（≙ FTS `atom*`），` atom ` 命中精确 token
+                // （≙ FTS `"字"`）。ASCII 走前缀，CJK 单字走精确。
+                let needle = if atom.chars().all(|c| c.is_ascii_alphanumeric()) {
+                    format!(" {}", atom)
+                } else {
+                    format!(" {} ", atom)
+                };
+                haystacks.iter().any(|hay| hay.contains(needle.as_str()))
+            }),
+            TermKind::Phrase => {
+                let needle = format!(" {} ", self.atoms.join(" "));
+                haystacks.iter().any(|hay| hay.contains(needle.as_str()))
+            }
+        }
     }
 }
 
@@ -467,8 +504,9 @@ impl QueryTerms {
     }
 
     /// Are all positive groups satisfied by at least one of `haystacks`?
-    /// Callers must check `excluded_by` separately — a title-only fast path
-    /// cannot see the body text a `-term` might live in.
+    /// `haystacks` must be `fts_token_stream` outputs. Callers must check
+    /// `excluded_by` separately — a title-only fast path cannot see the body
+    /// text a `-term` might live in.
     fn positives_match(&self, haystacks: &[&str]) -> bool {
         if self.positive.is_empty() {
             return false;
@@ -3133,14 +3171,16 @@ impl DataService {
         let mut results = Vec::new();
         for (idx, indexed) in stories.iter().enumerate() {
             let story = &indexed.story;
-            let story_name_norm = normalize_for_fuzzy(&story.story_name);
-            let code_norm = story
+            // 判定一律在 `fts_token_stream` 上做：标题流是 `tokenized_content`
+            // 开头那截（`searchable_text` = 标题 + 正文），代码流对应索引里的
+            // `story_code` 列（unicode61 同样在 `-` 处断词）。
+            let name_stream = fts_token_stream(&story.story_name);
+            let code_stream = story
                 .story_code
                 .as_ref()
-                .map(|s| normalize_for_fuzzy(s))
+                .map(|s| fts_token_stream(s))
                 .unwrap_or_default();
-            let title_hits =
-                terms.positives_match(&[story_name_norm.as_str(), code_norm.as_str()]);
+            let title_hits = terms.positives_match(&[name_stream.as_str(), code_stream.as_str()]);
 
             // Fast path: title/code hit and nothing to exclude. With NOT terms
             // in play we still have to read the body, since an exclusion may
@@ -3162,8 +3202,9 @@ impl DataService {
                 // 查询就突然搜不到了。
                 self.story_searchable_text(&story.story_name, &story.story_txt)
                     .and_then(|content| {
-                        let content_norm = normalize_for_fuzzy(&content);
-                        let haystacks = [content_norm.as_str(), code_norm.as_str()];
+                        // 与索引里 `tokenized_content` 逐 token 相同的流。
+                        let content_stream = fts_token_stream(&content);
+                        let haystacks = [content_stream.as_str(), code_stream.as_str()];
                         if terms.excluded_by(&haystacks) {
                             return None;
                         }
@@ -3511,6 +3552,9 @@ impl DataService {
         };
 
         let context_probe = normalize_for_fuzzy(trimmed);
+        // 预览定位用：多词查询的整串探针几乎必落空（词与词很少恰好相邻），
+        // 逐词探针能把片段对准真正命中的那个词，而不是裁一段开头了事。
+        let terms = split_query_terms(trimmed);
         let mut hits: Vec<SegmentHit> = Vec::new();
         let mut seen: std::collections::HashSet<(String, usize)> = Default::default();
         for row in rows {
@@ -3536,18 +3580,22 @@ impl DataService {
             };
 
             // Build the preview. When the body actually contains the term we
-            // center the preview around the match; otherwise we show the
-            // whole segment (trimmed) so the user gets meaningful context
-            // even for short "好 / 嗯 / mon3tr" segments.
-            let matched_text = if body_hit {
-                let extracted = self.extract_context(&raw_text, &context_probe);
+            // center the preview around the match; for multi-term queries the
+            // full probe almost never hits, so fall back to per-term probes
+            // (whole terms first, then single atoms) before giving up and
+            // clipping the head — a hit at the tail of a long narration used
+            // to vanish from its own preview. Short "好 / 嗯 / mon3tr"
+            // segments still end up shown whole either way.
+            let matched_text = {
+                let extracted = self.extract_context_any(
+                    &raw_text,
+                    std::iter::once(context_probe.as_str()).chain(terms.preview_probes()),
+                );
                 if extracted.trim().is_empty() {
                     Self::clip_preview(&raw_text, 240)
                 } else {
                     extracted
                 }
-            } else {
-                Self::clip_preview(&raw_text, 240)
             };
             let (story_name, category) = labels
                 .and_then(|c| c.label_for(&story_id))
@@ -3574,45 +3622,58 @@ impl DataService {
             });
         }
 
-        // Merge story-name / story-code hits from the story-level index so
-        // exact title lookups like `大地惊雷` still surface as a clickable
-        // result even though the title itself isn't stored as a segment.
-        // Each such hit is presented as a pseudo-"header" segment at index 0
-        // so the reader lands on the beginning of the story when clicked.
-        if let Ok(story_rows) = Self::story_level_title_hits(&conn, &fts_query, trimmed, labels) {
-            let remaining = SEARCH_RESULT_LIMIT.saturating_sub(hits.len());
-            for hit in story_rows.into_iter().take(remaining) {
-                let key = (hit.story_id.clone(), hit.segment_index);
-                if !seen.contains(&key) {
-                    seen.insert(key);
-                    hits.push(hit);
-                }
-            }
-        }
-
         // Skip the COUNT(*) round-trip when we clearly aren't truncated —
-        // `rows.len() < LIMIT` implies every matching row is in `hits`.
-        // Only when the LIMIT kicked in do we need the authoritative total
-        // to drive the "已显示 X / Y" hint in the UI.
-        let total_matched = if hits.len() >= SEARCH_RESULT_LIMIT {
+        // `rows.len() < LIMIT` implies every matching segment row is in
+        // `hits`. Only when the LIMIT kicked in do we need the authoritative
+        // total to drive the "已显示 X / Y" hint in the UI. 必须在合并标题
+        // 伪命中**之前**判断：标题命中把 hits 填到上限并不代表段落查询被
+        // 截断，反之段落行数没到上限时 COUNT 也不会更大。
+        let seg_returned = hits.len();
+        let seg_total = if seg_returned >= SEARCH_RESULT_LIMIT {
             let total: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM story_segment_index WHERE story_segment_index MATCH ?1",
                     params![fts_query.clone()],
                     |row| row.get(0),
                 )
-                .unwrap_or(hits.len() as i64);
-            hits.len().max(total.max(0) as usize)
+                .unwrap_or(seg_returned as i64);
+            seg_returned.max(total.max(0) as usize)
         } else {
-            hits.len()
+            seg_returned
         };
+
+        // Merge story-name / story-code hits from the story-level index so
+        // exact title lookups like `大地惊雷` still surface as a clickable
+        // result even though the title itself isn't stored as a segment.
+        // Each such hit is presented as a pseudo-"header" segment at index 0
+        // so the reader lands on the beginning of the story when clicked.
+        //
+        // 被 LIMIT 掐掉的标题命中也要计入总数：段落命中恰好填满上限时，
+        // 以前这里静默丢掉全部标题命中，`total_matched` 却只报段落 COUNT，
+        // `truncated` 顺势谎报成 false——用户看到「共 N 段」以为一条不少，
+        // 实际标题命中根本没进列表。
+        let mut title_total = 0usize;
+        if let Ok(story_rows) = Self::story_level_title_hits(&conn, &fts_query, trimmed, labels) {
+            let fresh: Vec<SegmentHit> = story_rows
+                .into_iter()
+                .filter(|hit| !seen.contains(&(hit.story_id.clone(), hit.segment_index)))
+                .collect();
+            title_total = fresh.len();
+            // `fresh` 与段落命中已去重，且每个 story_id 至多一行。
+            let remaining = SEARCH_RESULT_LIMIT.saturating_sub(hits.len());
+            hits.extend(fresh.into_iter().take(remaining));
+        }
+
+        let total_matched = seg_total + title_total;
+        // 截断与否只有一个诚实的判据：还有没有没返回的命中。
+        let truncated = total_matched > hits.len();
 
         progress("完成", 2, 2, format!("命中 {} 段", total_matched));
 
         Ok(SegmentSearchPage {
             hits,
             total_matched,
-            truncated: total_matched > SEARCH_RESULT_LIMIT,
+            truncated,
         })
     }
 
@@ -4533,6 +4594,17 @@ mod tests {
         terms.negative.iter().map(|t| t.text.as_str()).collect()
     }
 
+    /// 判定发生在与索引相同的 token 流上；测试给原文，这里代为转换。
+    fn matches_text(terms: &QueryTerms, text: &str) -> bool {
+        let hay = fts_token_stream(text);
+        terms.positives_match(&[hay.as_str()])
+    }
+
+    fn excludes_text(terms: &QueryTerms, text: &str) -> bool {
+        let hay = fts_token_stream(text);
+        terms.excluded_by(&[hay.as_str()])
+    }
+
     #[test]
     fn split_query_terms_basic() {
         let terms = split_query_terms("凯尔希 阿米娅");
@@ -4545,10 +4617,14 @@ mod tests {
         let terms = split_query_terms("\"凯尔希 阿米娅\"");
         // Quoted phrase collapses internal whitespace because of fuzzy normalization.
         assert_eq!(positive_texts(&terms), vec![vec!["凯尔希阿米娅"]]);
-        // 短语只有一个原子：整串必须连续出现，对应 FTS 的 `"凯 尔 希 阿 米 娅"`。
-        assert_eq!(terms.positive[0][0].atoms, vec!["凯尔希阿米娅"]);
-        assert!(terms.positives_match(&["和凯尔希阿米娅一起"]));
-        assert!(!terms.positives_match(&["凯尔希在，阿米娅不在"]));
+        // 短语保留原子序列并要求连续出现，对应 FTS 的 `"凯 尔 希 阿 米 娅"`。
+        assert_eq!(terms.positive[0][0].kind, TermKind::Phrase);
+        assert_eq!(
+            terms.positive[0][0].atoms,
+            vec!["凯", "尔", "希", "阿", "米", "娅"]
+        );
+        assert!(matches_text(&terms, "和凯尔希阿米娅一起"));
+        assert!(!matches_text(&terms, "凯尔希在，阿米娅不在"));
     }
 
     #[test]
@@ -4557,9 +4633,9 @@ mod tests {
         // 连续。线性扫描必须用同样的判定，否则索引建好前后结果集会变。
         let terms = split_query_terms("凯尔希");
         assert_eq!(terms.positive[0][0].atoms, vec!["凯", "尔", "希"]);
-        assert!(terms.positives_match(&["凯尔希"]));
-        assert!(terms.positives_match(&["凯瑟琳、尔后、希望"]));
-        assert!(!terms.positives_match(&["凯尔"]));
+        assert!(matches_text(&terms, "凯尔希"));
+        assert!(matches_text(&terms, "凯瑟琳、尔后、希望"));
+        assert!(!matches_text(&terms, "凯尔"));
     }
 
     #[test]
@@ -4584,9 +4660,9 @@ mod tests {
         let terms = split_query_terms("-凯尔希 博士");
         assert_eq!(positive_texts(&terms), vec![vec!["博士"]]);
         assert_eq!(negative_texts(&terms), vec!["凯尔希"]);
-        assert!(terms.positives_match(&["博士说过的话"]));
-        assert!(terms.excluded_by(&["凯尔希说过的话"]));
-        assert!(!terms.excluded_by(&["博士说过的话"]));
+        assert!(matches_text(&terms, "博士说过的话"));
+        assert!(excludes_text(&terms, "凯尔希说过的话"));
+        assert!(!excludes_text(&terms, "博士说过的话"));
     }
 
     #[test]
@@ -4596,7 +4672,7 @@ mod tests {
         let terms = split_query_terms("博士 -\"凯尔希\"");
         assert_eq!(positive_texts(&terms), vec![vec!["博士"]]);
         assert_eq!(negative_texts(&terms), vec!["凯尔希"]);
-        assert!(terms.excluded_by(&["凯尔希来了"]));
+        assert!(excludes_text(&terms, "凯尔希来了"));
 
         // 引号没闭合时同样保住否定语义。
         let terms = split_query_terms("博士 -\"凯尔希");
@@ -4644,7 +4720,9 @@ mod tests {
         // 全角引号 U+FF02 NFKC 后是 `"`，FTS 侧按短语解析；回退侧一致。
         let terms = split_query_terms("＂凯尔希 阿米娅＂");
         assert_eq!(positive_texts(&terms), vec![vec!["凯尔希阿米娅"]]);
-        assert_eq!(terms.positive[0][0].atoms, vec!["凯尔希阿米娅"]);
+        assert_eq!(terms.positive[0][0].kind, TermKind::Phrase);
+        assert!(matches_text(&terms, "凯尔希阿米娅登场"));
+        assert!(!matches_text(&terms, "凯尔希与阿米娅"));
     }
 
     #[test]
@@ -4679,9 +4757,9 @@ mod tests {
     #[test]
     fn split_query_terms_or_group_matches_either_alternative() {
         let terms = split_query_terms("凯尔希 or 阿米娅");
-        assert!(terms.positives_match(&["只提到凯尔希"]));
-        assert!(terms.positives_match(&["只提到阿米娅"]));
-        assert!(!terms.positives_match(&["只提到博士"]));
+        assert!(matches_text(&terms, "只提到凯尔希"));
+        assert!(matches_text(&terms, "只提到阿米娅"));
+        assert!(!matches_text(&terms, "只提到博士"));
     }
 
     #[test]
@@ -4695,10 +4773,121 @@ mod tests {
         );
         let terms = split_query_terms("0-1");
         assert_eq!(terms.positive[0][0].atoms, vec!["0", "1"]);
-        assert!(terms.positives_match(&["编队0号与1号"]));
+        assert!(matches_text(&terms, "编队0号与1号"));
 
         let terms = split_query_terms("prts-2");
         assert_eq!(terms.positive[0][0].atoms, vec!["prts", "2"]);
+    }
+
+    #[test]
+    fn word_ascii_atoms_match_token_prefixes_like_fts() {
+        // FTS 的 `prts*` 只认「以 prts 开头的 token」。以前回退侧在压平文本
+        // 上做子串 contains：`superprts` 的腹部、`grape rts` 压平后的骑缝
+        // （`graperts`）都会被误命中，索引建好前后结果集分叉。
+        let terms = split_query_terms("prts");
+        assert!(matches_text(&terms, "PRTS系统上线"));
+        assert!(matches_text(&terms, "prts2 已部署")); // 前缀命中，同 `prts*`
+        assert!(!matches_text(&terms, "superprts 出场"));
+        assert!(!matches_text(&terms, "grape rts"));
+
+        // 数字同理：`0*` 不命中 `10` 的个位。查询 `0-1` 以前会命中任何
+        // 同时含 0 和 1 的数字串（如「第10回合，2020年」）。
+        let terms = split_query_terms("0-1");
+        assert!(matches_text(&terms, "0号与1号"));
+        assert!(!matches_text(&terms, "第10回合，2020年"));
+    }
+
+    #[test]
+    fn phrase_atoms_match_consecutive_exact_tokens_like_fts() {
+        // ASCII 短语在 FTS 里是精确 token 序列（没有前缀星号）。以前回退侧
+        // 把原子拼接后做子串 contains，`foobar`、骑缝的 `foob ar` 都会被
+        // 误命中；`"prts"` 也会命中 `prts2`。
+        let terms = split_query_terms("\"foo bar\"");
+        assert!(matches_text(&terms, "说 foo bar 的人"));
+        assert!(!matches_text(&terms, "foobar"));
+        assert!(!matches_text(&terms, "xfoo bar"));
+        assert!(!matches_text(&terms, "foob ar"));
+
+        let terms = split_query_terms("\"prts\"");
+        assert!(matches_text(&terms, "prts 系统"));
+        assert!(!matches_text(&terms, "prts2 系统"));
+
+        // 分词器丢掉的字符（假名等）不打断 token 相邻：`凯あ尔` 在索引里
+        // 就是相邻的 `凯 尔`，FTS 短语能命中，回退侧必须一样。
+        let terms = split_query_terms("\"凯尔\"");
+        assert!(matches_text(&terms, "凯あ尔"));
+        assert!(matches_text(&terms, "凯、尔"));
+        assert!(!matches_text(&terms, "凯不挨着尔"));
+    }
+
+    #[test]
+    fn bare_and_mixes_with_or_like_the_index() {
+        // `AND` 与 `or` 混写：裸词 and 是无操作连接词，or 只并相邻两项。
+        // FTS 串与回退分组都必须与去掉 and 的写法逐字节 / 逐项相同。
+        assert_eq!(
+            DataService::build_fts_query_advanced("希 or 章 AND 雪"),
+            DataService::build_fts_query_advanced("希 or 章 雪")
+        );
+        assert_eq!(
+            DataService::build_fts_query_advanced("希 or 章 AND 雪").as_deref(),
+            Some("(\"希\" OR \"章\") AND \"雪\"")
+        );
+        assert_eq!(
+            split_query_terms("希 or 章 AND 雪"),
+            split_query_terms("希 or 章 雪")
+        );
+
+        // `A AND B or C`：AND 不打断后面的 OR 组，语义是 A AND (B OR C)。
+        assert_eq!(
+            DataService::build_fts_query_advanced("凯尔希 AND 博士 or 德克萨斯"),
+            DataService::build_fts_query_advanced("凯尔希 博士 or 德克萨斯")
+        );
+        let terms = split_query_terms("凯尔希 AND 博士 or 德克萨斯");
+        assert_eq!(
+            positive_texts(&terms),
+            vec![vec!["凯尔希"], vec!["博士", "德克萨斯"]]
+        );
+
+        // `A or AND B`：夹在中间的 and 不吞掉悬挂的 or。
+        assert_eq!(
+            split_query_terms("凯尔希 or AND 阿米娅"),
+            split_query_terms("凯尔希 or 阿米娅")
+        );
+        assert_eq!(
+            DataService::build_fts_query_advanced("凯尔希 or AND 阿米娅"),
+            DataService::build_fts_query_advanced("凯尔希 or 阿米娅")
+        );
+    }
+
+    #[test]
+    fn fullwidth_connectives_fold_to_keywords_after_nfkc() {
+        // 全角字母（中文输入法全角档）经 NFKC + 小写后就是 and/or/not，
+        // 两条路径都解析在归一化后的文本上，必须与半角写法完全等价。
+        let pairs = [
+            ("凯尔希 ＡＮＤ 博士", "凯尔希 博士"),
+            ("凯尔希 ＯＲ 博士", "凯尔希 or 博士"),
+            ("凯尔希 ＮＯＴ 博士", "凯尔希 -博士"),
+        ];
+        for (fullwidth, canonical) in pairs {
+            assert_eq!(
+                DataService::build_fts_query_advanced(fullwidth),
+                DataService::build_fts_query_advanced(canonical),
+                "FTS 串分叉: {:?} vs {:?}",
+                fullwidth,
+                canonical
+            );
+            assert_eq!(
+                split_query_terms(fullwidth),
+                split_query_terms(canonical),
+                "回退解析分叉: {:?} vs {:?}",
+                fullwidth,
+                canonical
+            );
+        }
+        // 语义抽查：全角 ＮＯＴ 真的把「博士」放进了排除列表。
+        let terms = split_query_terms("凯尔希 ＮＯＴ 博士");
+        assert_eq!(positive_texts(&terms), vec![vec!["凯尔希"]]);
+        assert_eq!(negative_texts(&terms), vec!["博士"]);
     }
 
     #[test]
@@ -5398,6 +5587,11 @@ mod tests {
             // 裸词连接词与显式减号 / 隐式 AND 的等价写法。
             "凯尔希 AND 博士",
             "凯尔希 NOT 博士",
+            // AND 与 or 混写：语义是 凯尔希 AND (博士 OR 德克萨斯)。
+            "凯尔希 AND 博士 or 德克萨斯",
+            // 全角连接词（NFKC 后才是 and/not）。
+            "凯尔希 ＡＮＤ 博士",
+            "凯尔希 ＮＯＴ 博士",
             // 悬挂 `not` 被已否定的 `-凯尔希` 消费，「雪」保持正向。
             "not -凯尔希 雪",
             // 开头的 `or` 是噪音，`not` 把「博士」反转成排除项。
@@ -5495,6 +5689,89 @@ mod tests {
         );
     }
 
+    /// storyCode 查询端到端：`0-1` 在索引建好前后都必须命中 0-1 这一篇，
+    /// 且不许把「正文里凑巧有 0 和 1 的数字」的剧情捞进来——FTS 的 `0*`
+    /// 只认以 0 开头的 token（`10`、`2020` 都不算），回退侧以前按子串
+    /// contains 会把这类剧情误报出来，索引建好前后结果集分叉。
+    #[test]
+    fn story_code_query_hits_end_to_end_without_digit_noise() {
+        let fx = Fixture::new("code_e2e");
+        fx.set_review_table(&format!(
+            "{{\"main_0\":{{\"id\":\"main_0\",\"name\":\"黑暗时代\",\"entryType\":\"MAINLINE\",\
+              \"infoUnlockDatas\":[{},{}]}}}}",
+            entry_json(
+                "main_00-01",
+                "序章",
+                "main_0",
+                1,
+                "obt/main/level_main_00-01",
+                "0-1",
+            ),
+            entry_json(
+                "digit_noise",
+                "回合战报",
+                "main_0",
+                2,
+                "obt/main/level_main_digits",
+                "9-9",
+            )
+        ));
+        fx.write_story("obt/main/level_main_digits", "第10回合，兵力2020人。\n");
+
+        // 索引没建好：线性扫描。凭 storyCode 命中，数字噪音不命中。
+        assert_eq!(
+            sorted_ids(&fx.service.search_stories("0-1").unwrap()),
+            vec!["main_00-01".to_string()]
+        );
+
+        // 建好索引后同一批结果。
+        fx.service.rebuild_story_index().expect("index builds");
+        assert_eq!(
+            sorted_ids(&fx.service.search_stories("0-1").unwrap()),
+            vec!["main_00-01".to_string()]
+        );
+    }
+
+    /// 引号短语端到端：`"凯尔"` 要求凯、尔作为**相邻 token** 出现。分词器
+    /// 丢掉的字符（假名）不打断相邻——`凯あ尔` 在索引里就是相邻的
+    /// `凯 尔`，FTS 短语命中；真正隔着会成词的字（`凯不挨着尔`）才不命中。
+    /// 回退侧以前在保留假名的压平文本上做 contains，前者只有索引能搜到。
+    #[test]
+    fn quoted_phrase_agrees_end_to_end_across_dropped_chars() {
+        let fx = Fixture::new("phrase_e2e");
+        fx.set_review_table(&format!(
+            "{{\"main_0\":{{\"id\":\"main_0\",\"name\":\"黑暗时代\",\"entryType\":\"MAINLINE\",\
+              \"infoUnlockDatas\":[{},{}]}}}}",
+            entry_json(
+                "kana_story",
+                "插曲一",
+                "main_0",
+                1,
+                "obt/main/level_main_kana",
+                "",
+            ),
+            entry_json(
+                "gap_story",
+                "插曲二",
+                "main_0",
+                2,
+                "obt/main/level_main_gap",
+                "",
+            )
+        ));
+        fx.write_story("obt/main/level_main_kana", "凯あ尔登场。\n");
+        fx.write_story("obt/main/level_main_gap", "凯不挨着尔。\n");
+
+        // 语料里还有肉鸽篇 ro2_1（说话人凯尔希）也含相邻的「凯尔」。
+        let expected = vec!["Obt/Roguelike/ro2/ro2_1".to_string(), "kana_story".to_string()];
+        let scanned = sorted_ids(&fx.service.search_stories("\"凯尔\"").unwrap());
+        assert_eq!(scanned, expected);
+
+        fx.service.rebuild_story_index().expect("index builds");
+        let indexed = sorted_ids(&fx.service.search_stories("\"凯尔\"").unwrap());
+        assert_eq!(indexed, expected);
+    }
+
     #[test]
     fn scan_reports_a_real_denominator() {
         let fx = Fixture::new("scan_progress");
@@ -5547,6 +5824,87 @@ mod tests {
         let terms = split_query_terms("凯尔希 博士");
         let preview = fx.service.preview_for(&scattered, &terms);
         assert!(preview.contains("博士"), "{}", preview);
+    }
+
+    /// 段命中恰好填满上限时，被挤掉的标题伪命中必须计入 total 并承认截断。
+    /// 以前 total 只报段落 COUNT、truncated 按 `total > LIMIT` 判——两者都
+    /// 看不见被 `take(remaining=0)` 丢掉的标题命中，UI 显示的总数看起来
+    /// 「一条不少」，实际「雪原」的标题命中根本没进列表。
+    #[test]
+    fn segment_search_admits_title_hits_dropped_by_the_limit() {
+        let fx = Fixture::new("seg_trunc");
+        // 全库恰好 SEARCH_RESULT_LIMIT 段命中「雪」：活动篇 1 段（标题
+        // 「雪原」另产生一条标题伪命中）+ 长篇 LIMIT-1 段。说话人甲/乙
+        // 交替，防止连续同名对白被合并成一段。
+        let mut long_story = String::new();
+        for i in 0..(SEARCH_RESULT_LIMIT - 1) {
+            let speaker = if i % 2 == 0 { "甲" } else { "乙" };
+            long_story.push_str(&format!("[name=\"{}\"]第{}夜的雪。\n", speaker, i));
+        }
+        fx.set_review_table(&format!(
+            "{{\"act_1\":{{\"id\":\"act_1\",\"name\":\"骑兵与猎人\",\"entryType\":\"ACTIVITY\",\
+              \"actType\":\"ACTIVITY_STORY\",\"infoUnlockDatas\":[{}]}},\
+              \"main_0\":{{\"id\":\"main_0\",\"name\":\"黑暗时代\",\"entryType\":\"MAINLINE\",\
+              \"infoUnlockDatas\":[{}]}}}}",
+            entry_json(
+                "act1_st01",
+                "雪原",
+                "act_1",
+                1,
+                "activities/act1/act1_st01",
+                "",
+            ),
+            entry_json(
+                "long_night",
+                "长夜",
+                "main_0",
+                1,
+                "obt/main/level_main_night",
+                "LN-1",
+            )
+        ));
+        fx.write_story("obt/main/level_main_night", &long_story);
+        fx.service.rebuild_story_index().expect("index builds");
+
+        let page = fx.service.search_segments("雪").unwrap();
+        assert_eq!(page.hits.len(), SEARCH_RESULT_LIMIT);
+        assert_eq!(
+            page.total_matched,
+            SEARCH_RESULT_LIMIT + 1,
+            "被挤掉的标题命中必须计入总数"
+        );
+        assert!(page.truncated, "有命中没进列表就必须承认截断");
+
+        // 对照：没截断时 total 就是列表长度。
+        let page = fx.service.search_segments("雪很大").unwrap();
+        assert_eq!(page.total_matched, page.hits.len());
+        assert!(!page.truncated);
+    }
+
+    /// 多词查询的段落预览：整串探针（词与词直接相邻）几乎必落空，必须
+    /// 退回逐词探针把片段对准命中的词；长段落裁头 240 字的旧行为会让段尾
+    /// 的命中在自己的预览里消失。
+    #[test]
+    fn segment_preview_centres_on_the_term_that_hit() {
+        let fx = Fixture::new("seg_preview");
+        let filler = "这是一段很长的旁白。".repeat(40);
+        fx.write_story(
+            "activities/act1/act1_st01",
+            &format!("{}凯尔希与阿米娅出发了。\n", filler),
+        );
+        fx.service.rebuild_story_index().expect("index builds");
+
+        let page = fx.service.search_segments("凯尔希 出发").unwrap();
+        let hit = page
+            .hits
+            .iter()
+            .find(|h| h.story_id == "act1_st01")
+            .expect("长旁白段必须命中");
+        assert!(
+            hit.matched_text.contains("凯尔希"),
+            "预览必须包含命中的词，实际: {}",
+            hit.matched_text
+        );
     }
 
     #[test]
