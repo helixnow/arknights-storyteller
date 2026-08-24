@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useToast } from "@/components/ui/toast";
 import type { ReaderSettings } from "@/hooks/useReaderSettings";
 
 export interface ReadingProgress {
@@ -62,6 +63,9 @@ function prune(map: ProgressMap): ProgressMap {
   for (const key of kept) next[key] = map[key];
   return next;
 }
+
+/** 失败提示的会话级闩锁：滚动落盘可达每 1.2s 一次，同一轮失败只提醒一次。 */
+let persistFailureNotified = false;
 
 /** @returns 是否真的写进了 localStorage（quota 满等失败时返回 false）。 */
 function writeProgressMap(map: ProgressMap): boolean {
@@ -148,6 +152,13 @@ export function useReadingProgress(
   const trackStateRef = useRef(options?.trackState ?? true);
   trackStateRef.current = options?.trackState ?? true;
 
+  // 冲刷跑在 setTimeout / pagehide / 模块级冲刷入口里，通过 ref 取最新 toast 句柄。
+  const toast = useToast();
+  const toastRef = useRef(toast);
+  useEffect(() => {
+    toastRef.current = toast;
+  }, [toast]);
+
   useEffect(() => {
     if (!storyPath) {
       latestRef.current = null;
@@ -186,8 +197,15 @@ export function useReadingProgress(
         // lastPersistedRef 推进到一个从没上过盘的值——否则这份进度就被
         // 无声丢弃：closeReader / pagehide / 切篇的强制冲刷全都会 no-op，
         // 哪怕之后配额被清理腾出来（启动期就会清历史搜索缓存）也救不回。
+        // 静默失败还等于骗用户「进度已记住」：阅读照常、重启后却回到旧
+        // 位置。收藏 / 划线 / 阅读设置的同类失败都会提示，这里补齐。
+        if (!persistFailureNotified) {
+          persistFailureNotified = true;
+          toastRef.current.warn("阅读进度未能保存到本地存储（空间可能已满），将自动重试");
+        }
         return;
       }
+      persistFailureNotified = false;
       pendingRef.current = null;
       lastPersistedRef.current = pending;
       if (trackStateRef.current) setProgress(pending);

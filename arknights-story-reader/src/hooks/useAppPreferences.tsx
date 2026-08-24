@@ -8,6 +8,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { useToast } from "@/components/ui/toast";
 
 interface AppPreferencesContextValue {
   showSummaries: boolean;
@@ -51,6 +52,9 @@ function normalizePrefs(parsed: unknown): Prefs {
   };
 }
 
+/** 失败提示的会话级闩锁：同一轮连续失败只打扰用户一次，写成功后复位。 */
+let persistFailureNotified = false;
+
 function samePrefs(a: Prefs, b: Prefs): boolean {
   return (
     a.showSummaries === b.showSummaries &&
@@ -75,8 +79,14 @@ function readPrefs(): Prefs {
     } catch {
       // 旧数据损坏，用默认值继续。
     }
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(migrated));
-    window.localStorage.removeItem(LEGACY_STORAGE_KEY);
+    try {
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(migrated));
+      window.localStorage.removeItem(LEGACY_STORAGE_KEY);
+    } catch {
+      // 回写新键失败（隐私模式 / 配额满）只影响「下次启动还要再迁一遍」，
+      // 绝不能连累本次会话：迁移值已经从旧键成功读出来了，必须原样返回。
+      // 之前这一步失败会掉进外层 catch、把用户的旧偏好整个打回默认。
+    }
     return migrated;
   } catch {
     return DEFAULT_PREFS;
@@ -85,6 +95,13 @@ function readPrefs(): Prefs {
 
 export function AppPreferencesProvider({ children }: { children: ReactNode }) {
   const [prefs, setPrefs] = useState<Prefs>(readPrefs);
+
+  // 写失败提示走 ref 取最新句柄，避免 toast 身份变化搅动持久化 effect 的 deps。
+  const toast = useToast();
+  const toastRef = useRef(toast);
+  useEffect(() => {
+    toastRef.current = toast;
+  }, [toast]);
 
   // 首帧的值就是刚从 localStorage 读出来的，回写没有意义；更糟的是：如果
   // 读取因数据损坏 / 迁移中断回落到了 DEFAULT_PREFS，这次回写会立刻用默认值
@@ -100,8 +117,16 @@ export function AppPreferencesProvider({ children }: { children: ReactNode }) {
     }
     try {
       window.localStorage.setItem(STORAGE_KEY, JSON.stringify(prefs));
+      persistFailureNotified = false;
     } catch {
-      // 隐私模式 / 配额不足：偏好只在本次会话内生效。
+      // 隐私模式 / 配额不足：偏好只在本次会话内生效。开关在界面上已经
+      // 翻过去了，静默失败等于骗用户「已保存」，重启后被打回——和收藏 /
+      // 划线 / 阅读设置的同类失败一样提示一次（下次任何偏好改动会带着
+      // 全量对象自然重试）。
+      if (!persistFailureNotified) {
+        persistFailureNotified = true;
+        toastRef.current.warn("偏好设置未能保存到本地存储（空间可能已满）");
+      }
     }
   }, [prefs]);
 
