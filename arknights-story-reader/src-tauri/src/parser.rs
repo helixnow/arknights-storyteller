@@ -353,7 +353,7 @@ fn parse_command_line(line: &str, current_char_id: Option<&str>) -> Option<Story
         }
         "subtitle" => {
             let text = overlay_text(&attrs, remainder)?;
-            let alignment = attrs.get("alignment").map(|s| s.trim().to_string());
+            let alignment = overlay_alignment(&attrs);
             Some(StorySegment::Subtitle { text, alignment })
         }
         // `spellsticker` 是主线 17 章的咒语浮层（`[spellsticker(...)]<p=1>“声音，
@@ -362,7 +362,7 @@ fn parse_command_line(line: &str, current_char_id: Option<&str>) -> Option<Story
         // `spellstickerclear` 清屏信号不匹配这个分支，照旧安静消失。
         "sticker" | "spellsticker" => {
             let text = overlay_text(&attrs, remainder)?;
-            let alignment = attrs.get("alignment").map(|s| s.trim().to_string());
+            let alignment = overlay_alignment(&attrs);
             Some(StorySegment::Sticker { text, alignment })
         }
         "header" => {
@@ -462,6 +462,22 @@ fn overlay_text(attrs: &HashMap<String, String>, remainder: &str) -> Option<Stri
             let trailing = clean_text(remainder);
             has_meaningful_content(&trailing).then_some(trailing)
         })
+}
+
+/// `[Subtitle]` / `[Sticker]` 的 `alignment`。语料取值全集是 left/center/
+/// right/middle（Subtitle 的 `middle` 共 11 处：story_horn_1_1 的日记日期行、
+/// story_ceylon_1_1 的信件引文、act16side/act21side 的定位浮层——同文件正文
+/// 用 `left`，`middle` 就是水平居中）。下游只认 left/center/right，`middle`
+/// 原样透传会被丢弃、退回左对齐，日期行就跟正文糊在一起，这里归一成 center。
+fn overlay_alignment(attrs: &HashMap<String, String>) -> Option<String> {
+    attrs.get("alignment").map(|s| {
+        let trimmed = s.trim();
+        if trimmed.eq_ignore_ascii_case("middle") {
+            "center".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    })
 }
 
 /// 只更新「当前说话人」而不产出任何段落的指令。
@@ -1580,6 +1596,44 @@ mod tests {
         let segment = only("[dialog]......");
         assert_eq!(segment.kind(), "narration");
         assert_eq!(segment.text(), Some("......"));
+    }
+
+    /// `alignment="middle"`（story_horn_1_1 的日记日期行等，全语料 11 处、
+    /// 全在 Subtitle）是水平居中：同文件正文行用 `left`，日期行用 `middle`
+    /// 与之区分。下游只认 left/center/right，透传 `middle` 会被丢弃、日期行
+    /// 退回左对齐——必须归一成 center。其余取值原样透传。
+    #[test]
+    fn test_subtitle_middle_alignment_normalizes_to_center() {
+        let segment = only(
+            r#"[Subtitle(text="3月20日", x=300, y=350, alignment="middle", size=24, delay=0.04, width=700)]"#,
+        );
+        match segment {
+            StorySegment::Subtitle { text, alignment } => {
+                assert_eq!(text, "3月20日");
+                assert_eq!(alignment.as_deref(), Some("center"));
+            }
+            other => panic!("expected subtitle segment, got {:?}", other),
+        }
+
+        // 语料里的其余取值（left 873 处、right 13 处、center 5063 处）不动。
+        let segment = only(
+            r#"[Subtitle(text="蔓德拉没有全力作战。", x=300, y=350, alignment="left", size=24, delay=0.04, width=700)]"#,
+        );
+        match segment {
+            StorySegment::Subtitle { alignment, .. } => {
+                assert_eq!(alignment.as_deref(), Some("left"));
+            }
+            other => panic!("expected subtitle segment, got {:?}", other),
+        }
+
+        // Sticker 与 Subtitle 同族共用一套归一化。
+        let segment = only(r#"[Sticker(text="档案编号：0021", alignment="right")]"#);
+        match segment {
+            StorySegment::Sticker { alignment, .. } => {
+                assert_eq!(alignment.as_deref(), Some("right"));
+            }
+            other => panic!("expected sticker segment, got {:?}", other),
+        }
     }
 
     /// `[Subtitle]` / `[Sticker]` 的正文可能写在 `]` 后面而不是 `text=` 里，
