@@ -869,6 +869,10 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
       setSegmentPage(null);
       // 结果已经清掉了，上一次成功留下的"已从缓存恢复"横幅不能继续挂着撒谎。
       setFromCache({ used: false });
+      // 调试记录同理：面板不带查询名，上一条查询的匹配日志留在这条查询的
+      // 错误卡旁边，会被当成本次失败的过程记录来读。
+      setDebugLogs([]);
+      setDebugExpanded(false);
       // 手动失败也记同一把钥匙：searchError 可能被别的路径清掉（比如切模式），
       // 这条 ref 是防抖 effect 不再替用户偷偷重发的最后一道闸。
       autoFailedRef.current = `${activeMode}:${raw}`;
