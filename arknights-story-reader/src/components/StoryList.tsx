@@ -554,6 +554,14 @@ export function StoryList({ onSelectStory }: StoryListProps) {
   const loadedRef = useRef<Record<SectionKey, boolean>>(initialSectionFlags(false));
   const pendingRef = useRef<Partial<Record<SectionKey, Promise<void>>>>({});
   /**
+   * 本轮数据源下是否出现过 NOT_INSTALLED / No such file 的确凿失败。
+   * 全局「未安装」结论会因为还有分块在途而被推迟,而负责收尾的最后一个
+   * 失败未必还是 NOT_INSTALLED(真没装数据时后端往往也卡着,收尾的很可能
+   * 是超时)——证据单独记下来,结论才不会因为收尾失败换了种类而永远丢失。
+   * 数据重新同步时随 loadedRef / pendingRef 一起清零。
+   */
+  const sawNotInstalledRef = useRef(false);
+  /**
    * 当前分类的镜像，供异步落地的请求判断「这块数据还与用户正看的页面
    * 相关吗」。典型场景：在活动分类等了几秒没等到、切回主线，8 秒后活动
    * 的超时才落地——它没有被 force 顶替（isCurrent 为真），但把「读取
@@ -589,39 +597,49 @@ export function StoryList({ onSelectStory }: StoryListProps) {
     const errorMsg = err instanceof Error ? err.message : String(err ?? "");
     console.error(`[StoryList] 加载${label}失败:`, errorMsg, err);
 
-    if (errorMsg === "TIMEOUT") {
-      if (!silent) setError({ kind: "timeout", label });
+    // 「数据目录不存在」的证据只认后端的 NOT_INSTALLED / No such file。
+    // TIMEOUT 不算：超时只说明后端忙（冷启动重建索引、IPC 拥堵），数据
+    // 多半还在，把它当证据会引着用户去做没必要的同步。
+    const isTimeout = errorMsg === "TIMEOUT";
+    if (!isTimeout && isNotInstalledError(errorMsg)) {
+      sawNotInstalledRef.current = true;
+    }
+
+    // 「未安装」是全局结论，下它要三个条件同时成立：本轮数据源里出现过
+    // NOT_INSTALLED 的确凿证据，没有任何分块成功读出，而且再没有别的
+    // 分块仍在途。
+    //
+    // 别的分块刚读到数据、只有一块报 NOT_INSTALLED（比如数据包里恰好缺
+    // 了肉鸽的 meta 表），说明是数据不完整而不是整包没装——按未安装处理
+    // 会把健康的列表整块换成「本机还没有剧情数据」的安装引导，和屏幕上
+    // 明明已经读出来的内容自相矛盾。
+    //
+    // 还有分块在途时同样不能急着下结论：缺失分块的「No such file」几乎
+    // 立刻就回来，健康分块的冷启动全量解析却要花上几秒——先到的失败若
+    // 直接把 installed 打成 false，整页会先挂几秒安装引导，错误卡也被
+    // 钉成「数据目录不存在」的误诊（健康分块随后成功只翻回 installed，
+    // 不会替这张卡改口）。
+    //
+    // 被推迟的结论由「最后落地的失败」补上，但收尾的失败未必还是
+    // NOT_INSTALLED——真没装数据时后端往往也卡着，某一块很可能以超时
+    // 收尾。所以每种失败都要走到这里、按记下的证据统一判，而不是只看
+    // 本次失败的种类，否则结论会随着一张「超时」误诊卡永远丢掉。
+    //
+    // 证据、loadedRef、pendingRef 都在数据重新同步时整体清零，所以这三
+    // 个判断一定是对当前数据源而言的。自己的在途标记要排掉：catch 跑在
+    // finally 之前，此刻 pendingRef 里还挂着本任务。
+    const anyLoaded = Object.values(loadedRef.current).some(Boolean);
+    const othersPending = (Object.keys(pendingRef.current) as SectionKey[]).some(
+      (section) => section !== key && Boolean(pendingRef.current[section])
+    );
+    if (sawNotInstalledRef.current && !anyLoaded && !othersPending) {
+      if (!silent) setError({ kind: "not-installed", label });
+      setInstalled(false);
       return;
     }
-    if (isNotInstalledError(errorMsg)) {
-      // 「未安装」是全局结论，下它要两个条件同时成立：本轮数据源还没有
-      // 任何分块成功读出，而且再没有别的分块仍在途。
-      //
-      // 别的分块刚读到数据、只有这一块报 NOT_INSTALLED（比如数据包里恰好
-      // 缺了肉鸽的 meta 表），说明是数据不完整而不是整包没装——按未安装
-      // 处理会把健康的列表整块换成「本机还没有剧情数据」的安装引导，和
-      // 屏幕上明明已经读出来的内容自相矛盾。
-      //
-      // 还有分块在途时同样不能急着下结论：缺失分块的「No such file」几乎
-      // 立刻就回来，健康分块的冷启动全量解析却要花上几秒——先到的失败若
-      // 直接把 installed 打成 false，整页会先挂几秒安装引导，错误卡也被
-      // 钉成「数据目录不存在」的误诊（健康分块随后成功只翻回 installed，
-      // 不会替这张卡改口）。真没装数据的话所有分块都会失败，最后落地的
-      // 那个自然满足「无人在途」，结论一个也不会少。
-      //
-      // loadedRef / pendingRef 在数据重新同步时整体清零，所以这两个判断
-      // 一定是对当前数据源而言的。自己的在途标记要排掉：catch 跑在
-      // finally 之前，此刻 pendingRef 里还挂着本任务。
-      const anyLoaded = Object.values(loadedRef.current).some(Boolean);
-      const othersPending = (Object.keys(pendingRef.current) as SectionKey[]).some(
-        (section) => section !== key && Boolean(pendingRef.current[section])
-      );
-      if (anyLoaded || othersPending) {
-        if (!silent) setError({ kind: "unknown", label, detail: errorMsg || undefined });
-      } else {
-        if (!silent) setError({ kind: "not-installed", label });
-        setInstalled(false);
-      }
+
+    if (isTimeout) {
+      if (!silent) setError({ kind: "timeout", label });
       return;
     }
     if (!silent) setError({ kind: "unknown", label, detail: errorMsg || undefined });
@@ -777,6 +795,9 @@ export function StoryList({ onSelectStory }: StoryListProps) {
       // 逛过的密录）若还在途，落地时会把同步前的旧数据写进 state 并自标
       // 已加载。清掉归属后它们会静默放弃写入，下次进入该分类重新拉取。
       pendingRef.current = {};
+      // 旧数据源攒下的 NOT_INSTALLED 证据对新包无效，不清会把换包后的
+      // 首个普通失败误判成「未安装」。
+      sawNotInstalledRef.current = false;
       summaryAttemptsRef.current.clear();
       summaryInflightRef.current.clear();
       setSummaryCache({});
@@ -1265,6 +1286,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
     // 同上面 data-updated 的处理：在途任务全部作废，免得旧数据回写；
     // 旧目录的列表也一并清空，不给换包后的旧卡留展示窗口。
     pendingRef.current = {};
+    sawNotInstalledRef.current = false;
     summaryAttemptsRef.current.clear();
     summaryInflightRef.current.clear();
     setSummaryCache({});
