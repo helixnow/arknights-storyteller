@@ -571,6 +571,16 @@ export function StoryList({ onSelectStory }: StoryListProps) {
   /** 每条简介已发起的请求次数 / 在途标记，配合 SUMMARY_MAX_ATTEMPTS 封顶。 */
   const summaryAttemptsRef = useRef<Map<string, number>>(new Map());
   const summaryInflightRef = useRef<Set<string>>(new Set());
+  /**
+   * 简介数据的代数，数据重新同步（换包）时 +1。换包只清空缓存和在途
+   * 标记是不够的：仍在途的旧简介请求随后落地，会把旧包的文案写回刚
+   * 清空的缓存——storyId 换包后通常不变，这个值能一直被查到，行组件
+   * 也就永远不会重新请求；若行组件在清空后已按新包重发了同一条，晚
+   * 落地的旧请求还会反过来盖掉新简介、误删新请求的在途 / loading 标记。
+   * 分块加载有 isCurrent 归属检查、目录缓存有 catalogVersion，简介用
+   * 这个代数对齐同一套「过期结果一律丢弃」的防线。
+   */
+  const summaryGenerationRef = useRef(0);
 
   const {
     favoriteStories,
@@ -798,6 +808,9 @@ export function StoryList({ onSelectStory }: StoryListProps) {
       // 旧数据源攒下的 NOT_INSTALLED 证据对新包无效，不清会把换包后的
       // 首个普通失败误判成「未安装」。
       sawNotInstalledRef.current = false;
+      // 在途的旧简介请求按代数整体作废：只清缓存挡不住它们落地时把旧包
+      // 的简介写回来。
+      summaryGenerationRef.current += 1;
       summaryAttemptsRef.current.clear();
       summaryInflightRef.current.clear();
       setSummaryCache({});
@@ -886,10 +899,14 @@ export function StoryList({ onSelectStory }: StoryListProps) {
     if (attempts >= SUMMARY_MAX_ATTEMPTS) return;
     summaryAttemptsRef.current.set(story.storyId, attempts + 1);
     summaryInflightRef.current.add(story.storyId);
+    // 发起时记下代数。落地时代数不符说明数据源已经换过，这份结果属于
+    // 旧包，缓存和标记都不能再写（见 summaryGenerationRef 的注释）。
+    const generation = summaryGenerationRef.current;
 
     setSummaryLoadingIds((prev) => ({ ...prev, [story.storyId]: true }));
     try {
       const raw = await scheduleSummary(() => api.getStoryInfo(storyInfo));
+      if (summaryGenerationRef.current !== generation) return;
       const normalized = raw.replace(/\r\n/g, "\n").trim();
       setSummaryCache((prev) => ({
         ...prev,
@@ -899,12 +916,16 @@ export function StoryList({ onSelectStory }: StoryListProps) {
       console.warn("[StoryList] 加载简介失败:", story.storyId, err);
       // 保留计数：行组件的 effect 会自动重试到上限为止，之后由占位文案兜底。
     } finally {
-      summaryInflightRef.current.delete(story.storyId);
-      setSummaryLoadingIds((prev) => {
-        const next = { ...prev };
-        delete next[story.storyId];
-        return next;
-      });
+      // 代数已变时在途 / loading 标记在换包时整体清空过，此刻的同名标记
+      // 属于换包后新发起的请求，旧请求不能替它收尾。
+      if (summaryGenerationRef.current === generation) {
+        summaryInflightRef.current.delete(story.storyId);
+        setSummaryLoadingIds((prev) => {
+          const next = { ...prev };
+          delete next[story.storyId];
+          return next;
+        });
+      }
     }
   }, []);
 
@@ -1287,6 +1308,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
     // 旧目录的列表也一并清空，不给换包后的旧卡留展示窗口。
     pendingRef.current = {};
     sawNotInstalledRef.current = false;
+    summaryGenerationRef.current += 1;
     summaryAttemptsRef.current.clear();
     summaryInflightRef.current.clear();
     setSummaryCache({});
