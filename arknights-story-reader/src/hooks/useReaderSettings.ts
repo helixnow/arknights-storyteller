@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useToast } from "@/components/ui/toast";
 
 export const FONT_FAMILIES = [
@@ -228,8 +228,13 @@ export function useReaderSettings() {
   // StrictMode 开发模式下挂载期 effect 连跑两次、ref 不会重置，第二次就把
   // 初始状态写回去了（收藏、划线两个 hook 都踩过同一个坑）。改为与初始
   // state 做引用比较——任何真实改动都会经 sanitizeSettings 产生新对象。
+  //
+  // pending 必须在 commit 同任务内物化：pagehide / visibilitychange 可能
+  // 抢在 passive effect 前触发。若这里仍用 useEffect，调完设置立即关应用时
+  // 冲刷会读到旧 pending（quota 失败后甚至会回写 failedSettingsWrite 里的
+  // 上一版），界面上的最终值便没有任何持久化凭据。
   const initialSettingsRef = useRef(settings);
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (typeof window === "undefined") return;
     if (settings === initialSettingsRef.current) {
       return;
