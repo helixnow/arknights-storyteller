@@ -82,6 +82,7 @@ function runCleanup(): void {
     const ranVersion = Number.isFinite(stored) ? stored : 0;
     if (ranVersion >= CLEANUP_VERSION) return;
 
+    let allRemoved = true;
     for (const step of CLEANUP_STEPS) {
       if (step.version <= ranVersion) continue;
       for (const key of step.keys) {
@@ -91,11 +92,18 @@ function runCleanup(): void {
         try {
           window.localStorage.removeItem(key);
         } catch {
-          // Individual failures are harmless; the next boot retries.
+          // Individual failures are harmless in themselves (the key is dead
+          // either way), but they must hold the sentinel back — advancing it
+          // anyway would mark the failed step as done and the leftover key
+          // would squat on quota forever. Removals are idempotent, so the
+          // next boot simply re-runs the whole batch.
+          allRemoved = false;
         }
       }
     }
-    window.localStorage.setItem(CLEANUP_SENTINEL_KEY, String(CLEANUP_VERSION));
+    if (allRemoved) {
+      window.localStorage.setItem(CLEANUP_SENTINEL_KEY, String(CLEANUP_VERSION));
+    }
   } catch {
     // Private-mode / quota — ignore.
   }

@@ -149,7 +149,11 @@ export function useAutoIndex() {
     void api
       .onIndexProgress((p) => {
         lastIndexProgressAt = Date.now();
-        backendBuilding = !(p.total > 0 && p.current >= p.total);
+        // 终态判定要对齐后端契约：正常收尾发 ("完成", total, total)，但
+        // 空数据集与「索引已是最新（0 篇）」的快速返回发的是 ("完成", 0, 0)。
+        // 只看 current >= total 会漏掉后者，backendBuilding 卡在 true，
+        // 兜底检查得白等满 60s 停更窗才恢复。
+        backendBuilding = !(p.phase === "完成" || (p.total > 0 && p.current >= p.total));
       })
       .then((unlisten) => {
         if (cancelled) {

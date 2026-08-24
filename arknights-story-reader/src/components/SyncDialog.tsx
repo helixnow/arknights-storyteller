@@ -418,9 +418,18 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
                 <>
                   <div className="flex justify-between text-sm">
                     <span className="text-[hsl(var(--color-muted-foreground))]">{progress.phase}</span>
-                    <span className="font-mono">
-                      {progress.current}/{progress.total}
-                    </span>
+                    {/* total <= 0 是后端「还没有真实刻度」的约定（见 api.ts）：
+                        下载无 Content-Length 时会一直发 (0, 0)，此时画确定态
+                        0% 进度条和「0/0」计数是编的——像卡死了一样。 */}
+                    {percent !== null ? (
+                      <span className="font-mono">
+                        {progress.current}/{progress.total}
+                      </span>
+                    ) : (
+                      <span className="font-mono" aria-hidden="true">
+                        …
+                      </span>
+                    )}
                   </div>
                   <div
                     role="progressbar"
@@ -431,10 +440,14 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
                     aria-valuetext={`${progress.phase}：${progress.message || `${progress.current}/${progress.total}`}`}
                     className="w-full bg-[hsl(var(--color-secondary))] rounded-full h-2 overflow-hidden"
                   >
-                    <div
-                      className="bg-[hsl(var(--color-primary))] h-full transition-all duration-300"
-                      style={{ width: `${percent ?? 0}%` }}
-                    />
+                    {percent !== null ? (
+                      <div
+                        className="bg-[hsl(var(--color-primary))] h-full transition-all duration-300"
+                        style={{ width: `${percent}%` }}
+                      />
+                    ) : (
+                      <div className="bg-[hsl(var(--color-primary))] h-full animate-pulse" style={{ width: "30%" }} />
+                    )}
                   </div>
                   <p className="text-xs text-[hsl(var(--color-muted-foreground))]">{progress.message}</p>
                 </>

@@ -649,8 +649,14 @@ export function Settings() {
 
   const isCheckingUpdate = updateStatus === "checking";
   const isInstallingUpdate = updateStatus === "installing";
-  /** 更新安装要等数据任务收工，否则重启/覆盖会打断正在写盘的同步。 */
-  const installBlocked = activeJob !== null && activeJob !== "update";
+  /**
+   * 更新安装要等数据任务收工，否则重启/覆盖会打断正在写盘的同步。
+   * 「update」不能整类放行：启动期自动更新（useAppUpdater）安装时占的也是
+   * 这把锁，那不是本卡片发起的安装（isInstallingUpdate 为 false），按钮留着
+   * 只会让用户点一下换一句冲突报错。只放行自己发起的安装——那时按钮本来
+   * 就被 isInstallingUpdate 禁用着，不会自己挡自己。
+   */
+  const installBlocked = activeJob !== null && !isInstallingUpdate;
   const dataProgressPercent =
     progress && progress.total > 0
       ? Math.min(Math.round((progress.current / progress.total) * 100), 100)
@@ -829,9 +835,18 @@ export function Settings() {
                       <>
                         <div className="flex justify-between text-sm">
                           <span className="text-[hsl(var(--color-muted-foreground))]">{progress.phase}</span>
-                          <span className="font-mono">
-                            {progress.current}/{progress.total}
-                          </span>
+                          {/* total <= 0 是后端「还没有真实刻度」的约定（见 api.ts）：
+                              下载无 Content-Length 时会一直发 (0, 0)，此时画确定态
+                              0% 进度条和「0/0」计数是编的——像卡死了一样。 */}
+                          {dataProgressPercent !== null ? (
+                            <span className="font-mono">
+                              {progress.current}/{progress.total}
+                            </span>
+                          ) : (
+                            <span className="font-mono" aria-hidden="true">
+                              …
+                            </span>
+                          )}
                         </div>
                         <div
                           role="progressbar"
@@ -842,10 +857,14 @@ export function Settings() {
                           aria-valuetext={`${progress.phase}：${progress.message || `${progress.current}/${progress.total}`}`}
                           className="w-full bg-[hsl(var(--color-secondary))] rounded-full h-2 overflow-hidden"
                         >
-                          <div
-                            className="bg-[hsl(var(--color-primary))] h-full transition-all duration-300"
-                            style={{ width: `${dataProgressPercent ?? 0}%` }}
-                          />
+                          {dataProgressPercent !== null ? (
+                            <div
+                              className="bg-[hsl(var(--color-primary))] h-full transition-all duration-300"
+                              style={{ width: `${dataProgressPercent}%` }}
+                            />
+                          ) : (
+                            <div className="bg-[hsl(var(--color-primary))] h-full animate-pulse" style={{ width: "30%" }} />
+                          )}
                         </div>
                         <p className="text-xs text-[hsl(var(--color-muted-foreground))]">{progress.message}</p>
                       </>
