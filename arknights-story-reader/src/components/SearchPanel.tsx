@@ -474,6 +474,14 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
   // 生成号：每次发起搜索 +1，输入变化 / 清空 / 换数据版本时也 +1。
   // Tauri 的 invoke 没有 abort，只能靠它让迟到的旧结果失去写状态的资格。
   const searchSeqRef = useRef(0);
+  /**
+   * 版本获取的生成号。挂载时和每次 `app:data-updated` 都会各发一次
+   * getCurrentVersion，invoke 不保证按序返回：数据更新后若挂载那次（或上
+   * 一轮更新的那次）响应迟到，会把旧 commit 写回 version——之后新数据的
+   * 搜索结果全按旧版本落缓存，数据一旦再回滚到那个 commit，这批错标条目
+   * 就成了脏命中。每次数据更新 +1，写 version 前必须核对生成号。
+   */
+  const versionSeqRef = useRef(0);
   const searchingRef = useRef(false);
   /**
    * 在途搜索查的词、模式、是否自动触发、成功后是否写历史：防抖 effect 与
@@ -547,10 +555,16 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
 
   // Load version for cache keying.
   useEffect(() => {
+    const token = versionSeqRef.current;
     void api
       .getCurrentVersion()
-      .then((v) => setVersion(stableVersionOf(v)))
-      .catch(() => setVersion(""));
+      .then((v) => {
+        if (token === versionSeqRef.current) setVersion(stableVersionOf(v));
+      })
+      .catch(() => {
+        // 失败也要过生成号：迟到的失败不能把 data-updated 刚取到的新值清空。
+        if (token === versionSeqRef.current) setVersion("");
+      });
   }, []);
 
   useEffect(() => {
@@ -558,11 +572,14 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
       // 数据整个换了，在途的那次搜索查的还是旧库。不作废的话它回来时会被
       // 当成新版本的结果写进缓存，之后一直拿旧数据糊弄用户。
       invalidateInFlight();
+      const token = ++versionSeqRef.current;
       setCache({});
       setSegmentCache({});
       void api
         .getCurrentVersion()
-        .then((v) => setVersion(stableVersionOf(v)))
+        .then((v) => {
+          if (token === versionSeqRef.current) setVersion(stableVersionOf(v));
+        })
         .catch(() => undefined);
     };
     window.addEventListener("app:data-updated", onUpdated);
@@ -682,11 +699,14 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
       if (!activeVersion) {
         try {
           activeVersion = stableVersionOf(await api.getCurrentVersion());
-          if (activeVersion) setVersion(activeVersion);
         } catch (err) {
           devLog("补取数据版本失败", err);
         }
+        // 先验过期再写回 state：等待期间若数据整个换掉（onUpdated 的
+        // invalidateInFlight 已把本次作废），这份响应对应的是旧库，写进
+        // version 会盖掉刚取到的新值，后续搜索全按旧版本读写缓存。
         if (isStale()) return;
+        if (activeVersion) setVersion(activeVersion);
       }
 
       if (activeMode === "segment") {
