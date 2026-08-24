@@ -23,6 +23,8 @@ import {
 } from "lucide-react";
 import { CustomScrollArea } from "@/components/ui/custom-scroll-area";
 import { cn } from "@/lib/utils";
+// 查询串解析（高亮词提取 / 自动搜可发判定）抽到纯模块里，供 node:test 锁行为。
+import { highlightTerms, isAutoSearchable } from "@/lib/searchTerms";
 import { useToast } from "@/components/ui/toast";
 import {
   acquireDataJob,
@@ -76,10 +78,7 @@ const SEARCH_MODE_KEY = "arknights-story-search-mode";
 
 const HISTORY_LIMIT = 10;
 const CACHE_LIMIT = 40;
-const MAX_HIGHLIGHT_TERMS = 12;
 
-/** 少于两个字符不自动搜：中文单字命中面太大，等于把整库拉一遍。 */
-const AUTO_SEARCH_MIN_LEN = 2;
 /** 已经有结果、用户在改词：给足停顿时间再发请求。 */
 const AUTO_DEBOUNCE_MS = 320;
 /** 空面板里敲下的第一个词：延迟压到一眼看不出来的量级，别让首字发木。 */
@@ -151,18 +150,6 @@ function dispatchIndexRebuildFinished(succeeded: boolean, status: StoryIndexStat
   }
 }
 
-/**
- * 半截的查询串先别发出去：引号还没配对、或者停在 `-` / `OR` 上时，
- * 后端只会返回一堆噪音，用户每敲一个符号就闪一次"没有结果"。
- */
-function isAutoSearchable(raw: string): boolean {
-  if (raw.length < AUTO_SEARCH_MIN_LEN) return false;
-  if ((raw.match(/"/g)?.length ?? 0) % 2 === 1) return false;
-  if (/-$/.test(raw)) return false;
-  if (/\b(or|and|not)$/i.test(raw)) return false;
-  return true;
-}
-
 function optionDomId(index: number): string {
   return `search-result-option-${index}`;
 }
@@ -172,52 +159,6 @@ function optionDomId(index: number): string {
 // ─────────────────────────────────────────────────────────
 
 type Highlighter = (text: string | null | undefined) => React.ReactNode;
-
-/**
- * 把查询串拆成用于高亮的词：
- *   - `-排除词` 不该被高亮（它压根不该出现在结果里）；
- *   - `OR` / `AND` 是连接符不是词；
- *   - 裸词 `NOT` 与减号同义（后端 `not X` ≡ `-X`），它后面那个词同样是
- *     排除词。段落模式的排除只看段落文本，剧情标题里仍可能出现该词——
- *     不跳过的话，用户明确排除的词会在标题里被标成"命中"；
- *   - `"短语"` 去掉引号整体高亮；
- *   - 纯中文长词后端按二元组匹配，顺带把单字也标出来，让用户看得出命中原因。
- */
-function highlightTerms(query: string): string[] {
-  const trimmed = query.trim();
-  if (!trimmed) return [];
-  const tokens = trimmed.match(/"[^"]*"|\S+/g) ?? [];
-  const terms: string[] = [];
-  let pendingNot = false;
-  for (const token of tokens) {
-    if (token.startsWith("-")) {
-      // 后端里 `-词` 会消费掉悬挂的 not（`not -博士 凯尔希` 的凯尔希是正向词）。
-      pendingNot = false;
-      continue;
-    }
-    // 连接词判定必须在去引号之前、只认裸词——与后端一致：`"not"` 是要
-    // 整体匹配（并高亮）的字面短语，不是连接词。
-    if (/^not$/i.test(token)) {
-      pendingNot = true;
-      continue;
-    }
-    if (/^(or|and)$/i.test(token)) continue;
-    const stripped = token.replace(/^["']+|["']+$/g, "").trim();
-    if (!stripped) continue;
-    if (pendingNot) {
-      pendingNot = false;
-      continue;
-    }
-    terms.push(stripped);
-    if (stripped.length >= 4 && /^[\u4e00-\u9fff\u3400-\u4dbf]+$/.test(stripped)) {
-      terms.push(...stripped.split(""));
-    }
-  }
-  // 长词优先，保证「凯尔希」整体先于单字命中；去重后限量，避免超长正则。
-  return Array.from(new Set(terms))
-    .sort((a, b) => b.length - a.length)
-    .slice(0, MAX_HIGHLIGHT_TERMS);
-}
 
 /** 按查询串编译一次正则，返回可复用的高亮函数。 */
 function createHighlighter(query: string): Highlighter {

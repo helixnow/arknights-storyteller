@@ -18,7 +18,8 @@ if (!process.features.typescript) args.push("--experimental-strip-types");
 args.push(
   "--test",
   path.join("src", "lib", "assetUrls.test.mjs"),
-  path.join("src", "lib", "segmentDigest.test.mjs")
+  path.join("src", "lib", "segmentDigest.test.mjs"),
+  path.join("src", "lib", "searchTerms.test.mjs")
 );
 
 const result = spawnSync(process.execPath, args, {
