@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { getVersion } from "@tauri-apps/api/app";
-import { invoke } from "@tauri-apps/api/core";
+import { addPluginListener, invoke } from "@tauri-apps/api/core";
 import { acquireDataJobWhenIdle } from "@/hooks/useDataSyncManager";
 import {
   classifyAndroidInstallResponse,
@@ -445,17 +445,21 @@ export async function installAndroidUpdate(
     throw new Error("已有更新下载正在进行，请等待完成后再试");
   }
   androidInstallInFlight = true;
-  let unlisten: (() => void) | null = null;
+  let progressListener: { unregister(): Promise<void> } | null = null;
   try {
     if (onProgress) {
       try {
-        const { listen } = await import("@tauri-apps/api/event");
-        // Listener registration itself is async. Await it before invoking the
+        // Kotlin Plugin.trigger publishes on the plugin listener channel, not
+        // Tauri's global event bus. Await registration before invoking the
         // plugin so the first (and cached-APK final) event cannot race past UI.
-        unlisten = await listen<unknown>("apk-progress", ({ payload }) => {
-          const normalized = normalizeAndroidDownloadProgress(payload);
-          if (normalized) onProgress(normalized);
-        });
+        progressListener = await addPluginListener<unknown>(
+          "apk-updater",
+          "apk-progress",
+          (payload) => {
+            const normalized = normalizeAndroidDownloadProgress(payload);
+            if (normalized) onProgress(normalized);
+          }
+        );
       } catch (error) {
         // Progress is best-effort; inability to subscribe must not prevent an
         // otherwise valid install.
@@ -471,7 +475,15 @@ export async function installAndroidUpdate(
     classifyAndroidInstallResponse(response);
     return response;
   } finally {
-    unlisten?.();
+    if (progressListener) {
+      try {
+        await progressListener.unregister();
+      } catch (error) {
+        // Listener cleanup failure must not turn a successfully launched
+        // installer into a false update failure.
+        devWarn("[Updater] 移除 Android 下载进度监听失败", error);
+      }
+    }
     androidInstallInFlight = false;
   }
 }

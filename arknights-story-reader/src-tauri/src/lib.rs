@@ -87,7 +87,7 @@ pub fn run() {
     // 权限会让构建直接失败）。而 Tauri 2 对所有 `plugin:` 前缀的 invoke 都
     // 强制走 ACL：不补授权的话，前端 invoke("plugin:apk-updater|…") /
     // ("plugin:image-sharer|…") 会被一律拒绝——应用内更新、保存到相册、
-    // 系统分享在 Android 上整个失效。这里在运行时把这五条命令按最小范围
+    // 系统分享在 Android 上整个失效。这里在运行时把所需命令按最小范围
     // 放行：仅 Android 编译、仅本地（Local）来源，窗口约束与
     // capabilities/default.json 的 main 主窗口一致（本应用只有这一个窗口）。
     #[cfg(target_os = "android")]
@@ -99,6 +99,11 @@ pub fn run() {
         for cmd in [
             "plugin:apk-updater|download_and_install",
             "plugin:apk-updater|open_install_permission_settings",
+            // @tauri-apps/api 2.11 的 addPluginListener 先试 snake_case，
+            // 再以 camelCase 兼容旧移动插件；unregister 固定走 remove_listener。
+            "plugin:apk-updater|register_listener",
+            "plugin:apk-updater|registerListener",
+            "plugin:apk-updater|remove_listener",
             "plugin:image-sharer|save_image",
             "plugin:image-sharer|share_image",
             "plugin:image-sharer|open_storage_permission_settings",

@@ -122,7 +122,7 @@ export function describeImportTransferFailure(
 ): string {
   const reason = localizeDataError(error, "导入失败");
   return cleanup === "cleaned"
-    ? `${reason} 未完成的导入暂存文件已清理。`
+    ? `${reason} 未完成的导入暂存文件会由应用自动清理。`
     : `${reason} 导入暂存文件未能立即清理，应用会在超时后自动释放；清理空间或权限后再重试。`;
 }
 

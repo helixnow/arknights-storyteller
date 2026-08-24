@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import {
   classifyAndroidInstallResponse,
@@ -163,4 +164,18 @@ test("Android 下载完成事件标记准备安装", () => {
     true
   );
   assert.equal(normalizeAndroidDownloadProgress({ current: -1, total: 100 }), null);
+});
+
+test("Android 下载进度使用 Plugin.trigger 对应的插件监听通道", () => {
+  const source = readFileSync(new URL("./useAppUpdater.ts", import.meta.url), "utf8");
+  assert.match(source, /addPluginListener<unknown>\(\s*"apk-updater",\s*"apk-progress"/);
+  assert.match(source, /await progressListener\.unregister\(\)/);
+  assert.doesNotMatch(source, /listen<unknown>\("apk-progress"/);
+});
+
+test("@tauri-apps/api 2.11 插件监听命令均在 Android ACL 白名单", () => {
+  const source = readFileSync(new URL("../../src-tauri/src/lib.rs", import.meta.url), "utf8");
+  assert.match(source, /plugin:apk-updater\|register_listener/);
+  assert.match(source, /plugin:apk-updater\|registerListener/);
+  assert.match(source, /plugin:apk-updater\|remove_listener/);
 });

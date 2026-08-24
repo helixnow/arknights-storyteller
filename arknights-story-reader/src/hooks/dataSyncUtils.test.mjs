@@ -93,11 +93,10 @@ test("空错误使用调用方兜底", () => {
   assert.equal(localizeDataError({}, "导入失败"), "导入失败");
 });
 
-test("分块失败且中止成功时明确暂存已清理", () => {
-  assert.match(
-    describeImportTransferFailure("ENOSPC", "cleaned"),
-    /存储空间不足.*暂存文件已清理/
-  );
+test("分块失败且中止成功时只承诺自动清理、不谎称已经删除", () => {
+  const message = describeImportTransferFailure("ENOSPC", "cleaned");
+  assert.match(message, /存储空间不足.*暂存文件会由应用自动清理/);
+  assert.doesNotMatch(message, /已清理|已经清理/);
 });
 
 test("分块失败且中止失败时不谎称清理完成", () => {
