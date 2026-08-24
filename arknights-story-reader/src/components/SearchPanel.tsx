@@ -479,7 +479,9 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
    * getCurrentVersion，invoke 不保证按序返回：数据更新后若挂载那次（或上
    * 一轮更新的那次）响应迟到，会把旧 commit 写回 version——之后新数据的
    * 搜索结果全按旧版本落缓存，数据一旦再回滚到那个 commit，这批错标条目
-   * 就成了脏命中。每次数据更新 +1，写 version 前必须核对生成号。
+   * 就成了脏命中。每次数据更新 +1，写 version 前必须核对生成号；搜索开头
+   * 的补取成功落值时也 +1（占住本代），让更早发出、仍在途的同代请求——
+   * 尤其挂载那次迟到才失败的 catch——失去写回资格。
    */
   const versionSeqRef = useRef(0);
   const searchingRef = useRef(false);
@@ -575,11 +577,20 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
       const token = ++versionSeqRef.current;
       setCache({});
       setSegmentCache({});
+      // version 必须立刻清空，不能等 getCurrentVersion 回来再改：事件到达时
+      // 数据已经换成新 commit，等待期间（以及取失败后的无限期）旧 commit 若
+      // 继续留在 state 里，此时发起的搜索查的是新库、落缓存却按旧版本记账
+      // ——手动搜还会写进 localStorage，数据一旦回滚到旧 commit 就成了跨
+      // 会话的脏命中。清空后这段窗口期按"无版本"处理：缓存整体停用，开搜
+      // 时自行补取，拿到的必然是换库后的新值。
+      setVersion("");
       void api
         .getCurrentVersion()
         .then((v) => {
           if (token === versionSeqRef.current) setVersion(stableVersionOf(v));
         })
+        // 失败不用再写状态：version 已在上面清空、缓存已停用，之后每次
+        // 搜索开头的补取就是自然重试，成功即恢复。
         .catch(() => undefined);
     };
     window.addEventListener("app:data-updated", onUpdated);
@@ -706,7 +717,15 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
         // invalidateInFlight 已把本次作废），这份响应对应的是旧库，写进
         // version 会盖掉刚取到的新值，后续搜索全按旧版本读写缓存。
         if (isStale()) return;
-        if (activeVersion) setVersion(activeVersion);
+        if (activeVersion) {
+          // 落值前占住版本生成号：挂载那次 getCurrentVersion 可能仍在途，
+          // token 相同拦不住它——若它之后才失败，catch 会把这里刚补到的
+          // 值清回空串，缓存又整段停用。本响应比一切更早发出的同代请求
+          // 新鲜，+1 让它们全部失去写回资格（onUpdated 若已发生，上面的
+          // isStale 早就拦下本次，不存在反向覆盖新代 token 的可能）。
+          versionSeqRef.current += 1;
+          setVersion(activeVersion);
+        }
       }
 
       if (activeMode === "segment") {
