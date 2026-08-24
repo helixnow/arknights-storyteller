@@ -67,6 +67,34 @@ function prune(map: ProgressMap): ProgressMap {
 /** 失败提示的会话级闩锁：滚动落盘可达每 1.2s 一次，同一轮失败只提醒一次。 */
 let persistFailureNotified = false;
 
+/**
+ * quota 满时没写进盘的进度，按 storyPath 暂存。pending 是实例级 ref，而
+ * 换篇 effect 会无条件把它重置——失败后滞留重试的那份进度以前就死在这一步，
+ * 「将自动重试」的提示成了空话。折进模块级暂存后，之后任何一次成功落盘都
+ * 会把它们带上并清空；叠加时按 `updatedAt` 对账，绝不拿旧进度盖掉盘上更新
+ * 的记录（配额腾出来后别的窗口可能已经写过更新的）。
+ */
+const failedProgressWrites = new Map<string, ReadingProgress>();
+
+/** 把暂存的失败重试叠到刚读出的整表上（盘上更新的记录优先保留）。 */
+function overlayFailedWrites(map: ProgressMap): ProgressMap {
+  if (failedProgressWrites.size === 0) return map;
+  const next = { ...map };
+  for (const [key, entry] of failedProgressWrites) {
+    const disk = next[key];
+    if (!disk || (disk.updatedAt ?? 0) <= entry.updatedAt) next[key] = entry;
+  }
+  return next;
+}
+
+/** 读某篇的最新已知进度：盘上记录和暂存的失败重试里取更新的那份。 */
+function readLatestKnown(path: string): ReadingProgress | null {
+  const disk = readProgressMap()[path] ?? null;
+  const stashed = failedProgressWrites.get(path);
+  if (stashed && (!disk || (disk.updatedAt ?? 0) <= stashed.updatedAt)) return stashed;
+  return disk;
+}
+
 /** @returns 是否真的写进了 localStorage（quota 满等失败时返回 false）。 */
 function writeProgressMap(map: ProgressMap): boolean {
   if (!isBrowser) return true;
@@ -139,7 +167,7 @@ export function useReadingProgress(
 ) {
   const [progress, setProgress] = useState<ReadingProgress | null>(() => {
     if (!storyPath) return null;
-    return readProgressMap()[storyPath] ?? null;
+    return readLatestKnown(storyPath);
   });
 
   /** 最新的合并结果（含尚未落盘的部分），也是下一次合并的基准。 */
@@ -166,9 +194,13 @@ export function useReadingProgress(
       setProgress(null);
       return;
     }
-    const stored = readProgressMap()[storyPath] ?? null;
+    // 回到 quota 失败过的篇目时，暂存里那份比盘上新——不读它的话恢复位置
+    // 会跳回旧进度，后续合并也从过期基准出发。
+    const stored = readLatestKnown(storyPath);
     latestRef.current = stored;
     lastPersistedRef.current = stored;
+    // 换篇前的 cleanup 已经 force 冲刷过：成功则 pending 本来就空，失败则
+    // 那份进度已折进 failedProgressWrites，这里重置不会弄丢它。
     pendingRef.current = null;
     setProgress(stored);
   }, [storyPath]);
@@ -184,14 +216,24 @@ export function useReadingProgress(
     (force = false) => {
       clearTimer();
       const pending = pendingRef.current;
-      if (!pending) return;
+      if (!pending) {
+        // 没有新进度、只剩 quota 失败后滞留的重试：趁强制冲刷（换篇 /
+        // 切后台 / 关阅读器）的时机再试一次，不用等下一次滚动。
+        if (force && failedProgressWrites.size > 0) {
+          if (writeProgressMap(overlayFailedWrites(readProgressMap()))) {
+            failedProgressWrites.clear();
+            persistFailureNotified = false;
+          }
+        }
+        return;
+      }
       if (!force && !isWorthPersisting(pending, lastPersistedRef.current)) {
         // 留着 pending：真正离开页面时还会以 force 冲刷一次。
         return;
       }
       // 成败都推进节流窗口：quota 满时不能退化成「每次滚动都重写整张表」。
       lastWriteRef.current = Date.now();
-      const map = readProgressMap();
+      const map = overlayFailedWrites(readProgressMap());
       if (!writeProgressMap({ ...map, [pending.storyPath]: pending })) {
         // 写失败（quota 满 / 隐私模式）时必须留着 pending，且不能把
         // lastPersistedRef 推进到一个从没上过盘的值——否则这份进度就被
@@ -199,13 +241,18 @@ export function useReadingProgress(
         // 哪怕之后配额被清理腾出来（启动期就会清历史搜索缓存）也救不回。
         // 静默失败还等于骗用户「进度已记住」：阅读照常、重启后却回到旧
         // 位置。收藏 / 划线 / 阅读设置的同类失败都会提示，这里补齐。
+        // 同时折进模块级暂存：pending 是实例级的，换篇 effect 会把它重置、
+        // 卸载会把它连实例一起回收，暂存才是「自动重试」真正的载体。
+        failedProgressWrites.set(pending.storyPath, pending);
         if (!persistFailureNotified) {
           persistFailureNotified = true;
           toastRef.current.warn("阅读进度未能保存到本地存储（空间可能已满），将自动重试");
         }
         return;
       }
+      // 这次成功的写入已把暂存的重试一并带上盘，清空以免下次再叠旧数据。
       persistFailureNotified = false;
+      failedProgressWrites.clear();
       pendingRef.current = null;
       lastPersistedRef.current = pending;
       if (trackStateRef.current) setProgress(pending);
@@ -283,7 +330,7 @@ export function useReadingProgress(
     if (!storyPath) return null;
     const latest = latestRef.current;
     if (latest && latest.storyPath === storyPath) return latest;
-    return readProgressMap()[storyPath] ?? null;
+    return readLatestKnown(storyPath);
   }, [storyPath]);
 
   /**
@@ -301,6 +348,9 @@ export function useReadingProgress(
     pendingRef.current = null;
     latestRef.current = null;
     lastPersistedRef.current = null;
+    // 暂存里若还压着这篇的失败重试，也一并清掉——不然下一次成功冲刷会把
+    // 刚清除的进度又复活回来。
+    failedProgressWrites.delete(storyPath);
     setProgress(null);
     const map = readProgressMap();
     if (storyPath in map) {

@@ -50,6 +50,38 @@ function readStorage(): HighlightStore {
 /** 失败提示的会话级闩锁：同一轮连续失败只打扰用户一次，写成功后复位。 */
 let persistFailureNotified = false;
 
+/**
+ * quota 满时没能落盘的划线改动（key → 划线列表；null 表示该 key 已删除）。
+ * pending / dirtyKeys 都是实例级 ref，而阅读器按 storyId 重挂——换章时旧
+ * 实例的卸载冲刷再次失败的话，滞留的改动会随实例一起被回收，「将自动重试」
+ * 的承诺就落空了。折进模块级暂存后，任何实例的下一次冲刷都会带上它重试，
+ * 真正写成功（或发现盘上已一致）才清空。
+ */
+const failedHighlightWrites = new Map<string, HighlightLike[] | null>();
+
+/**
+ * 把本地尚未落盘的改动叠到 `base`（刚读出的盘上整表）上：先叠上一批实例
+ * 遗留的失败重试，再叠本实例的脏键——后者一定更新，压轴生效。
+ */
+function overlayLocalChanges(
+  base: HighlightStore,
+  pending: HighlightStore | null,
+  dirtyKeys?: ReadonlySet<string>
+): HighlightStore {
+  const merged: HighlightStore = { ...base };
+  for (const [key, value] of failedHighlightWrites) {
+    if (value === null) delete merged[key];
+    else merged[key] = value;
+  }
+  if (pending !== null && dirtyKeys) {
+    for (const key of dirtyKeys) {
+      if (key in pending) merged[key] = pending[key];
+      else delete merged[key];
+    }
+  }
+  return merged;
+}
+
 function normalizeEntry(item: HighlightLike): HighlightEntry | null {
   if (typeof item === "number") {
     if (!Number.isFinite(item) || item < 0) return null;
@@ -91,7 +123,9 @@ function normalizeEntry(item: HighlightLike): HighlightEntry | null {
  *   unmount so navigating away right after a toggle never drops it.
  */
 export function useHighlights(storyPath: string, segmentDigests?: readonly string[]) {
-  const [store, setStore] = useState<HighlightStore>(() => readStorage());
+  // 初始状态也要叠上遗留的失败重试：quota 失败后换章重挂，新实例只读盘的
+  // 话，用户刚画的线会先「消失」再随重试成功回来——直接从合并结果起步。
+  const [store, setStore] = useState<HighlightStore>(() => overlayLocalChanges(readStorage(), null));
 
   // Persist on change — but coalesce bursts. `store` updates from toggle /
   // clear land in the same microtask most of the time, so waiting one tick
@@ -123,37 +157,52 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
    */
   const flushPendingStore = useCallback(() => {
     const pending = pendingStoreRef.current;
-    if (pending === null) return;
+    // 没有本实例的新改动、也没有遗留的失败重试时才是 no-op；只剩遗留重试
+    //（上一个实例 quota 失败后被回收）也要趁冲刷时机再试一次。
+    if (pending === null && failedHighlightWrites.size === 0) return;
     // 不能把内存里的整表直接覆写上盘。阅读器按 storyId 重挂，换章时新实例
     // 的 useState 初始化在 render 阶段就读了盘，而旧实例的卸载冲刷要到
     // commit 的 passive 清理阶段才落盘——新实例的整表快照因此天然落后一笔
     //（quota 失败后 pending 长期滞留重试时，落后的窗口更是无限大）。之后
     // 新实例任何一次整表覆写都会把旧实例刚救回来的划线无声抹掉。这里改成
-    // 和阅读进度 hook 同一口径：写盘时现读最新整表，只把本实例真正改过的
-    // key 并进去，别的 key（上一章的划线、别的窗口的写入）以盘为准。
-    const merged: HighlightStore = { ...readStorage() };
-    for (const key of dirtyKeysRef.current) {
-      if (key in pending) merged[key] = pending[key];
-      else delete merged[key];
-    }
+    // 和阅读进度 hook 同一口径：写盘时现读最新整表，只把本地真正改过的
+    // key（遗留重试 + 本实例脏键）并进去，别的 key（上一章的划线、别的
+    // 窗口的写入）以盘为准。
+    const merged = overlayLocalChanges(readStorage(), pending, dirtyKeysRef.current);
     const raw = JSON.stringify(merged);
     if (raw === lastRawRef.current) {
       // 内容与盘上完全一致（典型场景：跟随 storage 事件之后的回写），
       // 再写一遍只会在别的窗口触发一轮多余的事件。
-      pendingStoreRef.current = null;
-      dirtyKeysRef.current.clear();
+      // 脏键只在其对应的 pending 真被并进 merged 时才算清账：toggle 是先
+      // 同步记脏键、等 persist effect 才物化 pending 的，中间若插进一次
+      // 只带遗留重试的冲刷，不能把还没消费过的脏键顺手抹掉。
+      if (pending !== null) {
+        pendingStoreRef.current = null;
+        dirtyKeysRef.current.clear();
+      }
+      failedHighlightWrites.clear();
       return;
     }
     try {
       window.localStorage.setItem(STORAGE_KEY, raw);
       lastRawRef.current = raw;
       persistFailureNotified = false;
-      pendingStoreRef.current = null;
-      dirtyKeysRef.current.clear();
+      if (pending !== null) {
+        pendingStoreRef.current = null;
+        dirtyKeysRef.current.clear();
+      }
+      failedHighlightWrites.clear();
       return;
     } catch {
       // Quota / private mode: the write fails atomically, the previously
       // stored value stays intact. Never write partial data.
+    }
+    // 失败时把本实例的脏键改动折进模块级暂存：实例还活着就继续靠 pending
+    // 重试；实例被换章回收后，新实例的冲刷也会带上这批改动。
+    if (pending !== null) {
+      for (const key of dirtyKeysRef.current) {
+        failedHighlightWrites.set(key, key in pending ? pending[key] : null);
+      }
     }
     if (!persistFailureNotified) {
       persistFailureNotified = true;
@@ -226,12 +275,23 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
       const raw = event.key === STORAGE_KEY ? event.newValue : null;
       if (event.key === STORAGE_KEY && raw === lastRawRef.current) return;
       lastRawRef.current = raw;
-      // 本窗口还压在防抖里的快照基于的是过期整表，冲出去会把对方刚写的
-      // 内容盖掉；外部写入以后到为准，把它丢弃（卸载冲刷随之变成 no-op，
-      // 记着的脏键也一并作废）。
-      pendingStoreRef.current = null;
-      dirtyKeysRef.current.clear();
-      setStore(readStorage());
+      const disk = readStorage();
+      const pending = pendingStoreRef.current;
+      const hasLocalChanges =
+        (pending !== null && dirtyKeysRef.current.size > 0) || failedHighlightWrites.size > 0;
+      if (!hasLocalChanges) {
+        pendingStoreRef.current = null;
+        dirtyKeysRef.current.clear();
+        setStore(disk);
+        return;
+      }
+      // 以前这里直接作废 pending 和脏键——那是整表覆写时代的自保。冲刷早已
+      // 改成「现读盘、只并本地改动」，外部写入本就不会被我们盖掉；继续作废
+      // 等于把还压在防抖里的划线、以及 quota 失败后承诺「将自动重试」的滞留
+      // 改动无声丢掉，UI 还会跟着 setStore 缩回去。改为把本地改动重放到外部
+      // 新状态上：两边都不丢，随后的防抖冲刷把合并结果落盘（若合并后与盘上
+      // 一致，冲刷里的回声抑制会直接清账，不产生多余写入）。
+      setStore(overlayLocalChanges(disk, pending, dirtyKeysRef.current));
     };
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);

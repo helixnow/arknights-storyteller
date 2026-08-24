@@ -355,9 +355,32 @@ function dropQueuedTasks() {
   }
 }
 
+/**
+ * 跟随别的窗口完成的数据同步。`app:data-updated` 是窗口内事件，桌面端开
+ * 多个窗口时只有执行同步的那个收得到；版本号却持久化在 localStorage 里。
+ * 不跟随的话：本窗口的 MEMO 一直按旧数据渲染插画（token 指向已被替换的
+ * 内容，直到重启都不刷新），readLsCache 还按旧版本前缀查缓存、把重新拉
+ * 到的结果写回旧版本 key——对方刚清理掉的脏条目又被塞回来。做法与
+ * `invalidateAll` 一致，只是版本号采用外部写入的值而不是自增。
+ */
+function adoptExternalDataVersion() {
+  const external = readDataVersion();
+  if (external === dataVersion) return;
+  dataVersion = external;
+  MEMO.clear();
+  dropQueuedTasks();
+  purgeStaleCache();
+  subscribers.forEach((notify) => notify());
+}
+
 if (typeof window !== "undefined") {
   purgeStaleCache();
   window.addEventListener("app:data-updated", invalidateAll);
+  window.addEventListener("storage", (event) => {
+    // key 为 null 表示外部 storage.clear()：版本号键也被清掉了，同样对账。
+    if (event.key !== null && event.key !== DATA_VERSION_KEY) return;
+    adoptExternalDataVersion();
+  });
 }
 
 function initialStateFor(storyPath: string | null | undefined): {
