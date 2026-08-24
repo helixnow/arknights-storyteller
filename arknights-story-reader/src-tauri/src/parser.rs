@@ -16,6 +16,11 @@ lazy_static! {
         Regex::new(r"(?i)<br\s*/?>").expect("invalid line break tag regex");
     static ref NICKNAME_RE: Regex =
         Regex::new(r"(?i)\{@nickname\}").expect("invalid nickname regex");
+    /// `{@nbs}` 是不换行空格插值符（act45side 的 "Ave{@nbs}Mujica"，
+    /// 全语料 25 处）。不替换就会把乐队名原样显示成 "Ave{@nbs}Mujica"。
+    /// 语料里的插值符全集只有 {@nickname} 与 {@nbs} 两种，其余花括号
+    /// 都是正文，不做通配剥除。
+    static ref NBS_RE: Regex = Regex::new(r"(?i)\{@nbs\}").expect("invalid nbs regex");
 }
 
 /// 立绘变体后缀：`#4`（表情）、`$1`（差分）、`_1`/`_2`（皮肤）、`_ex`（异格）。
@@ -649,6 +654,8 @@ fn clean_text(text: &str) -> String {
     cleaned = LINE_BREAK_TAG_RE.replace_all(&cleaned, "\n").to_string();
     cleaned = GENERIC_TAG_RE.replace_all(&cleaned, "").to_string();
     cleaned = NICKNAME_RE.replace_all(&cleaned, "博士").to_string();
+    // 不换行空格按普通空格落地，与上面 \u{00A0} 的归一化一致。
+    cleaned = NBS_RE.replace_all(&cleaned, " ").to_string();
     cleaned = cleaned.trim().to_string();
 
     if cleaned.contains('\n') {
@@ -1260,6 +1267,10 @@ mod tests {
         assert_eq!(clean_text("你好\u{200B}，博士"), "你好，博士");
         assert_eq!(clean_text("\u{3000}前置全角空格"), "前置全角空格");
         assert_eq!(clean_text("{@NickName}，早上好"), "博士，早上好");
+        // act45side（BanG Dream 联动）的 `{@nbs}` 是不换行空格插值符，
+        // 不替换会把乐队名显示成 "Ave{@nbs}Mujica"。大小写同 nickname 宽容。
+        assert_eq!(clean_text("Ave{@nbs}Mujica的世界。"), "Ave Mujica的世界。");
+        assert_eq!(clean_text("Ave{@NBS}Mujica"), "Ave Mujica");
         // 空行会被折掉，段落之间只留一个换行。
         assert_eq!(clean_text(r"上\n\n\n下"), "上\n下");
     }
