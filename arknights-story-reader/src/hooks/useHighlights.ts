@@ -15,7 +15,7 @@ export interface HighlightEntry {
   digest?: string;
 }
 
-type HighlightLike = number | HighlightEntry;
+export type HighlightLike = number | HighlightEntry;
 
 type HighlightStore = Record<string, HighlightLike[]>;
 
@@ -57,7 +57,55 @@ let persistFailureNotified = false;
  * 的承诺就落空了。折进模块级暂存后，任何实例的下一次冲刷都会带上它重试，
  * 真正写成功（或发现盘上已一致）才清空。
  */
-const failedHighlightWrites = new Map<string, HighlightLike[] | null>();
+interface HighlightChange {
+  /** 这轮本地编辑开始时看到的列表。 */
+  base: HighlightLike[] | null;
+  /** 本地最终想要的列表；null 表示删除该 story key。 */
+  desired: HighlightLike[] | null;
+}
+
+const failedHighlightWrites = new Map<string, HighlightChange>();
+
+function highlightEntryKey(item: HighlightLike): string | null {
+  const normalized = normalizeHighlightEntry(item);
+  if (!normalized) return null;
+  // digest 相同的重复台词仍可分别收藏，下标是身份的一部分。
+  return `${normalized.digest ?? ""}\u0000${normalized.segmentIndex}`;
+}
+
+/**
+ * 同一篇剧情的三方合并：只把 base → desired 之间真正发生的本地增删应用到
+ * external。这样 A 窗口新增第 10 段、B 窗口同时新增第 20 段时，两边不会再
+ * 用整列表互相覆盖；本地没碰过的条目始终以外部最新值为准。
+ */
+export function mergeHighlightLists(
+  base: HighlightLike[] | null | undefined,
+  desired: HighlightLike[] | null | undefined,
+  external: HighlightLike[] | null | undefined
+): HighlightEntry[] | null {
+  const toMap = (items: HighlightLike[] | null | undefined) => {
+    const map = new Map<string, HighlightEntry>();
+    for (const item of items ?? []) {
+      const normalized = normalizeHighlightEntry(item);
+      const key = normalized ? highlightEntryKey(normalized) : null;
+      if (normalized && key) map.set(key, normalized);
+    }
+    return map;
+  };
+  const baseMap = toMap(base);
+  const desiredMap = toMap(desired);
+  const result = toMap(external);
+  const touched = new Set([...baseMap.keys(), ...desiredMap.keys()]);
+  for (const key of touched) {
+    const before = baseMap.get(key);
+    const after = desiredMap.get(key);
+    if (Boolean(before) === Boolean(after)) continue;
+    if (after) result.set(key, after);
+    else result.delete(key);
+  }
+  if (result.size === 0) return null;
+  return Array.from(result.values()).sort((a, b) => a.segmentIndex - b.segmentIndex);
+}
 
 /**
  * 把本地尚未落盘的改动叠到 `base`（刚读出的盘上整表）上：先叠上一批实例
@@ -69,23 +117,30 @@ function overlayLocalChanges(
   base: HighlightStore,
   pending: HighlightStore | null,
   dirtyKeys?: ReadonlySet<string>,
-  stash: ReadonlyMap<string, HighlightLike[] | null> = failedHighlightWrites
+  dirtyBases?: ReadonlyMap<string, HighlightLike[] | null>,
+  stash: ReadonlyMap<string, HighlightChange> = failedHighlightWrites
 ): HighlightStore {
   const merged: HighlightStore = { ...base };
-  for (const [key, value] of stash) {
+  for (const [key, change] of stash) {
+    const value = mergeHighlightLists(change.base, change.desired, merged[key]);
     if (value === null) delete merged[key];
     else merged[key] = value;
   }
-  if (pending !== null && dirtyKeys) {
+  if (pending !== null && dirtyKeys && dirtyBases) {
     for (const key of dirtyKeys) {
-      if (key in pending) merged[key] = pending[key];
-      else delete merged[key];
+      const value = mergeHighlightLists(
+        dirtyBases.get(key),
+        key in pending ? pending[key] : null,
+        merged[key]
+      );
+      if (value === null) delete merged[key];
+      else merged[key] = value;
     }
   }
   return merged;
 }
 
-function normalizeEntry(item: HighlightLike): HighlightEntry | null {
+export function normalizeHighlightEntry(item: HighlightLike): HighlightEntry | null {
   if (typeof item === "number") {
     if (!Number.isFinite(item) || item < 0) return null;
     return { segmentIndex: Math.trunc(item) };
@@ -100,6 +155,34 @@ function normalizeEntry(item: HighlightLike): HighlightEntry | null {
     };
   }
   return null;
+}
+
+/**
+ * 划线预览的首尾标点不应占 70 字预算，也不该出现“句号 + 省略号”的双尾巴。
+ * 只修首尾，正文内部标点原样保留。
+ */
+export function trimHighlightPreview(text: string, maxLength = 70): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (!normalized) return "";
+  if (normalized.length <= maxLength) return normalized;
+  const head = normalized
+    .slice(0, Math.max(0, maxLength))
+    .replace(/[\p{P}\p{S}\s]+$/gu, "");
+  return head ? `${head}…` : "";
+}
+
+/** 数据换包后按 digest 找回原段；内容已消失时返回 -1，绝不绑到同下标的新句子。 */
+export function resolveHighlightEntryIndex(
+  entry: HighlightEntry,
+  segmentDigests?: readonly string[],
+  digestIndex?: ReadonlyMap<string, number> | null
+): number {
+  if (!entry.digest || !segmentDigests || segmentDigests.length === 0) {
+    return entry.segmentIndex;
+  }
+  if (segmentDigests[entry.segmentIndex] === entry.digest) return entry.segmentIndex;
+  const shifted = digestIndex?.get(entry.digest) ?? segmentDigests.indexOf(entry.digest);
+  return shifted >= 0 ? shifted : -1;
 }
 
 /**
@@ -125,7 +208,11 @@ function normalizeEntry(item: HighlightLike): HighlightEntry | null {
  *   write, not one per toggle. A still-pending write is flushed on
  *   unmount so navigating away right after a toggle never drops it.
  */
-export function useHighlights(storyPath: string, segmentDigests?: readonly string[]) {
+export function useHighlights(
+  storyPath: string,
+  segmentDigests?: readonly string[],
+  active = true
+) {
   // 初始状态也要叠上遗留的失败重试：quota 失败后换章重挂，新实例只读盘的
   // 话，用户刚画的线会先「消失」再随重试成功回来——直接从合并结果起步。
   const [store, setStore] = useState<HighlightStore>(() => overlayLocalChanges(readStorage(), null));
@@ -143,6 +230,11 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
   // 本实例真正改过的 story key。冲刷时只把这些 key 并到盘上最新状态里，
   // 其余 key 一律以盘为准——见 flushPendingStore 里的换章竞态说明。
   const dirtyKeysRef = useRef<Set<string>>(new Set());
+  // 每个 key 第一次本地编辑时看到的基线。冲刷 / storage 事件用它做三方
+  // 合并，而不是让本窗口的整列表覆盖另一个窗口刚加的划线。
+  const dirtyBasesRef = useRef<Map<string, HighlightLike[] | null>>(new Map());
+  const activeRef = useRef(active);
+  activeRef.current = active;
 
   // 冲刷跑在 setTimeout 回调和卸载清理里，通过 ref 取最新的 toast 句柄。
   const toast = useToast();
@@ -171,7 +263,13 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
     // 和阅读进度 hook 同一口径：写盘时现读最新整表，只把本地真正改过的
     // key（遗留重试 + 本实例脏键）并进去，别的 key（上一章的划线、别的
     // 窗口的写入）以盘为准。
-    const merged = overlayLocalChanges(readStorage(), pending, dirtyKeysRef.current);
+    const disk = readStorage();
+    const merged = overlayLocalChanges(
+      disk,
+      pending,
+      dirtyKeysRef.current,
+      dirtyBasesRef.current
+    );
     const raw = JSON.stringify(merged);
     if (raw === lastRawRef.current) {
       // 内容与盘上完全一致（典型场景：跟随 storage 事件之后的回写），
@@ -183,6 +281,7 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
       if (pending !== null) {
         pendingStoreRef.current = null;
         dirtyKeysRef.current.clear();
+        dirtyBasesRef.current.clear();
       }
       failedHighlightWrites.clear();
       return;
@@ -194,6 +293,7 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
       if (pending !== null) {
         pendingStoreRef.current = null;
         dirtyKeysRef.current.clear();
+        dirtyBasesRef.current.clear();
       }
       failedHighlightWrites.clear();
       return;
@@ -205,7 +305,12 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
     // 重试；实例被换章回收后，新实例的冲刷也会带上这批改动。
     if (pending !== null) {
       for (const key of dirtyKeysRef.current) {
-        failedHighlightWrites.set(key, key in pending ? pending[key] : null);
+        // 以本次实际读到的盘为新基线，把本实例与更早失败重试合成后的最终
+        // 结果存成一轮变更。之后即使另一个窗口继续改同篇，也还能再三方合并。
+        failedHighlightWrites.set(key, {
+          base: disk[key] ?? null,
+          desired: key in merged ? merged[key] : null,
+        });
       }
     }
     if (!persistFailureNotified) {
@@ -240,7 +345,7 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
   const storeRef = useRef(store);
   useLayoutEffect(() => {
     storeRef.current = store;
-    if (typeof window === "undefined") return;
+    if (typeof window === "undefined" || !active) return;
     if (store === initialStoreRef.current) {
       return;
     }
@@ -260,12 +365,41 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
         persistTimerRef.current = null;
       }
     };
-  }, [store, flushPendingStore]);
+  }, [active, store, flushPendingStore]);
 
   // Unmount flush: if a debounced write is still pending when the reader
   // unmounts (toggle a highlight, immediately navigate back), write it now
   // instead of silently dropping the annotation.
   useEffect(() => () => flushPendingStore(), [flushPendingStore]);
+
+  // KeepAlive 隐藏时冲刷并停掉定时器；重新激活时现读盘，把隐藏期间其它
+  // 窗口的改动与仍未落盘的本地 dirty 三方合并后再恢复监听。
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!active) {
+      if (persistTimerRef.current !== null) {
+        window.clearTimeout(persistTimerRef.current);
+        persistTimerRef.current = null;
+      }
+      flushPendingStore();
+      return;
+    }
+    flushPendingStore();
+    const disk = readStorage();
+    const hasLocalChanges =
+      dirtyKeysRef.current.size > 0 || failedHighlightWrites.size > 0;
+    const next = hasLocalChanges
+      ? overlayLocalChanges(
+          disk,
+          pendingStoreRef.current ?? storeRef.current,
+          dirtyKeysRef.current,
+          dirtyBasesRef.current
+        )
+      : disk;
+    initialStoreRef.current = next;
+    storeRef.current = next;
+    setStore(next);
+  }, [active, flushPendingStore]);
 
   // 切后台 / 关标签页冲刷：移动端杀掉 app、桌面端直接关窗口都不会走
   // unmount（阅读器被 KeepAlive 常驻挂载）。划线的防抖只有一个宏任务，
@@ -273,7 +407,7 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
   // 失败后留着重试的 pending 更是只能靠这里兜底落盘。与阅读进度 hook 的
   // 同名兜底对齐。
   useEffect(() => {
-    if (typeof window === "undefined") return;
+    if (typeof window === "undefined" || !active) return;
     const handleHide = () => {
       if (document.visibilityState === "hidden") flushPendingStore();
     };
@@ -284,14 +418,14 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
       document.removeEventListener("visibilitychange", handleHide);
       window.removeEventListener("pagehide", handlePageHide);
     };
-  }, [flushPendingStore]);
+  }, [active, flushPendingStore]);
 
   // 多窗口（桌面端可以开多个）时跟随其它窗口的修改。划线和收藏一样是
   // 「整表读进内存 → 任意改动整表回写」，不跟随的话：A 窗口刚画的线会在
   // B 窗口的下一次回写里被 B 的旧内存快照整体覆盖，无声丢失（收藏 hook
   // 修过同一个坑）。
   useEffect(() => {
-    if (typeof window === "undefined") return;
+    if (typeof window === "undefined" || !active) return;
     const onStorage = (event: StorageEvent) => {
       // key 为 null 表示外部 storage.clear()，也要跟随。
       if (event.key !== null && event.key !== STORAGE_KEY) return;
@@ -309,6 +443,9 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
         // 脏键此刻必为空；pending 若非空也只是跟随上一次外部状态的回声
         // 快照，直接作废、整表跟盘。
         pendingStoreRef.current = null;
+        dirtyBasesRef.current.clear();
+        initialStoreRef.current = disk;
+        storeRef.current = disk;
         setStore(disk);
         return;
       }
@@ -327,18 +464,28 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
       // 无声抹掉（盘上其实是对的），要等下一次外部事件或重挂才恢复。快照
       // 与 `disk` 同一时刻取，视图自洽；随后的冲刷仍对实时状态收敛落盘。
       const dirtyAtEvent = new Set(dirtyKeysRef.current);
+      const basesAtEvent = new Map(dirtyBasesRef.current);
       const stashAtEvent = new Map(failedHighlightWrites);
-      setStore((prev) => overlayLocalChanges(disk, prev, dirtyAtEvent, stashAtEvent));
+      const next = overlayLocalChanges(
+        disk,
+        storeRef.current,
+        dirtyAtEvent,
+        basesAtEvent,
+        stashAtEvent
+      );
+      initialStoreRef.current = next;
+      storeRef.current = next;
+      setStore(next);
     };
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);
-  }, []);
+  }, [active]);
 
   // The raw entries as persisted. Always an array of (upgraded) objects.
   const entries = useMemo<HighlightEntry[]>(
     () =>
       (store[storyPath] ?? [])
-        .map(normalizeEntry)
+        .map(normalizeHighlightEntry)
         .filter((e): e is HighlightEntry => e !== null),
     [store, storyPath]
   );
@@ -364,16 +511,12 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
    * the same digest, keep it. Only when the content moved away do we fall
    * back to the digest table (which maps to the first occurrence) — this
    * keeps two highlights on identical paragraphs from collapsing onto one.
-   * Entries whose content vanished keep their stored index as-is.
+   * 内容已经消失的条目保留在持久化层等待未来数据版本恢复，但当前视图返回
+   * -1，不得把划线错误套到新包里恰好占同一下标的另一句话上。
    */
   const resolveEntryIndex = useCallback(
     (entry: HighlightEntry): number => {
-      if (entry.digest && segmentDigests && segmentDigests.length > 0) {
-        if (segmentDigests[entry.segmentIndex] === entry.digest) return entry.segmentIndex;
-        const shifted = digestIndex?.get(entry.digest);
-        if (typeof shifted === "number") return shifted;
-      }
-      return entry.segmentIndex;
+      return resolveHighlightEntryIndex(entry, segmentDigests, digestIndex);
     },
     [segmentDigests, digestIndex]
   );
@@ -434,15 +577,19 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
    */
   const toggleHighlight = useCallback(
     (segmentIndex: number) => {
+      if (!activeRef.current || !Number.isFinite(segmentIndex) || segmentIndex < 0) return;
       // `segmentDigestMap` uses "" for unrecognised segment types — never
       // persist that as a fingerprint.
       const digest = segmentDigests?.[segmentIndex] || undefined;
+      if (!dirtyKeysRef.current.has(storyPath)) {
+        dirtyBasesRef.current.set(storyPath, storeRef.current[storyPath] ?? null);
+      }
       dirtyKeysRef.current.add(storyPath);
       setStore((prev) => {
         const rawList = prev[storyPath] ?? [];
         const current: HighlightEntry[] = [];
         for (const item of rawList) {
-          const n = normalizeEntry(item);
+          const n = normalizeHighlightEntry(item);
           if (n) current.push(realignEntry(n));
         }
 
@@ -474,6 +621,7 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
   );
 
   const clearHighlights = useCallback(() => {
+    if (!activeRef.current) return;
     // 对不存在的 key 不能先记脏键再靠 setStore 原样 bail-out 兜底：bail-out
     // 后 layout effect 不跑、冲刷不会被调度，这个脏键会一直挂着没人消费。
     // 之后任何一次外部 storage 事件都会把它重放成「本地要删掉这个 key」
@@ -483,6 +631,9 @@ export function useHighlights(storyPath: string, segmentDigests?: readonly strin
     // 到这里；闭包里的 store 也早已过期，所以存在性只能查镜像 ref。
     // 镜像里没有这个 key 就说明清空是 no-op，什么都不记。
     if (!(storyPath in storeRef.current)) return;
+    if (!dirtyKeysRef.current.has(storyPath)) {
+      dirtyBasesRef.current.set(storyPath, storeRef.current[storyPath] ?? null);
+    }
     dirtyKeysRef.current.add(storyPath);
     setStore((prev) => {
       if (!(storyPath in prev)) {
