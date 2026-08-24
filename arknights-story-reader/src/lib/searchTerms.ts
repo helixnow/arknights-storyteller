@@ -49,6 +49,17 @@ interface ParsedTerm {
 }
 
 /**
+ * 与后端 Rust `char::is_whitespace`（Unicode White_Space 属性）逐字对齐的
+ * 切词空白集，不能用 JS 的 `\s`：`\s` 比 White_Space 多收 U+FEFF（BOM，
+ * 粘贴文本常见）、少收 U+0085（NEL）。差一个字符就翻极性——`-\uFEFF博士`
+ * 后端是一个否定词条，`\s` 却在 BOM 处切开，纯减号被丢、博士变成正向词，
+ * 被排除的词反被高亮成命中还放行自动搜；`not\u0085博士` 后端切成
+ * 连接词 + 排除词（纯否定 → 静态空集），`\s` 把它粘成一个正向词误发出去。
+ */
+const QUERY_WHITESPACE_RE =
+  /[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]/;
+
+/**
  * 与后端 `build_fts_query_advanced` / `split_query_terms` 同构的逐字符
  * 扫描器。必须逐字符、不能按空白切 token：后端在任意位置遇到 `"` 都会
  * 切换引号态，`博士"凯尔希"` 是「词 博士 + 短语 凯尔希」两个正向词条；
@@ -107,7 +118,7 @@ function parseQueryTerms(query: string): ParsedTerm[] {
         quoteIsNot = dashPrefix || notPrefix;
         inQuotes = true;
       }
-    } else if (!inQuotes && /\s/.test(ch)) {
+    } else if (!inQuotes && QUERY_WHITESPACE_RE.test(ch)) {
       flushBare();
     } else {
       buf += ch;

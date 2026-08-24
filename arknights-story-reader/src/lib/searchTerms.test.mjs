@@ -136,6 +136,21 @@ test("highlightTerms：纯减号串不消费悬挂 NOT，顺延给下一个词",
   assert.deepEqual(highlightTerms("凯尔希 not - 博士"), ["凯尔希"]);
 });
 
+test("highlightTerms：切词空白集对齐后端 char::is_whitespace（U+0085 切、U+FEFF 不切）", () => {
+  // 后端按 Unicode White_Space 切词：U+0085（NEL）是空白、U+FEFF（BOM）
+  // 不是；JS 的 `\s` 恰好相反。差一个字符就翻极性，两个方向各钉一条。
+  // NEL 切开：`not` 成连接词，博士被排除（后端纯否定 → 静态空集）。
+  assert.deepEqual(highlightTerms("not\u0085博士"), []);
+  assert.deepEqual(highlightTerms("博士\u0085凯尔希"), ["凯尔希", "博士"]);
+  // BOM 不切：`-\uFEFF博士` 整体是一个否定词条，博士不能被高亮成正向；
+  // `not\uFEFF博士` 整体是一个正向词（不是连接词），不能吞掉它。
+  assert.deepEqual(highlightTerms("-\uFEFF博士"), []);
+  assert.deepEqual(highlightTerms("not\uFEFF博士 凯尔希"), [
+    "not\uFEFF博士",
+    "凯尔希",
+  ]);
+});
+
 // ─────────────────────────────────────────────────────────
 // highlightTerms：OR / AND 连接词
 // ─────────────────────────────────────────────────────────
@@ -242,6 +257,17 @@ test("isAutoSearchable：没有正向词的查询不自动发（后端静态空�
   assert.equal(isAutoSearchable('"" 博士'), true);
   assert.equal(isAutoSearchable("凯尔希 -博士"), true);
   assert.equal(isAutoSearchable('not"博士" 凯尔希'), true);
+});
+
+test("isAutoSearchable：U+0085/U+FEFF 按后端空白集判定纯否定", () => {
+  // NEL 是后端空白：`not\u0085博士` 是纯否定（静态空集），不能自动发；
+  // 切开后旁边有正向词则恢复可搜。
+  assert.equal(isAutoSearchable("not\u0085博士"), false);
+  assert.equal(isAutoSearchable("not\u0085博士 凯尔希"), true);
+  // BOM 不是后端空白：`-\uFEFF博士` 是一个否定词条 → 纯否定不自动发；
+  // `not\uFEFF博士` 是一个正向词 → 照常可搜。
+  assert.equal(isAutoSearchable("-\uFEFF博士"), false);
+  assert.equal(isAutoSearchable("not\uFEFF博士"), true);
 });
 
 test("isAutoSearchable：`\\b` 只拦裸连接词，不误伤以 not 结尾的英文单词", () => {
