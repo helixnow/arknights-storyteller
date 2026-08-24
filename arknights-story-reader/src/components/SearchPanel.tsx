@@ -702,6 +702,17 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     setProgress({ phase: "搜索中", current: 0, total: 0, message: "" });
 
     try {
+      // 段级搜索没有调试输出，但调试记录的渲染条件只看 debugLogs 非空、
+      // 不看模式：从整篇切到段落时，上一轮整篇搜索的调试记录会挂在段落
+      // 结果（乃至请求在途的等待期）上冒充本次日志。必须清在下面版本补取
+      // 的 await 之前，而不是进段落分支才清：数据更新会立刻清空 version，
+      // 其后的段搜常态化地先等一次 getCurrentVersion 才进分支（补取失败
+      // 时还要等到 searchSegments 返回），清晚了旧日志就在这整段等待期里
+      // 顶着段搜的加载态照常展示。
+      if (activeMode === "segment") {
+        setDebugLogs([]);
+        setDebugExpanded(false);
+      }
       // 挂载时的 getCurrentVersion 可能失败过一次，version 会停在空串，
       // 缓存就整个会话都不可用。真正开搜这一刻补取一次（同样只留稳定的
       // commit 前缀）：成功就把 version 落回 state，本次搜索立刻能用缓存；
@@ -729,12 +740,6 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
       }
 
       if (activeMode === "segment") {
-        // 段级搜索没有调试输出，但调试记录的渲染条件只看 debugLogs 非空、
-        // 不看模式：从整篇切到段落时，上一轮整篇搜索的调试记录会挂在段落
-        // 结果（乃至请求在途的等待期）上冒充本次日志。进分支就清、且在
-        // 任何 await 之前，段搜一发起旧日志立刻消失，不给它任何展示窗口。
-        setDebugLogs([]);
-        setDebugExpanded(false);
         // version 还没就绪（getCurrentVersion 未返回或失败）时缓存整体停用：
         // 空串没法证明缓存对应的是当前这份数据。
         const cached = opts?.forceRefresh || !activeVersion ? undefined : segmentCache[raw];
