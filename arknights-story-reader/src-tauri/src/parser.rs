@@ -152,10 +152,13 @@ pub fn parse_story_text(content: &str) -> ParsedStoryContent {
 
         let text = clean_text(line);
         // 状态指令后面偶尔粘着数据残次（`[character]]` 的多余 `]`、
-        // `[charslot(...)]4` 的手滑字符）。真实脚本里状态指令后从来没有
-        // 正经台词直接开口，这些渣走旁白就成了孤零零的 `]` 段；提高门槛，
-        // 但不动独立成行的正文（歌声淡出的 `...` 是有意写的）。
-        if ate_state_prefix && !has_meaningful_content(&text) {
+        // `[charslot(...)]4` 的手滑字符、main_12-17 的编辑批注 `已改`）。
+        // 真实脚本里状态指令后从来没有正经台词直接开口——全语料这种残渣
+        // 共 31 处、全部 ≤2 个字符，其中 CJK 渣（`已改`、`我`）是合法
+        // 文字，能穿过 has_meaningful_content，所以再加一道字符数门槛。
+        // 独立成行的正文（歌声淡出的 `...`、单字 "咦"）没有状态前缀，
+        // 不受影响。
+        if ate_state_prefix && (text.chars().count() <= 2 || !has_meaningful_content(&text)) {
             continue;
         }
         if !text.is_empty() {
@@ -1345,6 +1348,20 @@ mod tests {
         let result = parse_story_text("......\n...");
         assert_eq!(kinds(&result), vec!["narration", "narration"]);
         assert_eq!(texts(&result), vec!["......", "..."]);
+
+        // 真实数据里的 CJK 残渣：level_main_12-17_end 的编辑批注 `已改`、
+        // story_blackd_2_1 的手滑 `我`。它们是合法文字，单靠
+        // has_meaningful_content 拦不住，会漏成孤立旁白。
+        assert!(parse_story_text(
+            r#"[charslot(slot="r",name="avg_4087_ines_1#1$1",focus="r")]已改"#
+        )
+        .segments
+        .is_empty());
+        assert!(parse_story_text(
+            r#"[charslot(slot = "m", name = "avg_198_blackd_1#6$1")]我"#
+        )
+        .segments
+        .is_empty());
     }
 
     /// 全角标点残渣同样不能漏成孤立段落：act18d3/act3d0 等 6 个文件有

@@ -2957,8 +2957,7 @@ impl DataService {
         // `raw_content`(UNINDEXED)=0. Higher = more relevant. (bug C1)
         let query_sql = format!(
             "
-            SELECT story_id, story_name, category, raw_content,
-                   snippet(story_index, 3, '', '', '...', 24) as snip
+            SELECT story_id, story_name, category, raw_content
             FROM story_index
             WHERE story_index MATCH ?1
             ORDER BY bm25(story_index, 0.0, 10.0, 0.0, 1.0, 5.0, 0.0)
@@ -2980,8 +2979,7 @@ impl DataService {
             let story_name: String = row.get(1)?;
             let category: String = row.get(2)?;
             let raw_content: String = row.get(3)?;
-            let snip: String = row.get(4).unwrap_or_else(|_| String::new());
-            Ok((story_id, story_name, category, raw_content, snip))
+            Ok((story_id, story_name, category, raw_content))
         }) {
             Ok(rows) => rows,
             Err(err) => {
@@ -2997,26 +2995,20 @@ impl DataService {
 
         // Fuzzy-normalized query for context extraction.
         let context_probe = normalize_for_fuzzy(query);
+        // 兜底定位用：整串探针把空白/标点全部压掉，只有词与词恰好相邻时
+        // 才命中；多词 AND、`or`、排除词都会落空，得退回首个正向词。
+        let terms = split_query_terms(query);
         let mut results = Vec::new();
         for row in rows {
-            if let Ok((story_id, story_name, category, raw_content, snip)) = row {
+            if let Ok((story_id, story_name, category, raw_content)) = row {
                 // 优先使用原始内容提取上下文，避免 tokenized_content 导致的空格断字
                 let mut matched_text = self.extract_context(&raw_content, &context_probe);
-                if matched_text.trim().is_empty() && !snip.trim().is_empty() {
-                    // 兜底：少数情况下 extract_context 未命中，回退 snippet 再做一次去空格优化
-                    let cleaned = snip
-                        .replace('\n', " ")
-                        .replace('\r', " ")
-                        .replace("  ", " ");
-                    matched_text = cleaned;
-                }
-                if matched_text.is_empty() {
-                    let preview: String = raw_content.chars().take(120).collect();
-                    matched_text = if preview.len() < raw_content.len() {
-                        format!("{}...", preview)
-                    } else {
-                        preview
-                    };
+                if matched_text.trim().is_empty() {
+                    // 以前这里回退 FTS 的 snippet()——那一列是逐字分词文本，
+                    // 每个汉字之间都有空格、标点全丢，展示出来是碎的。改走
+                    // 线性扫描同一套预览：先整词、再单原子定位，最后给正文
+                    // 开头的干净预览，两条路径的片段观感保持一致。
+                    matched_text = self.preview_for(&raw_content, terms.primary());
                 }
                 results.push(SearchResult {
                     story_id,
