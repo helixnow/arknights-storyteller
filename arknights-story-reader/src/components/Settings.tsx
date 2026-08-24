@@ -183,6 +183,17 @@ export function Settings() {
   const blockedBy = activeJob && !dataBusy ? activeJob : null;
   const dataActionsDisabled = dataBusy || blockedBy !== null;
 
+  // 数据可能在别处被换掉：数据未安装时 StoryList 会自动弹出同步对话框，
+  // 用户在那儿装好数据再进设置页是首装的常规路线。本页被 KeepAlive 常驻
+  // 挂载，版本信息只在挂载时加载过一次，不跟着刷新就会顶着「未安装」的
+  // 过期徽章按首装话术催用户再下一遍完整数据包。与 SyncDialog 的同名
+  // 监听互为镜像（它防的是反方向：设置页装完、对话框还催装）。
+  useEffect(() => {
+    const handler = () => void loadVersionInfo({ silent: true });
+    window.addEventListener("app:data-updated", handler);
+    return () => window.removeEventListener("app:data-updated", handler);
+  }, [loadVersionInfo]);
+
   const handleRefreshInfo = () => {
     showStatus(null);
     setError(null);
