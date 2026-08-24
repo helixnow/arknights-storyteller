@@ -1,4 +1,4 @@
-import { ChangeEvent, useCallback, useEffect, useRef } from "react";
+import { ChangeEvent, useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { AlertCircle, CheckCircle, Download, Loader2, Upload } from "lucide-react";
@@ -52,6 +52,9 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
     loadVersionInfo,
     resetProgress,
   } = useDataSyncManager({ active: open, onSuccess });
+
+  /** 「重新同步」确认框弹着的忙态；此时 "sync" 任务锁已被下面的点击流程预占。 */
+  const [preparingSync, setPreparingSync] = useState(false);
 
   useEffect(() => {
     if (!open) {
@@ -293,7 +296,7 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
 
   if (!open) return null;
 
-  const actionsDisabled = busy || blockedBy !== null;
+  const actionsDisabled = busy || preparingSync || blockedBy !== null;
   const percent =
     progress && progress.total > 0
       ? Math.min(Math.round((progress.current / progress.total) * 100), 100)
@@ -382,8 +385,10 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
             )}
           </div>
 
-          {/* 别处（设置页 / 自动索引 / 更新安装）占着任务锁时，说清在等谁。 */}
-          {blockedBy && (
+          {/* 别处（设置页 / 自动索引 / 更新安装）占着任务锁时，说清在等谁。
+              确认框期间锁被本对话框自己预占（preparingSync），这行不该出来
+              说「正在同步剧情数据」——那会和还没点头的确认框自相矛盾。 */}
+          {blockedBy && !preparingSync && (
             <div className="flex items-center gap-2 text-xs text-[hsl(var(--color-muted-foreground))]" role="status">
               <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
               <span>正在{describeDataJob(blockedBy)}，完成后即可继续操作。</span>
@@ -462,10 +467,30 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
               onClick={async () => {
                 if (actionsDisabled) return;
                 if (status === "up-to-date") {
-                  const ok = await safeConfirm(
-                    "当前已是最新。再次同步会重新下载并覆盖本机数据，确定继续？",
-                    { title: "重新同步", kind: "warning" }
-                  );
+                  // 与设置页 handleSyncClick 同一纪律：确认框是异步的，弹着的
+                  // 这段时间锁必须先占住。空着的话，自动索引的重试定时器或排队
+                  // 等锁的自动更新安装（拿到锁会直接重启进程）随时抢入，用户
+                  // 点完「确定」只会收到一句冲突报错，刚给出的确认就被吞掉了。
+                  const releaseJob = acquireDataJob("sync");
+                  if (!releaseJob) {
+                    setError(dataJobConflictMessage("同步"));
+                    return;
+                  }
+                  setPreparingSync(true);
+                  let ok = false;
+                  try {
+                    ok = await safeConfirm(
+                      "当前已是最新。再次同步会重新下载并覆盖本机数据，确定继续？",
+                      { title: "重新同步", kind: "warning" }
+                    );
+                  } finally {
+                    // handleSync 自己抢锁，这里必须先放。放锁与它的抢锁在同一个
+                    // 宏任务里，定时器插不进来；能截走锁的只有 acquireDataJobWhenIdle
+                    // 的同步等待者（用户已点头的自动更新安装），那种情况下
+                    // handleSync 会给出明确的冲突提示，而不是静默吞确认。
+                    releaseJob();
+                    setPreparingSync(false);
+                  }
                   if (!ok) return;
                 }
                 void handleSync();
