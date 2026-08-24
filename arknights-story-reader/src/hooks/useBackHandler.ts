@@ -44,6 +44,23 @@ const entries: BackEntry[] = [];
 let seqCounter = 0;
 let dispatching = false;
 
+/**
+ * 当前注册的 overlay 级处理器数量（只读探针）。
+ *
+ * 边缘返回手势在 pointerdown **捕获阶段**采样它：阅读器 ⋯ 菜单这类浮层把
+ * 「点外部关闭」挂在 window 冒泡的 pointerdown 上，而 React 18 会把 discrete
+ * 输入事件触发的 setState 连同 effect 注销在 touchstart 派发前同步 flush 完
+ * ——touchstart 再采样看到的已经是关完之后的栈。只有捕获阶段跑在那个关闭
+ * 器之前，采到的才是「手指按下那一刻」的真实状态。见 useEdgeSwipeBack。
+ */
+export function getOverlayHandlerCount(): number {
+  let count = 0;
+  for (const entry of entries) {
+    if (entry.priority >= BACK_PRIORITY.overlay) count += 1;
+  }
+  return count;
+}
+
 interface RequestBackOptions {
   /**
    * 只询问优先级不低于这个值的处理器。用于「手势只想关掉更上层的东西」

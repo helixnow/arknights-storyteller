@@ -95,8 +95,19 @@ export function useAutoIndex() {
         }
 
         if (isBackendBuilding()) {
-          devLog(`索引未就绪，但后端已在重建，让路（${reason}）`);
-          deferRetry(reason);
+          // 这里不能走 deferRetry 消耗让路预算：预算总共 6×10s=60s，而
+          // 「停更即死」的判定窗也是 60s——后端自动重建失败时不发终态
+          // index-progress（失败通知走 sync-progress），只要它发过几秒进度
+          // 再死（磁盘满、IO 错都是这种形态），预算必先于判定窗耗尽，
+          // 兜底重建从此整个会话不再发生。改为定到停更判定刚好过期的
+          // 时刻回来：活着的重建会用新进度把下次检查继续往后推（约每
+          // 60s 读一次状态），死掉的则在判定过期后立刻接手；索引一就绪
+          // 就停，不会无限轮询。让路预算只留给下面的锁竞争分支。
+          devLog(`索引未就绪，但后端已在重建，等它结束或停更再看（${reason}）`);
+          later(
+            () => void ensureIndex(reason),
+            Math.max(RETRY_DELAY_MS, lastIndexProgressAt + INDEX_PROGRESS_STALE_MS - Date.now() + 1_000)
+          );
           return;
         }
 
