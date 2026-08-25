@@ -94,6 +94,11 @@ fn acquire_install_lock(task: &'static str) -> Result<InstallLockGuard, String> 
 struct ImportTransferHold {
     guard: InstallLockGuard,
     last_chunk_at: Instant,
+    /// 下一块必须携带的字节偏移。只校验磁盘当前长度还不够：弃单被回收后，
+    /// 一条迟到的旧请求可能在新传输刚写完同尺寸首块时偷走新 guard，把两份
+    /// ZIP 拼在一起。把协议进度跟 guard 绑在同一个锁槽里，至少让不同进度
+    /// 的旧请求在碰暂存文件之前失败。
+    next_offset: u64,
 }
 
 static IMPORT_TRANSFER_HOLD: Mutex<Option<ImportTransferHold>> = Mutex::new(None);
@@ -115,12 +120,27 @@ fn take_transfer_hold() -> Option<InstallLockGuard> {
     lock_transfer_hold().take().map(|hold| hold.guard)
 }
 
-/// 一块落盘成功后把持有放回寄存处并刷新活跃时间，等下一块来取。
-fn stow_transfer_hold(guard: InstallLockGuard) {
+/// 一块落盘成功后把持有和下一偏移放回寄存处，等下一块来取。
+fn stow_transfer_hold(guard: InstallLockGuard, next_offset: u64) {
     *lock_transfer_hold() = Some(ImportTransferHold {
         guard,
         last_chunk_at: Instant::now(),
+        next_offset,
     });
+}
+
+/// 只有偏移与当前传输协议进度完全一致时才交出 guard。寄存已空表示传输
+/// 已取消、超时回收或进程刚重启；绝不能重新抢一把安装锁后凭磁盘残骸续传，
+/// 否则被判死的旧请求能在同步/新导入的空档里复活。
+fn take_transfer_hold_for(offset: u64) -> Result<InstallLockGuard, String> {
+    let mut slot = lock_transfer_hold();
+    if slot.as_ref().is_some_and(|hold| hold.next_offset == offset) {
+        return slot
+            .take()
+            .map(|hold| hold.guard)
+            .ok_or_else(|| IMPORT_STREAM_BROKEN.to_string());
+    }
+    Err(IMPORT_STREAM_BROKEN.to_string())
 }
 
 /// 判定寄存持有是否已是弃单。单独抽成纯函数是为了让单测不必真等一
@@ -598,14 +618,9 @@ fn acquire_import_transfer_guard(offset: u64) -> Result<InstallLockGuard, String
     if offset == 0 {
         acquire_install_lock("import_from_zip_bytes")
     } else {
-        // Continuation takes back the exact guard stowed by the preceding
-        // chunk. If it was reaped after a long pause, reacquiring still lets
-        // append_import_chunk's strict offset/file checks decide whether the
-        // stream can safely continue.
-        match take_transfer_hold() {
-            Some(guard) => Ok(guard),
-            None => acquire_install_lock("import_from_zip_bytes"),
-        }
+        // 续传只能接回上一块留下的同一份 guard，且偏移必须与协议进度一致。
+        // 超时/取消后的续传统一失败，要求前端从 offset 0 重开一轮。
+        take_transfer_hold_for(offset)
     }
 }
 
@@ -667,6 +682,14 @@ pub async fn import_from_zip_bytes(
     let service = clone_service(&state);
     run_blocking("import_from_zip_bytes", move || {
         let chunk = decode_base64(&chunk_base64)?;
+        if chunk.is_empty() && !last {
+            return Err("ZIP 数据块为空且不是收尾块，请重新选择文件导入".to_string());
+        }
+        let next_offset = offset
+            .checked_add(
+                u64::try_from(chunk.len()).map_err(|_| "ZIP 数据块长度超出支持范围".to_string())?,
+            )
+            .ok_or_else(|| "ZIP 数据块偏移溢出，请重新选择文件导入".to_string())?;
         let staging = service.import_staging_path()?;
         // 解码或落盘失败会把 guard 一起带走（Drop 放锁）：废掉的传输
         // 不该继续占着安装互斥。
@@ -679,7 +702,7 @@ pub async fn import_from_zip_bytes(
             promote_import_staging(&staging, &service.import_temp_zip_path()?)?;
             service.import_promoted_zip(app)
         } else {
-            stow_transfer_hold(guard);
+            stow_transfer_hold(guard, next_offset);
             Ok(())
         }
     })
@@ -1313,7 +1336,7 @@ mod tests {
 
         // 首块拿锁后寄存，传输在途时 sync 必须立刻被拒。
         let guard = acquire_install_lock("import_from_zip_bytes").expect("空闲时首块必须拿到锁");
-        stow_transfer_hold(guard);
+        stow_transfer_hold(guard, 4);
         let err = acquire_install_lock("sync_data").expect_err("传输在途时 sync 必须快速失败");
         assert!(
             err.contains("import_from_zip_bytes"),
@@ -1331,14 +1354,14 @@ mod tests {
 
         // 弃单：寄存后长时间无新块，抢锁者必须能把它收走并拿到锁。
         let guard = acquire_install_lock("import_from_zip_bytes").expect("上一段结束后锁应空闲");
-        stow_transfer_hold(guard);
+        stow_transfer_hold(guard, 4);
         reap_stale_transfer_hold_at(Instant::now() + IMPORT_TRANSFER_STALE);
         assert!(take_transfer_hold().is_none(), "弃单必须已被收走");
         drop(acquire_install_lock("sync_data").expect("弃单收走后 sync 必须能拿到锁"));
 
         // 新鲜持有绝不能被误杀。
         let guard = acquire_install_lock("import_from_zip_bytes").expect("锁应空闲");
-        stow_transfer_hold(guard);
+        stow_transfer_hold(guard, 4);
         reap_stale_transfer_hold_at(Instant::now());
         acquire_install_lock("sync_data").expect_err("新鲜持有不该被当弃单收走");
         drop(take_transfer_hold());
@@ -1350,7 +1373,7 @@ mod tests {
         drop(take_transfer_hold());
 
         let first = acquire_import_transfer_guard(0).expect("first transfer starts");
-        stow_transfer_hold(first);
+        stow_transfer_hold(first, 4);
 
         let err = acquire_import_transfer_guard(0)
             .expect_err("a concurrent offset-zero chunk must be rejected");
@@ -1360,7 +1383,7 @@ mod tests {
         );
         let continuing = take_transfer_hold()
             .expect("rejected newcomer must not drop the original transfer's guard");
-        stow_transfer_hold(continuing);
+        stow_transfer_hold(continuing, 4);
 
         // Once the original hold is genuinely stale, a new first chunk may
         // reap it and start cleanly.
@@ -1372,6 +1395,43 @@ mod tests {
         let replacement = acquire_import_transfer_guard(0).expect("stale transfer may be replaced");
         drop(replacement);
         assert!(take_transfer_hold().is_none());
+    }
+
+    #[test]
+    fn continuation_requires_the_live_holds_exact_next_offset() {
+        let _serial = serialize_global_lock_tests();
+        drop(take_transfer_hold());
+
+        let first = acquire_import_transfer_guard(0).expect("first transfer starts");
+        stow_transfer_hold(first, 8);
+
+        let err = acquire_import_transfer_guard(16)
+            .expect_err("a chunk from another transfer/progress must be rejected");
+        assert_eq!(err, IMPORT_STREAM_BROKEN);
+        let continuing =
+            take_transfer_hold_for(8).expect("a rejected chunk must not steal the live guard");
+        drop(continuing);
+        drop(acquire_install_lock("sync_data").expect("valid continuation releases lock"));
+    }
+
+    #[test]
+    fn stale_transfer_cannot_be_resurrected_by_a_late_continuation() {
+        let _serial = serialize_global_lock_tests();
+        drop(take_transfer_hold());
+
+        let first = acquire_import_transfer_guard(0).expect("first transfer starts");
+        stow_transfer_hold(first, 8);
+        {
+            let mut slot = lock_transfer_hold();
+            slot.as_mut().unwrap().last_chunk_at =
+                Instant::now() - IMPORT_TRANSFER_STALE - Duration::from_secs(1);
+        }
+        reap_stale_transfer_hold_at(Instant::now());
+
+        let err = acquire_import_transfer_guard(8)
+            .expect_err("a reaped transfer must restart from offset zero");
+        assert_eq!(err, IMPORT_STREAM_BROKEN);
+        drop(acquire_install_lock("sync_data").expect("late continuation must not seize lock"));
     }
 
     /// 显式中止在途传输：立刻放锁 + 清理暂存，不必等 60 秒弃单超时；
@@ -1394,7 +1454,7 @@ mod tests {
         // 暂存并立刻释放安装互斥——这正是修的那个「点同步要等一分钟」。
         append_import_chunk(&staging, 0, b"half transfer").expect("首块必须成功");
         let guard = acquire_install_lock("import_from_zip_bytes").expect("空闲时必须拿到锁");
-        stow_transfer_hold(guard);
+        stow_transfer_hold(guard, 4);
         assert!(
             abort_import_transfer(&staging).expect("中止必须成功"),
             "实际删除暂存时应返回 true"
@@ -1417,7 +1477,7 @@ mod tests {
 
         // 暂存文件本就不存在（首块还没落盘就失败）时中止照样成功放锁。
         let guard = acquire_install_lock("import_from_zip_bytes").expect("锁应空闲");
-        stow_transfer_hold(guard);
+        stow_transfer_hold(guard, 4);
         std::fs::remove_file(&staging).unwrap();
         assert!(
             !abort_import_transfer(&staging).expect("暂存缺失时中止必须成功"),
@@ -1486,7 +1546,7 @@ mod tests {
         // 传输在途（持有已寄存、半截暂存在盘上）时用户点了取消。
         append_import_chunk(&staging, 0, b"half transfer").expect("首块必须成功");
         let guard = acquire_install_lock("import_from_zip_bytes").expect("空闲时必须拿到锁");
-        stow_transfer_hold(guard);
+        stow_transfer_hold(guard, 4);
         abort_import_transfer(&staging).expect("中止必须成功");
         assert!(!staging.exists(), "中止后暂存文件必须已被清理");
 

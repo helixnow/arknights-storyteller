@@ -285,10 +285,11 @@ pub fn snapshot() -> CharacterIndex {
     // 拿不到 character_table_path，因而不会调用 refresh_from_file。这里
     // 必须主动撤掉上一包的 overlay，否则 snapshot 会永久回传旧角色索引。
     let mut overlaid = OVERLAID.write().unwrap_or_else(PoisonError::into_inner);
-    if overlaid
-        .as_ref()
-        .is_some_and(|applied| std::fs::metadata(&applied.path).is_err())
-    {
+    if overlaid.as_ref().is_some_and(|applied| {
+        std::fs::metadata(&applied.path)
+            .map(|meta| !meta.is_file())
+            .unwrap_or(true)
+    }) {
         *RUNTIME.write().unwrap_or_else(PoisonError::into_inner) = CharacterIndex::from_embedded();
         *overlaid = None;
     }
@@ -784,6 +785,9 @@ mod tests {
 
         let _ = std::fs::remove_file(&bad);
         let _ = std::fs::remove_file(&good);
+        // 换包后同一路径若变成目录（损坏/恶意 ZIP），metadata 仍成功；
+        // 只检查“路径存在”会让上一包 overlay 永久残留。
+        std::fs::create_dir(&good).expect("replace character table with a directory");
         let reset = snapshot();
         assert!(
             !reset.name_to_char_id.contains_key("泽兹测试干员"),
@@ -794,5 +798,6 @@ mod tests {
             Some("char_502_nblade"),
             "撤掉 overlay 后仍应保留嵌入索引"
         );
+        let _ = std::fs::remove_dir(&good);
     }
 }

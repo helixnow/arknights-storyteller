@@ -108,6 +108,12 @@ fn validate_url(url: &str) -> Result<String, String> {
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
         return Err("更新地址无效：仅支持 http/https 链接".to_string());
     }
+    // Basic-auth 凭据会出现在 authority（https://user:pass@host），不属于
+    // query/fragment；旧的日志/错误脱敏只截后两者，会把密码原样带出去。
+    // 更新直链没有使用 URL userinfo 的合理场景，入口直接拒绝。
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("更新地址无效：链接不得包含用户名或密码".to_string());
+    }
     Ok(trimmed.to_string())
 }
 
@@ -266,6 +272,8 @@ mod tests {
         assert!(validate_url("ftp://example.com/app.apk").is_err());
         assert!(validate_url("file:///sdcard/app.apk").is_err());
         assert!(validate_url("javascript:alert(1)").is_err());
+        assert!(validate_url("https://user@example.com/app.apk").is_err());
+        assert!(validate_url("https://user:secret@example.com/app.apk").is_err());
     }
 
     #[test]

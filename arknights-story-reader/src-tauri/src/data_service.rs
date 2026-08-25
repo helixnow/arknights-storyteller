@@ -780,11 +780,10 @@ impl DataService {
         let p = self
             .data_dir
             .join("zh_CN/gamedata/excel/character_table.json");
-        if p.exists() {
-            Some(p)
-        } else {
-            None
-        }
+        fs::metadata(&p)
+            .ok()
+            .filter(|meta| meta.is_file())
+            .map(|_| p)
     }
     pub fn new(app_data_dir: PathBuf) -> Self {
         let service = Self {
@@ -2426,7 +2425,10 @@ impl DataService {
 
         let story_root = dir.join("zh_CN/gamedata/story");
         let has_readable_script = stories.iter().any(|story| {
-            fs::metadata(story_root.join(format!("{}.txt", story.story_txt)))
+            Self::story_file_path(&story_root, &story.story_txt)
+                .and_then(|path| {
+                    fs::metadata(path).map_err(|err| format!("无法读取剧情脚本元数据: {}", err))
+                })
                 .map(|meta| meta.is_file() && meta.len() > 0)
                 .unwrap_or(false)
         });
@@ -2943,26 +2945,43 @@ impl DataService {
 
     /// 读取剧情文本
     pub fn read_story_text(&self, story_path: &str) -> Result<String, String> {
-        let full_path = self
-            .data_dir
-            .join("zh_CN/gamedata/story")
-            .join(format!("{}.txt", story_path));
+        let story_root = self.data_dir.join("zh_CN/gamedata/story");
+        let full_path = Self::story_file_path(&story_root, story_path)?;
 
         fs::read_to_string(&full_path).map_err(|e| format!("Failed to read story file: {}", e))
+    }
+
+    /// 把游戏表里的剧情相对路径收敛到 story 根目录内。命令层也会校验来自
+    /// WebView 的参数，但索引重建、缩略图提取和 ZIP 安装验收会直接消费
+    /// 用户导入 JSON 里的 `storyTxt`；只守 IPC 边界会让恶意/损坏数据包借
+    /// `../../` 读取应用数据目录外的任意 `.txt` 文件。
+    fn normalize_story_relative_path(relative: &str) -> Result<String, String> {
+        let relative = relative.trim();
+        let invalid = relative.is_empty()
+            || relative.starts_with('/')
+            || relative.starts_with('\\')
+            || relative.contains(':')
+            || relative.contains('\0')
+            || relative
+                .split(['/', '\\'])
+                .any(|part| part.is_empty() || matches!(part, "." | ".."));
+        if invalid {
+            return Err(format!("非法的剧情路径: {}", relative));
+        }
+        Ok(relative.replace('\\', "/"))
+    }
+
+    fn story_file_path(root: &Path, relative: &str) -> Result<PathBuf, String> {
+        let normalized = Self::normalize_story_relative_path(relative)?;
+        Ok(root.join(format!("{}.txt", normalized)))
     }
 
     /// 读取剧情简介
     pub fn read_story_info(&self, info_path: &str) -> Result<String, String> {
         let base_dir = self.data_dir.join("zh_CN/gamedata/story");
 
-        let trimmed = info_path.trim();
-        if trimmed.is_empty() {
-            return Err("Failed to read info file: empty info path".to_string());
-        }
-
-        let normalized = trimmed
-            .trim_matches(|c| c == '/' || c == '\\')
-            .replace('\\', "/");
+        // 简介的 `[uc]info` 回退与普通剧情共享同一套越界规则。
+        let normalized = Self::normalize_story_relative_path(info_path)?;
 
         let mut candidates = Vec::new();
         candidates.push(base_dir.join(format!("{}.txt", normalized)));
@@ -5032,6 +5051,52 @@ mod tests {
             .read_story_info("info/demo/interp")
             .expect("should read interpolated summary");
         assert_eq!(content, "Ave Mujica即将开演。\n博士， 请入席。{保留}");
+
+        let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn all_story_disk_reads_reject_untrusted_relative_paths() {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_root = std::env::temp_dir().join(format!("story_path_guard_{}", timestamp));
+        let story_root = temp_root.join("ArknightsGameData/zh_CN/gamedata/story");
+        fs::create_dir_all(story_root.join("obt/main")).unwrap();
+        fs::write(story_root.join("obt/main/safe.txt"), "safe").unwrap();
+        fs::write(temp_root.join("outside.txt"), "must not be readable").unwrap();
+        let service = DataService {
+            data_dir: temp_root.join("ArknightsGameData"),
+            index_db_path: temp_root.join("story_index.db"),
+        };
+
+        assert_eq!(
+            service.read_story_text(r"obt\main\safe").as_deref(),
+            Ok("safe")
+        );
+        for path in [
+            "",
+            ".",
+            "../outside",
+            "obt/../../outside",
+            r"obt\..\..\outside",
+            "/tmp/outside",
+            r"\\server\share\outside",
+            "C:/outside",
+            "story.txt:stream",
+            "obt//main/safe",
+            "nul\0suffix",
+        ] {
+            assert!(
+                service.read_story_text(path).is_err(),
+                "剧情读取必须拒绝不安全路径 {path:?}"
+            );
+            assert!(
+                service.read_story_info(path).is_err(),
+                "简介读取必须拒绝不安全路径 {path:?}"
+            );
+        }
 
         let _ = fs::remove_dir_all(&temp_root);
     }
