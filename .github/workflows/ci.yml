@@ -27,7 +27,7 @@ defaults:
 
 jobs:
   frontend:
-    name: Frontend (typecheck + build)
+    name: Frontend (tests + typecheck + build)
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -43,9 +43,8 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # 目前没有 test script；加上 --if-present 是为了以后补测试时 CI 自动接上。
       - name: Unit tests
-        run: npm run test --if-present
+        run: npm test
 
       - name: Typecheck
         run: npx tsc --noEmit
@@ -83,9 +82,13 @@ jobs:
         with:
           workspaces: arknights-story-reader/src-tauri -> target
 
-      # 只跑 --lib：解析器、搜索、数据整理的单元测试都在 lib 里，
-      # tests/search_recall.rs 需要真实剧情数据，不适合放进 PR 门禁。
+      # --lib 覆盖解析器、搜索和数据整理等内嵌单元测试。
       # --locked：Cargo.lock 已入库，锁文件过期时直接报错而不是悄悄重新解析。
       - name: cargo test --lib
         run: cargo test --lib --locked
+        working-directory: arknights-story-reader/src-tauri
+
+      # search_recall 的 fixture 层自建微型数据集；真实剧情数据用例均标记为 ignored。
+      - name: Search recall fixture tests
+        run: cargo test --test search_recall --locked
         working-directory: arknights-story-reader/src-tauri
