@@ -245,7 +245,7 @@ jobs:
           echo "  \"fileName\": \"$APK_NAME\"" >> "$JSON_PATH"
           echo "}" >> "$JSON_PATH"
           cat "$JSON_PATH"
-          gh release upload "$TAG" "$JSON_PATH#$JSON_PATH" --clobber
+          gh release upload "$TAG" "$JSON_PATH" --clobber
         working-directory: arknights-story-reader
 
       # 桌面 updater 从 releases/latest/download/latest.json 读取更新 feed（见 TODO 注释）。
