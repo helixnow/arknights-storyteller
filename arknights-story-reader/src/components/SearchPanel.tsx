@@ -29,6 +29,7 @@ import {
   advanceSearchProgress,
   beginIndexProgress,
   beginSearchProgress,
+  hasIndexableSearchAtoms,
   highlightTerms,
   isAutoSearchable,
   isSearchIndexTrusted,
@@ -1493,7 +1494,9 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
       setAnnouncement(
         indexStatus == null && indexError
           ? `${scope}无法确认索引状态，当前空页不是权威零命中`
-          : `${scope}${searchEmptyAnnouncement(indexStatus, indexBusy)}`
+          : !hasIndexableSearchAtoms(lastQuery) && isSearchIndexTrusted(indexStatus, indexBusy)
+            ? `${scope}这次查询没有能进索引的字，假名、西里尔字母或纯标点目前搜不到`
+            : `${scope}${searchEmptyAnnouncement(indexStatus, indexBusy)}`
       );
     }
   }, [
@@ -1858,7 +1861,9 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
           {mode === "segment" ? "未找到包含该关键词的段落" : "未找到相关剧情"}
         </div>
         <p className="text-xs leading-relaxed text-[hsl(var(--color-muted-foreground))]">
-          索引是完整的，确实没有匹配项。可以换个说法，或者改用另一种搜索粒度。
+          {!hasIndexableSearchAtoms(lastQuery || query)
+            ? "索引目前只收录汉字和英文/数字。假名、西里尔字母或纯标点进不了索引，会得到空结果。请改用中文名、代号或英文。"
+            : "索引是完整的，确实没有匹配项。可以换个说法，或者改用另一种搜索粒度。"}
         </p>
         {mode === "segment" ? (
           <Button variant="outline" className="min-h-[44px]" onClick={() => switchMode("story")}>
@@ -2465,6 +2470,10 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
                     <div>
                       <span className="font-mono text-[hsl(var(--color-foreground))]">"短语"</span>
                       <span className="ml-2">用英文引号匹配精确短语。中文默认按单字 AND，搜「凯尔希」请写成 <code>"凯尔希"</code></span>
+                    </div>
+                    <div>
+                      <span className="font-mono text-[hsl(var(--color-foreground))]">可检索字符</span>
+                      <span className="ml-2">目前只索引汉字与英文/数字。日文假名、西里尔等会得到空结果，请改用中文名或代号</span>
                     </div>
                     <div>
                       <span className="font-mono text-[hsl(var(--color-foreground))]">↑ ↓ Enter</span>

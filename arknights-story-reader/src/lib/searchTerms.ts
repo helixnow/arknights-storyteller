@@ -128,6 +128,20 @@ export function isAutoSearchable(raw: string): boolean {
   return false;
 }
 
+/**
+ * 查询里是否至少有一个能落进索引的正向原子。假名、西里尔、纯标点、
+ * 纯否定在后端都是静态空集；强制回车也会零命中，空态不该说「确实没有匹配」。
+ */
+export function hasIndexableSearchAtoms(raw: string): boolean {
+  const query = normalizeQuery(raw);
+  if (!query) return false;
+  for (const term of parseQueryTerms(query)) {
+    if (term.isNot) continue;
+    if (atomLengthOf(term.text) > 0) return true;
+  }
+  return false;
+}
+
 /** 单个查询词条：text 已剥掉引号/减号等语法字符，isNot 标记它被排除。 */
 interface ParsedTerm {
   text: string;

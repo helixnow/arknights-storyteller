@@ -14,6 +14,7 @@ import {
   advanceSearchProgress,
   beginIndexProgress,
   beginSearchProgress,
+  hasIndexableSearchAtoms,
   highlightTerms,
   isAutoSearchable,
   isIndexProgressTerminal,
@@ -346,6 +347,16 @@ test("isAutoSearchable：全角 ＮＯＴ／－／＂ 经 NFKC 折叠后同样�
   assert.equal(isAutoSearchable("＂博士"), false);
   // 折叠后配对完整则照常可搜。
   assert.equal(isAutoSearchable("＂博士＂"), true);
+});
+
+test("hasIndexableSearchAtoms：假名、纯标点、纯否定没有索引原子", () => {
+  assert.equal(hasIndexableSearchAtoms("アイ"), false);
+  assert.equal(hasIndexableSearchAtoms("！！"), false);
+  assert.equal(hasIndexableSearchAtoms("-博士"), false);
+  assert.equal(hasIndexableSearchAtoms("not 博士"), false);
+  assert.equal(hasIndexableSearchAtoms("凯尔希"), true);
+  assert.equal(hasIndexableSearchAtoms("doctor"), true);
+  assert.equal(hasIndexableSearchAtoms("博士 アイ"), true);
 });
 
 test("isAutoSearchable：没有正向词的查询不自动发（后端静态空集）", () => {
