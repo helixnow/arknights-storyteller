@@ -185,14 +185,22 @@ export function StoryInsightsPanel({
             </Button>
           </div>
           <div className="space-y-1 text-sm text-[hsl(var(--color-muted-foreground))]">
-            {decision.options.map((option, optionIndex) => (
-              <div key={optionIndex} className="flex gap-2 leading-relaxed">
-                <span className="text-[hsl(var(--color-primary))] tabular-nums font-medium">
-                  {optionIndex + 1}.
-                </span>
-                <span className="flex-1">{option}</span>
-              </div>
-            ))}
+            {decision.options.map((option, optionIndex) => {
+              const value = decision.values?.[optionIndex]?.trim();
+              return (
+                <div key={optionIndex} className="flex items-start gap-2 leading-relaxed">
+                  <span className="text-[hsl(var(--color-primary))] tabular-nums font-medium">
+                    {optionIndex + 1}.
+                  </span>
+                  <span className="min-w-0 flex-1">{option}</span>
+                  {value ? (
+                    <span className="max-w-[40%] flex-shrink-0 truncate text-[11px] uppercase tracking-wider opacity-75">
+                      {value}
+                    </span>
+                  ) : null}
+                </div>
+              );
+            })}
           </div>
         </SheetGroup>
       )),

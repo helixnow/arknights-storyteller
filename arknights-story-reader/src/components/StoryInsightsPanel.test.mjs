@@ -16,3 +16,12 @@ test("导览清理操作：清空与清除高亮同时满足 44px 最小触控�
     assert.match(button, /min-w-\[44px\]/);
   }
 });
+
+test("导览抉择：选项携带 value 时同步展示，空白标签不占位", async () => {
+  const source = await readFile(
+    new URL("./StoryInsightsPanel.tsx", import.meta.url),
+    "utf8"
+  );
+  assert.match(source, /const value = decision\.values\?\.\[optionIndex\]\?\.trim\(\)/);
+  assert.match(source, /\{value \? \([\s\S]*?\{value\}[\s\S]*?\) : null\}/);
+});
