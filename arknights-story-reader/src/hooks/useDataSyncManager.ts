@@ -8,6 +8,7 @@ import {
   isFailureSyncProgress,
   isTerminalSyncProgress,
   localizeDataError,
+  shouldAbortImportTransfer,
   syncProgressLingerMs,
 } from "@/hooks/dataSyncUtils";
 import {
@@ -131,6 +132,7 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
   /** loadVersionInfo 的代际号：慢的旧请求不许覆盖新请求已写入的结果。 */
   const loadSeqRef = useRef(0);
   const onSuccessRef = useRef(onSuccess);
+  const importCancelRef = useRef(false);
 
   useEffect(() => {
     onSuccessRef.current = onSuccess;
@@ -370,6 +372,7 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
     async (file: File, options: { transferredJob?: () => void } = {}) => {
       await runImport(`正在准备暂存 ${file.name}`, async () => {
         devLog("[useDataSyncManager] 导入 ZIP 字节数:", file.size);
+        importCancelRef.current = false;
         // 绝不能 file.arrayBuffer() 一口吞：整包会先占满 JS 堆，再被
         // IPC 序列化成 JSON 数字数组，几百 MB 的 ZIP 在 Android 上直接
         // OOM。改成逐块 slice → base64 → 追加到后端暂存文件，最后一块
@@ -378,6 +381,9 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
         let offset = 0;
         try {
           do {
+            if (shouldAbortImportTransfer(importCancelRef.current)) {
+              throw new Error("操作已取消");
+            }
             const end = Math.min(offset + IMPORT_CHUNK_BYTES, total);
             const chunk = await blobToBase64(file.slice(offset, end));
             const isLast = end >= total;
@@ -447,6 +453,10 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
     progressIsFailureRef.current = false;
   }, [cancelAutoClear]);
 
+  const cancelImportTransfer = useCallback(() => {
+    importCancelRef.current = true;
+  }, []);
+
   const status = useMemo(() => {
     // 后端约定：只有数据集真的不存在才返回「未安装」；已安装但 version.json
     // 缺失/损坏时返回「本地数据（版本未知）」。空串意味着还没加载出来或读取
@@ -486,6 +496,7 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
     handleSync,
     importFromFile,
     importFromPath,
+    cancelImportTransfer,
     loadVersionInfo,
     resetProgress,
   };

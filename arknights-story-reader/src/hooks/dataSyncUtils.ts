@@ -114,6 +114,27 @@ export function localizeDataError(error: unknown, fallback = "操作失败"): st
   return /[\u4e00-\u9fff]/.test(text) ? safeText : `${fallback}：${safeText}`;
 }
 
+export type SyncDialogCloseAction = "block" | "settle-parked" | "background" | "idle";
+
+/**
+ * 同步对话框的关闭策略：确认框还在时不能关；真实同步/导入只把对话框
+ * 收到后台；等文件选择器时要收尾寄存锁。
+ */
+export function planSyncDialogClose(input: {
+  busy: boolean;
+  preparingSync: boolean;
+  preparingImport: boolean;
+}): SyncDialogCloseAction {
+  if (input.preparingSync) return "block";
+  if (input.busy) return "background";
+  if (input.preparingImport) return "settle-parked";
+  return "idle";
+}
+
+export function shouldAbortImportTransfer(cancelled: boolean): boolean {
+  return cancelled === true;
+}
+
 export type ImportCleanupResult = "cleaned" | "deferred";
 
 export function describeImportTransferFailure(

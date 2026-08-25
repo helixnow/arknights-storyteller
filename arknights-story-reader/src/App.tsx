@@ -17,7 +17,7 @@ import { BACK_PRIORITY, useBackHandler } from "@/hooks/useBackHandler";
 import { useAutoIndex } from "@/hooks/useAutoIndex";
 import { flushReadingProgressWrites } from "@/hooks/useReadingProgress";
 import { useLegacyStorageCleanup } from "@/hooks/useLegacyStorageCleanup";
-import { ToastProvider } from "@/components/ui/toast";
+import { ToastProvider, useToast } from "@/components/ui/toast";
 import { READER_RETENTION_MS } from "@/lib/appShellLogic";
 
 const TABS = ["home", "stories", "characters", "search", "settings"] as const;
@@ -44,8 +44,16 @@ interface ReaderIntent {
   jump?: ReaderJump;
 }
 
+function AppUpdaterHost() {
+  const toast = useToast();
+  useAppUpdater({
+    notify: (message, kind) =>
+      toast.show(message, { kind: kind === "warning" ? "warning" : "default", duration: 5000 }),
+  });
+  return null;
+}
+
 function App() {
-  useAppUpdater();
   useAutoIndex();
   useLegacyStorageCleanup();
   const [activeTab, setActiveTab] = useState<Tab>("home");
@@ -341,6 +349,7 @@ function App() {
   return (
     <ThemeProvider defaultTheme="system" storageKey="story-teller-theme">
       <ToastProvider>
+        <AppUpdaterHost />
         <FavoritesProvider>
           <AppPreferencesProvider>
             <CharacterResolverProvider>{appContent}</CharacterResolverProvider>

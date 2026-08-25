@@ -29,3 +29,31 @@ export function isCharacterStatsEpochCurrent(
 ): boolean {
   return runEpoch === currentEpoch;
 }
+
+/**
+ * 阅读器盖上或面板切走时，人物扫描 / 金句抓取必须让出 IPC。
+ * 代际过期则直接结束，不要空等。
+ */
+export function characterStatsIpcShouldYield(
+  panelActive: boolean,
+  epochCurrent: boolean
+): boolean {
+  return epochCurrent && !panelActive;
+}
+
+export async function waitWhileCharacterStatsYields({
+  isActive,
+  isCurrent,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  intervalMs = 250,
+}: {
+  isActive: () => boolean;
+  isCurrent: () => boolean;
+  sleep?: (ms: number) => Promise<void>;
+  intervalMs?: number;
+}): Promise<boolean> {
+  while (characterStatsIpcShouldYield(isActive(), isCurrent())) {
+    await sleep(intervalMs);
+  }
+  return isCurrent();
+}

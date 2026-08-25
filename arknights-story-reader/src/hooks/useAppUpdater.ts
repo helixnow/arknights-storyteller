@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { addPluginListener, invoke } from "@tauri-apps/api/core";
 import { acquireDataJobWhenIdle } from "@/hooks/useDataSyncManager";
@@ -512,7 +512,12 @@ let autoUpdateFlowStarted = false;
  */
 const INSTALL_LOCK_WAIT_MS = 5 * 60_000;
 
-export function useAppUpdater() {
+export function useAppUpdater(options?: {
+  notify?: (message: string, kind?: "info" | "warning") => void;
+}) {
+  const notifyRef = useRef(options?.notify);
+  notifyRef.current = options?.notify;
+
   useEffect(() => {
     if (autoUpdateFlowStarted || !isTauriEnvironment()) return;
     autoUpdateFlowStarted = true;
@@ -609,6 +614,7 @@ export function useAppUpdater() {
           return;
         }
         userConfirmedInstall = true;
+        notifyRef.current?.("已在后台下载更新包，完成后会自动拉起安装器");
 
         const releaseJob = await acquireDataJobWhenIdle("update", INSTALL_LOCK_WAIT_MS);
         if (!releaseJob) {

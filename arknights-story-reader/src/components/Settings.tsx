@@ -160,6 +160,7 @@ export function Settings() {
     handleSync,
     importFromFile,
     importFromPath,
+    cancelImportTransfer,
     loadVersionInfo,
     resetProgress,
   } = useDataSyncManager({
@@ -884,6 +885,15 @@ export function Settings() {
                           )}
                         </div>
                         <p className="text-xs text-[hsl(var(--color-muted-foreground))]">{progress.message}</p>
+                        {importing && progress.phase === "暂存" && (
+                          <Button
+                            variant="outline"
+                            className="min-h-[44px]"
+                            onClick={() => cancelImportTransfer()}
+                          >
+                            取消导入
+                          </Button>
+                        )}
                       </>
                     ) : (
                       <>

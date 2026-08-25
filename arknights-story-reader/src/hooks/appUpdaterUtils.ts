@@ -163,6 +163,13 @@ export interface AndroidManifestData {
   notes?: string | null;
 }
 
+export function isAllowedAndroidDownloadProtocol(
+  protocol: string,
+  allowInsecure = false
+): boolean {
+  return protocol === "https:" || (allowInsecure && protocol === "http:");
+}
+
 export function validateAndroidFeedUrl(feed: string): string {
   let parsed: URL;
   try {
@@ -170,8 +177,14 @@ export function validateAndroidFeedUrl(feed: string): string {
   } catch {
     throw new Error("android-latest.json 更新源地址无效");
   }
-  if (!/^https?:$/.test(parsed.protocol) || !parsed.pathname.endsWith("/android-latest.json")) {
-    throw new Error("Android 更新必须使用 android-latest.json");
+  const allowInsecure = import.meta.env?.DEV === true;
+  if (
+    !(
+      isAllowedAndroidDownloadProtocol(parsed.protocol, allowInsecure) &&
+      parsed.pathname.endsWith("/android-latest.json")
+    )
+  ) {
+    throw new Error("Android 更新必须使用 https 上的 android-latest.json");
   }
   return parsed.toString();
 }
@@ -191,8 +204,9 @@ export function parseAndroidManifest(input: unknown): AndroidManifestData {
   } catch {
     throw new Error("更新 manifest 下载地址无效");
   }
-  if (!/^https?:$/.test(parsedUrl.protocol)) {
-    throw new Error("更新 manifest 下载地址无效");
+  const allowInsecure = import.meta.env?.DEV === true;
+  if (!isAllowedAndroidDownloadProtocol(parsedUrl.protocol, allowInsecure)) {
+    throw new Error("更新 manifest 下载地址必须使用 https");
   }
 
   const fileName =

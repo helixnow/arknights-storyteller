@@ -9,7 +9,7 @@ import {
   useDataSyncManager,
 } from "@/hooks/useDataSyncManager";
 import { safeConfirm } from "@/hooks/useAppUpdater";
-import { progressPercent } from "@/hooks/dataSyncUtils";
+import { planSyncDialogClose, progressPercent } from "@/hooks/dataSyncUtils";
 
 interface SyncDialogProps {
   open: boolean;
@@ -50,6 +50,7 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
     status,
     handleSync,
     importFromFile,
+    cancelImportTransfer,
     loadVersionInfo,
     resetProgress,
   } = useDataSyncManager({ active: open, onSuccess });
@@ -67,11 +68,10 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
   const [importAwaitingConfirm, setImportAwaitingConfirm] = useState(false);
 
   useEffect(() => {
-    if (!open) {
-      resetProgress();
-      setError(null);
-    }
-  }, [open, resetProgress, setError]);
+    if (open || busy) return;
+    resetProgress();
+    setError(null);
+  }, [open, busy, resetProgress, setError]);
 
   // 数据可能在别处被换掉（设置页的同步/导入）：本对话框在数据未安装时会
   // 自动弹出并跨 tab 常开，用户切去设置页装完数据再切回来，这里若不跟着
@@ -218,16 +218,19 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
   }, []);
 
   const handleClose = useCallback(() => {
-    // 真正的同步/导入不能伪装成已取消；仅处于导入准备态、尚未开始导入时
-    // 则允许关闭，并同步释放寄存锁，不能让无失焦平台一直卡到兜底超时。
-    if (busy || preparingSync || (preparingImport && importing)) return;
+    const action = planSyncDialogClose({ busy, preparingSync, preparingImport });
+    if (action === "block") return;
+    // 真实同步/导入只把对话框收起，任务和进度监听继续跑。
+    if (action === "background") {
+      onClose();
+      return;
+    }
     settleParkedImport();
     resetProgress();
     setError(null);
     onClose();
   }, [
     busy,
-    importing,
     onClose,
     preparingImport,
     preparingSync,
@@ -557,15 +560,24 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
             <Button
               variant="outline"
               onClick={handleClose}
-              disabled={busy || preparingSync || preparingImport}
+              disabled={preparingSync}
               className="flex-1 min-h-[44px]"
             >
-              关闭
+              {busy ? "后台继续" : "关闭"}
             </Button>
+            {importing && progress?.phase === "暂存" && (
+              <Button
+                variant="outline"
+                className="flex-1 min-h-[44px]"
+                onClick={() => cancelImportTransfer()}
+              >
+                取消导入
+              </Button>
+            )}
             <Button
               onClick={async () => {
                 if (actionsDisabled) return;
-                if (status === "up-to-date") {
+                if (status === "up-to-date" || status === "not-installed") {
                   // 与设置页 handleSyncClick 同一纪律：确认框是异步的，弹着的
                   // 这段时间锁必须先占住。空着的话，自动索引的重试定时器或排队
                   // 等锁的自动更新安装（拿到锁会直接重启进程）随时抢入，用户
@@ -579,8 +591,10 @@ export function SyncDialog({ open, onClose, onSuccess }: SyncDialogProps) {
                   let ok = false;
                   try {
                     ok = await safeConfirm(
-                      "当前已是最新。再次同步会重新下载并覆盖本机数据，确定继续？",
-                      { title: "重新同步", kind: "warning" }
+                      status === "not-installed"
+                        ? "将从 GitHub 下载完整剧情数据包（通常几百 MB，建议连 Wi-Fi），确定开始？"
+                        : "当前已是最新。再次同步会重新下载并覆盖本机数据，确定继续？",
+                      { title: status === "not-installed" ? "同步剧情数据" : "重新同步", kind: "warning" }
                     );
                   } finally {
                     // handleSync 自己抢锁，这里必须先放。放锁与它的抢锁在同一个

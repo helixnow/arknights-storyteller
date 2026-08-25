@@ -9,7 +9,9 @@ import {
   isDialogPluginUnavailableError,
   isTerminalSyncProgress,
   localizeDataError,
+  planSyncDialogClose,
   progressPercent,
+  shouldAbortImportTransfer,
   syncProgressLingerMs,
 } from "./dataSyncUtils.ts";
 
@@ -104,6 +106,21 @@ test("分块失败且中止失败时不谎称清理完成", () => {
   assert.match(message, /未能立即清理/);
   assert.match(message, /超时后自动释放/);
   assert.doesNotMatch(message, /已清理/);
+});
+
+test("同步对话框：确认中禁止关，忙时只收到后台，等文件时收尾寄存锁", () => {
+  assert.equal(planSyncDialogClose({ busy: false, preparingSync: true, preparingImport: false }), "block");
+  assert.equal(planSyncDialogClose({ busy: true, preparingSync: false, preparingImport: false }), "background");
+  assert.equal(
+    planSyncDialogClose({ busy: false, preparingSync: false, preparingImport: true }),
+    "settle-parked"
+  );
+  assert.equal(planSyncDialogClose({ busy: false, preparingSync: false, preparingImport: false }), "idle");
+});
+
+test("分块导入循环在用户取消后停止继续传块", () => {
+  assert.equal(shouldAbortImportTransfer(true), true);
+  assert.equal(shouldAbortImportTransfer(false), false);
 });
 
 test("只有插件注册或 ACL 缺失才回退第二选择器", () => {

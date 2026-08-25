@@ -102,10 +102,8 @@ test("文件选择器 cancel 事件立即释放寄存导入锁与准备态", () 
   assert.match(settingsSource, cancelHandler);
 });
 
-test("等待文件期间关闭会收尾寄存锁，真实导入仍禁止关闭", () => {
-  assert.match(
-    syncDialogSource,
-    /if \(busy \|\| preparingSync \|\| \(preparingImport && importing\)\) return;/
-  );
+test("等待文件期间关闭会收尾寄存锁，真实同步只把对话框收到后台", () => {
+  assert.match(syncDialogSource, /planSyncDialogClose\(\{ busy, preparingSync, preparingImport \}\)/);
+  assert.match(syncDialogSource, /action === "background"/);
   assert.match(syncDialogSource, /settleParkedImport\(\);\s*resetProgress\(\);/);
 });

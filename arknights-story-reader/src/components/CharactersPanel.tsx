@@ -24,8 +24,11 @@ import { BACK_PRIORITY, useBackHandler } from "@/hooks/useBackHandler";
 import {
   isCharacterStatsEpochCurrent,
   planCharacterStatsDataUpdate,
+  waitWhileCharacterStatsYields,
 } from "@/lib/characterStatsRefresh";
 import { applyInstantScroll } from "@/lib/appShellLogic";
+import { localizeBackendError } from "@/hooks/useDataSyncManager";
+import { useToast } from "@/components/ui/toast";
 
 interface CharactersPanelProps {
   active?: boolean;
@@ -347,6 +350,7 @@ export function CharactersPanel({
   onOpenStory,
   onOpenStoryJump,
 }: CharactersPanelProps) {
+  const toast = useToast();
   const [loading, setLoading] = useState(true);
   const [progress, setProgress] = useState({ current: 0, total: 0 });
   const [error, setError] = useState<string | null>(null);
@@ -619,6 +623,14 @@ export function CharactersPanel({
         const worker = async () => {
           // 面板卸载或数据换包后剩下的几千次读取直接放弃，不再排队占用 IPC。
           while (isCurrent()) {
+            if (
+              !(await waitWhileCharacterStatsYields({
+                isActive: () => activeRef.current,
+                isCurrent,
+              }))
+            ) {
+              return;
+            }
             const i = cursor++;
             if (i >= stories.length) return;
             const story = stories[i];
@@ -715,7 +727,7 @@ export function CharactersPanel({
         // 已经过期。不清掉的话，未安装空态和错误卡会叠在一起（各带一个
         // 「去设置同步」/「重试」按钮），两句话互相矛盾。
         setNotInstalled(false);
-        setError(raw || "加载失败");
+        setError(localizeBackendError(raw || err, "加载失败"));
       }
     } finally {
       if (aliveRef.current) setLoading(false);
@@ -865,9 +877,14 @@ export function CharactersPanel({
   // 详情开着的时候数据可能被重扫（同步完成后改名/删档），selected 就悬空
   // 了：详情块因为 selectedAgg 为 null 不渲染，网格又因为 selected 非空不
   // 渲染——正文区只剩一块白屏。统计落定后名字不在了就自动退回列表。
+  const toastRef = useRef(toast);
+  toastRef.current = toast;
   useEffect(() => {
     if (loading || !selected) return;
-    if (!aggregates.has(selected)) setSelected(null);
+    if (!aggregates.has(selected)) {
+      setSelected(null);
+      toastRef.current.show("数据已更新，该角色统计已刷新", { kind: "default" });
+    }
   }, [aggregates, loading, selected]);
 
   const groupedByChapter = useMemo(() => {
@@ -950,6 +967,14 @@ export function CharactersPanel({
 
     const worker = async () => {
       while (live()) {
+        if (
+          !(await waitWhileCharacterStatsYields({
+            isActive: () => activeRef.current,
+            isCurrent: live,
+          }))
+        ) {
+          return;
+        }
         if (collected.length >= QUOTE_HARD_CAP) return;
         const i = cursor++;
         if (i >= targets.length) return;

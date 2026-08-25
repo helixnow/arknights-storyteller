@@ -7,6 +7,7 @@ import {
   compareVersions,
   describeUpdateError,
   normalizeAndroidDownloadProgress,
+  isAllowedAndroidDownloadProtocol,
   parseAndroidManifest,
   validateAndroidFeedUrl,
 } from "./appUpdaterUtils.ts";
@@ -90,6 +91,13 @@ test("Android feed 拒绝非 HTTP 协议", () => {
   assert.throws(() => validateAndroidFeedUrl("file:///tmp/android-latest.json"), /android-latest/);
 });
 
+test("Android 下载协议：正式环境只接受 https，调试才放行 http", () => {
+  assert.equal(isAllowedAndroidDownloadProtocol("https:"), true);
+  assert.equal(isAllowedAndroidDownloadProtocol("http:"), false);
+  assert.equal(isAllowedAndroidDownloadProtocol("http:", true), true);
+  assert.equal(isAllowedAndroidDownloadProtocol("file:"), false);
+});
+
 test("Android manifest 规范化合法字段", () => {
   assert.deepEqual(
     parseAndroidManifest({
@@ -126,9 +134,10 @@ test("Android manifest 拒绝危险文件名", () => {
 test("Android manifest 拒绝非网络下载地址", () => {
   assert.throws(
     () => parseAndroidManifest({ version: "1.2.3", url: "file:///sdcard/app.apk" }),
-    /下载地址无效/
+    /https|下载地址/
   );
 });
+
 
 test("Android 安装只接受权限需求或已拉起安装器", () => {
   assert.equal(classifyAndroidInstallResponse({ needsPermission: true }), "needs-permission");
