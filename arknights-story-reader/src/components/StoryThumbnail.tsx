@@ -17,6 +17,10 @@ import {
   pickLiveCandidate,
 } from "@/lib/assetUrls";
 import type { StoryEntry } from "@/types/story";
+import {
+  getStoryThumbnailSources,
+  thumbnailCandidateTransition,
+} from "@/components/storyThumbnailSources";
 
 /**
  * 剧情列表/首页上的缩略图。优先展示该关卡剧情里真正出现的那张插画；
@@ -43,29 +47,15 @@ export function StoryThumbnail({
   // 缩略图和卡片模糊背景里各渲染一次，两处拿到的是同一个数组引用，字符串
   // 拼接也只做一次。
   const candidates = useMemo(() => {
-    const urls: string[] = [];
-
-    if (previewToken) {
-      urls.push(...peekAssetCandidates(previewToken.kind, previewToken.token));
-    }
-
-    const storyTxt = story.storyTxt ?? "";
-    const group = story.storyGroup ?? "";
-    if (!group) {
-      // 没 group，没法兜底
-    } else if (storyTxt.startsWith("obt/main/")) {
-      urls.push(...peekAssetCandidates("chapter_cover", group));
-    } else if (storyTxt.startsWith("activities/")) {
-      urls.push(...peekAssetCandidates("activity_kv", group));
-    }
-
+    const urls = getStoryThumbnailSources(story, previewToken).flatMap(({ kind, token }) =>
+      peekAssetCandidates(kind, token)
+    );
     return Array.from(new Set(urls));
-  }, [previewToken, story.storyTxt, story.storyGroup]);
+  }, [previewToken, story.storyGroup, story.storyPic, story.storyTxt]);
 
   // ---- 图片加载状态 ----
-  // 用 ref 跟踪"当前成功加载的 URL"，当 candidates 变化时，如果已成功的
-  // URL 仍在新列表中，就保持显示，不重置。这避免了 token 异步回来后把已经
-  // 显示好的图片闪掉再重新加载的问题。
+  // 用 ref 跟踪当前成功加载的 URL。候选变化后它仍是首选就原位保留；若
+  // 篇内插画晚到、把它挤到后面，则作为 bridge 垫底并从新首选开始升级。
   const loadedUrlRef = useRef<string | null>(null);
   /** 有失败发生在离线窗口内（没写进共享失败缓存），等 online 后要重试。 */
   const offlineFailedRef = useRef(false);
@@ -74,6 +64,8 @@ export function StoryThumbnail({
   // React 对同一个 key/src 再发请求。
   const [requestNonce, setRequestNonce] = useState(0);
   const [loaded, setLoaded] = useState(false);
+  /** 篇内插画晚到时用已解码的章节/活动封面垫底，直到新首选解码完成。 */
+  const [bridgeUrl, setBridgeUrl] = useState<string | null>(null);
 
   // candidates 变了就同步 state（React 允许在 render 中条件性 setState，
   // 只要不会无限循环）。
@@ -83,14 +75,12 @@ export function StoryThumbnail({
     appliedKeyRef.current = candidatesKey;
     offlineFailedRef.current = false;
     setRequestNonce(0);
-    const keptIdx = loadedUrlRef.current ? candidates.indexOf(loadedUrlRef.current) : -1;
-    if (keptIdx >= 0) {
-      setCursor(keptIdx);
-      setLoaded(true);
-    } else {
+    const transition = thumbnailCandidateTransition(candidates, loadedUrlRef.current);
+    setCursor(transition.cursor);
+    setLoaded(transition.loaded);
+    setBridgeUrl(transition.bridgeUrl);
+    if (!transition.loaded && !transition.bridgeUrl) {
       loadedUrlRef.current = null;
-      setCursor(0);
-      setLoaded(false);
     }
   }
 
@@ -103,13 +93,14 @@ export function StoryThumbnail({
   // 渐变兜底上。真正失败过的 URL 仍被 deadUrls 跳过，不会原地打转；
   // 图片正常显示时不订阅，零开销。
   const stuck = live === null && candidates.length > 0;
+  const visuallyLoaded = Boolean(live && loadedUrlRef.current === live.url) || loaded;
   const healthNonce = useAssetHealthNonce(stuck);
   const healthNonceRef = useRef(healthNonce);
   const healthRecoveryAction = getAssetRecoveryAction(
     healthNonceRef.current,
     healthNonce,
     stuck,
-    stuck || (live !== null && !(loaded && loadedUrlRef.current === live.url))
+    stuck || (live !== null && !visuallyLoaded)
   );
   if (healthRecoveryAction === "retry") {
     healthNonceRef.current = healthNonce;
@@ -146,6 +137,13 @@ export function StoryThumbnail({
   if (loaded && loadedUrlRef.current !== (live?.url ?? null)) {
     setLoaded(false);
   }
+
+  // bridge 也要尊重共享失败表/host 熔断。另一条渲染路径已证明它失效时，
+  // 不能为了无闪烁继续把旧图钉在屏幕上。
+  const liveBridge =
+    bridgeUrl && bridgeUrl !== live?.url
+      ? pickLiveCandidate([bridgeUrl], 0)?.url ?? null
+      : null;
 
   // 解码放到主线程之外：滚动时一张 1920px 的活动 KV 同步解码足以掉帧。
   // 解码完成前保持兜底色块，完成后再淡入，避免"半张图"闪现。
@@ -186,8 +184,20 @@ export function StoryThumbnail({
           既不会在图片到位的瞬间产生一次 DOM 增删，也不会有任何布局位移。 */}
       <GradientFallback
         seed={story.storyGroup || story.storyId}
-        hidden={Boolean(live) && loaded}
+        hidden={(Boolean(live) && visuallyLoaded) || Boolean(liveBridge)}
       />
+      {liveBridge ? (
+        <img
+          src={liveBridge}
+          alt=""
+          aria-hidden="true"
+          loading="eager"
+          decoding="async"
+          referrerPolicy="no-referrer"
+          draggable={false}
+          className={cn("absolute inset-0 h-full w-full object-cover", tintClass)}
+        />
+      ) : null}
       {live ? (
         <img
           key={`${live.url}::${requestNonce}`}
@@ -206,6 +216,7 @@ export function StoryThumbnail({
               if (!mountedRef.current || currentUrlRef.current !== url) return;
               loadedUrlRef.current = url;
               offlineFailedRef.current = false;
+              setBridgeUrl(null);
               setLoaded(true);
             };
             if (typeof img.decode === "function") {
@@ -237,7 +248,7 @@ export function StoryThumbnail({
           className={cn(
             "absolute inset-0 h-full w-full object-cover motion-safe:transition-opacity motion-safe:duration-300",
             tintClass,
-            loaded ? "opacity-100" : "opacity-0"
+            visuallyLoaded ? "opacity-100" : "opacity-0"
           )}
         />
       ) : null}

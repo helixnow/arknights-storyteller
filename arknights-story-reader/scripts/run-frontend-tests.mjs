@@ -32,7 +32,11 @@ args.push(
   path.join("src", "hooks", "useReadingProgress.test.mjs"),
   path.join("src", "hooks", "useHighlights.test.mjs"),
   path.join("src", "hooks", "useEdgeSwipeBack.test.mjs"),
-  path.join("src", "components", "StoryInsightsPanel.test.mjs")
+  path.join("src", "components", "StoryInsightsPanel.test.mjs"),
+  path.join("src", "components", "storyListState.test.mjs"),
+  path.join("src", "components", "homeState.test.mjs"),
+  path.join("src", "components", "storyThumbnailSources.test.mjs"),
+  path.join("src", "hooks", "storyPreviewCache.test.mjs")
 );
 
 const result = spawnSync(process.execPath, args, {

@@ -171,3 +171,14 @@ test("进度失败重试：外部窗口即使复用 updatedAt，只要内容变�
   assert.equal(shouldRetryFailedProgress(baseline, external), false);
   assert.equal(shouldRetryFailedProgress(null, external), false);
 });
+
+test("生产 hook 使用经过双边钳位的进度节流 helper", async () => {
+  const source = (await readFile(new URL("./useReadingProgress.ts", import.meta.url), "utf8")).replace(
+    /\s+/g,
+    " "
+  );
+  assert.match(
+    source,
+    /const delay = progressPersistDelay\(Date\.now\(\), lastWriteRef\.current\);/
+  );
+});
