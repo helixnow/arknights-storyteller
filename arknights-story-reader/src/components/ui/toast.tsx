@@ -10,6 +10,7 @@ import {
 } from "react";
 import { cn } from "@/lib/utils";
 import { CheckCircle2, Info, X, XCircle, AlertTriangle } from "lucide-react";
+import { calculateKeyboardInset, enqueueToast, toastViewportZIndex } from "@/lib/appShellLogic";
 
 export type ToastKind = "default" | "success" | "warning" | "error";
 
@@ -31,6 +32,7 @@ const ToastContext = createContext<ToastContextValue | null>(null);
 
 /** 同屏最多堆叠的条数；溢出的紧急提示排队，绝不挤掉仍在计时的错误。 */
 const MAX_VISIBLE = 3;
+const URGENT_KINDS = new Set<ToastKind>(["warning", "error"]);
 
 /* 失败信息通常更长、也更需要用户读完再决定下一步，所以给它明显更长的停留
    时间；成功/普通提示只是确认动作，快速消失反而不打扰。 */
@@ -66,9 +68,56 @@ const ICON_CLASSES: Record<ToastKind, string> = {
   error: "text-[hsl(var(--color-status-error))]",
 };
 
+const KEYBOARD_INSET_VAR = "--keyboard-inset";
+const TOAST_Z_VAR = "--toast-z";
+
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [toasts, setToasts] = useState<ToastPayload[]>([]);
   const nextId = useRef(1);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    const syncKeyboard = () => {
+      const viewport = window.visualViewport;
+      const inset = viewport
+        ? calculateKeyboardInset(window.innerHeight, viewport.height, viewport.offsetTop)
+        : 0;
+      root.style.setProperty(KEYBOARD_INSET_VAR, `${inset}px`);
+    };
+    syncKeyboard();
+    window.visualViewport?.addEventListener("resize", syncKeyboard);
+    window.visualViewport?.addEventListener("scroll", syncKeyboard);
+    window.addEventListener("resize", syncKeyboard);
+    return () => {
+      window.visualViewport?.removeEventListener("resize", syncKeyboard);
+      window.visualViewport?.removeEventListener("scroll", syncKeyboard);
+      window.removeEventListener("resize", syncKeyboard);
+      root.style.removeProperty(KEYBOARD_INSET_VAR);
+    };
+  }, []);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    const syncModal = () => {
+      const hasModal = Boolean(document.querySelector('[aria-modal="true"]'));
+      root.style.setProperty(TOAST_Z_VAR, String(toastViewportZIndex(hasModal)));
+    };
+    syncModal();
+    const observer =
+      typeof MutationObserver === "undefined"
+        ? null
+        : new MutationObserver(syncModal);
+    observer?.observe(document.body, {
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["aria-modal"],
+      childList: true,
+    });
+    return () => {
+      observer?.disconnect();
+      root.style.removeProperty(TOAST_Z_VAR);
+    };
+  }, []);
 
   const remove = useCallback((id: number) => {
     setToasts((prev) => prev.filter((t) => t.id !== id));
@@ -84,17 +133,10 @@ export function ToastProvider({ children }: { children: ReactNode }) {
         duration: options?.duration ?? DEFAULT_DURATION[kind],
       };
       setToasts((prev) => {
-        if (prev.length < MAX_VISIBLE) return [...prev, payload];
-        // 只从当前可见的三条里挤普通/成功提示。数组尾部可能已有排队中的
-        // 错误；把搜索范围扩到整列会误删一条尚未展示、计时器都没启动的提示。
-        const evict = prev
-          .slice(0, MAX_VISIBLE)
-          .findIndex((t) => t.kind !== "error" && t.kind !== "warning");
-        if (evict !== -1) return [...prev.filter((_, i) => i !== evict), payload];
-        // 三个可见位全是错误/警告时，新紧急提示留在队尾；前面的提示关闭或
-        // 到期后它才挂载并开始自己的完整倒计时。普通/成功提示直接丢弃，
-        // 避免一句迟到数秒的「已复制」在故障提示读完后反而冒出来误导用户。
-        return kind === "error" || kind === "warning" ? [...prev, payload] : prev;
+        // 只从当前可见窗口里挤普通/成功提示；排队中的错误保持 FIFO，直到
+        // 真正挂载才开始自己的完整倒计时。可见位已满时普通提示直接丢弃，
+        // 避免迟到数秒的「已复制」在故障提示读完后反而冒出来误导用户。
+        return enqueueToast(prev, payload, MAX_VISIBLE, URGENT_KINDS);
       });
     },
     []
@@ -113,9 +155,9 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   return (
     <ToastContext.Provider value={value}>
       {children}
-      {/* 抬升高度由 `.toast-viewport` 读 BottomNav 发布的 --bottom-nav-inset
-          决定：底栏在就贴着它上沿，阅读器全屏时自动落回只避开 home indicator
-          的安全间距，不需要在这里测量布局。 */}
+      {/* 抬升高度由 `.toast-viewport` 读 --bottom-nav-inset 与 --keyboard-inset
+          决定：底栏在就贴着它上沿，键盘展开再抬一次，阅读器全屏时自动落回
+          只避开 home indicator 的安全间距。有 aria-modal 时 --toast-z 降到 45。 */}
       <div className="toast-viewport">
         {toasts.slice(0, MAX_VISIBLE).map((t) => (
           <ToastItem key={t.id} toast={t} onDismiss={remove} />
@@ -198,7 +240,7 @@ function ToastItem({
           onClick={dismiss}
           aria-label="关闭提示"
           className={cn(
-            "-mr-1 -mt-1 flex-shrink-0 rounded-full p-1 text-[hsl(var(--color-muted-foreground))]",
+            "-mr-3 -my-2 flex h-11 w-11 flex-shrink-0 items-center justify-center rounded-full text-[hsl(var(--color-muted-foreground))]",
             "transition-colors hover:bg-[hsl(var(--color-foreground)/0.08)] hover:text-[hsl(var(--color-foreground))]",
             "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--color-ring))]"
           )}

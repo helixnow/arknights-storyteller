@@ -58,6 +58,21 @@ fi
 info "Building web assets..."
 npm run build
 
+# CLI 2.8.4 + tauri-build 2.6.3 都不会写 tauri.properties，Gradle 会回退成
+# versionCode=1 / versionName=1.0。构建前按清单算出正式 versionCode。
+APP_VERSION="$(node -p "require('./package.json').version")"
+if [[ ! "$APP_VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+  fail "Invalid package.json version: $APP_VERSION"
+fi
+VERSION_CODE=$(( ${BASH_REMATCH[1]} * 1000000 + ${BASH_REMATCH[2]} * 1000 + ${BASH_REMATCH[3]} ))
+TAURI_PROPS="src-tauri/gen/android/app/tauri.properties"
+mkdir -p "$(dirname "$TAURI_PROPS")"
+cat > "$TAURI_PROPS" <<EOF
+tauri.android.versionName=$APP_VERSION
+tauri.android.versionCode=$VERSION_CODE
+EOF
+info "Wrote $TAURI_PROPS ($APP_VERSION / $VERSION_CODE)"
+
 info "Building Android APK via Tauri (release profile)..."
 
 # Clean up stale tauri plugin cache directories to avoid "File exists" conflicts
@@ -80,6 +95,20 @@ KEY_ALIAS="${ANDROID_KEY_ALIAS:-release}"
 KEYSTORE_PASSWORD="${ANDROID_KEYSTORE_PASSWORD:-}"
 KEY_PASSWORD="${ANDROID_KEY_PASSWORD:-$KEYSTORE_PASSWORD}"
 USING_RELEASE_KEYSTORE=false
+STRICT_RELEASE=false
+
+if [ "${RELEASE_STRICT:-0}" = "1" ] \
+  || { [ "${CI:-false}" = "true" ] && [ "${RELEASE_JOB:-false}" = "true" ]; }; then
+  STRICT_RELEASE=true
+fi
+
+handle_release_keystore_failure() {
+  local reason="$1"
+  if [ "$STRICT_RELEASE" = true ]; then
+    fail "$reason Debug keystore fallback is disabled for release builds."
+  fi
+  warn "$reason Falling back to debug keystore."
+}
 
 check_keystore_entry() {
   local keystore="$1"
@@ -106,13 +135,13 @@ if [ -f "$KEYSTORE_PATH" ] && [ -n "$KEYSTORE_PASSWORD" ] && [ -n "$KEY_PASSWORD
     info "Using release keystore: $KEYSTORE_PATH (alias $KEY_ALIAS)"
     USING_RELEASE_KEYSTORE=true
   else
-    warn "Release keystore '$KEYSTORE_PATH' alias '$KEY_ALIAS' is invalid, falling back to debug keystore."
+    handle_release_keystore_failure "Release keystore '$KEYSTORE_PATH' alias '$KEY_ALIAS' is invalid."
   fi
 else
   if [ ! -f "$KEYSTORE_PATH" ]; then
-    warn "Release keystore '$KEYSTORE_PATH' not found; falling back to debug keystore."
+    handle_release_keystore_failure "Release keystore '$KEYSTORE_PATH' not found."
   else
-    warn "Release keystore passwords not provided; falling back to debug keystore."
+    handle_release_keystore_failure "Release keystore passwords not provided."
   fi
 fi
 

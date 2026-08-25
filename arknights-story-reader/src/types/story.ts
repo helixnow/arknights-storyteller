@@ -154,6 +154,8 @@ export interface SearchResultsPage {
   totalMatched: number;
   truncated: boolean;
   facets: Record<string, number>;
+  /** 后端 serde 固定返回 camelCase；仅成功执行权威 FTS 查询时为 true。 */
+  indexUsed: boolean;
 }
 
 /** 段级搜索命中——对应 Rust `SegmentHit`。 */
@@ -187,6 +189,8 @@ export interface SegmentSearchPage {
   hits: SegmentHit[];
   totalMatched: number;
   truncated: boolean;
+  /** 后端 serde 固定返回 camelCase；仅成功执行段级 MATCH 时为 true。 */
+  indexUsed: boolean;
 }
 
 export interface SearchDebugResponse {

@@ -185,14 +185,22 @@ export function StoryInsightsPanel({
             </Button>
           </div>
           <div className="space-y-1 text-sm text-[hsl(var(--color-muted-foreground))]">
-            {decision.options.map((option, optionIndex) => (
-              <div key={optionIndex} className="flex gap-2 leading-relaxed">
-                <span className="text-[hsl(var(--color-primary))] tabular-nums font-medium">
-                  {optionIndex + 1}.
-                </span>
-                <span className="flex-1">{option}</span>
-              </div>
-            ))}
+            {decision.options.map((option, optionIndex) => {
+              const value = decision.values?.[optionIndex]?.trim();
+              return (
+                <div key={optionIndex} className="flex items-start gap-2 leading-relaxed">
+                  <span className="text-[hsl(var(--color-primary))] tabular-nums font-medium">
+                    {optionIndex + 1}.
+                  </span>
+                  <span className="min-w-0 flex-1">{option}</span>
+                  {value ? (
+                    <span className="max-w-[40%] flex-shrink-0 truncate text-[11px] uppercase tracking-wider opacity-75">
+                      {value}
+                    </span>
+                  ) : null}
+                </div>
+              );
+            })}
           </div>
         </SheetGroup>
       )),
@@ -250,7 +258,7 @@ export function StoryInsightsPanel({
                 {highlightEntries.length > 0 && (
                   <button
                     type="button"
-                    className="-my-2 inline-flex min-h-[44px] items-center px-2 text-[11px] font-medium text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-destructive))] transition-colors"
+                    className="-my-2 inline-flex min-h-[44px] min-w-[44px] items-center justify-center px-2 text-[11px] font-medium text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-destructive))] transition-colors"
                     onClick={() => {
                       void (async () => {
                         const ok = await safeConfirm(
@@ -294,7 +302,7 @@ export function StoryInsightsPanel({
                 {activeCharacter && (
                   <button
                     type="button"
-                    className="-my-2 inline-flex min-h-[44px] items-center px-2 text-[11px] font-medium text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-destructive))] transition-colors"
+                    className="-my-2 inline-flex min-h-[44px] min-w-[44px] items-center justify-center px-2 text-[11px] font-medium text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-destructive))] transition-colors"
                     onClick={onClearCharacter}
                   >
                     清除高亮

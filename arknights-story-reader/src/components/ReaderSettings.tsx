@@ -335,19 +335,24 @@ export const ReaderSettingsPanel = memo(function ReaderSettingsPanel({
                     onClick={() =>
                       onUpdateSettings({ paragraphIndent: !settings.paragraphIndent })
                     }
-                    className={cn(
-                      "relative inline-flex h-7 w-12 flex-shrink-0 items-center rounded-full transition-colors duration-200 ease-spring focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--color-ring))]",
-                      settings.paragraphIndent
-                        ? "bg-[hsl(var(--color-primary))]"
-                        : "bg-[hsl(var(--color-foreground)/0.18)]"
-                    )}
+                    className="inline-flex h-11 w-14 flex-shrink-0 items-center justify-center rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--color-ring))]"
                   >
                     <span
                       className={cn(
-                        "inline-block h-6 w-6 transform rounded-full bg-white shadow-[0_2px_6px_-1px_hsl(0_0%_0%/0.3)] transition-transform duration-200 ease-spring",
-                        settings.paragraphIndent ? "translate-x-[22px]" : "translate-x-0.5"
+                        "relative inline-flex h-7 w-12 items-center rounded-full transition-colors duration-200 ease-spring",
+                        settings.paragraphIndent
+                          ? "bg-[hsl(var(--color-primary))]"
+                          : "bg-[hsl(var(--color-foreground)/0.18)]"
                       )}
-                    />
+                      aria-hidden="true"
+                    >
+                      <span
+                        className={cn(
+                          "inline-block h-6 w-6 transform rounded-full bg-white shadow-[0_2px_6px_-1px_hsl(0_0%_0%/0.3)] transition-transform duration-200 ease-spring",
+                          settings.paragraphIndent ? "translate-x-[22px]" : "translate-x-0.5"
+                        )}
+                      />
+                    </span>
                   </button>
                 </div>
               </div>

@@ -1,8 +1,11 @@
 import {
+  createContext,
   type CSSProperties,
   type MouseEvent as ReactMouseEvent,
+  type TouchEvent as ReactTouchEvent,
   memo,
   useCallback,
+  useContext,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -11,6 +14,7 @@ import {
   useSyncExternalStore,
 } from "react";
 import { api } from "@/services/api";
+import { shouldSampleTopAnchor } from "@/lib/appShellLogic";
 import type { ParsedStoryContent, StorySegment } from "@/types/story";
 import { Button } from "@/components/ui/button";
 import {
@@ -18,6 +22,7 @@ import {
   BookmarkCheck,
   BookmarkPlus,
   CheckSquare,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   ListTree,
@@ -30,11 +35,21 @@ import {
 import { useReaderSettings } from "@/hooks/useReaderSettings";
 import { ReaderSettingsPanel } from "@/components/ReaderSettings";
 import { StoryInsightsPanel } from "@/components/StoryInsightsPanel";
-import { useReadingProgress, type ReadingProgress } from "@/hooks/useReadingProgress";
+import {
+  pageIndexFromPercentage,
+  useReadingProgress,
+  type ReadingProgress,
+} from "@/hooks/useReadingProgress";
 import { useFavorites } from "@/hooks/useFavorites";
-import { useHighlights } from "@/hooks/useHighlights";
+import { trimHighlightPreview, useHighlights } from "@/hooks/useHighlights";
 import { useBackHandler } from "@/hooks/useBackHandler";
-import { useEdgeSwipeBack } from "@/hooks/useEdgeSwipeBack";
+import {
+  isUnambiguousPageTap,
+  shouldIgnorePagedTapAfterMenuClose,
+  shouldSuppressRejectedTouchClick,
+  useEdgeSwipeBack,
+  type TouchClickOutcome,
+} from "@/hooks/useEdgeSwipeBack";
 import { cn } from "@/lib/utils";
 import { segmentDigest } from "@/lib/segmentDigest";
 import { CustomScrollArea } from "@/components/ui/custom-scroll-area";
@@ -86,11 +101,26 @@ interface SegmentRowState {
   selected: boolean;
 }
 
+interface PageTouchState {
+  identifier: number;
+  startX: number;
+  startY: number;
+  maxDistance: number;
+  maxTouchCount: number;
+}
+
 type SegmentRenderer = (
   item: RenderableSegment,
   isLast: boolean,
   state: SegmentRowState
 ) => React.ReactNode;
+
+/**
+ * 只让真正需要全局健康度订阅的失败插画跟随阅读器前后台状态。若把 `active`
+ * 塞进 renderSegment 依赖，KeepAlive 每次显隐都会让上千个段落因 renderer
+ * 换身份而重画；context 只唤醒少量 ReaderImageSegment 消费者。
+ */
+const ReaderActivityContext = createContext(true);
 
 const BASE_MAX_WIDTH = 768; // px
 const TARGET_CHARS_PER_PAGE = 900; // approximate characters we aim to fit per page
@@ -110,13 +140,16 @@ interface CacheEntry<T> {
   storedAt: number;
 }
 
-function createLruCache<T>(limit: number) {
+export function createLruCache<T>(limit: number) {
   const entries = new Map<string, CacheEntry<T>>();
   return {
     get(key: string): T | null {
       const hit = entries.get(key);
       if (!hit) return null;
-      if (Date.now() - hit.storedAt > PREFETCH_TTL_MS) {
+      const age = Date.now() - hit.storedAt;
+      // 墙钟回拨后 age 为负；继续把它当“很新”会让旧正文命中到时钟追上
+      // storedAt 为止（可能数月），与 TTL 的承诺相反。
+      if (age < 0 || age > PREFETCH_TTL_MS) {
         entries.delete(key);
         return null;
       }
@@ -134,6 +167,9 @@ function createLruCache<T>(limit: number) {
         entries.delete(oldest.value);
       }
     },
+    clear() {
+      entries.clear();
+    },
   };
 }
 
@@ -141,6 +177,20 @@ function createLruCache<T>(limit: number) {
 const storyContentCache = createLruCache<ParsedStoryContent>(4);
 const storyNeighborsCache = createLruCache<StoryNeighbors>(16);
 const storyEntryCache = createLruCache<StoryEntry>(16);
+
+// 数据同步 / 导入换包后，TTL 内的正文同样已经失效。模块监听先于组件监听
+// 注册：事件到来先清缓存并 bump epoch，前台阅读器随后重载；后台阅读器恢复
+// 时比较 epoch 再重载，绝不闪旧正文。
+let storyDataEpoch = 0;
+function invalidateReaderCaches() {
+  storyDataEpoch += 1;
+  storyContentCache.clear();
+  storyNeighborsCache.clear();
+  storyEntryCache.clear();
+}
+if (typeof window !== "undefined") {
+  window.addEventListener("app:data-updated", invalidateReaderCaches);
+}
 
 type IdleHandle = { kind: "idle"; id: number } | { kind: "timeout"; id: number };
 
@@ -245,6 +295,148 @@ export function postProcessSegments(segments: readonly StorySegment[]): StorySeg
   });
 
   return merged;
+}
+
+/**
+ * issuedAt 缺失的旧调用方也需要稳定的一次性 token。直接在 effect 里
+ * `?? Date.now()` 会让每次重渲染都生成新 token，把读者反复拽回旧命中。
+ */
+export function stableReaderIntentToken(issuedAt?: number): number {
+  return typeof issuedAt === "number" && Number.isFinite(issuedAt) ? issuedAt : 0;
+}
+
+export function readerLocalDayKey(date: Date): string {
+  return `${date.getFullYear()}-${date.getMonth() + 1}-${date.getDate()}`;
+}
+
+export interface ReaderContentSignature {
+  segmentCount: number;
+  firstDigest: string;
+  lastDigest: string;
+}
+
+/** 与划线重定位共用同一段落指纹口径。 */
+function readerSegmentIdentity(segment: StorySegment): string {
+  switch (segment.type) {
+    case "dialogue":
+      return segmentDigest(`${segment.characterName}\u0001${segment.text}`);
+    case "narration":
+    case "subtitle":
+    case "sticker":
+      return segmentDigest(segment.text);
+    case "system":
+      return segmentDigest(`${segment.speaker ?? ""}\u0001${segment.text}`);
+    case "decision":
+      return segmentDigest(segment.options.join("\u0001"));
+    case "header":
+      return segmentDigest(segment.title);
+    case "image":
+      return segmentDigest(`image\u0001${segment.token}`);
+    case "music":
+      return segmentDigest(`music\u0001${segment.key}`);
+    default:
+      return "";
+  }
+}
+
+function readerContentSignature(
+  content: ParsedStoryContent | null
+): ReaderContentSignature | null {
+  if (!content) return null;
+  const segments = content.segments;
+  return {
+    segmentCount: segments.length,
+    firstDigest: segments.length > 0 ? readerSegmentIdentity(segments[0]) : "",
+    lastDigest:
+      segments.length > 0 ? readerSegmentIdentity(segments[segments.length - 1]) : "",
+  };
+}
+
+/**
+ * 普通 TTL 重验拿回等价正文时保留页码与 restoredKey；换包、空态重试或正文
+ * 首尾/段数变化时重置，让进度恢复在新布局上重新跑一遍。
+ */
+export function shouldResetReaderPositionForContent(
+  previous: ReaderContentSignature | null,
+  next: ReaderContentSignature | null,
+  forceReset = false
+): boolean {
+  if (forceReset || !previous || !next) return true;
+  return (
+    previous.segmentCount !== next.segmentCount ||
+    previous.firstDigest !== next.firstDigest ||
+    previous.lastDigest !== next.lastDigest
+  );
+}
+
+/** 把“锚段当前几何位置”换成让它回到记录偏移所需的 scrollTop。 */
+export function scrollTopFromAnchorGeometry(
+  currentScrollTop: number,
+  containerTop: number,
+  anchorTop: number,
+  savedOffset: number,
+  maxTop: number
+): number | null {
+  if (
+    !Number.isFinite(currentScrollTop) ||
+    !Number.isFinite(containerTop) ||
+    !Number.isFinite(anchorTop) ||
+    !Number.isFinite(savedOffset) ||
+    !Number.isFinite(maxTop)
+  ) {
+    return null;
+  }
+  const target = currentScrollTop + (anchorTop - containerTop) - savedOffset;
+  return Math.max(0, Math.min(Math.max(0, maxTop), target));
+}
+
+export function estimateReaderSegmentHeightPx(
+  fontSize: number,
+  lineHeight: number,
+  lines = 3
+): number {
+  const size = Number.isFinite(fontSize) && fontSize > 0 ? fontSize : 16;
+  const height = Number.isFinite(lineHeight) && lineHeight > 0 ? lineHeight : 1.7;
+  const count = Number.isFinite(lines) && lines > 0 ? lines : 3;
+  return Math.max(120, Math.ceil(size * height * count));
+}
+
+function reanchorScrollContainer(
+  container: HTMLElement,
+  anchor: { index: number; offset: number } | null,
+  fallbackRatio: number
+): void {
+  const maxTop = Math.max(container.scrollHeight - container.clientHeight, 0);
+  if (maxTop <= 0) return;
+  let nextTop: number | null = null;
+  if (anchor) {
+    const element = container.querySelector<HTMLElement>(
+      `[data-segment-index="${anchor.index}"]`
+    );
+    if (element) {
+      nextTop = scrollTopFromAnchorGeometry(
+        container.scrollTop,
+        container.getBoundingClientRect().top,
+        element.getBoundingClientRect().top,
+        anchor.offset,
+        maxTop
+      );
+    }
+  }
+  if (nextTop === null) nextTop = fallbackRatio * maxTop;
+  const clampedTop = Math.max(0, Math.min(nextTop, maxTop));
+  container.scrollTo({ top: clampedTop, behavior: "instant" });
+}
+
+/** 合计分页视口外的实际 chrome，高度向上取整避免亚像素造成固定溢出。 */
+export function readerChromeHeightFromMeasurements(
+  heights: readonly number[]
+): number {
+  const total = heights.reduce(
+    (sum, height) => sum + (Number.isFinite(height) && height > 0 ? height : 0),
+    0
+  );
+  return Math.ceil(total);
 }
 
 /**
@@ -384,6 +576,8 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const readerRootRef = useRef<HTMLDivElement | null>(null);
   const headerRef = useRef<HTMLElement | null>(null);
+  const footerRef = useRef<HTMLElement | null>(null);
+  const neighborBarRef = useRef<HTMLDivElement | null>(null);
   const loadTokenRef = useRef(0);
   const focusAppliedRef = useRef<number | null>(null);
   const characterAppliedRef = useRef<string | null>(null);
@@ -400,18 +594,52 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   // 连续滚动模式下贴着容器顶部的段落。字号/行距一变正文整体重排，靠它把
   // 读者钉回原来那一段，而不是让百分比把人甩到别处。
   const topAnchorRef = useRef<{ index: number; offset: number } | null>(null);
+  const lastAnchorSampleAtRef = useRef(0);
   const scrollRatioRef = useRef(0);
   // 当前正文的镜像，供 loadStory 判断缓存命中时内容是否真的换了。
   const contentRef = useRef(content);
   contentRef.current = content;
+  const activeRef = useRef(active);
+  activeRef.current = active;
+  const [dataEpoch, setDataEpoch] = useState(storyDataEpoch);
+  const seenDataEpochRef = useRef(storyDataEpoch);
+  const recordedReadingDayRef = useRef("");
 
-  const { settings, updateSettings, resetSettings } = useReaderSettings();
+  const recordReadingDay = useCallback(() => {
+    const day = readerLocalDayKey(new Date());
+    if (recordedReadingDayRef.current === day) return;
+    recordedReadingDayRef.current = day;
+    try {
+      bumpReadingStreak();
+    } catch {}
+  }, []);
+
+  const installLoadedContent = useCallback(
+    (next: ParsedStoryContent, forceReset = false) => {
+      const resetPosition = shouldResetReaderPositionForContent(
+        readerContentSignature(contentRef.current),
+        readerContentSignature(next),
+        forceReset
+      );
+      if (resetPosition) {
+        // 清 restoredKey 才会让 layout 恢复在新内容上重跑；只把页码设 0
+        // 会被随后的分页进度 effect 当成真实阅读位置落盘。
+        restoredKeyRef.current = null;
+        setCurrentPage(0);
+      }
+      setContent(next);
+    },
+    []
+  );
+
+  const { settings, updateSettings, resetSettings } = useReaderSettings(active);
   const { showSummaries, minimalMode, inlineImages } = useAppPreferences();
   // `trackState: false`：阅读器只在挂载时要一次初始值，之后一律走
   // `getProgress()`。让每 1.2s 一次的落盘去驱动 state，只会白白把整棵
   // 阅读器重渲染一遍。
   const { progress, updateProgress, getProgress, flushProgress } = useReadingProgress(storyPath, {
     trackState: false,
+    active,
   });
   const { isFavorite, toggleFavorite } = useFavorites();
   const [neighbors, setNeighbors] = useState<StoryNeighbors>(
@@ -429,6 +657,17 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   const moreMenuRef = useRef<HTMLDivElement | null>(null);
   const moreMenuTriggerRef = useRef<HTMLButtonElement | null>(null);
   const moreMenuPanelRef = useRef<HTMLDivElement | null>(null);
+  const pageTouchRef = useRef<PageTouchState | null>(null);
+  const lastTouchOutcomeRef = useRef<TouchClickOutcome | null>(null);
+  const pageMenuCloseAtRef = useRef(0);
+
+  useEffect(() => {
+    const onOverlayClosed = () => {
+      pageMenuCloseAtRef.current = Date.now();
+    };
+    window.addEventListener("app:overlay-closed", onOverlayClosed);
+    return () => window.removeEventListener("app:overlay-closed", onOverlayClosed);
+  }, []);
 
   // 抽屉 / 选段工具栏是否占据了界面。滚动监听里用 ref 读取，避免因为这些
   // 状态变化而反复重建 scroll listener。
@@ -488,9 +727,10 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     const firstItem = panel?.querySelector<HTMLElement>("[role='menuitem']:not([disabled])");
     (firstItem ?? panel)?.focus({ preventScroll: true });
 
-    const handlePointer = (event: PointerEvent) => {
+    const handleOutside = (event: Event) => {
       const target = event.target as Node | null;
       if (target && moreMenuRef.current?.contains(target)) return;
+      pageMenuCloseAtRef.current = Date.now();
       setMoreMenuOpen(false);
     };
     const handleKey = (event: KeyboardEvent) => {
@@ -503,10 +743,17 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       // 顺势关掉（不拦默认行为，焦点照常往下走）。
       if (event.key === "Tab") setMoreMenuOpen(false);
     };
-    window.addEventListener("pointerdown", handlePointer);
+    if (typeof PointerEvent === "undefined") {
+      window.addEventListener("touchstart", handleOutside);
+      window.addEventListener("mousedown", handleOutside);
+    } else {
+      window.addEventListener("pointerdown", handleOutside);
+    }
     window.addEventListener("keydown", handleKey);
     return () => {
-      window.removeEventListener("pointerdown", handlePointer);
+      window.removeEventListener("pointerdown", handleOutside);
+      window.removeEventListener("touchstart", handleOutside);
+      window.removeEventListener("mousedown", handleOutside);
       window.removeEventListener("keydown", handleKey);
       // 焦点已经被别处接走（例如 Tab 出去了）就别抢回来。
       const activeElement = document.activeElement;
@@ -516,11 +763,17 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     };
   }, [active, moreMenuOpen]);
 
-  // 阅读器退到后台（列表页盖在上面）时收掉浮层菜单：它挂着全局 pointerdown /
-  // keydown，状态留着不但会占返回栈，回到阅读器时还会看到一张过期的菜单。
+  // 阅读器退到后台（列表页盖在上面）时停止所有会话型 UI。滚动位置、页码
+  // 与已经选中的段落保留；只退出 selectMode，回来后再次进入选段仍能继续。
   useEffect(() => {
     if (active) return;
     setMoreMenuOpen(false);
+    setSettingsOpen(false);
+    setInsightsOpen(false);
+    setShareDialogOpen(false);
+    setSelectMode(false);
+    setSearchPulseToken(0);
+    setHeaderHidden(false);
     // 角色意图的「已应用」记号一并清掉：同一个角色字符串没有 issuedAt 可
     // 判重，只能把「退到后台再回来」当作一次新意图的边界——用户再次从
     // 人物面板点「在剧情中查看」时才能重新定位到该角色。
@@ -538,6 +791,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     // 边缘手势模拟的是同一个「返回」，不该越过菜单直接把整个阅读器关掉。
     enabled:
       active && !settingsOpen && !insightsOpen && !shareDialogOpen && !selectMode && !moreMenuOpen,
+    active,
     onBack,
   });
 
@@ -555,33 +809,13 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
    */
   const segmentDigestMap = useMemo<string[]>(() => {
     if (!processedSegments.length) return [];
-    return processedSegments.map((segment) => {
-      switch (segment.type) {
-        case "dialogue":
-          return segmentDigest(`${segment.characterName}\u0001${segment.text}`);
-        case "narration":
-        case "subtitle":
-        case "sticker":
-          return segmentDigest(segment.text);
-        case "system":
-          return segmentDigest(`${segment.speaker ?? ""}\u0001${segment.text}`);
-        case "decision":
-          return segmentDigest(segment.options.join("\u0001"));
-        case "header":
-          return segmentDigest(segment.title);
-        case "image":
-          return segmentDigest(`image\u0001${segment.token}`);
-        case "music":
-          return segmentDigest(`music\u0001${segment.key}`);
-        default:
-          return "";
-      }
-    });
+    return processedSegments.map(readerSegmentIdentity);
   }, [processedSegments]);
 
   const { highlights, toggleHighlight, isHighlighted, clearHighlights } = useHighlights(
     storyPath,
-    segmentDigestMap
+    segmentDigestMap,
+    active
   );
 
   const highlightEntries = useMemo(
@@ -608,11 +842,10 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
               return null;
           }
 
-          const normalized = preview.replace(/\s+/g, " ").trim();
-          if (!normalized) {
+          const label = trimHighlightPreview(preview);
+          if (!label) {
             return null;
           }
-          const label = normalized.length > 70 ? `${normalized.slice(0, 70)}…` : normalized;
           return { index: segmentIndex, label };
         })
         .filter((entry): entry is { index: number; label: string } => entry !== null),
@@ -701,6 +934,10 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       // Drive max-width via CSS var so it composes with the stylesheet
       // default instead of double-clipping to 48rem. (bug: double max-width)
       ["--reader-max-width" as unknown as string]: `${maxWidthPx}px`,
+      ["--reader-seg-estimate" as unknown as string]: `${estimateReaderSegmentHeightPx(
+        settings.fontSize,
+        settings.lineHeight
+      )}px`,
       width: "100%",
       ...(settings.paragraphIndent
         ? { textIndent: "2em" }
@@ -918,14 +1155,11 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       // 进度落盘还会把第 0 页写回存储——真实的阅读进度就此丢失。只有
       // 内容真的变化（错误/空态重试后命中新缓存）才需要重置页码。
       if (contentRef.current !== cached) {
-        setContent(cached);
-        setCurrentPage(0);
+        installLoadedContent(cached);
       }
       setError(null);
       setLoading(false);
-      try {
-        bumpReadingStreak();
-      } catch {}
+      recordReadingDay();
       return;
     }
 
@@ -933,30 +1167,53 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       setLoading(true);
       setError(null);
       const data = await api.getStoryContent(storyPath);
-      if (token !== loadTokenRef.current) return;
+      if (token !== loadTokenRef.current || !activeRef.current) return;
       // 空结果不进缓存，否则「重新加载」永远只会拿回同一份空正文。
       if (data.segments.length > 0) storyContentCache.set(storyPath, data);
-      setContent(data);
-      setCurrentPage(0);
-      // Bump reading streak when user actually opens a story.
-      try {
-        bumpReadingStreak();
-      } catch {}
+      installLoadedContent(data);
+      recordReadingDay();
     } catch (err) {
       if (token !== loadTokenRef.current) return;
       setError(err instanceof Error ? err.message : "加载失败");
     } finally {
       if (token === loadTokenRef.current) setLoading(false);
     }
-  }, [storyPath]);
+  }, [installLoadedContent, recordReadingDay, storyPath]);
 
   useEffect(() => {
-    loadStory();
-  }, [loadStory]);
+    if (!active) return;
+    const syncEpoch = () => {
+      if (seenDataEpochRef.current === storyDataEpoch) return;
+      seenDataEpochRef.current = storyDataEpoch;
+      // 与 epoch 更新同批清掉旧正文：换包事件到重载 effect 之间也不允许
+      // 再绘制一帧旧包内容。
+      setContent(null);
+      setLoading(true);
+      setError(null);
+      setCurrentPage(0);
+      restoredKeyRef.current = null;
+      setDataEpoch(storyDataEpoch);
+    };
+    // 换包发生在后台时没有组件监听；恢复前台的第一轮 effect 先对账 epoch。
+    syncEpoch();
+    window.addEventListener("app:data-updated", syncEpoch);
+    return () => window.removeEventListener("app:data-updated", syncEpoch);
+  }, [active]);
+
+  useEffect(() => {
+    if (!active || dataEpoch !== storyDataEpoch) return;
+    void loadStory();
+    return () => {
+      // 主正文 invoke 不能真正 abort，但可以让隐藏后才返回的旧包结果失效。
+      loadTokenRef.current += 1;
+    };
+  }, [active, dataEpoch, loadStory]);
 
   // 加载完整的 StoryEntry 用于收藏
   useEffect(() => {
+    if (!active) return;
     let mounted = true;
+    setStoryEntry(storyEntryCache.get(storyId));
     (async () => {
       try {
         const entry = await api.getStoryEntry(storyId);
@@ -968,10 +1225,11 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       }
     })();
     return () => { mounted = false; };
-  }, [storyId]);
+  }, [active, dataEpoch, storyId]);
 
   // 加载 prev/next（预取过就先用缓存里的，底部导航栏不用先闪一遍「—」）
   useEffect(() => {
+    if (!active) return;
     let mounted = true;
     setNeighbors(storyNeighborsCache.get(storyId) ?? { prev: null, next: null });
     (async () => {
@@ -991,7 +1249,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     return () => {
       mounted = false;
     };
-  }, [storyId]);
+  }, [active, dataEpoch, storyId]);
 
   /**
    * 预取上一话 / 下一话的正文与元数据。
@@ -1050,6 +1308,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
 
   // 加载章节/活动名，供分享图与顶栏使用
   useEffect(() => {
+    if (!active) return;
     let mounted = true;
     setCategoryName(null);
     (async () => {
@@ -1063,9 +1322,10 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     return () => {
       mounted = false;
     };
-  }, [storyId]);
+  }, [active, dataEpoch, storyId]);
 
   useEffect(() => {
+    if (!active) return;
     let cancelled = false;
     setStoryInfoText(null);
     const infoPath = storyEntry?.storyInfo?.trim();
@@ -1095,11 +1355,14 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     return () => {
       cancelled = true;
     };
-  }, [storyEntry?.storyInfo]);
+  }, [active, dataEpoch, storyEntry?.storyInfo]);
 
   useEffect(() => {
     setHighlightSegmentIndex(null);
     focusAppliedRef.current = null;
+    jumpAppliedRef.current = null;
+    pendingScrollIndexRef.current = null;
+    pendingLandingFallbackRef.current = null;
     setActiveCharacter(null);
   }, [storyId, storyPath]);
 
@@ -1124,7 +1387,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
         const storedPage =
           stored?.readingMode === "paged" && typeof stored.currentPage === "number"
             ? Math.max(0, Math.min(stored.currentPage, lastPage))
-            : Math.round(storedPercentage * lastPage);
+            : pageIndexFromPercentage(storedPercentage, totalPages);
         setCurrentPage(storedPage);
         progressStore.set(totalPages <= 1 ? 1 : (storedPage + 1) / totalPages);
         return true;
@@ -1133,10 +1396,36 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       const container = scrollContainerRef.current;
       if (!container) return false;
       const maxTop = Math.max(container.scrollHeight - container.clientHeight, 0);
-      let storedTop =
-        stored?.readingMode === "scroll" && typeof stored.scrollTop === "number"
-          ? stored.scrollTop
-          : storedPercentage * maxTop;
+      let restoredAnchor: { index: number; offset: number } | null = null;
+      let storedTop: number | null = null;
+      if (
+        stored?.readingMode === "scroll" &&
+        typeof stored.anchorIndex === "number" &&
+        typeof stored.anchorOffset === "number"
+      ) {
+        const anchor = container.querySelector<HTMLElement>(
+          `[data-segment-index="${stored.anchorIndex}"]`
+        );
+        if (anchor) {
+          const containerRect = container.getBoundingClientRect();
+          storedTop = scrollTopFromAnchorGeometry(
+            container.scrollTop,
+            containerRect.top,
+            anchor.getBoundingClientRect().top,
+            stored.anchorOffset,
+            maxTop
+          );
+          if (storedTop !== null) {
+            restoredAnchor = { index: stored.anchorIndex, offset: stored.anchorOffset };
+          }
+        }
+      }
+      if (storedTop === null) {
+        storedTop =
+          stored?.readingMode === "scroll" && typeof stored.scrollTop === "number"
+            ? stored.scrollTop
+            : storedPercentage * maxTop;
+      }
       // 布局比记录进度时矮（旋转 / 缩放视口、插画被隐藏）会让绝对 scrollTop
       // 失真：直接 scrollTo 会被夹到文末，按 storedTop 反推的 ratio 还会算出
       // >1、把进度直接标成 100%。此时退回按百分比换算。
@@ -1147,13 +1436,9 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       // 还是起点附近的位置，会先把一份 ~0% 的进度落盘，短暂盖掉真实记录。
       container.scrollTo({ top: storedTop, behavior: "instant" });
       lastScrollTopRef.current = storedTop;
-      // 视口已被程序化挪到新位置，此前捕获的顶部锚点随之过期。不清掉的话，
-      // 「切到分页读了很久 → 切回滚动（此时设置抽屉还开着，滚动监听因
-      // textObscuredRef 不会刷新锚点）→ 顺手调字号」这条动线会让排版重排
-      // 效果按旧锚点把读者拽回上一次滚动会话的段落，随后进度落盘再把错误
-      // 位置写成真实进度。清空后重排走 scrollRatioRef 的百分比兜底，位置
-      // 与本次恢复一致；用户一旦真正滚动，锚点会照常重新捕获。
-      topAnchorRef.current = null;
+      // 锚点恢复成功就继续保留它供字号/视口重排；旧记录或失效索引走几何
+      // 兜底时清掉上个滚动会话的锚点，避免随后重排把人拽回旧段落。
+      topAnchorRef.current = restoredAnchor;
       const ratio = maxTop <= 0 ? 1 : storedTop / maxTop;
       const clamped = Number.isFinite(ratio) ? Math.max(0, Math.min(1, ratio)) : 0;
       scrollRatioRef.current = clamped;
@@ -1171,7 +1456,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
    * 进度，于是形成 滚动 → 写进度 → 重新恢复 的回路，表现为滚动被拽回去。
    */
   useLayoutEffect(() => {
-    if (!processedSegments.length) return;
+    if (!active || !processedSegments.length) return;
 
     const restoreKey = `${storyPath}::${settings.readingMode}`;
     if (restoredKeyRef.current === restoreKey) return;
@@ -1181,23 +1466,15 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     // 这两个 prop 在整个阅读会话里都不会消失，只看 prop 是否存在的话，
     // 搜索进来的读者之后每次切换阅读模式都会被跳过恢复、直接甩回开头，
     // 随后的进度落盘还会把 ~0% 写回存储，真实进度就此丢失。
-    // issuedAt 缺失时的判重必须与应用侧的记账口径一致：应用 effect 记的是
-    // `issuedAt ?? Date.now()`，这里若仍与 null 比较，「已应用」会被永远当成
-    // 挂起——之后每次切换阅读模式都跳过恢复，读者被留在原地、进度再被
-    // ~0% 覆盖。App 目前总是带 issuedAt，此处是对齐两侧口径的加固：缺失
-    // 时只在「从未应用过任何意图」时才算挂起。
+    // issuedAt 缺失时也与应用侧共用稳定 token；两侧判重口径不能分叉。
     const focusPending =
       initialFocus &&
       initialFocus.storyId === storyId &&
-      (initialFocus.issuedAt != null
-        ? focusAppliedRef.current !== initialFocus.issuedAt
-        : focusAppliedRef.current === null);
+      focusAppliedRef.current !== stableReaderIntentToken(initialFocus.issuedAt);
     const jumpPending =
       initialJump &&
       initialJump.storyId === storyId &&
-      (initialJump.issuedAt != null
-        ? jumpAppliedRef.current !== initialJump.issuedAt
-        : jumpAppliedRef.current === null);
+      jumpAppliedRef.current !== stableReaderIntentToken(initialJump.issuedAt);
     const shouldSkipRestore =
       pendingScrollIndexRef.current !== null || focusPending || jumpPending;
     if (shouldSkipRestore) {
@@ -1218,6 +1495,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     restoredKeyRef.current = restoreKey;
   }, [
     processedSegments,
+    active,
     settings.readingMode,
     storyPath,
     initialFocus,
@@ -1255,18 +1533,24 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
         const clamped = Number.isFinite(ratio) ? Math.max(0, Math.min(1, ratio)) : 0;
         scrollRatioRef.current = clamped;
         progressStore.set(clamped);
-        updateProgress({
-          readingMode: "scroll",
-          scrollTop,
-          percentage: clamped,
-          updatedAt: Date.now(),
-        });
-
         // 抽屉盖住正文时命中测试会打在遮罩上，这时保留上一次的锚点。
-        if (!textObscuredRef.current) {
+        if (
+          !textObscuredRef.current &&
+          shouldSampleTopAnchor(lastAnchorSampleAtRef.current, Date.now())
+        ) {
+          lastAnchorSampleAtRef.current = Date.now();
           const anchor = captureTopAnchor(container);
           if (anchor) topAnchorRef.current = anchor;
         }
+        const anchor = topAnchorRef.current;
+        updateProgress({
+          readingMode: "scroll",
+          scrollTop,
+          anchorIndex: anchor?.index,
+          anchorOffset: anchor?.offset,
+          percentage: clamped,
+          updatedAt: Date.now(),
+        });
 
         // 沉浸阅读：向下滚动收起顶栏腾出屏幕，向上滚动或靠近顶部时复原。
         // 抽屉/选段工具栏打开时保持顶栏可见，避免操作路径消失。
@@ -1274,7 +1558,10 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
         if (Math.abs(delta) >= 6) {
           lastScrollTopRef.current = scrollTop;
           if (!overlayOpenRef.current) {
-            setHeaderHidden(delta > 0 && scrollTop > 96);
+            const focusInHeader = Boolean(
+              headerRef.current?.contains(document.activeElement)
+            );
+            setHeaderHidden(!focusInHeader && delta > 0 && scrollTop > 96);
           }
         }
         if (scrollTop <= 24) {
@@ -1293,7 +1580,14 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   }, [active, processedSegments, settings.readingMode, updateProgress, progressStore]);
 
   useEffect(() => {
-    if (!processedSegments.length || settings.readingMode !== "paged" || totalPages === 0) return;
+    if (
+      !active ||
+      !processedSegments.length ||
+      settings.readingMode !== "paged" ||
+      totalPages === 0
+    )
+      return;
+    if (pendingScrollIndexRef.current !== null) return;
     const ratio = totalPages <= 1 ? 1 : (currentPage + 1) / totalPages;
     const clamped = Number.isFinite(ratio) ? Math.max(0, Math.min(1, ratio)) : 0;
     progressStore.set(clamped);
@@ -1305,6 +1599,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     });
   }, [
     processedSegments,
+    active,
     currentPage,
     settings.readingMode,
     totalPages,
@@ -1315,9 +1610,9 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   // 把标题 / 关卡号一并写进进度记录，首页的「继续阅读」卡片就不用等索引
   // 加载完才知道自己在显示哪一话。旧记录没有这两个字段，读取方按可选处理。
   useEffect(() => {
-    if (!processedSegments.length) return;
+    if (!active || !processedSegments.length) return;
     updateProgress({ storyName, storyCode: storyEntry?.storyCode ?? null });
-  }, [processedSegments, storyName, storyEntry?.storyCode, updateProgress]);
+  }, [active, processedSegments, storyName, storyEntry?.storyCode, updateProgress]);
 
   // 退到后台（KeepAlive 只隐藏、不卸载，卸载冲刷不会跑）时把节流窗口里的
   // 进度强制落盘。关闭动线上 closeReader 在广播 home-refresh 前已经同步冲
@@ -1335,6 +1630,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   currentPageRef.current = currentPage;
   const pagedAnchorRef = useRef<{ key: string; boundaries: number[] } | null>(null);
   useLayoutEffect(() => {
+    if (!active) return;
     const previous = pagedAnchorRef.current;
     pagedAnchorRef.current = { key: storyPath, boundaries: pageBoundaries };
     if (!previous || previous.key !== storyPath || previous.boundaries === pageBoundaries) return;
@@ -1351,7 +1647,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       }
     }
     setCurrentPage((prev) => (prev === target ? prev : target));
-  }, [pageBoundaries, settings.readingMode, storyPath]);
+  }, [active, pageBoundaries, settings.readingMode, storyPath]);
 
   /**
    * 连续滚动模式下的同类问题：正文重排后滚动位置会漂。优先把顶部那一段钉
@@ -1382,6 +1678,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   ].join("|");
   const typographyRef = useRef<string | null>(null);
   useLayoutEffect(() => {
+    if (!active) return;
     const previous = typographyRef.current;
     typographyRef.current = typographySignature;
     if (previous === null || previous === typographySignature) return;
@@ -1389,29 +1686,47 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
 
     const container = scrollContainerRef.current;
     if (!container) return;
-    const maxTop = Math.max(container.scrollHeight - container.clientHeight, 0);
-    if (maxTop <= 0) return;
-
-    let nextTop: number | null = null;
-    const anchor = topAnchorRef.current;
-    if (anchor) {
-      const element = container.querySelector<HTMLElement>(
-        `[data-segment-index="${anchor.index}"]`
-      );
-      if (element) {
-        const delta = element.getBoundingClientRect().top - container.getBoundingClientRect().top;
-        nextTop = container.scrollTop + delta - anchor.offset;
-      }
-    }
-    if (nextTop === null) nextTop = scrollRatioRef.current * maxTop;
-
-    const clampedTop = Math.max(0, Math.min(nextTop, maxTop));
     // 排版重排是瞬时的，锚点校正也必须瞬时（instant 覆盖视口上的 CSS
     // smooth），否则正文先跳一下再缓缓滚回去，看起来像坏了。
-    container.scrollTo({ top: clampedTop, behavior: "instant" });
-    lastScrollTopRef.current = clampedTop;
-    scrollRatioRef.current = clampedTop / maxTop;
-  }, [typographySignature, settings.readingMode]);
+    reanchorScrollContainer(container, topAnchorRef.current, scrollRatioRef.current);
+    lastScrollTopRef.current = container.scrollTop;
+    const maxTop = Math.max(container.scrollHeight - container.clientHeight, 0);
+    if (maxTop > 0) scrollRatioRef.current = container.scrollTop / maxTop;
+  }, [active, typographySignature, settings.readingMode]);
+
+  useEffect(() => {
+    if (!active || settings.readingMode !== "scroll") return;
+    const container = scrollContainerRef.current;
+    if (!container) return;
+    let lastBox = { width: container.clientWidth, height: container.clientHeight };
+    let frame = 0;
+    const reanchor = () => {
+      if (pendingScrollIndexRef.current !== null) return;
+      const width = container.clientWidth;
+      const height = container.clientHeight;
+      if (width === lastBox.width && height === lastBox.height) return;
+      lastBox = { width, height };
+      reanchorScrollContainer(container, topAnchorRef.current, scrollRatioRef.current);
+      lastScrollTopRef.current = container.scrollTop;
+      const maxTop = Math.max(container.scrollHeight - container.clientHeight, 0);
+      if (maxTop > 0) scrollRatioRef.current = container.scrollTop / maxTop;
+    };
+    const schedule = () => {
+      if (frame) cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(reanchor);
+    };
+    const observer =
+      typeof ResizeObserver === "undefined" ? null : new ResizeObserver(schedule);
+    observer?.observe(container);
+    window.addEventListener("resize", schedule);
+    window.addEventListener("orientationchange", schedule);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", schedule);
+      window.removeEventListener("orientationchange", schedule);
+      if (frame) cancelAnimationFrame(frame);
+    };
+  }, [active, settings.readingMode]);
 
   /**
    * 分页模式翻页后把视口滚回页首。单页允许高于一屏（分页只保证 min-height），
@@ -1421,6 +1736,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
    */
   const pagedViewKeyRef = useRef<string | null>(null);
   useLayoutEffect(() => {
+    if (!active) return;
     const key = settings.readingMode === "paged" ? String(currentPage) : null;
     const previous = pagedViewKeyRef.current;
     pagedViewKeyRef.current = key;
@@ -1428,19 +1744,53 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     if (pendingScrollIndexRef.current !== null) return;
     // 显式 instant：翻页不该带滚动动画（视口 CSS 是 smooth）。
     scrollContainerRef.current?.scrollTo({ top: 0, behavior: "instant" });
-  }, [currentPage, settings.readingMode]);
+  }, [active, currentPage, settings.readingMode]);
 
-  // 顶栏实际高度（带关卡编号/标签时会比 3.5rem 高），收起时按这个值上移。
+  // 顶栏实际高度用于沉浸收起；同时把分页视口外的顶栏、页脚、邻话栏实测
+  // 高度写进根节点，让 CSS 的每页 min-height 跟当前 chrome 同步。
   useLayoutEffect(() => {
-    const element = headerRef.current;
-    if (!element) return;
-    const measure = () => setHeaderHeight(element.offsetHeight || 56);
+    const root = readerRootRef.current;
+    if (!active || !root) {
+      root?.style.removeProperty("--reader-chrome");
+      return;
+    }
+    const header = headerRef.current;
+    if (!header) {
+      root.style.removeProperty("--reader-chrome");
+      return;
+    }
+    const measuredElements = [header, footerRef.current, neighborBarRef.current].filter(
+      (element): element is HTMLElement => element !== null
+    );
+    const measure = () => {
+      setHeaderHeight(header.offsetHeight || 56);
+      const chromeHeight = readerChromeHeightFromMeasurements(
+        measuredElements.map((element) => element.getBoundingClientRect().height)
+      );
+      root.style.setProperty("--reader-chrome", `${chromeHeight}px`);
+    };
     measure();
-    if (typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(measure);
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, [content, storyEntry]);
+    const observer =
+      typeof ResizeObserver === "undefined" ? null : new ResizeObserver(measure);
+    measuredElements.forEach((element) => observer?.observe(element));
+    return () => {
+      observer?.disconnect();
+      root.style.removeProperty("--reader-chrome");
+    };
+  }, [
+    active,
+    content,
+    error,
+    insightsOpen,
+    loading,
+    neighbors.next,
+    neighbors.prev,
+    selectMode,
+    settings.readingMode,
+    settingsOpen,
+    shareDialogOpen,
+    storyEntry,
+  ]);
 
   // 任一抽屉/选段工具栏打开、切到分页模式或换篇时，顶栏一律复位为可见。
   useEffect(() => {
@@ -1469,22 +1819,36 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   }, [storyPath]);
 
   const goToPrevPage = useCallback(() => {
+    recordReadingDay();
     setCurrentPage((prev) => Math.max(0, prev - 1));
-  }, []);
+  }, [recordReadingDay]);
 
   const goToNextPage = useCallback(() => {
+    recordReadingDay();
     setCurrentPage((prev) => Math.min(Math.max(totalPages - 1, 0), prev + 1));
-  }, [totalPages]);
+  }, [recordReadingDay, totalPages]);
 
   // 分页模式的触控翻页：点正文左侧 20% 上一页、右侧 20% 下一页。
   // 选段模式和任何抽屉打开时都关掉，避免抢走点击。
   const pageTapEnabled =
+    active &&
     settings.readingMode === "paged" &&
     !selectMode &&
     !settingsOpen &&
     !insightsOpen &&
     !shareDialogOpen &&
     !moreMenuOpen;
+
+  // 手指按下后可能立刻点返回、开抽屉或切阅读模式，此时 touchend 不一定还会
+  // 派发给已被 KeepAlive 设为 inert 的正文。若把旧触点留在 ref，重新激活后
+  // 下一次 touchstart 会被误认成「同一手势的第二根手指」，分页点击失灵；
+  // 更糟时还会拿旧坐标生成一份拒绝记录，吞掉新点击。布局阶段同步清空，确保
+  // 页面一旦不可翻就不携带任何跨会话触摸状态。
+  useLayoutEffect(() => {
+    if (pageTapEnabled) return;
+    pageTouchRef.current = null;
+    lastTouchOutcomeRef.current = null;
+  }, [pageTapEnabled]);
 
   // 「上一话 / 下一话」栏在底部时是最下面的一层，安全区内边距只由它来吃；
   // 否则进度条 / 分页页脚会再叠一份，底部凭空多出一条空白。
@@ -1496,9 +1860,97 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     Boolean(neighbors.prev || neighbors.next);
   const bottomSafeArea = showNeighborBar ? "0px" : "env(safe-area-inset-bottom, 0px)";
 
+  const handlePageTouchStart = useCallback(
+    (event: ReactTouchEvent<HTMLElement>) => {
+      if (!pageTapEnabled) {
+        pageTouchRef.current = null;
+        return;
+      }
+      const existing = pageTouchRef.current;
+      if (existing) {
+        existing.maxTouchCount = Math.max(existing.maxTouchCount, event.touches.length);
+        return;
+      }
+      const touch = event.touches[0];
+      if (!touch) return;
+      pageTouchRef.current = {
+        identifier: touch.identifier,
+        startX: touch.clientX,
+        startY: touch.clientY,
+        maxDistance: 0,
+        maxTouchCount: event.touches.length,
+      };
+    },
+    [pageTapEnabled]
+  );
+
+  const handlePageTouchMove = useCallback((event: ReactTouchEvent<HTMLElement>) => {
+    const state = pageTouchRef.current;
+    if (!state) return;
+    state.maxTouchCount = Math.max(state.maxTouchCount, event.touches.length);
+    const touch = Array.from(event.touches).find(
+      (candidate) => candidate.identifier === state.identifier
+    );
+    if (!touch) return;
+    state.maxDistance = Math.max(
+      state.maxDistance,
+      Math.hypot(touch.clientX - state.startX, touch.clientY - state.startY)
+    );
+  }, []);
+
+  const handlePageTouchEnd = useCallback((event: ReactTouchEvent<HTMLElement>) => {
+    const state = pageTouchRef.current;
+    if (!state) return;
+    state.maxTouchCount = Math.max(state.maxTouchCount, event.touches.length);
+    const ended = Array.from(event.changedTouches).find(
+      (candidate) => candidate.identifier === state.identifier
+    );
+    if (ended) {
+      state.maxDistance = Math.max(
+        state.maxDistance,
+        Math.hypot(ended.clientX - state.startX, ended.clientY - state.startY)
+      );
+    }
+    const accepted =
+      event.touches.length === 0 &&
+      isUnambiguousPageTap(state.maxTouchCount, state.maxDistance, 0);
+    lastTouchOutcomeRef.current = {
+      at: Date.now(),
+      accepted,
+      clientX: ended?.clientX ?? state.startX,
+      clientY: ended?.clientY ?? state.startY,
+    };
+    pageTouchRef.current = null;
+  }, []);
+
+  const handlePageTouchCancel = useCallback(() => {
+    pageTouchRef.current = null;
+    lastTouchOutcomeRef.current = null;
+  }, []);
+
   const handleReaderTap = useCallback(
     (event: ReactMouseEvent<HTMLElement>) => {
       if (!pageTapEnabled) return;
+      if (shouldIgnorePagedTapAfterMenuClose(pageMenuCloseAtRef.current, Date.now())) {
+        return;
+      }
+
+      // 触摸结束后浏览器会再合成 click。拒绝的触摸只吞同一落点附近的合成
+      // click；用户 800ms 内移鼠标点到远处时不能被上一轮捏合误伤。
+      const touchOutcome = lastTouchOutcomeRef.current;
+      if (touchOutcome) {
+        lastTouchOutcomeRef.current = null;
+        if (
+          shouldSuppressRejectedTouchClick(
+            touchOutcome,
+            event.clientX,
+            event.clientY,
+            Date.now()
+          )
+        ) {
+          return;
+        }
+      }
 
       // 书签按钮、上一话/下一话、插图里的链接以及滚动条本身优先。
       const target = event.target as HTMLElement | null;
@@ -1572,9 +2024,11 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
           goToNextPage();
         } else if (event.key === "Home") {
           event.preventDefault();
+          recordReadingDay();
           setCurrentPage(0);
         } else if (event.key === "End") {
           event.preventDefault();
+          recordReadingDay();
           setCurrentPage(Math.max(totalPages - 1, 0));
         }
         return;
@@ -1587,15 +2041,19 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
 
       if (event.key === "PageDown" || (isSpace && !event.shiftKey)) {
         event.preventDefault();
+        recordReadingDay();
         container.scrollBy({ top: step, behavior: "smooth" });
       } else if (event.key === "PageUp" || (isSpace && event.shiftKey)) {
         event.preventDefault();
+        recordReadingDay();
         container.scrollBy({ top: -step, behavior: "smooth" });
       } else if (event.key === "Home") {
         event.preventDefault();
+        recordReadingDay();
         container.scrollTo({ top: 0, behavior: "smooth" });
       } else if (event.key === "End") {
         event.preventDefault();
+        recordReadingDay();
         container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
       }
     };
@@ -1611,6 +2069,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     shareDialogOpen,
     moreMenuOpen,
     selectMode,
+    recordReadingDay,
     goToPrevPage,
     goToNextPage,
   ]);
@@ -1687,8 +2146,14 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
 
   // 优先处理初始段落跳转（搜索结果点击、人物面板等）
   useEffect(() => {
-    if (!initialJump || !processedSegments.length) return;
-    const token = initialJump.issuedAt ?? Date.now();
+    if (
+      !active ||
+      !initialJump ||
+      initialJump.storyId !== storyId ||
+      !processedSegments.length
+    )
+      return;
+    const token = stableReaderIntentToken(initialJump.issuedAt);
     if (jumpAppliedRef.current === token) return;
 
     let target = initialJump.segmentIndex;
@@ -1716,6 +2181,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     jumpAppliedRef.current = token;
   }, [
     initialJump,
+    active,
     processedSegments,
     findFocusSegmentIndex,
     jumpToSegment,
@@ -1753,7 +2219,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
 
   // 当页面或段落渲染完成后，执行挂起的滚动请求（最多尝试几次）
   useLayoutEffect(() => {
-    if (pendingScrollIndexRef.current === null) return;
+    if (!active || pendingScrollIndexRef.current === null) return;
     let tries = 0;
     let cancelled = false;
     let frame = 0;
@@ -1805,6 +2271,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     // 失败的插画段），jumpToSegment 靠它启动这条重试链，其余依赖都不会变。
   }, [
     renderableSegments,
+    active,
     currentPage,
     settings.readingMode,
     scrollToSegment,
@@ -1813,8 +2280,14 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   ]);
 
   useEffect(() => {
-    if (!initialFocus || !processedSegments.length) return;
-    const token = initialFocus.issuedAt ?? Date.now();
+    if (
+      !active ||
+      !initialFocus ||
+      initialFocus.storyId !== storyId ||
+      !processedSegments.length
+    )
+      return;
+    const token = stableReaderIntentToken(initialFocus.issuedAt);
     // 只按 token 判重。曾经这里还要求 highlightSegmentIndex 非空才算“已应用”，
     // 结果高亮一被清掉（导览里跳章节、清除人物高亮都会把它置回 null），
     // 这个 effect 就重新触发，把读者拽回搜索命中段、盖掉用户刚刚的跳转。
@@ -1835,7 +2308,15 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     setActiveCharacter(null);
     jumpToSegment(targetIndex, { highlightSearch: true });
     focusAppliedRef.current = token;
-  }, [initialFocus, processedSegments, findFocusSegmentIndex, jumpToSegment, applyStoredProgress]);
+  }, [
+    active,
+    initialFocus,
+    processedSegments,
+    findFocusSegmentIndex,
+    jumpToSegment,
+    applyStoredProgress,
+    storyId,
+  ]);
 
   const handleCharacterHighlight = useCallback(
     (name: string, firstIndex: number) => {
@@ -1911,10 +2392,10 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   // attribute detaches. The underlying ring remains (static highlight)
   // until the user navigates to a new hit or closes the search focus.
   useEffect(() => {
-    if (searchPulseToken === 0) return;
+    if (!active || searchPulseToken === 0) return;
     const id = window.setTimeout(() => setSearchPulseToken(0), 1800);
     return () => window.clearTimeout(id);
-  }, [searchPulseToken]);
+  }, [active, searchPulseToken]);
 
   /**
    * Lazily assemble the payload passed to `<ShareImageDialog />`. Kept as a
@@ -2337,14 +2818,27 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   if (loading) {
     return (
       <div
+        ref={readerRootRef}
         className="h-full flex flex-col overflow-hidden reader-surface"
         data-reader-theme={settings.theme}
         aria-busy="true"
         aria-live="polite"
       >
-        <header className="flex-shrink-0 z-20 bg-[hsl(var(--color-background)/0.95)] backdrop-blur border-b">
+        <header
+          className="flex-shrink-0 z-20 backdrop-blur border-b"
+          style={{
+            backgroundColor: "color-mix(in srgb, var(--reader-bg) 95%, transparent)",
+            borderColor: "color-mix(in srgb, var(--reader-fg) 14%, transparent)",
+          }}
+        >
           <div className="container flex items-center gap-2 h-14">
-            <Button variant="ghost" size="icon" onClick={onBack} aria-label="返回剧情列表">
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-11 w-11"
+              onClick={onBack}
+              aria-label="返回剧情列表"
+            >
               <ArrowLeft className="h-5 w-5" />
             </Button>
             <h1 className="flex-1 min-w-0 text-base font-semibold truncate">{storyName}</h1>
@@ -2363,6 +2857,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   if (error) {
     return (
       <ReaderStatusScreen
+        rootRef={readerRootRef}
         theme={settings.theme}
         storyName={storyName}
         onBack={onBack}
@@ -2379,6 +2874,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   if (!content || processedSegments.length === 0) {
     return (
       <ReaderStatusScreen
+        rootRef={readerRootRef}
         theme={settings.theme}
         storyName={storyName}
         onBack={onBack}
@@ -2400,19 +2896,27 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     >
       <header
         ref={headerRef}
-        className="flex-shrink-0 z-20 bg-[hsl(var(--color-background)/0.95)] backdrop-blur border-b motion-safe:transition-[margin-top,opacity] motion-safe:duration-200"
+        className="flex-shrink-0 z-20 bg-[hsl(var(--color-background)/0.95)] backdrop-blur border-b motion-safe:transition-opacity motion-safe:duration-200"
         style={{
           marginTop: headerHidden ? `-${headerHeight}px` : 0,
           opacity: headerHidden ? 0 : 1,
           pointerEvents: headerHidden ? "none" : undefined,
+          backgroundColor: "color-mix(in srgb, var(--reader-bg) 95%, transparent)",
+          borderColor: "color-mix(in srgb, var(--reader-fg) 14%, transparent)",
         }}
         // 光有 aria-hidden 会留下一排「看不见但仍能 Tab 到」的按钮，
         // 键盘焦点会凭空消失在收起的顶栏里；inert 把它整块摘干净。
         aria-hidden={headerHidden}
         inert={headerHidden}
       >
-        <div className="container flex items-center gap-2 h-14">
-          <Button variant="ghost" size="icon" onClick={onBack} aria-label="返回剧情列表">
+        <div className="container flex items-center gap-1 sm:gap-2 min-h-14">
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-11 w-11 flex-shrink-0"
+            onClick={onBack}
+            aria-label="返回剧情列表"
+          >
             <ArrowLeft className="h-5 w-5" />
           </Button>
           <div className="flex-1 min-w-0">
@@ -2432,6 +2936,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
             <Button
               variant="ghost"
               size="icon"
+              className="h-11 w-11"
               onClick={() => setInsightsOpen((prev) => !prev)}
               aria-label="剧情导览"
             >
@@ -2440,17 +2945,18 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
             <Button
               variant="ghost"
               size="icon"
+              className={cn("h-11 w-11", selectMode && "text-[hsl(var(--color-primary))]")}
               onClick={() => (selectMode ? exitSelectMode() : enterSelectMode())}
               aria-label={selectMode ? "退出选段" : "选段"}
               title={selectMode ? "退出选段" : "选段（收藏 / 生成图片）"}
               aria-pressed={selectMode}
-              className={cn(selectMode && "text-[hsl(var(--color-primary))]")}
             >
               <CheckSquare className="h-5 w-5" />
             </Button>
             <Button
               variant="ghost"
               size="icon"
+              className="h-11 w-11"
               onClick={() => setSettingsOpen(true)}
               aria-label="打开阅读设置"
             >
@@ -2461,11 +2967,14 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
                 ref={moreMenuTriggerRef}
                 variant="ghost"
                 size="icon"
+                className={cn(
+                  "h-11 w-11",
+                  isFavorite(storyId) && "text-[hsl(var(--color-primary))]"
+                )}
                 onClick={() => setMoreMenuOpen((prev) => !prev)}
                 aria-label="更多操作"
                 aria-haspopup="menu"
                 aria-expanded={moreMenuOpen}
-                className={cn(isFavorite(storyId) && "text-[hsl(var(--color-primary))]")}
               >
                 <MoreHorizontal className="h-5 w-5" />
               </Button>
@@ -2486,7 +2995,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
                       if (storyEntry) toggleFavorite(storyEntry);
                       setMoreMenuOpen(false);
                     }}
-                    className="flex w-full items-center gap-2 px-3 py-2 text-sm hover:bg-[hsl(var(--color-accent))] disabled:opacity-50 disabled:cursor-not-allowed"
+                    className="flex min-h-[44px] w-full items-center gap-2 px-3 py-2 text-sm hover:bg-[hsl(var(--color-accent))] disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     <Star
                       className="h-4 w-4"
@@ -2502,7 +3011,34 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
         </div>
       </header>
 
-      <main className="relative flex-1 overflow-hidden" onClick={handleReaderTap}>
+      <main
+        className="relative flex-1 overflow-hidden"
+        onClick={handleReaderTap}
+        onTouchStartCapture={handlePageTouchStart}
+        onTouchMoveCapture={handlePageTouchMove}
+        onTouchEndCapture={handlePageTouchEnd}
+        onTouchCancelCapture={handlePageTouchCancel}
+      >
+        {active && headerHidden && (
+          <button
+            type="button"
+            className="absolute left-1/2 top-1 z-20 inline-flex h-11 w-11 -translate-x-1/2 items-center justify-center rounded-full border border-[color-mix(in_srgb,var(--reader-fg)_18%,transparent)] bg-[var(--reader-bg)]/90 text-[var(--reader-fg)] shadow-md backdrop-blur focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--reader-accent)]"
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              setHeaderHidden(false);
+              requestAnimationFrame(() =>
+                headerRef.current
+                  ?.querySelector<HTMLElement>("button")
+                  ?.focus({ preventScroll: true })
+              );
+            }}
+            aria-label="显示顶部工具栏"
+            title="显示顶部工具栏"
+          >
+            <ChevronDown className="h-5 w-5" aria-hidden="true" />
+          </button>
+        )}
         {pageTapEnabled && (
           <>
             {currentPage > 0 && (
@@ -2544,7 +3080,10 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
               {showSummaries &&
                 storyInfoText &&
                 (settings.readingMode !== "paged" || currentPage === 0) && (
-                <div className="reader-summary motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-700">
+                <div
+                  className="reader-summary motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-700"
+                  style={{ lineHeight: "inherit" }}
+                >
                   {/* 概述块的字号同样用 em，随阅读器字号一起缩放。 */}
                   <div className="reader-summary-label" style={{ fontSize: "0.75em" }}>
                     剧情概述
@@ -2554,15 +3093,17 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
                   </div>
                 </div>
               )}
-              <ReaderSegmentList
-                segments={renderableSegments}
-                render={renderSegment}
-                isHighlighted={isHighlighted}
-                selectedSet={selectedSegmentSet}
-                searchIndex={highlightSegmentIndex}
-                searchPulseActive={searchPulseToken > 0}
-                activeCharacter={activeCharacter}
-              />
+              <ReaderActivityContext.Provider value={active}>
+                <ReaderSegmentList
+                  segments={renderableSegments}
+                  render={renderSegment}
+                  isHighlighted={isHighlighted}
+                  selectedSet={selectedSegmentSet}
+                  searchIndex={highlightSegmentIndex}
+                  searchPulseActive={searchPulseToken > 0}
+                  activeCharacter={activeCharacter}
+                />
+              </ReaderActivityContext.Provider>
             </div>
           </div>
         </CustomScrollArea>
@@ -2574,8 +3115,13 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
 
       {settings.readingMode === "paged" && !selectMode && (
         <footer
-          className="flex-shrink-0 bg-[hsl(var(--color-background)/0.95)] backdrop-blur border-t px-4 pt-4 pb-4"
-          style={{ paddingBottom: `calc(${bottomSafeArea} + 1rem)` }}
+          ref={footerRef}
+          className="flex-shrink-0 backdrop-blur border-t px-4 pt-4 pb-4"
+          style={{
+            paddingBottom: `calc(${bottomSafeArea} + 1rem)`,
+            backgroundColor: "color-mix(in srgb, var(--reader-bg) 95%, transparent)",
+            borderColor: "color-mix(in srgb, var(--reader-fg) 14%, transparent)",
+          }}
         >
           <div className="container flex items-center justify-between gap-3" role="group" aria-label="翻页">
             <Button
@@ -2622,8 +3168,13 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       {/* 上/下一话导航 —— 基于 storyGroup + storySort 推导（仅在阅读且无选段/无抽屉时展示）。 */}
       {showNeighborBar && (
         <div
+          ref={neighborBarRef}
           className="flex-shrink-0 border-t border-[hsl(var(--color-border))] bg-[hsl(var(--color-background)/0.92)] backdrop-blur px-4 py-2"
-          style={{ paddingBottom: "calc(env(safe-area-inset-bottom, 0px) + 0.5rem)" }}
+          style={{
+            paddingBottom: "calc(env(safe-area-inset-bottom, 0px) + 0.5rem)",
+            backgroundColor: "color-mix(in srgb, var(--reader-bg) 92%, transparent)",
+            borderColor: "color-mix(in srgb, var(--reader-fg) 14%, transparent)",
+          }}
         >
           <div className="container grid grid-cols-2 gap-2" role="group" aria-label="话数导航">
             <button
@@ -2662,8 +3213,13 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
 
       {selectMode && (
         <footer
-          className="flex-shrink-0 bg-[hsl(var(--color-background)/0.95)] backdrop-blur border-t px-4 py-3 space-y-2"
-          style={{ paddingBottom: "calc(env(safe-area-inset-bottom, 0px) + 0.75rem)" }}
+          ref={footerRef}
+          className="flex-shrink-0 backdrop-blur border-t px-4 py-3 space-y-2"
+          style={{
+            paddingBottom: "calc(env(safe-area-inset-bottom, 0px) + 0.75rem)",
+            backgroundColor: "color-mix(in srgb, var(--reader-bg) 95%, transparent)",
+            borderColor: "color-mix(in srgb, var(--reader-fg) 14%, transparent)",
+          }}
         >
           {/* Paged mode needs the page controls inside the select footer;
               otherwise the user is stuck on one page while picking segments. */}
@@ -2709,8 +3265,8 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
               </Button>
             </div>
           )}
-          <div className="container flex items-center gap-2">
-            <div className="flex-1 min-w-0 text-sm">
+          <div className="container flex flex-wrap items-center gap-2">
+            <div className="min-w-[8rem] flex-1 text-sm">
               <div className="font-medium">选段</div>
               <div className="text-xs text-[hsl(var(--color-muted-foreground))]">
                 已选 {selectedSegments.length} 段 · 点击段落切换选中
@@ -2719,19 +3275,24 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
             <Button
               variant="ghost"
               size="sm"
-              className="min-h-[44px]"
+              className="min-h-[44px] flex-1 sm:flex-none"
               onClick={clearSelection}
               disabled={selectedSegments.length === 0}
             >
               清空
             </Button>
-            <Button variant="outline" size="sm" className="min-h-[44px]" onClick={exitSelectMode}>
+            <Button
+              variant="outline"
+              size="sm"
+              className="min-h-[44px] flex-1 sm:flex-none"
+              onClick={exitSelectMode}
+            >
               取消
             </Button>
             <Button
               variant="outline"
               size="sm"
-              className="min-h-[44px]"
+              className="min-h-[44px] flex-1 sm:flex-none"
               onClick={handleBookmarkSelection}
               disabled={selectionBookmarkState.mode === "none"}
               title={
@@ -2749,7 +3310,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
             </Button>
             <Button
               size="sm"
-              className="min-h-[44px]"
+              className="min-h-[44px] flex-1 sm:flex-none"
               onClick={() => setShareDialogOpen(true)}
               disabled={selectedSegments.length === 0}
             >
@@ -2761,8 +3322,8 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       )}
 
       {/* 抽屉的 open 同样与 `active` 相与：它们各自会挂一个全局 Esc 监听并
-          锁 body 滚动，阅读器退到后台时这些副作用不该继续生效。状态本身
-          保留，回到阅读器时抽屉会照原样恢复。 */}
+          锁 body 滚动，阅读器退到后台时这些副作用不该继续生效；inactive
+          effect 也会清掉会话型 open 状态，避免恢复时盖回过期浮层。 */}
       <StoryInsightsPanel
         open={active && insightsOpen}
         insights={insights}
@@ -2816,8 +3377,12 @@ const ReaderScrollProgress = memo(function ReaderScrollProgress({
   const percentage = toPercentage(ratio);
   return (
     <div
-      className="flex-shrink-0 bg-[hsl(var(--color-background)/0.92)] backdrop-blur border-t border-[hsl(var(--color-border))]"
-      style={{ paddingBottom: bottomSafeArea }}
+      className="flex-shrink-0 backdrop-blur border-t"
+      style={{
+        paddingBottom: bottomSafeArea,
+        backgroundColor: "color-mix(in srgb, var(--reader-bg) 92%, transparent)",
+        borderColor: "color-mix(in srgb, var(--reader-fg) 14%, transparent)",
+      }}
     >
       <div
         className="progress-track"
@@ -2842,6 +3407,7 @@ const ReaderScrollProgress = memo(function ReaderScrollProgress({
 });
 
 interface ReaderStatusScreenProps {
+  rootRef: React.RefObject<HTMLDivElement | null>;
   theme: string;
   storyName: string;
   onBack: () => void;
@@ -2860,6 +3426,7 @@ interface ReaderStatusScreenProps {
  * 整个塌一次；返回入口也始终在同一个位置，不必靠正中间那颗按钮找路。
  */
 function ReaderStatusScreen({
+  rootRef,
   theme,
   storyName,
   onBack,
@@ -2872,12 +3439,25 @@ function ReaderStatusScreen({
 }: ReaderStatusScreenProps) {
   return (
     <div
+      ref={rootRef}
       className="h-full flex flex-col overflow-hidden reader-surface"
       data-reader-theme={theme}
     >
-      <header className="flex-shrink-0 z-20 bg-[hsl(var(--color-background)/0.95)] backdrop-blur border-b">
+      <header
+        className="flex-shrink-0 z-20 backdrop-blur border-b"
+        style={{
+          backgroundColor: "color-mix(in srgb, var(--reader-bg) 95%, transparent)",
+          borderColor: "color-mix(in srgb, var(--reader-fg) 14%, transparent)",
+        }}
+      >
         <div className="container flex items-center gap-2 h-14">
-          <Button variant="ghost" size="icon" onClick={onBack} aria-label="返回剧情列表">
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-11 w-11"
+            onClick={onBack}
+            aria-label="返回剧情列表"
+          >
             <ArrowLeft className="h-5 w-5" />
           </Button>
           <h1 className="flex-1 min-w-0 text-base font-semibold truncate">{storyName}</h1>
@@ -3062,14 +3642,16 @@ function ReaderImageSegment({
   selectionClass,
 }: ReaderImageSegmentProps) {
   const [failed, setFailed] = useState(false);
+  const readerActive = useContext(ReaderActivityContext);
   // exhausted 不一定是「素材真没了」：断网/源被墙时，一段插画只有 3 条
   // 候选，会在主机熔断阈值（8 次）攒够之前就逐条 onerror，AssetImage 只能
   // 上报 exhausted。此时若把段落永久删掉，等网络恢复（markAssetUrlAlive
   // 撤销那批不可靠的失败记录）插画也回不来了——AssetImage 已被卸载，谁都
-  // 收不到健康事件。所以隐藏期间订阅健康度：事件到来（源首次被证明可达 /
-  // 熔断窗口到期）时撤销 failed、重挂 AssetImage 再试一次；真正 404 的
-  // 段落会立刻再次 exhausted，照旧隐藏。
-  const healthNonce = useAssetHealthNonce(failed);
+  // 收不到健康事件。所以插画因失败隐藏、且阅读器仍在前台时订阅健康度：
+  // 事件到来（源首次被证明可达 / 熔断窗口到期）时撤销 failed、重挂
+  // AssetImage 再试一次；真正 404 的段落会立刻再次 exhausted，照旧隐藏。
+  // KeepAlive 退到后台时暂停订阅，重新激活会从外部 store 的最新快照对账。
+  const healthNonce = useAssetHealthNonce(failed && readerActive);
   const seenHealthNonceRef = useRef(healthNonce);
   if (seenHealthNonceRef.current !== healthNonce) {
     seenHealthNonceRef.current = healthNonce;

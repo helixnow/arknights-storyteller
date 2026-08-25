@@ -40,7 +40,7 @@ export interface ReaderSettings {
   paragraphIndent: boolean;
 }
 
-const DEFAULT_SETTINGS: ReaderSettings = {
+export const DEFAULT_READER_SETTINGS: ReaderSettings = {
   fontFamily:
     "'Arknights Noto Serif SC', 'Noto Serif SC', 'Source Han Serif SC', 'Songti SC', 'SimSun', serif",
   fontSize: 19,
@@ -56,19 +56,19 @@ const DEFAULT_SETTINGS: ReaderSettings = {
 
 const STORAGE_KEY = "reader-settings";
 
-/** 各数值项的合法区间，和设置面板里滑杆的 min/max 保持一致。 */
-const NUMERIC_RANGES: Record<
+/** 各数值项的合法区间与步进，和设置面板里的 range 控件保持一致。 */
+const NUMERIC_SPECS: Record<
   "fontSize" | "lineHeight" | "letterSpacing" | "paragraphSpacing" | "pageWidth",
-  [number, number]
+  readonly [min: number, max: number, step: number]
 > = {
-  fontSize: [14, 32],
+  fontSize: [14, 32, 1],
   // 滑杆最小值是 1.4。早前这里写成 1.2：落在 [1.2, 1.4) 的旧值能通过校验，
   // 但 range 元素会把 value 钳到 min 显示——滑块停在 1.4、数字标签却显示
   // 1.2/1.3，「调小」按钮还被误禁用。区间必须与滑杆完全一致。
-  lineHeight: [1.4, 3.4],
-  letterSpacing: [0, 4],
-  paragraphSpacing: [0.3, 3],
-  pageWidth: [60, 100],
+  lineHeight: [1.4, 3.4, 0.1],
+  letterSpacing: [0, 4, 0.5],
+  paragraphSpacing: [0.3, 3, 0.1],
+  pageWidth: [60, 100, 5],
 };
 
 const THEMES = new Set<ReaderSettings["theme"]>([
@@ -81,7 +81,11 @@ const THEMES = new Set<ReaderSettings["theme"]>([
 const READING_MODES = new Set<ReaderSettings["readingMode"]>(["paged", "scroll"]);
 const TEXT_ALIGNS = new Set<ReaderSettings["textAlign"]>(["left", "justify"]);
 
-function clampNumber(value: unknown, [min, max]: [number, number], fallback: number): number {
+function clampSteppedNumber(
+  value: unknown,
+  [min, max, step]: readonly [number, number, number],
+  fallback: number
+): number {
   // 只接受数字和非空数字字符串（老版本可能把滑杆值序列化成字符串）。
   // 其余形状（null / 布尔 / 数组等）一律回落默认值：直接 Number(null) === 0
   // 会把缺失值钳到区间下限——pageWidth 变 60%、字号变 14，页面明显不对。
@@ -92,58 +96,94 @@ function clampNumber(value: unknown, [min, max]: [number, number], fallback: num
         ? Number(value)
         : Number.NaN;
   if (!Number.isFinite(parsed)) return fallback;
-  return Math.min(max, Math.max(min, parsed));
+  const clamped = Math.min(max, Math.max(min, parsed));
+  // localStorage 可能来自旧版本或手工编辑。只钳区间还不够：pageWidth=73
+  // 会让正文按 73% 生效，但 step=5 的滑杆只能显示在 75% 附近；行距 1.73
+  // 同样会显示成 1.7、实际却按 1.73 排版。统一吸附到以 min 为基准的步进格，
+  // 保证「存的值、标签显示、滑块位置、正文样式」四者一致。
+  const snapped = min + Math.round((clamped - min) / step) * step;
+  const decimals = (String(step).split(".")[1] ?? "").length;
+  return Number(Math.min(max, Math.max(min, snapped)).toFixed(decimals));
 }
 
 /**
  * 把任意来源（localStorage、老版本、外部写入）的设置收敛成合法值。
  * 之前只校验了字体，一份被改坏的 `fontSize: 0` 就能让正文整块塌掉。
  */
-function sanitizeSettings(input: Partial<ReaderSettings> | null | undefined): ReaderSettings {
+export function sanitizeReaderSettings(
+  input: Partial<ReaderSettings> | null | undefined
+): ReaderSettings {
   const source = input ?? {};
   const fontFamily =
     typeof source.fontFamily === "string" && FONT_FAMILY_VALUES.has(source.fontFamily)
       ? source.fontFamily
-      : DEFAULT_SETTINGS.fontFamily;
+      : DEFAULT_READER_SETTINGS.fontFamily;
   return {
     fontFamily,
-    fontSize: clampNumber(source.fontSize, NUMERIC_RANGES.fontSize, DEFAULT_SETTINGS.fontSize),
-    lineHeight: clampNumber(source.lineHeight, NUMERIC_RANGES.lineHeight, DEFAULT_SETTINGS.lineHeight),
-    letterSpacing: clampNumber(
+    fontSize: clampSteppedNumber(
+      source.fontSize,
+      NUMERIC_SPECS.fontSize,
+      DEFAULT_READER_SETTINGS.fontSize
+    ),
+    lineHeight: clampSteppedNumber(
+      source.lineHeight,
+      NUMERIC_SPECS.lineHeight,
+      DEFAULT_READER_SETTINGS.lineHeight
+    ),
+    letterSpacing: clampSteppedNumber(
       source.letterSpacing,
-      NUMERIC_RANGES.letterSpacing,
-      DEFAULT_SETTINGS.letterSpacing
+      NUMERIC_SPECS.letterSpacing,
+      DEFAULT_READER_SETTINGS.letterSpacing
     ),
-    paragraphSpacing: clampNumber(
+    paragraphSpacing: clampSteppedNumber(
       source.paragraphSpacing,
-      NUMERIC_RANGES.paragraphSpacing,
-      DEFAULT_SETTINGS.paragraphSpacing
+      NUMERIC_SPECS.paragraphSpacing,
+      DEFAULT_READER_SETTINGS.paragraphSpacing
     ),
-    pageWidth: clampNumber(source.pageWidth, NUMERIC_RANGES.pageWidth, DEFAULT_SETTINGS.pageWidth),
+    pageWidth: clampSteppedNumber(
+      source.pageWidth,
+      NUMERIC_SPECS.pageWidth,
+      DEFAULT_READER_SETTINGS.pageWidth
+    ),
     textAlign: TEXT_ALIGNS.has(source.textAlign as ReaderSettings["textAlign"])
       ? (source.textAlign as ReaderSettings["textAlign"])
-      : DEFAULT_SETTINGS.textAlign,
+      : DEFAULT_READER_SETTINGS.textAlign,
     theme: THEMES.has(source.theme as ReaderSettings["theme"])
       ? (source.theme as ReaderSettings["theme"])
-      : DEFAULT_SETTINGS.theme,
+      : DEFAULT_READER_SETTINGS.theme,
     readingMode: READING_MODES.has(source.readingMode as ReaderSettings["readingMode"])
       ? (source.readingMode as ReaderSettings["readingMode"])
-      : DEFAULT_SETTINGS.readingMode,
+      : DEFAULT_READER_SETTINGS.readingMode,
     paragraphIndent:
       typeof source.paragraphIndent === "boolean"
         ? source.paragraphIndent
-        : DEFAULT_SETTINGS.paragraphIndent,
+        : DEFAULT_READER_SETTINGS.paragraphIndent,
   };
 }
 
+/** 合并局部设置并统一做范围 / 枚举校验，UI、storage 与测试共用同一入口。 */
+export function mergeReaderSettings(
+  base: ReaderSettings,
+  partial: Partial<ReaderSettings>
+): ReaderSettings {
+  return sanitizeReaderSettings({ ...base, ...partial });
+}
+
+/** 字段级比较，避免滑杆重复 input 触发整篇正文重排。 */
+export function readerSettingsEqual(a: ReaderSettings, b: ReaderSettings): boolean {
+  return (Object.keys(DEFAULT_READER_SETTINGS) as Array<keyof ReaderSettings>).every(
+    (key) => a[key] === b[key]
+  );
+}
+
 function loadSettings(): ReaderSettings {
-  if (typeof window === "undefined") return DEFAULT_SETTINGS;
+  if (typeof window === "undefined") return DEFAULT_READER_SETTINGS;
   try {
     const stored = window.localStorage.getItem(STORAGE_KEY);
-    if (!stored) return DEFAULT_SETTINGS;
-    return sanitizeSettings(JSON.parse(stored) as Partial<ReaderSettings>);
+    if (!stored) return DEFAULT_READER_SETTINGS;
+    return sanitizeReaderSettings(JSON.parse(stored) as Partial<ReaderSettings>);
   } catch {
-    return DEFAULT_SETTINGS;
+    return DEFAULT_READER_SETTINGS;
   }
 }
 
@@ -165,8 +205,13 @@ function loadLatestSettings(): ReaderSettings {
   return failedSettingsWrite ?? loadSettings();
 }
 
-export function useReaderSettings() {
+export function useReaderSettings(active = true) {
   const [settings, setSettings] = useState<ReaderSettings>(loadLatestSettings);
+  // 事件回调同步维护的最新快照。pending 不能只等 layout effect：更新设置的
+  // 同一个任务末尾若立刻 pagehide，最终值必须已经有可冲刷的凭据。
+  const settingsRef = useRef(settings);
+  const activeRef = useRef(active);
+  activeRef.current = active;
 
   // Persist on change, but coalesce bursts from slider drags so we don't
   // hit localStorage 18 times while the user is pulling the font-size
@@ -235,7 +280,8 @@ export function useReaderSettings() {
   // 上一版），界面上的最终值便没有任何持久化凭据。
   const initialSettingsRef = useRef(settings);
   useLayoutEffect(() => {
-    if (typeof window === "undefined") return;
+    settingsRef.current = settings;
+    if (typeof window === "undefined" || !active) return;
     if (settings === initialSettingsRef.current) {
       return;
     }
@@ -256,13 +302,13 @@ export function useReaderSettings() {
         persistTimerRef.current = null;
       }
     };
-  }, [settings, flushPendingSettings]);
+  }, [active, settings, flushPendingSettings]);
 
   // 卸载冲刷：拖着滑杆直接关掉抽屉/离开阅读器时，把还在防抖窗口里的
   // 最终值写掉，而不是悄悄丢弃。
   useEffect(() => () => flushPendingSettings(), [flushPendingSettings]);
 
-  // 挂载后对账一次盘上内容。阅读器按 storyId 重挂，换章时新实例的 useState
+  // 挂载 / KeepAlive 重新激活后对账盘上内容。阅读器按 storyId 重挂，换章时新实例的 useState
   // 初始化在 render 阶段读盘，而旧实例的卸载冲刷要到 commit 的 passive 清理
   // 阶段才落盘（React 先跑被删子树的 passive 清理、再跑新子树的 passive
   // effect，所以这里必然读得到那笔写入）——初始快照因此可能落后一笔：旧实例
@@ -271,21 +317,32 @@ export function useReaderSettings() {
   // 旧样。逐键比较：值全一致时保留原引用，别惊动排版，也别触发回写。
   useEffect(() => {
     if (typeof window === "undefined") return;
+    if (!active) {
+      if (persistTimerRef.current !== null) {
+        window.clearTimeout(persistTimerRef.current);
+        persistTimerRef.current = null;
+      }
+      flushPendingSettings();
+      return;
+    }
+    flushPendingSettings();
     setSettings((prev) => {
       const disk = loadLatestSettings();
+      initialSettingsRef.current = disk;
+      settingsRef.current = disk;
       const changed = (Object.keys(disk) as Array<keyof ReaderSettings>).some(
         (key) => disk[key] !== prev[key]
       );
       return changed ? disk : prev;
     });
-  }, []);
+  }, [active, flushPendingSettings]);
 
   // 切后台 / 关标签页冲刷：移动端杀掉 app、桌面端直接关窗口都不会走
   // unmount（阅读器被 KeepAlive 常驻挂载，settings hook 跟着常驻）。
   // 调完字号 200ms 内锁屏或关掉 app，防抖窗口里的最终值以前会静默丢失，
   // 下次打开排版被打回旧样。与阅读进度 hook 的同名兜底对齐。
   useEffect(() => {
-    if (typeof window === "undefined") return;
+    if (typeof window === "undefined" || !active) return;
     const handleHide = () => {
       if (document.visibilityState === "hidden") flushPendingSettings();
     };
@@ -296,13 +353,13 @@ export function useReaderSettings() {
       document.removeEventListener("visibilitychange", handleHide);
       window.removeEventListener("pagehide", handlePageHide);
     };
-  }, [flushPendingSettings]);
+  }, [active, flushPendingSettings]);
 
   // 多窗口（桌面端可以开多个）时跟随其它窗口的修改。设置是整对象回写：
   // 不跟随的话，A 窗口刚调好的字号会在 B 窗口下一次改主题的回写里被 B 的
   // 旧内存快照打回（收藏 / 偏好 hook 修过同一个坑）。
   useEffect(() => {
-    if (typeof window === "undefined") return;
+    if (typeof window === "undefined" || !active) return;
     const onStorage = (event: StorageEvent) => {
       // key 为 null 表示外部 storage.clear()，也要跟随。
       if (event.key !== null && event.key !== STORAGE_KEY) return;
@@ -314,8 +371,16 @@ export function useReaderSettings() {
       pendingSettingsRef.current = null;
       failedSettingsWrite = null;
       persistFailureNotified = false;
+      if (persistTimerRef.current !== null) {
+        window.clearTimeout(persistTimerRef.current);
+        persistTimerRef.current = null;
+      }
+      const next = loadSettings();
+      // setState 的函数式 updater 可能稍后才执行；ref 必须在事件任务内同步，
+      // 否则本窗口紧接着的局部设置合并仍会从外部修改前的快照起步。
+      initialSettingsRef.current = next;
+      settingsRef.current = next;
       setSettings((prev) => {
-        const next = loadSettings();
         const changed = (Object.keys(next) as Array<keyof ReaderSettings>).some(
           (key) => next[key] !== prev[key]
         );
@@ -324,27 +389,30 @@ export function useReaderSettings() {
     };
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);
-  }, []);
+  }, [active]);
 
   const updateSettings = useCallback((partial: Partial<ReaderSettings>) => {
-    setSettings((prev) => {
-      const next = sanitizeSettings({ ...prev, ...partial });
-      // 滑杆按住不动也会持续派发 input 事件；值没变就别制造新对象，
-      // 否则上千段的正文会跟着白白重排一次。
-      const changed = (Object.keys(next) as Array<keyof ReaderSettings>).some(
-        (key) => next[key] !== prev[key]
-      );
-      return changed ? next : prev;
-    });
+    if (!activeRef.current) return;
+    const prev = settingsRef.current;
+    const next = mergeReaderSettings(prev, partial);
+    // 滑杆按住不动也会持续派发 input 事件；值没变就别制造新对象，
+    // 否则上千段的正文会跟着白白重排一次。
+    if (readerSettingsEqual(next, prev)) return;
+    // 先物化、后交给 React：即便 pagehide 抢在 commit/layout effect 前，
+    // flushPendingSettings 也能拿到用户刚刚操作的最终快照。
+    settingsRef.current = next;
+    pendingSettingsRef.current = next;
+    setSettings(next);
   }, []);
 
   const resetSettings = useCallback(() => {
-    setSettings((prev) => {
-      const changed = (Object.keys(DEFAULT_SETTINGS) as Array<keyof ReaderSettings>).some(
-        (key) => DEFAULT_SETTINGS[key] !== prev[key]
-      );
-      return changed ? { ...DEFAULT_SETTINGS } : prev;
-    });
+    if (!activeRef.current) return;
+    const prev = settingsRef.current;
+    if (readerSettingsEqual(prev, DEFAULT_READER_SETTINGS)) return;
+    const next = { ...DEFAULT_READER_SETTINGS };
+    settingsRef.current = next;
+    pendingSettingsRef.current = next;
+    setSettings(next);
   }, []);
 
   return useMemo(

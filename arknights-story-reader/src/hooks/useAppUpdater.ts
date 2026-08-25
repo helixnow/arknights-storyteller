@@ -1,19 +1,31 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { getVersion } from "@tauri-apps/api/app";
-import { invoke } from "@tauri-apps/api/core";
+import { addPluginListener, invoke } from "@tauri-apps/api/core";
 import { acquireDataJobWhenIdle } from "@/hooks/useDataSyncManager";
+import {
+  classifyAndroidInstallResponse,
+  compareVersions,
+  describeUpdateError,
+  normalizeAndroidDownloadProgress,
+  parseAndroidManifest,
+  redactSensitive,
+  validateAndroidFeedUrl,
+  type AndroidManifestData,
+  type UpdateIssue,
+} from "@/hooks/appUpdaterUtils";
+
+export {
+  compareVersions,
+  describeUpdateError,
+  redactSensitive,
+} from "@/hooks/appUpdaterUtils";
+export type {
+  UpdateIssue,
+  UpdateIssueKind,
+  UpdateIssueTone,
+} from "@/hooks/appUpdaterUtils";
 
 const IS_DEV = import.meta.env.DEV;
-
-/**
- * 更新源地址、下载直链、签名参数都不该出现在正式包的控制台里（用户随手截个图
- * 就把私有分发地址带出去了），界面文案里同样不该出现。
- */
-export function redactSensitive(text: string): string {
-  return text
-    .replace(/\b[a-z][a-z0-9+.-]*:\/\/\S+/gi, "<链接>")
-    .replace(/\b(token|key|signature|sig|secret|password)=[^\s&"']+/gi, "$1=<已隐藏>");
-}
 
 /**
  * 诊断日志只在开发构建输出。更新 / 同步流程打点很密，正式包里既刷屏又会把
@@ -44,12 +56,7 @@ export function detectRuntimePlatform(): RuntimePlatform {
 type PluginUpdaterModule = typeof import("@tauri-apps/plugin-updater");
 type PluginUpdateHandle = Awaited<ReturnType<PluginUpdaterModule["check"]>>;
 
-export type AndroidUpdateManifest = {
-  version: string;
-  url: string;
-  fileName?: string | null;
-  notes?: string | null;
-};
+export type AndroidUpdateManifest = AndroidManifestData;
 
 export interface DesktopUpdateAvailable {
   platform: "desktop";
@@ -81,159 +88,6 @@ export interface UpdateDownloadProgress {
   /** 0-100；总长度未知时为 null。 */
   percent: number | null;
   done: boolean;
-}
-
-const enum CompareResult {
-  Greater = 1,
-  Equals = 0,
-  Less = -1,
-}
-
-export function compareVersions(a: string, b: string): CompareResult {
-  // 预发布段（-beta.1）必须单独切出来：直接按「.」切段再 parseInt 会把
-  // 「1.2.3-beta.1」拆成 [1,2,3,1]，排到正式版 1.2.3 前面——更新源一发
-  // 预发布包，正式版用户就会被误提示"新版本"，预发布用户反而永远等不到
-  // 转正提示。构建元数据（+xxx）按 semver 不参与排序。
-  const parse = (input: string) => {
-    const cleaned = input.trim().replace(/^v/i, "").split("+")[0];
-    const dashIndex = cleaned.indexOf("-");
-    return {
-      core: (dashIndex === -1 ? cleaned : cleaned.slice(0, dashIndex)).split("."),
-      prerelease: dashIndex === -1 ? null : cleaned.slice(dashIndex + 1),
-    };
-  };
-  const versionA = parse(a);
-  const versionB = parse(b);
-
-  const length = Math.max(versionA.core.length, versionB.core.length);
-  for (let i = 0; i < length; i += 1) {
-    const segmentA = parseInt(versionA.core[i] ?? "0", 10);
-    const segmentB = parseInt(versionB.core[i] ?? "0", 10);
-    if (Number.isNaN(segmentA) || Number.isNaN(segmentB)) {
-      return CompareResult.Equals;
-    }
-    if (segmentA > segmentB) return CompareResult.Greater;
-    if (segmentA < segmentB) return CompareResult.Less;
-  }
-
-  // 核心版本相同时，带预发布段的一方更旧（1.2.3-beta < 1.2.3）。
-  if (versionA.prerelease === null && versionB.prerelease === null) return CompareResult.Equals;
-  if (versionA.prerelease === null) return CompareResult.Greater;
-  if (versionB.prerelease === null) return CompareResult.Less;
-  return comparePrereleaseIdentifiers(versionA.prerelease, versionB.prerelease);
-}
-
-/** semver 预发布段排序：数字标识符按数值比且低于字母标识符，标识符少的更旧。 */
-function comparePrereleaseIdentifiers(a: string, b: string): CompareResult {
-  const idsA = a.split(".");
-  const idsB = b.split(".");
-  const length = Math.max(idsA.length, idsB.length);
-  for (let i = 0; i < length; i += 1) {
-    const idA = idsA[i];
-    const idB = idsB[i];
-    if (idA === undefined) return CompareResult.Less;
-    if (idB === undefined) return CompareResult.Greater;
-    const numA = /^\d+$/.test(idA) ? parseInt(idA, 10) : null;
-    const numB = /^\d+$/.test(idB) ? parseInt(idB, 10) : null;
-    if (numA !== null && numB !== null) {
-      if (numA > numB) return CompareResult.Greater;
-      if (numA < numB) return CompareResult.Less;
-    } else if (numA !== null) {
-      return CompareResult.Less;
-    } else if (numB !== null) {
-      return CompareResult.Greater;
-    } else if (idA !== idB) {
-      return idA > idB ? CompareResult.Greater : CompareResult.Less;
-    }
-  }
-  return CompareResult.Equals;
-}
-
-export type UpdateIssueTone = "info" | "warning" | "error";
-
-/**
- * 失败原因分类。调用方要靠它区分「用户自己取消」「网络不通」「签名不对」——
- * 前者根本不算错误，后者必须当成安全事件对待，不能混成同一条红字。
- */
-export type UpdateIssueKind =
-  | "unsupported"
-  | "not-configured"
-  | "cancelled"
-  | "signature"
-  | "feed"
-  | "network"
-  | "unknown";
-
-export interface UpdateIssue {
-  tone: UpdateIssueTone;
-  kind: UpdateIssueKind;
-  message: string;
-}
-
-/**
- * 更新检查失败在绝大多数情况下都不是用户能修的问题（没打更新签名、没配更新源、
- * 网络不通），所以只有签名校验这类真正危险的分支才用 error 语气。
- */
-const UPDATE_ERROR_RULES: Array<{ test: RegExp; tone: UpdateIssueTone; kind: UpdateIssueKind; message: string }> = [
-  {
-    test: /并非\s*Tauri|not a tauri/i,
-    tone: "info",
-    kind: "unsupported",
-    message: "当前环境不是桌面/移动客户端，无法检查更新。",
-  },
-  {
-    test: /VITE_ANDROID_UPDATE_FEED|未配置安卓更新源/i,
-    tone: "info",
-    kind: "not-configured",
-    message: "当前构建未配置更新源，请前往项目发布页手动下载新版本。",
-  },
-  {
-    test: /not allowed|unknown plugin|plugin .*not (?:found|registered)|updater.*disabled/i,
-    tone: "info",
-    kind: "not-configured",
-    message: "当前安装包未启用自动更新，请前往项目发布页手动下载新版本。",
-  },
-  {
-    // 用户自己点了「取消」/UAC 拒绝（Windows 1223），不是故障。
-    test: /user cancell?ed|cancell?ed by (?:the )?user|操作已取消|用户已?取消|os error 1223/i,
-    tone: "info",
-    kind: "cancelled",
-    message: "更新已取消，可稍后在设置里重新检查。",
-  },
-  {
-    test: /signature|pubkey|public key|verif/i,
-    tone: "error",
-    kind: "signature",
-    message: "更新包签名校验失败，出于安全考虑已中止安装。",
-  },
-  {
-    test: /could not fetch a valid release|releases?\.json|manifest|缺少 version|HTTP 4\d\d|HTTP 5\d\d/i,
-    tone: "warning",
-    kind: "feed",
-    message: "更新源暂时不可用，请稍后再试。",
-  },
-  {
-    test: /network|failed to fetch|error sending request|timed? ?out|超时|dns|connect|ECONN|ENOTFOUND|offline|网络/i,
-    tone: "warning",
-    kind: "network",
-    message: "无法连接更新服务器，请检查网络后重试。",
-  },
-];
-
-/** 把更新流程里的异常翻译成一句不吓人的中文；兜底透出的原文先脱敏。 */
-export function describeUpdateError(
-  error: unknown,
-  fallback = "本次更新检查没有完成，可稍后再试。"
-): UpdateIssue {
-  const raw = error instanceof Error ? error.message : String(error ?? "");
-  const text = raw.trim();
-  for (const rule of UPDATE_ERROR_RULES) {
-    if (rule.test.test(text)) {
-      return { tone: rule.tone, kind: rule.kind, message: rule.message };
-    }
-  }
-  if (!text) return { tone: "warning", kind: "unknown", message: fallback };
-  return { tone: "warning", kind: "unknown", message: `${fallback}（${redactSensitive(text)}）` };
 }
 
 /**
@@ -268,20 +122,22 @@ async function fetchAndroidManifest(options: ManifestOptions = {}): Promise<Andr
     devLog("[Updater] 未配置 VITE_ANDROID_UPDATE_FEED，跳过安卓更新检查");
     return null;
   }
-
   // 更新源挂掉时不能让请求一直吊着，否则启动期的自动检查会一直占着连接。
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(feed, { cache: "no-store", signal: controller.signal });
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
-    const data = (await response.json()) as AndroidUpdateManifest;
-    if (!data?.version || !data?.url) {
-      throw new Error("更新 manifest 缺少 version 或 url 字段");
-    }
-    return data;
+    const manifestUrl = validateAndroidFeedUrl(feed);
+    // GitHub Releases 下载链没有 CORS 头，WebView fetch 会被浏览器拦下。
+    // 超时由原生 10s 限制和这边的 AbortController 竞态一起兜住。
+    const payload = await Promise.race([
+      invoke<unknown>("fetch_update_manifest", { url: manifestUrl }),
+      new Promise<never>((_, reject) => {
+        controller.signal.addEventListener("abort", () => {
+          reject(new DOMException("请求更新信息超时", "AbortError"));
+        });
+      }),
+    ]);
+    return parseAndroidManifest(payload);
   } catch (error) {
     const normalized =
       error instanceof DOMException && error.name === "AbortError"
@@ -299,10 +155,166 @@ async function fetchAndroidManifest(options: ManifestOptions = {}): Promise<Andr
   }
 }
 
+let fallbackDialogQueue: Promise<void> = Promise.resolve();
+
+function enqueueFallbackDialog(
+  message: string,
+  options: {
+    title: string;
+    kind: "info" | "warning" | "error";
+    messageOnly?: boolean;
+  }
+): Promise<boolean> {
+  if (typeof document === "undefined" || !document.body) {
+    try {
+      return Promise.resolve(options.messageOnly ? (window.alert(message), true) : window.confirm(message));
+    } catch {
+      return Promise.resolve(false);
+    }
+  }
+
+  const show = () =>
+    new Promise<boolean>((resolve) => {
+      const previouslyFocused = document.activeElement as HTMLElement | null;
+      const previousOverflow = document.body.style.overflow;
+      const overlay = document.createElement("div");
+      const dialog = document.createElement("div");
+      const title = document.createElement("h2");
+      const body = document.createElement("p");
+      const actions = document.createElement("div");
+      const cancel = document.createElement("button");
+      const confirm = document.createElement("button");
+      const id = `safe-dialog-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+      overlay.dataset.safeDialog = "true";
+      Object.assign(overlay.style, {
+        position: "fixed",
+        inset: "0",
+        zIndex: "2147483647",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding:
+          "max(16px, env(safe-area-inset-top, 0px)) max(16px, env(safe-area-inset-right, 0px)) max(16px, env(safe-area-inset-bottom, 0px)) max(16px, env(safe-area-inset-left, 0px))",
+        background: "rgba(0, 0, 0, 0.55)",
+      });
+      dialog.setAttribute("role", "dialog");
+      dialog.setAttribute("aria-modal", "true");
+      dialog.setAttribute("aria-labelledby", `${id}-title`);
+      dialog.setAttribute("aria-describedby", `${id}-body`);
+      dialog.tabIndex = -1;
+      Object.assign(dialog.style, {
+        width: "min(100%, 420px)",
+        maxHeight: "calc(100dvh - 32px)",
+        overflowY: "auto",
+        border: "1px solid hsl(var(--color-border))",
+        borderRadius: "14px",
+        padding: "20px",
+        background: "hsl(var(--color-card))",
+        color: "hsl(var(--color-card-foreground))",
+        boxShadow: "0 20px 60px rgba(0, 0, 0, 0.35)",
+      });
+      title.id = `${id}-title`;
+      title.textContent = options.title;
+      Object.assign(title.style, { margin: "0", fontSize: "18px", fontWeight: "600" });
+      body.id = `${id}-body`;
+      body.textContent = message;
+      Object.assign(body.style, {
+        margin: "12px 0 20px",
+        fontSize: "16px",
+        lineHeight: "1.6",
+        whiteSpace: "pre-wrap",
+        overflowWrap: "anywhere",
+      });
+      Object.assign(actions.style, {
+        display: "flex",
+        justifyContent: "flex-end",
+        flexWrap: "wrap",
+        gap: "10px",
+      });
+      for (const button of [cancel, confirm]) {
+        button.type = "button";
+        Object.assign(button.style, {
+          minWidth: "88px",
+          minHeight: "44px",
+          borderRadius: "9px",
+          padding: "8px 16px",
+          border: "1px solid hsl(var(--color-border))",
+          font: "inherit",
+          fontSize: "16px",
+          cursor: "pointer",
+        });
+      }
+      cancel.textContent = "取消";
+      Object.assign(cancel.style, {
+        background: "hsl(var(--color-background))",
+        color: "hsl(var(--color-foreground))",
+      });
+      confirm.textContent = options.messageOnly ? "知道了" : "确定";
+      Object.assign(confirm.style, {
+        background:
+          options.kind === "error"
+            ? "hsl(var(--color-destructive))"
+            : "hsl(var(--color-primary))",
+        color:
+          options.kind === "error"
+            ? "hsl(var(--color-destructive-foreground))"
+            : "hsl(var(--color-primary-foreground))",
+      });
+
+      let settled = false;
+      const finish = (result: boolean) => {
+        if (settled) return;
+        settled = true;
+        document.removeEventListener("keydown", onKeyDown, true);
+        overlay.remove();
+        document.body.style.overflow = previousOverflow;
+        if (previouslyFocused && document.contains(previouslyFocused)) previouslyFocused.focus();
+        resolve(result);
+      };
+      const onKeyDown = (event: KeyboardEvent) => {
+        if (event.key === "Escape" || event.key === "BrowserBack" || event.key === "GoBack") {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          finish(options.messageOnly === true);
+          return;
+        }
+        if (event.key !== "Tab") return;
+        const focusable = options.messageOnly ? [confirm] : [cancel, confirm];
+        const current = document.activeElement;
+        const index = focusable.indexOf(current as HTMLButtonElement);
+        event.preventDefault();
+        const next = event.shiftKey
+          ? (index <= 0 ? focusable.length : index) - 1
+          : (index + 1) % focusable.length;
+        focusable[next].focus();
+      };
+
+      cancel.addEventListener("click", () => finish(false));
+      confirm.addEventListener("click", () => finish(true));
+      overlay.addEventListener("click", (event) => {
+        if (event.target === overlay) finish(options.messageOnly === true);
+      });
+      actions.append(...(options.messageOnly ? [confirm] : [cancel, confirm]));
+      dialog.append(title, body, actions);
+      overlay.append(dialog);
+      document.body.append(overlay);
+      document.body.style.overflow = "hidden";
+      document.addEventListener("keydown", onKeyDown, true);
+      (options.messageOnly ? confirm : cancel).focus();
+    });
+
+  const result = fallbackDialogQueue.then(show, show);
+  fallbackDialogQueue = result.then(
+    () => undefined,
+    () => undefined
+  );
+  return result;
+}
+
 /**
- * 确认对话框。macOS / iOS 的 WKWebView 不实现 JS 的 window.confirm（直接静默
- * 返回 false），所以优先走 plugin-dialog；Android 上该插件未注册，调用会被 ACL
- * 拒绝，此时再回退到 window.confirm（Android WebView 支持）。
+ * Native dialog first; if the mobile plugin is unavailable, use an in-app
+ * modal instead of trusting WebView `confirm`, which may silently return false.
  */
 export async function safeConfirm(
   message: string,
@@ -318,19 +330,13 @@ export async function safeConfirm(
       return await dialog.ask(message, { title, kind });
     }
   } catch (error) {
-    devLog("[Dialog] 对话框插件不可用，回退到 window.confirm", error);
+    devLog("[Dialog] 对话框插件不可用，回退到应用内确认框", error);
   }
-  try {
-    return window.confirm(message);
-  } catch (error) {
-    devWarn("[Dialog] window.confirm 不可用", error);
-    return false;
-  }
+  return enqueueFallbackDialog(message, { title, kind });
 }
 
 /**
- * 提示对话框，回退策略与 safeConfirm 相同（WKWebView 不实现 window.alert，
- * 优先 plugin-dialog；Android 上插件被 ACL 拒绝时回退 window.alert）。
+ * 提示对话框，回退策略与 safeConfirm 相同。
  * 它本身就是兜底反馈，展示失败只记日志，绝不能再抛错打断调用方。
  */
 export async function safeMessage(
@@ -345,13 +351,9 @@ export async function safeMessage(
       return;
     }
   } catch (error) {
-    devLog("[Dialog] 对话框插件不可用，回退到 window.alert", error);
+    devLog("[Dialog] 对话框插件不可用，回退到应用内提示框", error);
   }
-  try {
-    window.alert(text);
-  } catch (error) {
-    devWarn("[Dialog] window.alert 不可用", error);
-  }
+  await enqueueFallbackDialog(text, { title, kind, messageOnly: true });
 }
 
 export async function checkDesktopUpdate(currentVersionOverride?: string): Promise<DesktopUpdateAvailable | null> {
@@ -428,7 +430,7 @@ export async function checkAndroidUpdate(currentVersionOverride?: string): Promi
     return null;
   }
 
-  if (compareVersions(manifest.version, currentVersion) <= CompareResult.Equals) {
+  if (compareVersions(manifest.version, currentVersion) <= 0) {
     return null;
   }
 
@@ -439,12 +441,57 @@ export async function checkAndroidUpdate(currentVersionOverride?: string): Promi
   };
 }
 
-export async function installAndroidUpdate(update: AndroidUpdateAvailable): Promise<AndroidInstallResponse> {
-  const response = await invoke<AndroidInstallResponse>("plugin:apk-updater|download_and_install", {
-    url: update.manifest.url,
-    fileName: update.manifest.fileName ?? null,
-  });
-  return response;
+let androidInstallInFlight = false;
+
+export async function installAndroidUpdate(
+  update: AndroidUpdateAvailable,
+  onProgress?: (progress: UpdateDownloadProgress) => void
+): Promise<AndroidInstallResponse> {
+  if (androidInstallInFlight) {
+    throw new Error("已有更新下载正在进行，请等待完成后再试");
+  }
+  androidInstallInFlight = true;
+  let progressListener: { unregister(): Promise<void> } | null = null;
+  try {
+    if (onProgress) {
+      try {
+        // Kotlin Plugin.trigger publishes on the plugin listener channel, not
+        // Tauri's global event bus. Await registration before invoking the
+        // plugin so the first (and cached-APK final) event cannot race past UI.
+        progressListener = await addPluginListener<unknown>(
+          "apk-updater",
+          "apk-progress",
+          (payload) => {
+            const normalized = normalizeAndroidDownloadProgress(payload);
+            if (normalized) onProgress(normalized);
+          }
+        );
+      } catch (error) {
+        // Progress is best-effort; inability to subscribe must not prevent an
+        // otherwise valid install.
+        devWarn("[Updater] 监听 Android 下载进度失败", error);
+      }
+    }
+    const response = await invoke<AndroidInstallResponse>("plugin:apk-updater|download_and_install", {
+      url: update.manifest.url,
+      fileName: update.manifest.fileName ?? null,
+    });
+    // A resolved invoke is not by itself proof that Android opened anything.
+    // Reject malformed/unknown plugin replies instead of declaring success.
+    classifyAndroidInstallResponse(response);
+    return response;
+  } finally {
+    if (progressListener) {
+      try {
+        await progressListener.unregister();
+      } catch (error) {
+        // Listener cleanup failure must not turn a successfully launched
+        // installer into a false update failure.
+        devWarn("[Updater] 移除 Android 下载进度监听失败", error);
+      }
+    }
+    androidInstallInFlight = false;
+  }
 }
 
 export async function openAndroidInstallPermissionSettings(): Promise<void> {
@@ -465,7 +512,12 @@ let autoUpdateFlowStarted = false;
  */
 const INSTALL_LOCK_WAIT_MS = 5 * 60_000;
 
-export function useAppUpdater() {
+export function useAppUpdater(options?: {
+  notify?: (message: string, kind?: "info" | "warning") => void;
+}) {
+  const notifyRef = useRef(options?.notify);
+  notifyRef.current = options?.notify;
+
   useEffect(() => {
     if (autoUpdateFlowStarted || !isTauriEnvironment()) return;
     autoUpdateFlowStarted = true;
@@ -521,7 +573,12 @@ export function useAppUpdater() {
         if (isCancelled()) return;
         // 缺少 `updater:allow-check` 权限、未配置更新源之类都是打包配置问题，
         // 启动期没必要在控制台刷红。
-        const issue = describeUpdateError(error);
+        const issue = describeUpdateError(
+          error,
+          userConfirmedInstall
+            ? "更新安装未完成，可稍后重试。"
+            : "本次更新检查没有完成，可稍后再试。"
+        );
         logUpdateIssue("[Updater] 桌面更新未完成：", issue, error);
         // 用户自己取消（含 Windows UAC 拒绝）不用再提醒一遍。
         if (userConfirmedInstall && issue.kind !== "cancelled") {
@@ -542,7 +599,7 @@ export function useAppUpdater() {
         const currentVersion = await getVersion();
         if (isCancelled()) return;
 
-        if (compareVersions(manifest.version, currentVersion) <= CompareResult.Equals) {
+        if (compareVersions(manifest.version, currentVersion) <= 0) {
           devLog("[Updater] 安卓端已是最新版本", currentVersion, manifest.version);
           return;
         }
@@ -557,6 +614,7 @@ export function useAppUpdater() {
           return;
         }
         userConfirmedInstall = true;
+        notifyRef.current?.("已在后台下载更新包，完成后会自动拉起安装器");
 
         const releaseJob = await acquireDataJobWhenIdle("update", INSTALL_LOCK_WAIT_MS);
         if (!releaseJob) {
@@ -600,7 +658,12 @@ export function useAppUpdater() {
         }
       } catch (error) {
         if (isCancelled()) return;
-        const issue = describeUpdateError(error);
+        const issue = describeUpdateError(
+          error,
+          userConfirmedInstall
+            ? "更新安装未完成，可稍后重试。"
+            : "本次更新检查没有完成，可稍后再试。"
+        );
         logUpdateIssue("[Updater] 安卓更新未完成：", issue, error);
         if (userConfirmedInstall && issue.kind !== "cancelled") {
           await safeMessage(issue.message, {

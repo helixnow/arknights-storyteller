@@ -17,7 +17,8 @@ import { BACK_PRIORITY, useBackHandler } from "@/hooks/useBackHandler";
 import { useAutoIndex } from "@/hooks/useAutoIndex";
 import { flushReadingProgressWrites } from "@/hooks/useReadingProgress";
 import { useLegacyStorageCleanup } from "@/hooks/useLegacyStorageCleanup";
-import { ToastProvider } from "@/components/ui/toast";
+import { ToastProvider, useToast } from "@/components/ui/toast";
+import { READER_RETENTION_MS } from "@/lib/appShellLogic";
 
 const TABS = ["home", "stories", "characters", "search", "settings"] as const;
 type Tab = (typeof TABS)[number];
@@ -43,8 +44,16 @@ interface ReaderIntent {
   jump?: ReaderJump;
 }
 
+function AppUpdaterHost() {
+  const toast = useToast();
+  useAppUpdater({
+    notify: (message, kind) =>
+      toast.show(message, { kind: kind === "warning" ? "warning" : "default", duration: 5000 }),
+  });
+  return null;
+}
+
 function App() {
-  useAppUpdater();
   useAutoIndex();
   useLegacyStorageCleanup();
   const [activeTab, setActiveTab] = useState<Tab>("home");
@@ -54,22 +63,47 @@ function App() {
   const [readerInitialCharacter, setReaderInitialCharacter] = useState<string | null>(null);
   const [readerInitialJump, setReaderInitialJump] = useState<ReaderJump | null>(null);
   const readerActive = readerVisible && readerStory !== null;
+  const activeTabRef = useRef<Tab>(activeTab);
 
   // 关闭阅读器时要不要广播 `app:home-refresh`，取决于它当时是不是真的开着。
   // 用 ref 而不是把 `readerVisible` 写进 useCallback 依赖：那样每次开合阅读器
   // 都会换掉 `handleGoToTab` 的引用，连带把 memo 过的首页视图重算一遍。
   const readerVisibleRef = useRef(readerVisible);
+  const readerFocusRestoreRef = useRef<HTMLElement | null>(null);
+  const readerEvictionTimerRef = useRef<number | null>(null);
   useEffect(() => {
     readerVisibleRef.current = readerVisible;
   }, [readerVisible]);
+
+  const cancelReaderEviction = useCallback(() => {
+    if (readerEvictionTimerRef.current === null) return;
+    window.clearTimeout(readerEvictionTimerRef.current);
+    readerEvictionTimerRef.current = null;
+  }, []);
+
+  const scheduleReaderEviction = useCallback(() => {
+    cancelReaderEviction();
+    readerEvictionTimerRef.current = window.setTimeout(() => {
+      readerEvictionTimerRef.current = null;
+      if (readerVisibleRef.current) return;
+      // KeepAlive 只负责短期返回时保住位置。超过预取缓存同样的 TTL 后真正
+      // 卸载阅读器，释放整篇段落、图片与观察器持有的实例内存。
+      setReaderStory(null);
+      setReaderFocus(null);
+      setReaderInitialCharacter(null);
+      setReaderInitialJump(null);
+    }, READER_RETENTION_MS);
+  }, [cancelReaderEviction]);
+
+  useEffect(() => cancelReaderEviction, [cancelReaderEviction]);
 
   /**
    * 收起阅读器并（仅在它确实开着时）广播一次进度刷新。首页的「继续阅读」和
    * 剧情列表的进度条都靠这个事件回读 localStorage —— 不管用户是按返回、点
    * 返回箭头还是被 `app:go-tab` 带走，都要走这里，否则列表会停在旧进度。
    */
-  const closeReader = useCallback(() => {
-    if (!readerVisibleRef.current) return;
+  const closeReader = useCallback((): boolean => {
+    if (!readerVisibleRef.current) return false;
     readerVisibleRef.current = false;
     setReaderVisible(false);
     // 进度是节流落盘的（≤1.2s），而下面的事件会让列表同步回读
@@ -77,17 +111,35 @@ function App() {
     // 再冲刷已经晚了。先在这里强制冲刷，列表读到的才是最终进度。
     flushReadingProgressWrites();
     window.dispatchEvent(new Event("app:home-refresh"));
-  }, []);
+    scheduleReaderEviction();
+    return true;
+  }, [scheduleReaderEviction]);
+
+  useEffect(() => {
+    if (readerVisible) return;
+    const previous = readerFocusRestoreRef.current;
+    readerFocusRestoreRef.current = null;
+    if (!previous) return;
+    if (previous.isConnected) {
+      previous.focus({ preventScroll: true });
+      return;
+    }
+    document.getElementById(tabButtonId(activeTabRef.current))?.focus({ preventScroll: true });
+  }, [readerVisible]);
 
   /** 打开阅读器的唯一入口：意图之间互斥，没带的一律清空。 */
   const openReader = useCallback((story: StoryEntry, intent: ReaderIntent = {}) => {
+    const active = document.activeElement;
+    readerFocusRestoreRef.current =
+      active instanceof HTMLElement && active !== document.body ? active : null;
+    cancelReaderEviction();
     setReaderStory(story);
     setReaderFocus(intent.focus ?? null);
     setReaderInitialCharacter(intent.character ?? null);
     setReaderInitialJump(intent.jump ?? null);
     readerVisibleRef.current = true;
     setReaderVisible(true);
-  }, []);
+  }, [cancelReaderEviction]);
 
   const handleSelectStory = useCallback(
     (story: StoryEntry) => {
@@ -97,7 +149,7 @@ function App() {
   );
 
   const handleBackToList = useCallback(() => {
-    closeReader();
+    void closeReader();
   }, [closeReader]);
 
   const handleSearchResult = useCallback(
@@ -136,15 +188,16 @@ function App() {
   );
 
   const handleTabChange = useCallback((tab: Tab) => {
+    activeTabRef.current = tab;
     setActiveTab(tab);
   }, []);
 
   const handleGoToTab = useCallback(
     (tab: Tab) => {
-      setActiveTab(tab);
+      handleTabChange(tab);
       closeReader();
     },
-    [closeReader]
+    [closeReader, handleTabChange]
   );
 
   useEffect(() => {
@@ -175,15 +228,18 @@ function App() {
   useBackHandler(
     readerActive,
     () => {
-      handleBackToList();
-      return true;
+      // React 的 effect 注销要等提交；ref 已在第一次返回里同步置 false，
+      // 连按时这层明确放行，不能再吞掉下一层 tab/退出返回。
+      return closeReader();
     },
     BACK_PRIORITY.view
   );
 
   useBackHandler(
-    !readerActive && activeTab !== "home",
+    activeTab !== "home",
     () => {
+      if (activeTabRef.current === "home") return false;
+      activeTabRef.current = "home";
       setActiveTab("home");
       return true;
     },
@@ -265,14 +321,20 @@ function App() {
   ];
 
   const appContent = (
-    <div className="h-full flex flex-col overflow-hidden pt-[max(env(safe-area-inset-top,0px),12px)]">
+    <div className="app-shell h-full flex flex-col overflow-hidden">
       <div className="relative flex-1 overflow-hidden">
         {/*
          * 阅读器是盖在 tab 层之上的整屏浮层，所以整层 tab 一起从无障碍树和
-         * 焦点序列里摘掉，而不是逐个面板去摘：`display: contents` 不产生盒子，
-         * 里面的绝对定位面板照旧相对外层的 relative 容器排布。
+         * 焦点序列里摘掉。这里必须是真正的盒子：`display: contents` 不产生
+         * 层叠/裁剪边界，inert 在部分 WebView 上也不会传到子树，隐藏 tab
+         * 会和阅读器叠在同一视口里抢渲染。不要加 isolate：那会把面板内
+         * z-50 模态封在包装层里，玻璃底栏会浮在同步框遮罩之上还能点。
          */}
-        <div className="contents" aria-hidden={readerActive} inert={readerActive}>
+        <div
+          className="absolute inset-0 overflow-hidden"
+          aria-hidden={readerActive}
+          inert={readerActive}
+        >
           {panels.map(({ tab, content }) => (
             <KeepAlive
               key={tab}
@@ -303,6 +365,7 @@ function App() {
   return (
     <ThemeProvider defaultTheme="system" storageKey="story-teller-theme">
       <ToastProvider>
+        <AppUpdaterHost />
         <FavoritesProvider>
           <AppPreferencesProvider>
             <CharacterResolverProvider>{appContent}</CharacterResolverProvider>

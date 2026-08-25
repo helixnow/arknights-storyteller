@@ -83,11 +83,29 @@ fn npc_override(token: &str) -> Option<&'static str> {
         .map(|(_, url)| *url)
 }
 
+/// 剧情层传来的 charId 可能仍带立绘/皮肤后缀；素材仓库的头像路径只认
+/// `char_<数字>_<alias>` 身份本体，而且路径大小写敏感，统一收敛为小写。
+fn normalize_direct_char_id(token: &str) -> Option<String> {
+    let base = token
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'')
+        .trim_start_matches('$')
+        .split(|c| c == '#' || c == '$')
+        .next()
+        .unwrap_or_default();
+    let parts: Vec<&str> = base.split('_').filter(|part| !part.is_empty()).collect();
+    if parts.len() < 3
+        || !parts[0].eq_ignore_ascii_case("char")
+        || !parts[1].chars().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(parts[..3].join("_").to_ascii_lowercase())
+}
+
 fn resolve_char_id(token: &str) -> Option<String> {
-    if token.starts_with("char_") {
-        // Strip skin suffix `#N`
-        let without_skin = token.split('#').next().unwrap_or(token);
-        return Some(without_skin.to_string());
+    if let Some(char_id) = normalize_direct_char_id(token) {
+        return Some(char_id);
     }
     character_table::name_to_id(token)
 }
@@ -98,8 +116,6 @@ fn avatar_candidates(token: &str) -> Vec<String> {
     }
     let mut out = Vec::new();
     if let Some(cid) = resolve_char_id(token) {
-        // 打包进 public/bundled/avatar/ 的内置头像，零网络开销，优先命中。
-        out.push(format!("/bundled/avatar/{}.png", cid));
         // yuanyan3060 的 avatar 是 char_xxx.png
         out.push(format!("{}/avatar/{}.png", YUANYAN, cid));
         // fexli 的 charpor（半身像）可用作备胎，但该目录所有文件都带
@@ -125,7 +141,6 @@ fn portrait_candidates(token: &str) -> Vec<String> {
         out.push(format!("{}/charpack/{}_2.png", FEXLI, cid));
         out.push(format!("{}/characters/{}_2.png", PUPPIIZ, cid));
         out.push(format!("{}/portrait/{}_1.png", YUANYAN, cid));
-        out.push(format!("{}/portrait/{}_1b.png", YUANYAN, cid));
         out.push(format!("{}/charpack/{}_1.png", FEXLI, cid));
         out.push(format!("{}/characters/{}_1.png", PUPPIIZ, cid));
     }
@@ -250,8 +265,6 @@ fn chapter_cover_candidates(token: &str) -> Vec<String> {
         raw.to_string()
     };
     dedup(vec![
-        // 打包进 public/bundled/mapreview/ 的内置章节封面。
-        format!("/bundled/mapreview/main_{}-01.png", padded),
         format!("{}/mapreview/main_{}-01.png", FEXLI, padded),
         format!("{}/avgs/bg_main_{}.png", FEXLI, raw),
         format!("{}/avgs/{}_i01.png", FEXLI, raw),
@@ -261,7 +274,9 @@ fn chapter_cover_candidates(token: &str) -> Vec<String> {
 
 fn dedup(urls: Vec<String>) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
-    urls.into_iter().filter(|u| seen.insert(u.clone())).collect()
+    urls.into_iter()
+        .filter(|u| seen.insert(u.clone()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -269,15 +284,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bundled_assets_come_first() {
-        // 内置素材零网络开销，必须排在任何远端源前面；前缀也得跟前端
-        // `public/` 下的实际布局一致。
+    fn removed_bundled_assets_are_not_returned_as_candidates() {
+        // 发布包不再携带大体积头像和章节封面；候选不能继续返回必然 404
+        // 的本地路径，否则每张图都会先白跑一次请求。
         let avatars = avatar_candidates("char_002_amiya");
-        assert_eq!(avatars[0], "/bundled/avatar/char_002_amiya.png");
+        assert!(avatars.iter().all(|url| !url.starts_with("/bundled/")));
+        assert!(avatars[0].ends_with("/avatar/char_002_amiya.png"));
 
         let covers = chapter_cover_candidates("main_8");
-        assert_eq!(covers[0], "/bundled/mapreview/main_08-01.png");
-        assert!(covers[1].ends_with("/mapreview/main_08-01.png"));
+        assert!(covers.iter().all(|url| !url.starts_with("/bundled/")));
+        assert!(covers[0].ends_with("/mapreview/main_08-01.png"));
     }
 
     #[test]
@@ -299,8 +315,14 @@ mod tests {
         let e2 = format!("{FEXLI}/charpor/char_002_amiya_2.png");
         let bare = format!("{FEXLI}/charpor/char_002_amiya.png");
         assert!(out.contains(&e1), "缺精一半身像备胎: {out:?}");
-        assert!(out.contains(&e2), "缺精二半身像备胎（近卫阿米娅等无精一素材）: {out:?}");
-        assert!(!out.contains(&bare), "裸 charpor 模板是全库 404，不得回归: {out:?}");
+        assert!(
+            out.contains(&e2),
+            "缺精二半身像备胎（近卫阿米娅等无精一素材）: {out:?}"
+        );
+        assert!(
+            !out.contains(&bare),
+            "裸 charpor 模板是全库 404，不得回归: {out:?}"
+        );
         // `_1` 几乎全员都有，排在 `_2` 前面少吃一次 404。
         let p1 = out.iter().position(|u| u == &e1).unwrap();
         let p2 = out.iter().position(|u| u == &e2).unwrap();
@@ -308,10 +330,78 @@ mod tests {
     }
 
     #[test]
+    fn direct_char_tokens_use_canonical_case_and_drop_all_art_suffixes() {
+        assert_eq!(
+            normalize_direct_char_id("CHAR_002_AMIYA_WINTER#1$2").as_deref(),
+            Some("char_002_amiya")
+        );
+        assert_eq!(
+            normalize_direct_char_id(r#""char_003_kalts_epoque#4""#).as_deref(),
+            Some("char_003_kalts")
+        );
+        assert_eq!(normalize_direct_char_id("npc_005_priestess"), None);
+
+        let out = avatar_candidates("CHAR_002_AMIYA_WINTER#1");
+        assert!(
+            out.iter()
+                .all(|url| !url.contains("AMIYA") && !url.contains("winter")),
+            "大小写/皮肤后缀泄漏进大小写敏感路径: {out:?}"
+        );
+        assert!(out
+            .iter()
+            .any(|url| url.ends_with("/avatar/char_002_amiya.png")));
+    }
+
+    #[test]
+    fn candidate_chains_exclude_repository_wide_dead_templates() {
+        let portrait = portrait_candidates("char_002_amiya");
+        assert!(
+            portrait.iter().all(|url| !url.ends_with("_1b.png")),
+            "yuanyan portrait 仓库没有任何 _1b 文件: {portrait:?}"
+        );
+        assert!(
+            portrait.iter().all(|url| !url.contains("/charpor/")),
+            "portrait 不应混入低分辨率 avatar 备胎: {portrait:?}"
+        );
+
+        for out in [
+            avg_candidates("32_i06"),
+            background_candidates("bg_courtyard"),
+        ] {
+            assert!(
+                out.iter().all(|url| !url.contains("/storyline/")),
+                "不存在的 Puppiiz storyline 子目录不得进入候选: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn chapter_story_art_keeps_case_sensitive_fallbacks_distinct() {
+        let out = chapter_cover_candidates("main_20");
+        assert!(out.iter().any(|url| url.ends_with("/avgs/20_i01.png")));
+        assert!(out.iter().any(|url| url.ends_with("/avgs/20_I01.png")));
+        assert_eq!(
+            out.iter()
+                .filter(|url| url.ends_with("/avgs/20_i01.png"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            out.iter()
+                .filter(|url| url.ends_with("/avgs/20_I01.png"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn story_art_chains_skip_missing_puppiiz_directories() {
         // Puppiiz 仓库没有 storyline/images 与 storyline/backgrounds 目录，
         // 这两条历史候选是全库 404，不得回归。
-        for out in [avg_candidates("32_i06"), background_candidates("bg_courtyard")] {
+        for out in [
+            avg_candidates("32_i06"),
+            background_candidates("bg_courtyard"),
+        ] {
             assert!(
                 out.iter().all(|u| !u.contains("/storyline/")),
                 "storyline 死模板不得回归: {out:?}"
@@ -322,8 +412,14 @@ mod tests {
 
     #[test]
     fn npc_overrides_bypass_char_table() {
-        assert_eq!(avatar_candidates("普瑞赛斯"), vec!["/avatars/npc/priestess.png"]);
-        assert_eq!(portrait_candidates("希尔达"), vec!["/avatars/npc/hierda.png"]);
+        assert_eq!(
+            avatar_candidates("普瑞赛斯"),
+            vec!["/avatars/npc/priestess.png"]
+        );
+        assert_eq!(
+            portrait_candidates("希尔达"),
+            vec!["/avatars/npc/hierda.png"]
+        );
     }
 
     #[test]
@@ -352,7 +448,10 @@ mod tests {
 
     #[test]
     fn strip_image_ext_matches_the_js_regex() {
-        assert_eq!(strip_image_ext("act17side_entrypic.png"), "act17side_entrypic");
+        assert_eq!(
+            strip_image_ext("act17side_entrypic.png"),
+            "act17side_entrypic"
+        );
         assert_eq!(strip_image_ext("cover.JPEG"), "cover");
         // 只削最后一层。
         assert_eq!(strip_image_ext("cover.png.webp"), "cover.png");

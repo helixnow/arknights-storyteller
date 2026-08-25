@@ -9,6 +9,12 @@ import {
   type ReactNode,
 } from "react";
 import { useToast } from "@/components/ui/toast";
+import {
+  DEFAULT_APP_PREFS,
+  hydrateAppPrefs,
+  type AppPrefsSnapshot,
+  type HydratedAppPrefs,
+} from "@/lib/appShellLogic";
 
 interface AppPreferencesContextValue {
   showSummaries: boolean;
@@ -26,31 +32,7 @@ const AppPreferencesContext = createContext<AppPreferencesContextValue | null>(n
 const STORAGE_KEY = "arknights-app-prefs-v2";
 const LEGACY_STORAGE_KEY = "arknights-app-prefs-v1";
 
-interface Prefs {
-  showSummaries: boolean;
-  minimalMode: boolean;
-  inlineImages: boolean;
-}
-
-const DEFAULT_PREFS: Prefs = {
-  showSummaries: false,
-  minimalMode: false,
-  inlineImages: true,
-};
-
-/** 持久化数据只认真正的布尔值；字符串 / 数字等脏值一律回落到各自默认。 */
-function readBoolean(value: unknown, fallback: boolean): boolean {
-  return typeof value === "boolean" ? value : fallback;
-}
-
-function normalizePrefs(parsed: unknown): Prefs {
-  const source = (parsed ?? {}) as Partial<Record<keyof Prefs, unknown>>;
-  return {
-    showSummaries: readBoolean(source.showSummaries, DEFAULT_PREFS.showSummaries),
-    minimalMode: readBoolean(source.minimalMode, DEFAULT_PREFS.minimalMode),
-    inlineImages: readBoolean(source.inlineImages, DEFAULT_PREFS.inlineImages),
-  };
-}
+type Prefs = AppPrefsSnapshot;
 
 /** 失败提示的会话级闩锁：同一轮连续失败只打扰用户一次，写成功后复位。 */
 let persistFailureNotified = false;
@@ -63,38 +45,34 @@ function samePrefs(a: Prefs, b: Prefs): boolean {
   );
 }
 
-function readPrefs(): Prefs {
-  if (typeof window === "undefined") return DEFAULT_PREFS;
+function readPrefs(): HydratedAppPrefs {
+  const unavailable = (): HydratedAppPrefs => {
+    const prefs = { ...DEFAULT_APP_PREFS };
+    return {
+      readable: false,
+      prefs,
+      source: "default",
+      currentCorrupt: false,
+      serialized: JSON.stringify(prefs),
+    };
+  };
+  if (typeof window === "undefined") return unavailable();
   try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (raw) return normalizePrefs(JSON.parse(raw));
-
-    const legacy = window.localStorage.getItem(LEGACY_STORAGE_KEY);
-    if (!legacy) return DEFAULT_PREFS;
-
-    // v1 只存过 showSummaries。就地升级成 v2 并清掉旧键，否则每次启动都要走一遍回退分支。
-    let migrated = DEFAULT_PREFS;
-    try {
-      migrated = normalizePrefs({ ...DEFAULT_PREFS, showSummaries: JSON.parse(legacy)?.showSummaries });
-    } catch {
-      // 旧数据损坏，用默认值继续。
-    }
-    try {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(migrated));
-      window.localStorage.removeItem(LEGACY_STORAGE_KEY);
-    } catch {
-      // 回写新键失败（隐私模式 / 配额满）只影响「下次启动还要再迁一遍」，
-      // 绝不能连累本次会话：迁移值已经从旧键成功读出来了，必须原样返回。
-      // 之前这一步失败会掉进外层 catch、把用户的旧偏好整个打回默认。
-    }
-    return migrated;
+    // Accessing the localStorage property itself can throw in a sandboxed or
+    // policy-restricted WebView, before getItem has a chance to be caught.
+    return hydrateAppPrefs(window.localStorage, STORAGE_KEY, LEGACY_STORAGE_KEY);
   } catch {
-    return DEFAULT_PREFS;
+    return unavailable();
   }
 }
 
 export function AppPreferencesProvider({ children }: { children: ReactNode }) {
-  const [prefs, setPrefs] = useState<Prefs>(readPrefs);
+  const initialHydrationRef = useRef<HydratedAppPrefs | null>(null);
+  if (initialHydrationRef.current === null) initialHydrationRef.current = readPrefs();
+  const [prefs, setPrefs] = useState<Prefs>(initialHydrationRef.current.prefs);
+  // 这份签名表示「storage 已经知道的值」。首帧、迁移结果和外部窗口更新都
+  // 先登记再 setState，持久化 effect 就不会把 hydration 当成一次用户修改。
+  const persistedPrefsRef = useRef(initialHydrationRef.current.serialized);
 
   // 写失败提示走 ref 取最新句柄，避免 toast 身份变化搅动持久化 effect 的 deps。
   const toast = useToast();
@@ -103,20 +81,12 @@ export function AppPreferencesProvider({ children }: { children: ReactNode }) {
     toastRef.current = toast;
   }, [toast]);
 
-  // 首帧的值就是刚从 localStorage 读出来的，回写没有意义；更糟的是：如果
-  // 读取因数据损坏 / 迁移中断回落到了 DEFAULT_PREFS，这次回写会立刻用默认值
-  // 覆盖掉尚未迁移或只读到一半的原始数据，连恢复的机会都不留。守卫不能用
-  // 「跳过第一次 effect」的布尔标记：StrictMode 开发模式下挂载期 effect 连跑
-  // 两次、ref 不会重置，第二次就把初始状态写回去了（收藏 / 高亮 hook 踩过
-  // 同一个坑）。改为与初始 state 做引用比较——用户任何真实改动都会产生新
-  // 对象，自然落盘。
-  const initialPrefsRef = useRef(prefs);
   useEffect(() => {
-    if (prefs === initialPrefsRef.current) {
-      return;
-    }
+    const serialized = JSON.stringify(prefs);
+    if (serialized === persistedPrefsRef.current) return;
     try {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(prefs));
+      window.localStorage.setItem(STORAGE_KEY, serialized);
+      persistedPrefsRef.current = serialized;
       persistFailureNotified = false;
     } catch {
       // 隐私模式 / 配额不足：偏好只在本次会话内生效。开关在界面上已经
@@ -134,10 +104,21 @@ export function AppPreferencesProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (typeof window === "undefined") return;
     const onStorage = (event: StorageEvent) => {
-      if (event.key !== null && event.key !== STORAGE_KEY) return;
+      if (
+        event.key !== null &&
+        event.key !== STORAGE_KEY &&
+        event.key !== LEGACY_STORAGE_KEY
+      ) {
+        return;
+      }
+      const hydrated = readPrefs();
+      // storage 暂时不可读（隐私权限切换等）时保留本窗口已经能用的状态；
+      // 把一次读取异常当成“用户清空了设置”会制造跨窗口数据丢失。
+      if (!hydrated.readable) return;
+      persistedPrefsRef.current = hydrated.serialized;
+      persistFailureNotified = false;
       setPrefs((prev) => {
-        const next = readPrefs();
-        return samePrefs(prev, next) ? prev : next;
+        return samePrefs(prev, hydrated.prefs) ? prev : hydrated.prefs;
       });
     };
     window.addEventListener("storage", onStorage);

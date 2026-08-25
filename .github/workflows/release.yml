@@ -65,15 +65,15 @@ jobs:
           echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> $GITHUB_ENV
           echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> $GITHUB_PATH
           echo "$ANDROID_HOME/platform-tools" >> $GITHUB_PATH
-          echo "$ANDROID_HOME/build-tools/34.0.0" >> $GITHUB_PATH
+          echo "$ANDROID_HOME/build-tools/36.0.0" >> $GITHUB_PATH
           
           # Accept licenses
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
           
           # Install required packages
           $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
-            "platforms;android-34" \
-            "build-tools;34.0.0" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
             "ndk;26.1.10909125"
           
           # Set NDK_HOME after NDK installation
@@ -93,51 +93,51 @@ jobs:
         run: npm ci
         working-directory: arknights-story-reader
 
-      - name: Bump version and get app version
+      - name: Validate and get app version
         id: get_version
         run: |
-          # Read current version
-          CURRENT_VERSION=$(node -p "require('./package.json').version")
-          echo "Current version: $CURRENT_VERSION"
-          
-          # Bump patch version
-          NEW_VERSION=$(node -e "
-            const current = '$CURRENT_VERSION';
-            const parts = current.split('.');
-            parts[2] = String(parseInt(parts[2]) + 1);
-            console.log(parts.join('.'));
-          ")
-          echo "New version: $NEW_VERSION"
-          
-          # Update package.json
-          npm version $NEW_VERSION --no-git-tag-version
-          
-          # Update tauri.conf.json
-          node -e "
-            const fs = require('fs');
-            const path = 'src-tauri/tauri.conf.json';
-            const config = JSON.parse(fs.readFileSync(path, 'utf8'));
-            config.version = '$NEW_VERSION';
-            fs.writeFileSync(path, JSON.stringify(config, null, 2) + '\n');
-          "
-          
-          # Update Cargo.toml
-          sed -i.bak "s/^version = \".*\"/version = \"$NEW_VERSION\"/" src-tauri/Cargo.toml
-          rm -f src-tauri/Cargo.toml.bak
-          
-          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
-        working-directory: arknights-story-reader
+          VERSION=$(node -p "require('./package.json').version")
+          LOCK_VERSION=$(node -p "require('./package-lock.json').version")
+          LOCK_ROOT_VERSION=$(node -p "require('./package-lock.json').packages[''].version")
+          TAURI_VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          CARGO_VERSION=$(awk '
+            /^\[package\]$/ { in_package=1; next }
+            in_package && /^version = / {
+              gsub(/^version = "|"$|"/, "")
+              print
+              exit
+            }
+          ' src-tauri/Cargo.toml)
+          CARGO_LOCK_VERSION=$(awk '
+            /^\[\[package\]\]$/ { name=""; version="" }
+            /^name = "story-teller"$/ { name="story-teller" }
+            name == "story-teller" && /^version = / {
+              gsub(/^version = "|"$|"/, "")
+              print
+              exit
+            }
+          ' src-tauri/Cargo.lock)
 
-      - name: Commit version bump
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          cd arknights-story-reader
-          git add package.json package-lock.json src-tauri/tauri.conf.json src-tauri/Cargo.toml
-          [ -f src-tauri/Cargo.lock ] && git add src-tauri/Cargo.lock || true
-          cd ..
-          git diff --staged --quiet || git commit -m "chore: bump version to ${{ steps.get_version.outputs.version }}"
-          git push origin release || echo "Failed to push version bump"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid release version: $VERSION" >&2
+            exit 1
+          fi
+
+          for candidate in \
+            "$LOCK_VERSION" \
+            "$LOCK_ROOT_VERSION" \
+            "$TAURI_VERSION" \
+            "$CARGO_VERSION" \
+            "$CARGO_LOCK_VERSION"; do
+            if [ "$candidate" != "$VERSION" ]; then
+              echo "Version mismatch: expected $VERSION, found $candidate" >&2
+              exit 1
+            fi
+          done
+
+          echo "Using repository version: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+        working-directory: arknights-story-reader
 
       - name: Create GitHub Release
         id: create_release
@@ -148,19 +148,30 @@ jobs:
           TAG="app-v${VERSION}"
           RELEASE_NAME="明日方舟剧情阅读器 v${VERSION}"
           
-          # Check if release already exists
+          # Never reuse an existing release or tag: doing so could overwrite old assets.
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG already exists"
-            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          else
-            echo "Creating new release $TAG"
-            gh release create "$TAG" \
-              --title "$RELEASE_NAME" \
-              --notes "自动构建版本。Android APK 安装包。" \
-              --draft \
-              --latest
-            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+            echo "Release $TAG already exists; choose a new repository version." >&2
+            exit 1
           fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
+            echo "Tag $TAG already exists; choose a new repository version." >&2
+            exit 1
+          else
+            STATUS=$?
+            if [ "$STATUS" -ne 2 ]; then
+              echo "Failed to check whether tag $TAG exists." >&2
+              exit "$STATUS"
+            fi
+          fi
+
+          echo "Creating new release $TAG"
+          gh release create "$TAG" \
+            --target "$(git rev-parse HEAD)" \
+            --title "$RELEASE_NAME" \
+            --notes "自动构建版本。Android APK 安装包。" \
+            --draft \
+            --latest
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Build frontend with update feed
         env:
@@ -189,6 +200,8 @@ jobs:
 
       - name: Build signed Android APK
         env:
+          RELEASE_STRICT: "1"
+          RELEASE_JOB: "true"
           ANDROID_KEYSTORE_PATH: "${{ github.workspace }}/arknights-story-reader/src-tauri/gen/android/upload-keystore.jks"
           ANDROID_KEY_ALIAS: "${{ secrets.ANDROID_KEY_ALIAS }}"
           ANDROID_KEYSTORE_PASSWORD: "${{ secrets.ANDROID_KEYSTORE_PASSWORD }}"
@@ -232,7 +245,7 @@ jobs:
           echo "  \"fileName\": \"$APK_NAME\"" >> "$JSON_PATH"
           echo "}" >> "$JSON_PATH"
           cat "$JSON_PATH"
-          gh release upload "$TAG" "$JSON_PATH#$JSON_PATH" --clobber
+          gh release upload "$TAG" "$JSON_PATH" --clobber
         working-directory: arknights-story-reader
 
       # 桌面 updater 从 releases/latest/download/latest.json 读取更新 feed（见 TODO 注释）。

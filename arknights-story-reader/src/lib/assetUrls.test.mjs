@@ -37,9 +37,8 @@ const PUPPIIZ = "https://raw.githubusercontent.com/PuppiizSunniiz/Arknight-Image
 // URL 拼接
 // ─────────────────────────────────────────────────────────────
 
-test("avatar：char_ id 依次产出内置 + 三个镜像源", () => {
+test("avatar：char_ id 只产出仍存在的三个远端镜像源", () => {
   assert.deepEqual(resolveAssetCandidatesLocal("avatar", "char_002_amiya", null), [
-    "/bundled/avatar/char_002_amiya.png",
     `${YUANYAN}/avatar/char_002_amiya.png`,
     `${FEXLI}/charpor/char_002_amiya.png`,
     `${PUPPIIZ}/avatars/char_002_amiya.png`,
@@ -150,7 +149,6 @@ test("background：bg 子目录优先，$ 前缀同样只剥一次", () => {
 
 test("chapter_cover：个位数章节号补零到两位，原始编号保留在 avgs 兜底里", () => {
   assert.deepEqual(resolveAssetCandidatesLocal("chapter_cover", "main_8", null), [
-    "/bundled/mapreview/main_08-01.png",
     `${FEXLI}/mapreview/main_08-01.png`,
     `${FEXLI}/avgs/bg_main_8.png`,
     `${FEXLI}/avgs/8_i01.png`,
@@ -158,7 +156,7 @@ test("chapter_cover：个位数章节号补零到两位，原始编号保留在 
   ]);
   // 两位数不再补零。
   const c13 = resolveAssetCandidatesLocal("chapter_cover", "main_13", null);
-  assert.equal(c13[0], "/bundled/mapreview/main_13-01.png");
+  assert.equal(c13[0], `${FEXLI}/mapreview/main_13-01.png`);
 });
 
 test("activity_kv：原始 token 永远排最前，图片扩展名被剥掉，无重复", () => {

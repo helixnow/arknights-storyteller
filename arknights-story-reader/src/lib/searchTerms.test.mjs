@@ -10,12 +10,24 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  advanceIndexProgress,
+  advanceSearchProgress,
+  beginIndexProgress,
+  beginSearchProgress,
+  hasIndexableSearchAtoms,
   highlightTerms,
   isAutoSearchable,
+  isIndexProgressTerminal,
   isSearchIndexTrusted,
   MAX_HIGHLIGHT_TERMS,
+  SEARCH_INDEX_VERSION,
   searchEmptyAnnouncement,
+  nextSearchResultLimit,
+  SEARCH_RESULT_PAGE_SIZE,
+  searchHitAnnouncement,
+  shouldShowSearchHistory,
   stableVersionOf,
+  trimSearchQuery,
 } from "./searchTerms.ts";
 
 // ─────────────────────────────────────────────────────────
@@ -25,6 +37,8 @@ import {
 test("stableVersionOf：只提取后端正常返回的 7 位十六进制 commit 头", () => {
   assert.equal(stableVersionOf("abcdef1 (3天前)"), "abcdef1");
   assert.equal(stableVersionOf("0123ABC (刚刚)"), "0123ABC");
+  // 缓存落盘后保存的是已经提纯的 key，重启加载时也要继续接受。
+  assert.equal(stableVersionOf("abcdef1"), "abcdef1");
 });
 
 test("stableVersionOf：假版本身份全部折成空串", () => {
@@ -37,9 +51,27 @@ test("stableVersionOf：假版本身份全部折成空串", () => {
     // 这些全是可见 ASCII，旧实现会误放行；但它们不是 commit 缩写。
     "fixture (刚刚)",
     "commit-1 (刚刚)",
+    // 不能只 split 第一段；后缀必须是后端约定的相对时间括号。
+    "abcdef1 arbitrary-text",
+    "abcdef1 (刚刚) trailing",
+    "abcdef1\t(刚刚)",
+    "abcdef1\n(刚刚)",
+    // 过短、过长都不是缓存协议使用的七位 key。
+    "abcdef",
+    "abcdef12",
   ]) {
     assert.equal(stableVersionOf(version), "", version);
   }
+});
+
+test("stableVersionOf：相对时间文案可变但不能含嵌套括号或换行", () => {
+  assert.equal(stableVersionOf("deadbee (较早前)"), "deadbee");
+  assert.equal(stableVersionOf("deadbee ((刚刚))"), "");
+  assert.equal(stableVersionOf("deadbee (刚刚\n伪造)"), "");
+});
+
+test("搜索缓存语料版本与后端 INDEX_VERSION 对齐", () => {
+  assert.equal(SEARCH_INDEX_VERSION, 10);
 });
 
 test("isSearchIndexTrusted：只信明确就绪且不在重建的状态", () => {
@@ -217,6 +249,19 @@ test("highlightTerms：切词空白集对齐后端 char::is_whitespace（U+0085 
   ]);
 });
 
+test("trimSearchQuery：只修掉 Rust White_Space，保留首尾 BOM", () => {
+  assert.equal(trimSearchQuery("\u0085\u3000博士\u202f"), "博士");
+  assert.equal(trimSearchQuery("\uFEFF博士\uFEFF"), "\uFEFF博士\uFEFF");
+  assert.equal(trimSearchQuery("\t\n博士\r"), "博士");
+});
+
+test("highlightTerms：首尾 BOM 不是空白，不会改变 NOT token 的极性", () => {
+  // 后端把整串视为普通正向 token，不把 BOM 后的 NOT 识别成连接词。
+  assert.deepEqual(highlightTerms("\uFEFFnot 博士"), ["not", "博士"]);
+  // 尾 BOM 同样让 `not` 不再是裸连接词。
+  assert.deepEqual(highlightTerms("博士 not\uFEFF"), ["not", "博士"]);
+});
+
 // ─────────────────────────────────────────────────────────
 // highlightTerms：OR / AND 连接词
 // ─────────────────────────────────────────────────────────
@@ -245,7 +290,7 @@ test("highlightTerms：长词排在前面，保证整词先于单字命中", () 
   assert.deepEqual(highlightTerms("博士 凯尔希"), ["凯尔希", "博士"]);
 });
 
-test("highlightTerms：4 字以上纯中文词补出单字（二元组匹配的可见化）", () => {
+test("highlightTerms：4 字以上纯中文词补出单字（单字 AND 的可见化）", () => {
   assert.deepEqual(highlightTerms("罗德岛制药"), [
     "罗德岛制药",
     "罗",
@@ -308,6 +353,16 @@ test("isAutoSearchable：全角 ＮＯＴ／－／＂ 经 NFKC 折叠后同样�
   assert.equal(isAutoSearchable("＂博士＂"), true);
 });
 
+test("hasIndexableSearchAtoms：假名、纯标点、纯否定没有索引原子", () => {
+  assert.equal(hasIndexableSearchAtoms("アイ"), false);
+  assert.equal(hasIndexableSearchAtoms("！！"), false);
+  assert.equal(hasIndexableSearchAtoms("-博士"), false);
+  assert.equal(hasIndexableSearchAtoms("not 博士"), false);
+  assert.equal(hasIndexableSearchAtoms("凯尔希"), true);
+  assert.equal(hasIndexableSearchAtoms("doctor"), true);
+  assert.equal(hasIndexableSearchAtoms("博士 アイ"), true);
+});
+
 test("isAutoSearchable：没有正向词的查询不自动发（后端静态空集）", () => {
   // `""`、纯否定在后端 build_fts_query_advanced 里直接构造成 None →
   // 空页。自动发出去只会闪一次"没有结果"；回车强搜不受影响。
@@ -341,11 +396,61 @@ test("isAutoSearchable：`\\b` 只拦裸连接词，不误伤以 not 结尾的�
   assert.equal(isAutoSearchable("cannot"), true);
 });
 
+test("isAutoSearchable：CJK 粘连 not 不是裸连接词", () => {
+  // JS `\b` 会在 CJK→ASCII 之间制造词边界；后端按空白切 token，不会。
+  assert.equal(isAutoSearchable("博士not"), true);
+  assert.equal(isAutoSearchable("博士or"), true);
+  assert.equal(isAutoSearchable("博士and"), true);
+  // 真正由 White_Space 隔开的尾连接词仍要拦截。
+  assert.equal(isAutoSearchable("博士\u0085not"), false);
+});
+
+test("isAutoSearchable：首尾 BOM 不被 JS trim 擅自删掉", () => {
+  assert.equal(isAutoSearchable("\uFEFFnot 博士"), true);
+  assert.equal(isAutoSearchable("博士 not\uFEFF"), true);
+});
+
 test("isAutoSearchable：少于两个字符返回 false，普通查询返回 true", () => {
   assert.equal(isAutoSearchable(""), false);
   assert.equal(isAutoSearchable("凯"), false);
   assert.equal(isAutoSearchable("博士"), true);
   assert.equal(isAutoSearchable("凯尔希 OR 博士"), true);
+  assert.equal(isAutoSearchable("凯 or 希"), false);
+});
+
+test("shouldShowSearchHistory：空态键盘打开仍显示历史", () => {
+  assert.equal(
+    shouldShowSearchHistory({ keyboardOpen: true, searched: false, query: "", historyCount: 2 }),
+    true
+  );
+  assert.equal(
+    shouldShowSearchHistory({ keyboardOpen: true, searched: true, query: "博士", historyCount: 2 }),
+    false
+  );
+  assert.equal(
+    shouldShowSearchHistory({ keyboardOpen: false, searched: true, query: "博士", historyCount: 2 }),
+    true
+  );
+});
+
+test("nextSearchResultLimit：按步长扩到总数，不越界", () => {
+  assert.equal(nextSearchResultLimit(80, 200), 160);
+  assert.equal(nextSearchResultLimit(160, 200), 200);
+  assert.equal(nextSearchResultLimit(0, 50), 50);
+  assert.equal(nextSearchResultLimit(SEARCH_RESULT_PAGE_SIZE, 10), 10);
+});
+
+test("searchHitAnnouncement：截断页报总数而不是只报已显示条数", () => {
+  assert.match(
+    searchHitAnnouncement({
+      query: "博士",
+      mode: "segment",
+      visibleCount: 200,
+      totalMatched: 3000,
+      truncated: true,
+    }),
+    /共 3000 段命中.*已显示前 200/
+  );
 });
 
 test("isAutoSearchable：门槛按索引原子数量，标点撑不起长度", () => {
@@ -361,4 +466,196 @@ test("isAutoSearchable：门槛按索引原子数量，标点撑不起长度", (
   assert.equal(isAutoSearchable("凯 尔"), true);
   assert.equal(isAutoSearchable("“博士”"), true);
   assert.equal(isAutoSearchable("𠀀𠀁"), true);
+});
+
+test("查询解析：NOT、减号、空词与引号粘连组合保持正向极性", () => {
+  assert.deepEqual(highlightTerms('not -"博士" 凯尔希'), ["凯尔希"]);
+  // 空引号消费悬挂 NOT，孤立减号不产生新极性，博士因此仍是正向词。
+  assert.deepEqual(highlightTerms('not "" - 博士'), ["博士"]);
+  assert.deepEqual(highlightTerms('not ！！ 博士'), ["博士"]);
+  assert.deepEqual(highlightTerms('博士 or -干员 凯尔希'), ["凯尔希", "博士"]);
+});
+
+test("查询解析：ASCII 前缀星号只作语法边缘，不进入高亮", () => {
+  assert.deepEqual(highlightTerms("凯*希"), ["凯", "希"]);
+  assert.deepEqual(highlightTerms("doctor*"), ["doctor"]);
+  assert.deepEqual(highlightTerms("-doctor* medic*"), ["medic"]);
+  assert.equal(isAutoSearchable("doctor*"), true);
+});
+
+// ─────────────────────────────────────────────────────────
+// search-progress：请求起点、单调性与数据代际
+// ─────────────────────────────────────────────────────────
+
+const progress = (phase, current, total, message = "") => ({
+  phase,
+  current,
+  total,
+  message,
+});
+
+test("search progress：当前查询的精确起点才能激活游标", () => {
+  const cursor = beginSearchProgress("story", "博士", 4);
+  assert.equal(
+    advanceSearchProgress(cursor, progress("检索", 0, 0, "搜索「凯尔希」"), 4),
+    null
+  );
+  assert.equal(
+    advanceSearchProgress(cursor, progress("完成", 1, 1, "共 1 条匹配"), 4),
+    null
+  );
+  const started = advanceSearchProgress(
+    cursor,
+    progress("检索", 0, 0, "搜索「博士」"),
+    4
+  );
+  assert.equal(started?.started, true);
+  assert.equal(started?.rank, 0);
+});
+
+test("search progress：段级起点与篇级起点不能串线", () => {
+  const cursor = beginSearchProgress("segment", "博士", 2);
+  assert.equal(
+    advanceSearchProgress(cursor, progress("检索", 0, 0, "搜索「博士」"), 2),
+    null
+  );
+  assert.ok(
+    advanceSearchProgress(cursor, progress("段落检索", 0, 0, "搜索「博士」"), 2)
+  );
+});
+
+test("search progress：旧数据代际的事件全部丢弃", () => {
+  const cursor = beginSearchProgress("story", "博士", 8);
+  assert.equal(
+    advanceSearchProgress(cursor, progress("检索", 0, 0, "搜索「博士」"), 9),
+    null
+  );
+});
+
+test("search progress：阶段倒退、跨阶段跳跃与迟到终态丢弃", () => {
+  const initial = beginSearchProgress("story", "博士", 1);
+  const started = advanceSearchProgress(
+    initial,
+    progress("检索", 0, 0, "搜索「博士」"),
+    1
+  );
+  assert.ok(started);
+  assert.equal(
+    advanceSearchProgress(started, progress("统计", 0, 0, "旧请求统计"), 1),
+    null,
+    "不能从起点跳过实际检索阶段"
+  );
+  assert.equal(
+    advanceSearchProgress(started, progress("完成", 1, 1, "旧请求完成"), 1),
+    null,
+    "终态只由当前 invoke Promise 收场"
+  );
+});
+
+test("search progress：线性扫描只接受单调 current 与稳定 total", () => {
+  let cursor = beginSearchProgress("story", "博士", 3);
+  cursor = advanceSearchProgress(cursor, progress("检索", 0, 0, "搜索「博士」"), 3);
+  cursor = advanceSearchProgress(cursor, progress("线性扫描", 0, 100, "开始遍历"), 3);
+  assert.ok(cursor);
+  const advanced = advanceSearchProgress(
+    cursor,
+    progress("线性扫描", 32, 100, "已扫描 32 / 100"),
+    3
+  );
+  assert.equal(advanced?.current, 32);
+  assert.equal(
+    advanceSearchProgress(advanced, progress("线性扫描", 16, 100, "迟到"), 3),
+    null
+  );
+  assert.equal(
+    advanceSearchProgress(advanced, progress("线性扫描", 64, 200, "乱序分母"), 3),
+    null
+  );
+});
+
+test("search progress：索引检索后可进入统计，但不能回到检索", () => {
+  let cursor = beginSearchProgress("story", "博士", 5);
+  cursor = advanceSearchProgress(cursor, progress("检索", 0, 0, "搜索「博士」"), 5);
+  cursor = advanceSearchProgress(cursor, progress("索引检索", 1, 1, "使用全文索引完成"), 5);
+  assert.ok(cursor);
+  const stats = advanceSearchProgress(cursor, progress("统计", 0, 0, "正在统计"), 5);
+  assert.equal(stats?.rank, 2);
+  assert.equal(
+    advanceSearchProgress(stats, progress("索引检索", 1, 1, "迟到"), 5),
+    null
+  );
+});
+
+test("search progress：负数、NaN 与超出 total 的载荷拒绝", () => {
+  const cursor = beginSearchProgress("story", "博士", 1);
+  assert.equal(
+    advanceSearchProgress(cursor, progress("检索", -1, 0, "搜索「博士」"), 1),
+    null
+  );
+  assert.equal(
+    advanceSearchProgress(cursor, progress("检索", Number.NaN, 0, "搜索「博士」"), 1),
+    null
+  );
+  assert.equal(
+    advanceSearchProgress(cursor, progress("检索", 2, 1, "搜索「博士」"), 1),
+    null
+  );
+});
+
+// ─────────────────────────────────────────────────────────
+// index-progress：乱序、迟到、空集终态与过期版本
+// ─────────────────────────────────────────────────────────
+
+test("index progress：正常收集→构建→完成单调推进", () => {
+  let cursor = beginIndexProgress(7);
+  cursor = advanceIndexProgress(cursor, progress("收集", 0, 100, "加载剧情清单"), 7);
+  cursor = advanceIndexProgress(cursor, progress("构建", 16, 100, "剧情 A"), 7);
+  cursor = advanceIndexProgress(cursor, progress("构建", 32, 100, "剧情 B"), 7);
+  cursor = advanceIndexProgress(cursor, progress("完成", 100, 100, "完成"), 7);
+  assert.equal(cursor?.terminal, true);
+});
+
+test("index progress：数据更新后旧构建与旧终态全部丢弃", () => {
+  const cursor = beginIndexProgress(3);
+  assert.equal(
+    advanceIndexProgress(cursor, progress("收集", 0, 10, "旧包"), 4),
+    null
+  );
+  assert.equal(
+    advanceIndexProgress(cursor, progress("完成", 10, 10, "旧包完成"), 4),
+    null
+  );
+});
+
+test("index progress：没有当前代收集起点时拒绝迟到构建与完成", () => {
+  const cursor = beginIndexProgress(1);
+  assert.equal(advanceIndexProgress(cursor, progress("构建", 16, 100), 1), null);
+  assert.equal(advanceIndexProgress(cursor, progress("完成", 100, 100), 1), null);
+});
+
+test("index progress：已知由当前 UI 发起时允许无收集的快速终态", () => {
+  const cursor = beginIndexProgress(1, true);
+  const done = advanceIndexProgress(cursor, progress("完成", 0, 0, "索引已是最新"), 1);
+  assert.equal(done?.terminal, true);
+});
+
+test("index progress：只有明确完成才是成功终态，满刻度仍需等待事务提交", () => {
+  assert.equal(isIndexProgressTerminal(progress("完成", 0, 0)), true);
+  assert.equal(isIndexProgressTerminal(progress("完成", 10, 10)), true);
+  assert.equal(isIndexProgressTerminal(progress("构建", 10, 10)), false);
+  assert.equal(isIndexProgressTerminal(progress("构建", 9, 10)), false);
+});
+
+test("index progress：满刻度构建后接收完成，倒退、变分母与终态迟到事件拒绝", () => {
+  let cursor = beginIndexProgress(9);
+  cursor = advanceIndexProgress(cursor, progress("收集", 0, 100), 9);
+  cursor = advanceIndexProgress(cursor, progress("构建", 32, 100), 9);
+  assert.ok(cursor);
+  assert.equal(advanceIndexProgress(cursor, progress("构建", 16, 100), 9), null);
+  assert.equal(advanceIndexProgress(cursor, progress("构建", 64, 200), 9), null);
+  const full = advanceIndexProgress(cursor, progress("构建", 100, 100), 9);
+  assert.equal(full?.terminal, false, "100% 只表示语料处理完，索引事务尚未提交");
+  const done = advanceIndexProgress(full, progress("完成", 100, 100), 9);
+  assert.ok(done);
+  assert.equal(advanceIndexProgress(done, progress("构建", 96, 100), 9), null);
 });

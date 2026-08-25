@@ -17,6 +17,48 @@ export const AUTO_SEARCH_MIN_LEN = 2;
 /** 高亮词上限：去重后仍超长的查询只取前几个，避免拼出超长正则。 */
 export const MAX_HIGHLIGHT_TERMS = 12;
 
+/** 首屏只渲这么多行；其余点「显示更多」再切片，避免一次挂几百张卡。 */
+export const SEARCH_RESULT_PAGE_SIZE = 80;
+
+export function nextSearchResultLimit(
+  current: number,
+  total: number,
+  step = SEARCH_RESULT_PAGE_SIZE
+): number {
+  const safeCurrent = Number.isFinite(current) && current > 0 ? current : 0;
+  const safeTotal = Number.isFinite(total) && total > 0 ? total : 0;
+  const safeStep = Number.isFinite(step) && step > 0 ? step : SEARCH_RESULT_PAGE_SIZE;
+  return Math.min(safeTotal, safeCurrent + safeStep);
+}
+
+/**
+ * 必须与 Rust `data_service.rs::INDEX_VERSION` 同步。搜索缓存的 namespace
+ * 会带上这个版本：索引语料/解析语义升级但数据 commit 不变时，旧结果也
+ * 必须失效，不能继续以当前 commit 的名义命中。
+ * bump 时必须同步在 useLegacyStorageCleanup 加清理步骤，旧键为
+ * `arknights-story-search-cache-v5-index<旧值>` 与
+ * `arknights-story-segment-cache-v4-index<旧值>`。
+ */
+export const SEARCH_INDEX_VERSION = 10;
+
+/**
+ * 与后端 Rust `char::is_whitespace`（Unicode White_Space 属性）逐字对齐的
+ * 切词空白集，不能用 JS 的 `\s`：`\s` 比 White_Space 多收 U+FEFF（BOM，
+ * 粘贴文本常见）、少收 U+0085（NEL）。差一个字符就会翻转 NOT 极性。
+ */
+const QUERY_WHITESPACE_RE =
+  /[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]/;
+
+/** Rust `str::trim` 同款修边；刻意不把 U+FEFF 当空白。 */
+export function trimSearchQuery(raw: string): string {
+  const chars = Array.from(raw);
+  let start = 0;
+  let end = chars.length;
+  while (start < end && QUERY_WHITESPACE_RE.test(chars[start])) start += 1;
+  while (end > start && QUERY_WHITESPACE_RE.test(chars[end - 1])) end -= 1;
+  return chars.slice(start, end).join("");
+}
+
 /**
  * 与后端 `normalize_nfkc_lower_strip_marks` 的 NFKC 一步对齐：后端解析
  * 查询前先整体折叠兼容形，全角 `ＮＯＴ`／`－`／`＂` 因此与半角同义
@@ -27,7 +69,9 @@ export const MAX_HIGHLIGHT_TERMS = 12;
  * 反而会让本来能命中的高亮失配。
  */
 function normalizeQuery(raw: string): string {
-  return raw.normalize("NFKC");
+  // 后端顺序是 raw.trim() → NFKC。先按同一空白集修边，不能用 JS trim：
+  // 它会擅自删掉后端视为正文的 U+FEFF。
+  return trimSearchQuery(raw).normalize("NFKC");
 }
 
 /**
@@ -39,8 +83,11 @@ function normalizeQuery(raw: string): string {
  * 让调用方停用缓存；loadCacheMap 也据此丢弃历史假版本条目。
  */
 export function stableVersionOf(version: string): string {
-  const head = version.split(" ")[0] ?? "";
-  return /^[0-9a-f]{7}$/i.test(head) ? head : "";
+  // 内存/落盘缓存保存的是纯 commit；后端原始返回则严格是
+  // `<commit> (<相对时间>)`。不能只 split 第一段，否则
+  // `abcdef1 arbitrary-text` 这种手改版本也会被误认成数据身份。
+  const match = /^([0-9a-f]{7})(?:$| \([^()\r\n]*\))$/i.exec(version);
+  return match?.[1] ?? "";
 }
 
 /** 只有状态查询明确报 ready、且当前没有重建，搜索结果才具备索引可信度。 */
@@ -55,6 +102,35 @@ export function isSearchIndexTrusted(
  * 零命中播报必须和可见空态共用同一套三分法。尤其 `status == null` 只表示
  * 状态尚未确认，不能借 `!indexReady` 把它说成“索引还没建好”。
  */
+export function shouldShowSearchHistory(input: {
+  keyboardOpen: boolean;
+  searched: boolean;
+  query: string;
+  historyCount: number;
+}): boolean {
+  if (input.historyCount <= 0) return false;
+  if (!input.keyboardOpen) return true;
+  return !input.searched && trimSearchQuery(input.query).length === 0;
+}
+
+export function searchHitAnnouncement(input: {
+  query: string;
+  mode: "story" | "segment";
+  visibleCount: number;
+  totalMatched: number;
+  truncated: boolean;
+  facet?: string | null;
+}): string {
+  const scope = input.query ? `「${input.query}」` : "";
+  const unit = input.mode === "segment" ? "段" : "条";
+  const facetScope =
+    input.mode === "story" && input.facet ? `，当前“${input.facet}”分类` : "";
+  if (input.truncated && input.totalMatched > input.visibleCount) {
+    return `${scope}共 ${input.totalMatched} ${unit}命中${facetScope}，已显示前 ${input.visibleCount} ${unit}，可用上下方向键浏览，回车打开`;
+  }
+  return `${scope}找到 ${input.visibleCount} ${unit}结果${facetScope}，可用上下方向键浏览，回车打开`;
+}
+
 export function searchEmptyAnnouncement(
   status: { ready: boolean } | null,
   buildingIndex: boolean
@@ -79,7 +155,13 @@ export function isAutoSearchable(raw: string): boolean {
   if (query.length < AUTO_SEARCH_MIN_LEN) return false;
   if ((query.match(/"/g)?.length ?? 0) % 2 === 1) return false;
   if (/-$/.test(query)) return false;
-  if (/\b(or|and|not)$/i.test(query)) return false;
+  // 连接词必须是整个裸 token。`\b` 会把 CJK→ASCII 的边界也当词边界，
+  // 将 `博士not` 误判成悬挂 NOT；后端把整串解析成普通正向词。
+  let tail = "";
+  for (const ch of query) {
+    tail = QUERY_WHITESPACE_RE.test(ch) ? "" : tail + ch;
+  }
+  if (/^(or|and|not)$/i.test(tail)) return false;
   // 只数正向词条里能落成索引 token 的字符：CJK 逐字、ASCII 字母数字逐个，
   // 标点/假名后端在子句生成阶段就丢掉，凑不出命中面。为 0 是静态空集
   // （等价于旧的 highlightTerms 为空判定），为 1 是单原子全库拉取，都不发。
@@ -87,7 +169,39 @@ export function isAutoSearchable(raw: string): boolean {
   for (const term of parseQueryTerms(query)) {
     if (term.isNot) continue;
     positiveAtoms += atomLengthOf(term.text);
-    if (positiveAtoms >= AUTO_SEARCH_MIN_LEN) return true;
+  }
+  if (positiveAtoms < AUTO_SEARCH_MIN_LEN) return false;
+  // OR 是并集：`凯 or 希` 两边都是单原子，命中面比被拦下的 `凯` 还大，
+  // 不能因为加总够 2 就自动发。每一侧都要独立达到门槛。
+  return orSidesMeetAutoThreshold(query);
+}
+
+function orSidesMeetAutoThreshold(query: string): boolean {
+  if (!/(?:^|[ \t\n\r\u0085\u00a0\u3000])or(?:$|[ \t\n\r\u0085\u00a0\u3000])/i.test(query)) {
+    return true;
+  }
+  const sides = query.split(/(?:^|[ \t\n\r\u0085\u00a0\u3000])or(?:$|[ \t\n\r\u0085\u00a0\u3000])/i);
+  if (sides.length < 2) return true;
+  return sides.every((side) => {
+    let atoms = 0;
+    for (const term of parseQueryTerms(side)) {
+      if (term.isNot) continue;
+      atoms += atomLengthOf(term.text);
+    }
+    return atoms >= AUTO_SEARCH_MIN_LEN;
+  });
+}
+
+/**
+ * 查询里是否至少有一个能落进索引的正向原子。假名、西里尔、纯标点、
+ * 纯否定在后端都是静态空集；强制回车也会零命中，空态不该说「确实没有匹配」。
+ */
+export function hasIndexableSearchAtoms(raw: string): boolean {
+  const query = normalizeQuery(raw);
+  if (!query) return false;
+  for (const term of parseQueryTerms(query)) {
+    if (term.isNot) continue;
+    if (atomLengthOf(term.text) > 0) return true;
   }
   return false;
 }
@@ -97,17 +211,6 @@ interface ParsedTerm {
   text: string;
   isNot: boolean;
 }
-
-/**
- * 与后端 Rust `char::is_whitespace`（Unicode White_Space 属性）逐字对齐的
- * 切词空白集，不能用 JS 的 `\s`：`\s` 比 White_Space 多收 U+FEFF（BOM，
- * 粘贴文本常见）、少收 U+0085（NEL）。差一个字符就翻极性——`-\uFEFF博士`
- * 后端是一个否定词条，`\s` 却在 BOM 处切开，纯减号被丢、博士变成正向词，
- * 被排除的词反被高亮成命中还放行自动搜；`not\u0085博士` 后端切成
- * 连接词 + 排除词（纯否定 → 静态空集），`\s` 把它粘成一个正向词误发出去。
- */
-const QUERY_WHITESPACE_RE =
-  /[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]/;
 
 /**
  * 与后端 `build_fts_query_advanced` / `split_query_terms` 同构的逐字符
@@ -220,10 +323,10 @@ const EDGE_TRIM_RE = /^[\p{P}\p{S}\p{Z}\p{C}]+|[\p{P}\p{S}\p{Z}\p{C}]+$/gu;
  *     排除词。段落模式的排除只看段落文本，剧情标题里仍可能出现该词——
  *     不跳过的话，用户明确排除的词会在标题里被标成"命中"；
  *   - `"短语"` 去掉引号整体高亮，引号粘在词后也按后端规则切开；
- *   - 纯中文长词后端按二元组匹配，顺带把单字也标出来，让用户看得出命中原因。
+ *   - 纯中文长词后端按单字 AND 匹配，顺带把单字也标出来，让用户看得出命中原因。
  */
 export function highlightTerms(query: string): string[] {
-  const trimmed = normalizeQuery(query).trim();
+  const trimmed = normalizeQuery(query);
   if (!trimmed) return [];
   const terms: string[] = [];
   for (const parsed of parseQueryTerms(trimmed)) {
@@ -234,13 +337,201 @@ export function highlightTerms(query: string): string[] {
     // 它们虽然不是索引原子，但仍是用户想找的字面内容的一部分。
     const stripped = parsed.text.replace(EDGE_TRIM_RE, "");
     if (!stripped || !ATOM_CHAR_RE.test(stripped)) continue;
-    terms.push(stripped);
-    if (stripped.length >= 4 && /^[\u4e00-\u9fff\u3400-\u4dbf]+$/.test(stripped)) {
-      terms.push(...stripped.split(""));
+    // 后端 sanitize 把这些 FTS 特殊字符当空格切原子；词内 `凯*希` 若整串
+    // 高亮，原文对不上，结果页会零高亮。
+    const pieces = stripped.split(/[*:\\^()+]+/g).filter((piece) => piece.length > 0);
+    for (const piece of pieces.length > 0 ? pieces : [stripped]) {
+      if (!ATOM_CHAR_RE.test(piece)) continue;
+      terms.push(piece);
+      if (piece.length >= 4 && /^[\u4e00-\u9fff\u3400-\u4dbf]+$/.test(piece)) {
+        terms.push(...piece.split(""));
+      }
     }
   }
   // 长词优先，保证「凯尔希」整体先于单字命中；去重后限量，避免超长正则。
   return Array.from(new Set(terms))
     .sort((a, b) => b.length - a.length)
     .slice(0, MAX_HIGHLIGHT_TERMS);
+}
+
+// ─────────────────────────────────────────────────────────
+// 无请求 ID 的后端进度事件门禁
+// ─────────────────────────────────────────────────────────
+
+/** SearchPanel / useAutoIndex 共用的最小进度形状。 */
+export interface SearchProgressLike {
+  phase: string;
+  current: number;
+  total: number;
+  message: string;
+}
+
+function isValidProgress(progress: SearchProgressLike): boolean {
+  return (
+    typeof progress.phase === "string" &&
+    typeof progress.message === "string" &&
+    Number.isFinite(progress.current) &&
+    Number.isFinite(progress.total) &&
+    progress.current >= 0 &&
+    progress.total >= 0 &&
+    (progress.total <= 0 || progress.current <= progress.total)
+  );
+}
+
+export interface SearchProgressCursor {
+  epoch: number;
+  mode: "story" | "segment";
+  query: string;
+  started: boolean;
+  rank: number;
+  current: number;
+  total: number;
+}
+
+/** 每次真正发 invoke 前创建新游标；epoch 是当前数据版本代际。 */
+export function beginSearchProgress(
+  mode: "story" | "segment",
+  query: string,
+  epoch: number
+): SearchProgressCursor {
+  return { epoch, mode, query, started: false, rank: -1, current: 0, total: 0 };
+}
+
+function searchProgressRank(mode: "story" | "segment", phase: string): number | null {
+  if (mode === "segment") return phase === "段落检索" ? 0 : null;
+  switch (phase) {
+    case "检索":
+      return 0;
+    case "索引检索":
+    case "线性扫描":
+      return 1;
+    case "统计":
+      return 2;
+    default:
+      return null;
+  }
+}
+
+/**
+ * 接受当前请求的单调进度，拒绝迟到、倒退、分母突变与旧数据代际。
+ *
+ * 后端事件没有 requestId/version，唯一可证明归属的边界是每个命令第一条
+ * `搜索「query」`。终态不在这里接收：Promise resolve/reject 才是当前
+ * invoke 的可靠终态，旧请求迟到的“完成”尤其不能替新请求收场。
+ */
+export function advanceSearchProgress(
+  cursor: SearchProgressCursor,
+  progress: SearchProgressLike,
+  epoch: number
+): SearchProgressCursor | null {
+  if (cursor.epoch !== epoch || !isValidProgress(progress)) return null;
+  const rank = searchProgressRank(cursor.mode, progress.phase);
+  if (rank == null) return null;
+
+  if (!cursor.started) {
+    const expectedPhase = cursor.mode === "segment" ? "段落检索" : "检索";
+    if (
+      progress.phase !== expectedPhase ||
+      progress.current !== 0 ||
+      progress.total !== 0 ||
+      progress.message !== `搜索「${cursor.query}」`
+    ) {
+      return null;
+    }
+    return { ...cursor, started: true, rank, current: 0, total: 0 };
+  }
+
+  if (rank < cursor.rank || rank > cursor.rank + 1) return null;
+  if (rank === cursor.rank) {
+    if (progress.current < cursor.current) return null;
+    if (cursor.total > 0 && progress.total !== cursor.total) return null;
+  }
+  return {
+    ...cursor,
+    rank,
+    current: progress.current,
+    total: progress.total,
+  };
+}
+
+export interface IndexProgressCursor {
+  epoch: number;
+  started: boolean;
+  terminal: boolean;
+  allowTerminalWithoutStart: boolean;
+  rank: number;
+  current: number;
+  total: number;
+}
+
+export function beginIndexProgress(
+  epoch: number,
+  allowTerminalWithoutStart = false
+): IndexProgressCursor {
+  return {
+    epoch,
+    started: false,
+    terminal: false,
+    allowTerminalWithoutStart,
+    rank: -1,
+    current: 0,
+    total: 0,
+  };
+}
+
+/**
+ * 只有后端明确发出的“完成”才是成功终态。最后一条“构建”事件通常已经是
+ * `current === total`，但事务此时尚未提交；若把满刻度当完成，会提前退出
+ * 忙碌态、查询到旧状态，并因游标已 terminal 而丢掉随后真正的“完成”事件。
+ */
+export function isIndexProgressTerminal(progress: SearchProgressLike): boolean {
+  return progress.phase === "完成";
+}
+
+/**
+ * 索引事件按数据代际与阶段单调推进。数据更新后调用方换 epoch 并重置游标，
+ * 旧构建迟到的“构建/完成”因没有当前代的“收集”起点而被丢弃。
+ */
+export function advanceIndexProgress(
+  cursor: IndexProgressCursor,
+  progress: SearchProgressLike,
+  epoch: number
+): IndexProgressCursor | null {
+  if (
+    cursor.epoch !== epoch ||
+    cursor.terminal ||
+    !isValidProgress(progress)
+  ) {
+    return null;
+  }
+  const terminal = isIndexProgressTerminal(progress);
+  const rank =
+    progress.phase === "收集" ? 0 : progress.phase === "构建" ? 1 : terminal ? 2 : null;
+  if (rank == null) return null;
+
+  if (!cursor.started) {
+    const isStart = progress.phase === "收集" && progress.current === 0;
+    if (!isStart && !(terminal && cursor.allowTerminalWithoutStart)) return null;
+    return {
+      ...cursor,
+      started: true,
+      terminal,
+      rank,
+      current: progress.current,
+      total: progress.total,
+    };
+  }
+
+  if (rank < cursor.rank) return null;
+  if (rank === cursor.rank) {
+    if (progress.current < cursor.current) return null;
+    if (cursor.total > 0 && progress.total !== cursor.total) return null;
+  }
+  return {
+    ...cursor,
+    terminal,
+    rank,
+    current: progress.current,
+    total: progress.total,
+  };
 }

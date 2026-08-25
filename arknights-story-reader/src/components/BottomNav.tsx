@@ -1,6 +1,11 @@
 import { type KeyboardEvent, useCallback, useEffect, useRef } from "react";
 import { Book, Home, Search, Settings, Users2 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import {
+  calculateBottomNavInset,
+  calculateKeyboardInset,
+  isKeyboardOccludingNav,
+} from "@/lib/appShellLogic";
 
 type Tab = "home" | "stories" | "characters" | "search" | "settings";
 
@@ -49,30 +54,59 @@ export function BottomNav({ activeTab, onTabChange }: BottomNavProps) {
     const nav = navRef.current;
     if (!nav) return;
     const root = document.documentElement;
+    let frame = 0;
 
     const sync = () => {
       // 用 offsetHeight + 计算后的 bottom，而不是 getBoundingClientRect：
       // 入场动画期间导航还带着 translateY，量矩形会得到一个偏小的值，而动画
       // 结束不触发任何观察器，那个错值就会一直留着。这两个量都只看布局，
       // 不受 transform 影响；`bottom` 还顺带把 max()/env() 解析成了 px。
+      const viewport = window.visualViewport;
+      const keyboardInset = viewport
+        ? calculateKeyboardInset(window.innerHeight, viewport.height, viewport.offsetTop)
+        : 0;
+      const hideForKeyboard = isKeyboardOccludingNav(keyboardInset);
+      nav.classList.toggle("bottom-nav-glass--keyboard-hidden", hideForKeyboard);
+      nav.toggleAttribute("inert", hideForKeyboard);
+      nav.setAttribute("aria-hidden", hideForKeyboard ? "true" : "false");
+      if (hideForKeyboard) {
+        root.style.removeProperty(INSET_VAR);
+        return;
+      }
       const bottom = Number.parseFloat(window.getComputedStyle(nav).bottom);
-      const inset = nav.offsetHeight + (Number.isFinite(bottom) ? bottom : 0);
-      root.style.setProperty(INSET_VAR, `${Math.round(inset)}px`);
+      const inset = calculateBottomNavInset(nav.offsetHeight, bottom);
+      root.style.setProperty(INSET_VAR, `${inset}px`);
+    };
+    const scheduleSync = () => {
+      if (frame) window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => {
+        frame = 0;
+        sync();
+      });
     };
 
     sync();
 
     // 导航自身高度变化（字号、换行）用 ResizeObserver；视口高度变化时导航
     // 尺寸没变、但它离底边的距离变了，得靠 resize/旋转事件兜住。
-    const observer = new ResizeObserver(sync);
-    observer.observe(nav);
-    window.addEventListener("resize", sync);
-    window.addEventListener("orientationchange", sync);
+    // visualViewport 的 resize/scroll 在部分 Android 上会跟着旋转一起到；
+    // 软键盘本身不改 offsetHeight / computed bottom，inset 不会被键盘抬起
+    // ——toast 的避让走 `--keyboard-inset`，不依赖这里。
+    const observer =
+      typeof ResizeObserver === "undefined" ? null : new ResizeObserver(scheduleSync);
+    observer?.observe(nav);
+    window.addEventListener("resize", scheduleSync);
+    window.addEventListener("orientationchange", scheduleSync);
+    window.visualViewport?.addEventListener("resize", scheduleSync);
+    window.visualViewport?.addEventListener("scroll", scheduleSync);
 
     return () => {
-      observer.disconnect();
-      window.removeEventListener("resize", sync);
-      window.removeEventListener("orientationchange", sync);
+      observer?.disconnect();
+      if (frame) window.cancelAnimationFrame(frame);
+      window.removeEventListener("resize", scheduleSync);
+      window.removeEventListener("orientationchange", scheduleSync);
+      window.visualViewport?.removeEventListener("resize", scheduleSync);
+      window.visualViewport?.removeEventListener("scroll", scheduleSync);
       root.style.removeProperty(INSET_VAR);
     };
   }, []);
@@ -161,7 +195,7 @@ export function BottomNav({ activeTab, onTabChange }: BottomNavProps) {
               )}
             >
               <Icon className="h-5 w-5" strokeWidth={active ? 2.4 : 2} />
-              <span className="text-[11px] leading-tight">{label}</span>
+              <span className="text-[0.6875rem] leading-tight">{label}</span>
               <span
                 aria-hidden="true"
                 className={cn(

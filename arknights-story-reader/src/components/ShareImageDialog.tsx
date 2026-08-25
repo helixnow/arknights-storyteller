@@ -30,6 +30,7 @@ import {
 } from "@/hooks/useImageSharer";
 import { peekAssetCandidates } from "@/hooks/useAsset";
 import {
+  characterAvatarIdentityKey,
   getAssetHealthVersion,
   hasNpcAvatarOverride,
   isAssetUrlDead,
@@ -286,7 +287,7 @@ const canvasFailedUrls = new Set<string>();
 const AVATAR_CACHE_LIMIT = 200;
 
 function avatarCacheKey(name: string | null | undefined, charId: string | null | undefined): string {
-  return `${(name ?? "").trim()}::${(charId ?? "").trim()}`;
+  return characterAvatarIdentityKey(name, charId);
 }
 
 function rememberAvatar(key: string, img: HTMLImageElement | null): void {
@@ -333,6 +334,26 @@ const AVATAR_LOAD_TIMEOUT_MS = 8_000;
 /** 用类型区分「超时」与「确定失败」：前者不能写进任何否定性缓存。 */
 class ImageLoadTimeoutError extends Error {}
 
+/** 同一角色在长选段里会重复出现；在途加载也要去重，不能等成功缓存落地。 */
+const avatarLoadsInFlight = new Map<string, Promise<HTMLImageElement | null>>();
+
+/** Canvas 私有失败表同样要有上限，长会话不能只进不出。 */
+const CANVAS_FAILED_URL_LIMIT = 4_000;
+const CANVAS_FAILED_URL_EVICT = 1_000;
+
+function rememberCanvasFailedUrl(url: string): void {
+  if (canvasFailedUrls.has(url)) return;
+  if (canvasFailedUrls.size >= CANVAS_FAILED_URL_LIMIT) {
+    let removed = 0;
+    for (const stale of canvasFailedUrls) {
+      canvasFailedUrls.delete(stale);
+      removed += 1;
+      if (removed >= CANVAS_FAILED_URL_EVICT) break;
+    }
+  }
+  canvasFailedUrls.add(url);
+}
+
 function loadImage(url: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -366,20 +387,11 @@ function loadImage(url: string): Promise<HTMLImageElement> {
  * 按候选顺序异步下载第一张可用的头像位图。失败时缓存 null，避免
  * 选段切换时反复尝试同一个不存在的头像。
  */
-async function loadAvatarImage(
+async function loadAvatarImageUncached(
   name: string | null | undefined,
-  charId: string | null | undefined
+  charId: string | null | undefined,
+  key: string
 ): Promise<HTMLImageElement | null> {
-  // 健康度版本变过（某个源首次被证明可达 / 熔断窗口到期）说明之前的
-  // 否定判决可能已失效，先放行再查缓存。
-  const healthVersion = getAssetHealthVersion();
-  if (healthVersion !== seenAssetHealthVersion) {
-    seenAssetHealthVersion = healthVersion;
-    purgeNegativeAvatarCaches();
-  }
-  const key = avatarCacheKey(name, charId);
-  if (avatarCache.has(key)) return avatarCache.get(key) ?? null;
-
   // NPC 覆盖名（普瑞赛斯 / 希尔达）不在干员表里，随台词传来的 charId 只
   // 可能是解析器「只写显示名就继承上一条 [Character] 立绘」启发式误配的
   // 别人的 id——该 id 的头像必然加载成功，若仍让它排在前面，分享长图里
@@ -443,12 +455,82 @@ async function loadAvatarImage(
       sawTransientFailure = true;
       continue;
     }
-    canvasFailedUrls.add(url);
+    rememberCanvasFailedUrl(url);
   }
   // 有候选因暂态故障被跳过时不能盖「无头像」章——缓存 null 会让这个
   // 角色在整个会话里都缺头像，下次打开弹窗理应重试。
   if (!sawTransientFailure) rememberAvatar(key, null);
   return null;
+}
+
+async function loadAvatarImage(
+  name: string | null | undefined,
+  charId: string | null | undefined
+): Promise<HTMLImageElement | null> {
+  // 健康度版本变过（某个源首次被证明可达 / 熔断窗口到期）说明之前的
+  // 否定判决可能已失效，先放行再查缓存。
+  const healthVersion = getAssetHealthVersion();
+  if (healthVersion !== seenAssetHealthVersion) {
+    seenAssetHealthVersion = healthVersion;
+    purgeNegativeAvatarCaches();
+  }
+
+  const key = avatarCacheKey(name, charId);
+  if (avatarCache.has(key)) return avatarCache.get(key) ?? null;
+  const pending = avatarLoadsInFlight.get(key);
+  if (pending) return pending;
+
+  const task = loadAvatarImageUncached(name, charId, key);
+  avatarLoadsInFlight.set(key, task);
+  try {
+    return await task;
+  } finally {
+    if (avatarLoadsInFlight.get(key) === task) avatarLoadsInFlight.delete(key);
+  }
+}
+
+/**
+ * 经典模板可能选中上百条对话。先按实际头像身份去重，再用小并发池加载：
+ * 同一说话人只请求一次，不同说话人也不会同时打出上百条跨域请求、把移动网
+ * 和 host fuse 一起压垮。
+ */
+async function loadDialogueAvatarImages(
+  entries: Array<ShareSegmentInput & { segment: DialogueSegment }>
+): Promise<Map<number, HTMLImageElement | null>> {
+  const groups = new Map<
+    string,
+    {
+      name: string;
+      charId: string | null;
+      indexes: number[];
+    }
+  >();
+  for (const entry of entries) {
+    const name = entry.segment.characterName;
+    const charId = entry.segment.characterId ?? null;
+    const key = avatarCacheKey(name, charId);
+    const existing = groups.get(key);
+    if (existing) {
+      existing.indexes.push(entry.index);
+    } else {
+      groups.set(key, { name, charId, indexes: [entry.index] });
+    }
+  }
+
+  const requests = Array.from(groups.values());
+  const result = new Map<number, HTMLImageElement | null>();
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < requests.length) {
+      const request = requests[cursor++];
+      const image = await loadAvatarImage(request.name, request.charId).catch(() => null);
+      request.indexes.forEach((index) => result.set(index, image));
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(4, requests.length) }, () => worker())
+  );
+  return result;
 }
 
 /**
@@ -828,6 +910,40 @@ interface RenderedImage {
   blob: Promise<Blob | null>;
 }
 
+const MAX_CANVAS_EDGE = 16_384;
+
+/**
+ * 按设备像素比配置导出画布，同时保证两条边都不超过 WebView 的纹理上限。
+ * scale 永不低于 1：超长图宁可明确报“选段过多”，不能悄悄导出一张比逻辑
+ * 1080 宽还糊的图。用实际取整后的像素尺寸反推缩放，避免 1.333x 设备上
+ * canvas 整数截断造成文字和背景边缘半像素错位。
+ */
+function prepareHiDpiCanvas(
+  canvas: HTMLCanvasElement,
+  width: number,
+  height: number
+): CanvasRenderingContext2D | null {
+  const requested = Number.isFinite(window.devicePixelRatio)
+    ? window.devicePixelRatio
+    : 1;
+  let scale = Math.max(1, Math.min(requested || 1, 2));
+  while (Math.max(width, height) * scale > MAX_CANVAS_EDGE && scale > 1) {
+    scale = Math.max(1, scale - 0.25);
+  }
+  if (Math.max(width, height) * scale > MAX_CANVAS_EDGE) {
+    throw new Error("所选段落过多，无法生成单张图片，请减少选段后再试");
+  }
+
+  canvas.width = Math.round(width * scale);
+  canvas.height = Math.round(height * scale);
+  canvas.style.width = `${width}px`;
+  canvas.style.height = `${height}px`;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+  ctx.setTransform(canvas.width / width, 0, 0, canvas.height / height, 0, 0);
+  return ctx;
+}
+
 /**
  * 把画好的 canvas 导出成 data URL + Blob，并挡住两类"静默失败"：
  * 跨域素材污染画布（`toDataURL` 抛 SecurityError）和尺寸过大导致部分
@@ -895,28 +1011,10 @@ function renderImage(
   const totalHeight = blocks.reduce((acc, block) => acc + block.marginTop + block.height, 0);
   const canvasHeight = CANVAS_TOP_PADDING + totalHeight + CANVAS_BOTTOM_PADDING;
 
-  // Most WebViews refuse to allocate a canvas whose largest dimension
-  // exceeds 16384 px. Back off dpr first, and if we still blow the ceiling
-  // there's simply too much content — bail rather than silently render a
-  // broken image.
-  let dpr = Math.min(window.devicePixelRatio || 1, 2);
-  const MAX_CANVAS_EDGE = 16384;
-  while (canvasHeight * dpr > MAX_CANVAS_EDGE && dpr > 1) {
-    dpr -= 0.25;
-  }
-  if (canvasHeight * dpr > MAX_CANVAS_EDGE) {
-    throw new Error("所选段落过多，无法生成单张图片，请减少选段后再试");
-  }
-
   // Now draw for real.
   const canvas = document.createElement("canvas");
-  canvas.width = width * dpr;
-  canvas.height = canvasHeight * dpr;
-  canvas.style.width = `${width}px`;
-  canvas.style.height = `${canvasHeight}px`;
-  const ctx = canvas.getContext("2d");
+  const ctx = prepareHiDpiCanvas(canvas, width, canvasHeight);
   if (!ctx) return null;
-  ctx.scale(dpr, dpr);
 
   // Background
   ctx.fillStyle = palette.bg;
@@ -987,15 +1085,9 @@ function renderQuoteImage(
   const height = QUOTE_CANVAS_HEIGHT;
   const contentWidth = width - QUOTE_HORIZONTAL_PADDING * 2;
 
-  const dpr = Math.min(window.devicePixelRatio || 1, 2);
   const canvas = document.createElement("canvas");
-  canvas.width = width * dpr;
-  canvas.height = height * dpr;
-  canvas.style.width = `${width}px`;
-  canvas.style.height = `${height}px`;
-  const ctx = canvas.getContext("2d");
+  const ctx = prepareHiDpiCanvas(canvas, width, height);
   if (!ctx) return null;
-  ctx.scale(dpr, dpr);
 
   // Background matches the classic template so the two feel like a set.
   ctx.fillStyle = palette.bg;
@@ -1151,9 +1243,14 @@ function describeShareError(err: unknown): string {
 const STORAGE_PERMISSION_HINT =
   "请到 系统设置 → 应用 → 明日方舟剧情阅读器 → 权限 中开启「存储 / 照片」后重试";
 
+function isStoragePermissionError(err: unknown): boolean {
+  const text = errorText(err);
+  return Boolean(text && /permission|denied|EACCES|权限/i.test(text));
+}
+
 function describeSaveError(err: unknown): string {
   const text = errorText(err);
-  if (text && /permission|denied|EACCES|权限/i.test(text)) {
+  if (isStoragePermissionError(err)) {
     return `系统拒绝了写入相册：${STORAGE_PERMISSION_HINT}`;
   }
   return text ?? "保存失败，请稍后重试";
@@ -1357,15 +1454,7 @@ export function ShareImageDialog({
             (s): s is ShareSegmentInput & { segment: DialogueSegment } =>
               s.segment.type === "dialogue"
           );
-          const resolved = await Promise.all(
-            dialogueEntries.map(async (entry) => {
-              const img = await loadAvatarImage(
-                entry.segment.characterName,
-                entry.segment.characterId ?? null
-              ).catch(() => null);
-              return [entry.index, img] as const;
-            })
-          );
+          const resolved = await loadDialogueAvatarImages(dialogueEntries);
           if (cancelled) return;
           for (const [idx, img] of resolved) avatarImages.set(idx, img);
         }
@@ -1461,6 +1550,22 @@ export function ShareImageDialog({
     return { dataUrl, fileName, title: storyName };
   }, [dataUrl, fileName, storyName]);
 
+  const guideStoragePermission = useCallback(async () => {
+    let jumped = true;
+    try {
+      await openStoragePermissionSettings();
+    } catch (openErr) {
+      jumped = false;
+      console.warn("[ShareImageDialog] open settings failed", openErr);
+    }
+    toast.warn(
+      jumped
+        ? "需要存储权限才能保存到相册：请在刚打开的系统设置里开启「存储 / 照片」权限，再回到应用重试"
+        : `需要存储权限才能保存到相册：${STORAGE_PERMISSION_HINT}`,
+      8000
+    );
+  }, [toast]);
+
   /*
    * 按钮的 `disabled` 要等一次渲染才生效，而两次极快的点击（触摸屏上的
    * 双击、或者回车与鼠标同时触发）会落在同一帧里——那就会真的弹出两次
@@ -1487,7 +1592,8 @@ export function ShareImageDialog({
     await runExclusive("share", async () => {
       try {
         if (platform === "android") {
-          await shareImageViaSystem(payload);
+          const response = await shareImageViaSystem(payload);
+          if (!response.shared) throw new Error("系统分享面板未能打开，请稍后重试");
           toast.show("已打开系统分享面板");
           return;
         }
@@ -1533,22 +1639,7 @@ export function ShareImageDialog({
         }
         const response = await saveImageToGallery(payload);
         if (response.needsPermission) {
-          let jumped = true;
-          try {
-            await openStoragePermissionSettings();
-          } catch (openErr) {
-            jumped = false;
-            console.warn("[ShareImageDialog] open settings failed", openErr);
-          }
-          // 权限被拒时最忌讳只说一句"失败"。无论有没有跳转成功，都要留下
-          // 一条照着做就能解决的路径——跳过去了就说在哪一屏点什么，没跳成
-          // 就把完整的设置路径写出来。
-          toast.warn(
-            jumped
-              ? "需要存储权限才能保存到相册：请在刚打开的系统设置里开启「存储 / 照片」权限，再回到应用重试"
-              : `需要存储权限才能保存到相册：${STORAGE_PERMISSION_HINT}`,
-            8000
-          );
+          await guideStoragePermission();
           return;
         }
         if (response.saved) {
@@ -1560,10 +1651,16 @@ export function ShareImageDialog({
         toast.error("保存到相册失败，可改用「分享」把图片发给自己，或稍后重试");
       } catch (err) {
         console.error("[ShareImageDialog] save failed", err);
+        // 老 Android / 厂商 ROM 有的插件版本会直接 reject，而不是返回
+        // needsPermission=true。两种原生形态都必须给出同一条“打开设置”出口。
+        if (platform === "android" && isStoragePermissionError(err)) {
+          await guideStoragePermission();
+          return;
+        }
         toast.error(describeSaveError(err));
       }
     });
-  }, [payload, platform, pngBlob, runExclusive, toast]);
+  }, [guideStoragePermission, payload, platform, pngBlob, runExclusive, toast]);
 
   const handleRetry = useCallback(() => {
     setRenderError(null);
@@ -1665,7 +1762,7 @@ export function ShareImageDialog({
                     tabIndex={active ? 0 : -1}
                     onClick={() => selectTemplate(opt.value)}
                     className={cn(
-                      "glass glass-pane text-left px-4 py-3 transition-[background-color,color,box-shadow] duration-200 ease-spring",
+                      "glass glass-pane min-h-[56px] touch-manipulation text-left px-4 py-3 transition-[background-color,color,box-shadow] duration-200 ease-spring",
                       active
                         ? "glass-thick ring-1 ring-[hsl(var(--color-primary)/0.45)] text-[hsl(var(--color-foreground))]"
                         : "glass-thin text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-foreground))]"
@@ -1685,20 +1782,20 @@ export function ShareImageDialog({
               </p>
             )}
             {resolvedTemplate === "classic" && (
-              <label className="flex items-center gap-2 px-1 py-1 text-xs text-[hsl(var(--color-muted-foreground))] cursor-pointer select-none">
+              <label className="flex min-h-[44px] touch-manipulation items-center gap-2 px-1 py-2 text-xs text-[hsl(var(--color-muted-foreground))] cursor-pointer select-none">
                 <input
                   type="checkbox"
-                  className="h-3.5 w-3.5 accent-[hsl(var(--color-primary))]"
+                  className="h-4 w-4 accent-[hsl(var(--color-primary))]"
                   checked={showAvatar}
                   onChange={(e) => setShowAvatar(e.target.checked)}
                 />
                 <span>在对话前显示角色头像</span>
               </label>
             )}
-            <label className="flex items-center gap-2 px-1 py-1 text-xs text-[hsl(var(--color-muted-foreground))] cursor-pointer select-none">
+            <label className="flex min-h-[44px] touch-manipulation items-center gap-2 px-1 py-2 text-xs text-[hsl(var(--color-muted-foreground))] cursor-pointer select-none">
               <input
                 type="checkbox"
-                className="h-3.5 w-3.5 accent-[hsl(var(--color-primary))]"
+                className="h-4 w-4 accent-[hsl(var(--color-primary))]"
                 checked={themeAware}
                 onChange={(e) => setThemeAware(e.target.checked)}
               />

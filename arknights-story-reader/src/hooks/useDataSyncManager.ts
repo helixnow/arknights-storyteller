@@ -1,6 +1,22 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { api, type SyncProgress } from "@/services/api";
-import { devLog, devWarn, redactSensitive } from "@/hooks/useAppUpdater";
+import { devLog, devWarn } from "@/hooks/useAppUpdater";
+import {
+  PROGRESS_DONE_LINGER_MS,
+  PROGRESS_FAIL_LINGER_MS,
+  describeImportTransferFailure,
+  isFailureSyncProgress,
+  isTerminalSyncProgress,
+  localizeDataError,
+  shouldAbortImportTransfer,
+  syncProgressLingerMs,
+} from "@/hooks/dataSyncUtils";
+import {
+  dataJobLock,
+  type DataJobKind,
+} from "@/hooks/dataJobLock";
+
+export type { DataJobKind } from "@/hooks/dataJobLock";
 
 interface UseDataSyncManagerOptions {
   active: boolean;
@@ -16,8 +32,6 @@ interface UseDataSyncManagerOptions {
  * `useDataSyncManager`，组件内的 ref 拦不住「一边开着对话框同步、一边在设置页
  * 点同步」这种情况。
  */
-export type DataJobKind = "sync" | "import" | "index" | "update";
-
 const DATA_JOB_LABELS: Record<DataJobKind, string> = {
   sync: "同步剧情数据",
   import: "导入 ZIP",
@@ -25,11 +39,8 @@ const DATA_JOB_LABELS: Record<DataJobKind, string> = {
   update: "安装应用更新",
 };
 
-let activeDataJob: DataJobKind | null = null;
-const dataJobListeners = new Set<() => void>();
-
 export function getActiveDataJob(): DataJobKind | null {
-  return activeDataJob;
+  return dataJobLock.getSnapshot();
 }
 
 /** 任务名，用来在按钮旁边说明「现在是谁占着」。 */
@@ -45,27 +56,12 @@ export function dataJobConflictMessage(intent: string): string {
     : `另一项数据任务正在进行，请稍后再${intent}。`;
 }
 
-function notifyDataJobListeners(): void {
-  for (const listener of [...dataJobListeners]) listener();
-}
-
 /**
  * 抢占任务锁。被别的任务占着时返回 null，调用方负责给提示；
  * 拿到的释放函数可重复调用（finally 里调一次、卸载时再兜底调一次都安全）。
  */
 export function acquireDataJob(kind: DataJobKind): (() => void) | null {
-  if (activeDataJob !== null) return null;
-  activeDataJob = kind;
-  notifyDataJobListeners();
-  let released = false;
-  return () => {
-    if (released) return;
-    released = true;
-    if (activeDataJob === kind) {
-      activeDataJob = null;
-      notifyDataJobListeners();
-    }
-  };
+  return dataJobLock.acquire(kind);
 }
 
 /**
@@ -75,39 +71,12 @@ export function acquireDataJob(kind: DataJobKind): (() => void) | null {
  * 先抢到的成功，其余继续等自己的超时。
  */
 export function acquireDataJobWhenIdle(kind: DataJobKind, timeoutMs: number): Promise<(() => void) | null> {
-  const immediate = acquireDataJob(kind);
-  if (immediate) return Promise.resolve(immediate);
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (release: (() => void) | null) => {
-      if (settled) {
-        // 超时和释放通知赛跑时拿到的锁不能吞掉，得还回去。
-        release?.();
-        return;
-      }
-      settled = true;
-      unsubscribe();
-      window.clearTimeout(timer);
-      resolve(release);
-    };
-    const unsubscribe = subscribeDataJob(() => {
-      if (settled || getActiveDataJob() !== null) return;
-      finish(acquireDataJob(kind));
-    });
-    const timer = window.setTimeout(() => finish(null), timeoutMs);
-  });
-}
-
-function subscribeDataJob(listener: () => void): () => void {
-  dataJobListeners.add(listener);
-  return () => {
-    dataJobListeners.delete(listener);
-  };
+  return dataJobLock.acquireWhenIdle(kind, timeoutMs);
 }
 
 /** 订阅任务锁，用于禁用冲突入口并显示占用者。 */
 export function useActiveDataJob(): DataJobKind | null {
-  return useSyncExternalStore(subscribeDataJob, getActiveDataJob, getActiveDataJob);
+  return useSyncExternalStore(dataJobLock.subscribe, getActiveDataJob, getActiveDataJob);
 }
 
 /**
@@ -134,113 +103,9 @@ function blobToBase64(blob: Blob): Promise<string> {
   });
 }
 
-/** 终态进度多留一会儿让用户看清「完成」，之后自动收起。 */
-const PROGRESS_DONE_LINGER_MS = 2200;
-/**
- * 带失败字样的终态（后台索引重建失败走 sync-progress 报「索引重建失败，
- * 可稍后在设置中手动重试」）要留得更久：它是那次失败在本流程里唯一的
- * 主动提示，2.2 秒就收起等于把失败演成了成功，用户根本来不及读完。
- */
-const PROGRESS_FAIL_LINGER_MS = 15_000;
-/** 后端长时间没有新进度时的兜底，避免进度条永远卡在中间。 */
-const PROGRESS_STALL_TIMEOUT_MS = 30_000;
-
-/**
- * 后端把错误统一成英文字符串抛过来（`Failed to ...` / `NOT_INSTALLED` 等），
- * 直接展示对用户毫无意义，这里按前缀翻译成可执行的中文提示。
- */
-const BACKEND_ERROR_RULES: Array<[RegExp, string]> = [
-  [/^NOT_INSTALLED$/i, "本机还没有剧情数据，请先同步或导入 ZIP。"],
-  [/Failed to create http client/i, "网络组件初始化失败，请重启应用后重试。"],
-  [/Failed to request latest commit/i, "无法连接 GitHub 获取版本信息，请检查网络或代理后重试。"],
-  [/GitHub API returned status 403/i, "GitHub 接口触发访问限流，请稍后再试。"],
-  [/GitHub API returned status (\d+)/i, "GitHub 接口返回异常状态 $1，请稍后再试。"],
-  [/Failed to (?:parse commit response|read commit sha)/i, "GitHub 返回的数据无法解析，请稍后再试。"],
-  [/Download returned status (\d+)/i, "下载失败，服务器返回状态 $1。"],
-  [/Download failed/i, "下载失败，请检查网络或代理后重试。"],
-  [/Failed to read download stream/i, "下载中断，请检查网络后重试。"],
-  [
-    /Failed to (?:create temp zip file|write zip data|flush zip file)/i,
-    "写入临时文件失败，请确认磁盘剩余空间是否充足。",
-  ],
-  [/Failed to read zip archive/i, "无法解析 ZIP，压缩包可能已损坏或不是有效的数据包。"],
-  [
-    /Failed to (?:create (?:extract dir|parent directory|directory|file)|write file)/i,
-    "解压写入失败，请确认磁盘空间与目录权限。",
-  ],
-  [/Failed to remove old data/i, "清理旧数据失败，请关闭占用数据目录的程序后重试。"],
-  [
-    /Failed to (?:create data directory|write version info)/i,
-    "写入版本信息失败，请确认磁盘空间与目录权限。",
-  ],
-  [/Failed to (?:copy file|read directory|read entry|read file type)/i, "读写数据目录失败，请确认目录权限。"],
-  [/Failed to (?:open|configure) .*database|Failed to (?:ensure index tables|init story index meta)/i,
-    "索引数据库读写失败，可在设置中重建全文索引。"],
-  [/Failed to parse/i, "数据解析失败，可能是数据包格式与当前版本不匹配。"],
-  [/Failed to join .*task/i, "后台任务异常结束，请重试。"],
-  [/Invalid data directory/i, "数据目录无效，请重新安装应用后重试。"],
-  [
-    /error sending request|dns error|connection (?:refused|reset|closed|aborted)|timed? ?out|tcp connect error|certificate|ECONN|ENOTFOUND/i,
-    "网络连接失败，请检查网络或代理后重试。",
-  ],
-];
-
 /** 把后端错误翻成中文；识别不了的英文原文加上中文前缀，中文原文原样透出。 */
 export function localizeBackendError(error: unknown, fallback = "操作失败"): string {
-  // Tauri 插件的 invoke 失败可能抛出带 message 字段的普通对象（不是 Error
-  // 实例）；不掏出来就会被 String() 压成 "[object Object]"，规则一条都
-  // 匹配不上，最后端给用户看一句「操作失败：[object Object]」。
-  const raw =
-    error instanceof Error
-      ? error.message
-      : typeof error === "string"
-        ? error
-        : error && typeof error === "object" && typeof (error as { message?: unknown }).message === "string"
-          ? (error as { message: string }).message
-          : String(error ?? "");
-  const text = raw.trim();
-  if (!text || text === "[object Object]") return fallback;
-
-  for (const [pattern, template] of BACKEND_ERROR_RULES) {
-    const match = text.match(pattern);
-    if (match) {
-      return template.replace(/\$(\d)/g, (_, index: string) => match[Number(index)] ?? "");
-    }
-  }
-
-  // 不含中文说明是没被规则覆盖到的后端原文，补个中文前缀再展示。
-  // 原文透出前先脱敏：后端错误串里可能嵌着完整下载地址（reqwest 的报错习惯），
-  // 数据源地址不该出现在界面文案里，用户截图求助时会一并带出去。
-  // 注意「是否含中文」要看原文——脱敏占位符 `<链接>` 本身就是中文。
-  const safeText = redactSensitive(text);
-  return /[\u4e00-\u9fff]/.test(text) ? safeText : `${fallback}：${safeText}`;
-}
-
-function isTerminalProgress(progress: SyncProgress): boolean {
-  // sync-progress 的 current/total 是「当前阶段」刻度，不是整条任务刻度：
-  // 后端会先发准备 1/1、下载 100/100，之后才解压并发真正的「完成」。
-  // 只有后台索引没有沿用「完成」phase，而以「索引」1/1 报成功/失败终态。
-  // 若把任意满刻度阶段都当终态，完成事件丢失时下面的本地兜底会误保留
-  // 「下载完成」，让同步看起来停在下载阶段后直接收起。
-  return (
-    progress.phase === "完成" ||
-    (progress.phase === "索引" && progress.total > 0 && progress.current >= progress.total)
-  );
-}
-
-/**
- * 终态是不是失败通知。sync-progress 通道上唯一带「失败」的消息就是
- * 后台索引重建的失败终态（其余失败都走 Promise reject / 错误卡片）；
- * 万一将来误伤别的消息，代价也只是多留几秒，绝不会把失败提前收掉。
- */
-function isFailureNotice(progress: SyncProgress): boolean {
-  return progress.message.includes("失败");
-}
-
-/** 终态按成败给不同的停留时长；非终态走停更兜底。 */
-function lingerFor(progress: SyncProgress): number {
-  if (!isTerminalProgress(progress)) return PROGRESS_STALL_TIMEOUT_MS;
-  return isFailureNotice(progress) ? PROGRESS_FAIL_LINGER_MS : PROGRESS_DONE_LINGER_MS;
+  return localizeDataError(error, fallback);
 }
 
 export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOptions) {
@@ -267,6 +132,7 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
   /** loadVersionInfo 的代际号：慢的旧请求不许覆盖新请求已写入的结果。 */
   const loadSeqRef = useRef(0);
   const onSuccessRef = useRef(onSuccess);
+  const importCancelRef = useRef(false);
 
   useEffect(() => {
     onSuccessRef.current = onSuccess;
@@ -361,13 +227,13 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
     const unlistenPromise = api.onSyncProgress((p) => {
       if (!mountedRef.current) return;
       setProgress(p);
-      progressIsFailureRef.current = isTerminalProgress(p) && isFailureNotice(p);
+      progressIsFailureRef.current = isTerminalSyncProgress(p) && isFailureSyncProgress(p);
       // 后端的索引重建是异步线程，会在 sync_data 返回之后继续发进度；
       // 这里跟着刷新收起计时，既能显示后续阶段，也不会永远挂在 100%。
       if (busyRef.current) {
         cancelAutoClear();
       } else {
-        scheduleAutoClear(lingerFor(p));
+        scheduleAutoClear(syncProgressLingerMs(p));
       }
     });
 
@@ -395,16 +261,17 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
       await api.syncData();
       window.dispatchEvent(new Event("app:data-updated"));
       onSuccessRef.current?.();
-      await loadVersionInfo({ silent: true });
+      void loadVersionInfo({ silent: true });
       if (mountedRef.current) {
-        // 只是兜底：后端在 sync_data 返回前已发过同款「完成」事件。这里隔着
-        // loadVersionInfo 的几次网络往返，索引重建线程可能已经经 sync-progress
+        // 只是兜底：后端在 sync_data 返回前已发过同款「完成」事件。版本查询
+        // 不占任务锁，避免离线导入后对话框被 GitHub 请求拖成 busy。
+        // 索引重建线程可能已经经 sync-progress
         // 发来自己的终态——尤其是快速失败（磁盘满、索引库打不开）时的
         // 「索引重建失败，可稍后在设置中手动重试」。无条件覆盖会把刚亮出来的
         // 失败通知刷成「同步完成」，那是它在本流程里唯一的主动提示。已是终态
         // 就保持原样，只在进度还停在中途（完成事件丢失/未达）时补写。
         setProgress((prev) =>
-          prev && isTerminalProgress(prev)
+          prev && isTerminalSyncProgress(prev)
             ? prev
             : { phase: "完成", current: 1, total: 1, message: "同步完成" }
         );
@@ -462,13 +329,13 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
         await run();
         window.dispatchEvent(new Event("app:data-updated"));
         onSuccessRef.current?.();
-        await loadVersionInfo({ silent: true });
+        void loadVersionInfo({ silent: true });
         if (mountedRef.current) {
           // 与 handleSync 同一句兜底纪律：后端已发过「完成」，这里只补
           // 事件丢失的场景；索引重建线程若已发来终态（含失败通知），
           // 保持原样，不许拿「导入完成」把它盖掉。
           setProgress((prev) =>
-            prev && isTerminalProgress(prev)
+            prev && isTerminalSyncProgress(prev)
               ? prev
               : { phase: "完成", current: 100, total: 100, message: "导入完成" }
           );
@@ -503,8 +370,9 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
    */
   const importFromFile = useCallback(
     async (file: File, options: { transferredJob?: () => void } = {}) => {
-      await runImport(`正在读取 ${file.name}`, async () => {
+      await runImport(`正在准备暂存 ${file.name}`, async () => {
         devLog("[useDataSyncManager] 导入 ZIP 字节数:", file.size);
+        importCancelRef.current = false;
         // 绝不能 file.arrayBuffer() 一口吞：整包会先占满 JS 堆，再被
         // IPC 序列化成 JSON 数字数组，几百 MB 的 ZIP 在 Android 上直接
         // OOM。改成逐块 slice → base64 → 追加到后端暂存文件，最后一块
@@ -513,6 +381,9 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
         let offset = 0;
         try {
           do {
+            if (shouldAbortImportTransfer(importCancelRef.current)) {
+              throw new Error("操作已取消");
+            }
             const end = Math.min(offset + IMPORT_CHUNK_BYTES, total);
             const chunk = await blobToBase64(file.slice(offset, end));
             const isLast = end >= total;
@@ -525,10 +396,12 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
             if (!isLast && mountedRef.current) {
               const ratio = total > 0 ? offset / total : 0;
               setProgress({
-                phase: "导入",
+                phase: "暂存",
                 current: Math.min(Math.round(ratio * 30), 30),
                 total: 100,
-                message: `正在传输 ZIP 数据…（${Math.round(ratio * 100)}%）`,
+                message: `正在分块暂存 ZIP；导入结束后会清理临时文件…（${Math.round(
+                  ratio * 100
+                )}%）`,
               });
               // 传输进度是非终态：上一次同步遗留的后台索引失败通知若恰好
               // 在传输中途到达又被这里盖掉，失败镜像也要跟着清，免得收尾
@@ -542,10 +415,14 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
           // 期间点「同步」只会收到「导入正在进行」。主动通知后端中止：
           // 立刻放锁并删掉半截暂存文件。中止本身失败也无妨（弃单超时
           // 仍是兜底），原始错误照样抛给 runImport 的统一错误处理。
-          await api.abortZipImport().catch((abortErr) => {
+          let cleanup: "cleaned" | "deferred" = "cleaned";
+          try {
+            await api.abortZipImport();
+          } catch (abortErr) {
+            cleanup = "deferred";
             devWarn("[useDataSyncManager] 通知后端中止分块导入失败:", abortErr);
-          });
-          throw err;
+          }
+          throw new Error(describeImportTransferFailure(err, cleanup));
         }
       }, options.transferredJob);
     },
@@ -575,6 +452,10 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
     setProgress(null);
     progressIsFailureRef.current = false;
   }, [cancelAutoClear]);
+
+  const cancelImportTransfer = useCallback(() => {
+    importCancelRef.current = true;
+  }, []);
 
   const status = useMemo(() => {
     // 后端约定：只有数据集真的不存在才返回「未安装」；已安装但 version.json
@@ -615,6 +496,7 @@ export function useDataSyncManager({ active, onSuccess }: UseDataSyncManagerOpti
     handleSync,
     importFromFile,
     importFromPath,
+    cancelImportTransfer,
     loadVersionInfo,
     resetProgress,
   };

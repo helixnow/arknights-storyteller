@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 interface UseSidePanelOptions {
   /** Controlled open flag from the parent. */
@@ -50,18 +50,27 @@ export function useSidePanel({
 }: UseSidePanelOptions): UseSidePanelResult {
   const [rendered, setRendered] = useState(open);
   const [state, setState] = useState<"open" | "closed">(open ? "open" : "closed");
+  const wasOpenRef = useRef(open);
 
   // Two-phase render: when opening, mount first, then flip data-state to
   // "open" on the next frame so the CSS transition is triggered. When closing,
   // flip to "closed" immediately and unmount after the exit animation.
   useEffect(() => {
     if (open) {
+      wasOpenRef.current = true;
       setRendered(true);
       const id = requestAnimationFrame(() => setState("open"));
       return () => cancelAnimationFrame(id);
     }
 
     setState("closed");
+    // 只在「曾经打开过」时广播：首次挂载 open=false 不能误伤阅读器翻页。
+    // 退场 300ms 内 scrim/面板都 pointer-events-none，点按会落到下层阅读器
+    // 的翻页热区。阅读器用同一条 400ms 守卫挡住这次合成点击。
+    if (wasOpenRef.current) {
+      wasOpenRef.current = false;
+      window.dispatchEvent(new Event("app:overlay-closed"));
+    }
     const id = window.setTimeout(() => setRendered(false), exitDurationMs);
     return () => window.clearTimeout(id);
   }, [open, exitDurationMs]);

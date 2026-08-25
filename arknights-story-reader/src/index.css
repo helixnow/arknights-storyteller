@@ -19,14 +19,7 @@
   font-display: swap;
   unicode-range: U+4E00-9FFF;
 }
-@font-face {
-  font-family: "Arknights Noto Sans SC";
-  src: url("/fonts/subset/NotoSansSC-ext.woff2") format("woff2");
-  font-weight: 400;
-  font-style: normal;
-  font-display: swap;
-  unicode-range: U+3400-4DBF, U+20000-2A6DF;
-}
+
 
 @font-face {
   font-family: "Arknights Noto Serif SC";
@@ -44,14 +37,7 @@
   font-display: swap;
   unicode-range: U+4E00-9FFF;
 }
-@font-face {
-  font-family: "Arknights Noto Serif SC";
-  src: url("/fonts/subset/NotoSerifSC-ext.woff2") format("woff2");
-  font-weight: 400;
-  font-style: normal;
-  font-display: swap;
-  unicode-range: U+3400-4DBF, U+20000-2A6DF;
-}
+
 
 @font-face {
   font-family: "Arknights LXGW WenKai";
@@ -69,14 +55,7 @@
   font-display: swap;
   unicode-range: U+4E00-9FFF;
 }
-@font-face {
-  font-family: "Arknights LXGW WenKai";
-  src: url("/fonts/subset/LXGWWenKai-ext.woff2") format("woff2");
-  font-weight: 400;
-  font-style: normal;
-  font-display: swap;
-  unicode-range: U+3400-4DBF, U+20000-2A6DF;
-}
+
 
 :root,
 :root[data-theme-color="default"] {
@@ -353,6 +332,27 @@ html, body, #root {
   margin: 0;
   padding: 0;
   height: 100%;
+  min-height: 0;
+  width: 100%;
+}
+
+/* 100%/vh 在移动浏览器地址栏展开、旋转以及软键盘出现时仍按旧布局视口算，
+   根节点会比用户真正看见的区域高一截。支持 dvh 的内核改用动态视口；
+   老 WebView 保留上面的 100% 兜底。 */
+@supports (height: 100dvh) {
+  html, body, #root {
+    height: 100dvh;
+  }
+}
+
+/*
+ * 应用壳统一避开状态栏，并把这段净空发布给内部的阅读器。阅读器分页高度用
+ * `100dvh - --reader-chrome` 计算，但动态 chrome 只测得到自己的顶栏/页脚；
+ * 若这里的壳层 padding 不单独扣除，每页都会固定多出一段状态栏高度。
+ */
+.app-shell {
+  --app-shell-top-inset: max(env(safe-area-inset-top, 0px), 12px);
+  padding-top: var(--app-shell-top-inset);
 }
 
 body {
@@ -405,8 +405,9 @@ body {
     touch-action: manipulation;
   }
 
-  :where(input, textarea) {
+  :where(input:not([type="range"]), textarea, select) {
     -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
   }
 }
 
@@ -869,12 +870,26 @@ body {
   cursor: grabbing;
 }
 
+/* 分页热区只要快速点按：禁双击缩放判定，保留捏合。连续滚动仍走 pan-y pinch-zoom。 */
+.reader-scroll--paged {
+  touch-action: manipulation;
+}
+
 .reader-scroll--paged .reader-content {
-  min-height: calc(100vh - 12rem);
+  /* --reader-chrome 由阅读器根元素发布实测值；这里不声明局部值，避免挡住
+     祖先上的测量结果。12rem 只服务尚未发布变量的旧调用方。第一条保留给
+     没有应用壳的独立调用方；应用内再扣掉壳层的状态栏安全区。 */
+  min-height: calc(100vh - var(--reader-chrome, 12rem));
+  min-height: calc(
+    100vh - var(--reader-chrome, 12rem) - var(--app-shell-top-inset, 0px)
+  );
   /* 移动端浏览器工具栏展开时 100vh 比可视视口高约一条工具栏，分页模式
      每一页都会多出一截滚动、页尾沉到折叠线下。dvh 跟随实际视口；
      旧内核不认识这行会自动回落到上面的 vh。 */
-  min-height: calc(100dvh - 12rem);
+  min-height: calc(100dvh - var(--reader-chrome, 12rem));
+  min-height: calc(
+    100dvh - var(--reader-chrome, 12rem) - var(--app-shell-top-inset, 0px)
+  );
 }
 
 .progress-track {
@@ -894,7 +909,10 @@ body {
 
 @media (max-width: 640px) {
   .reader-content {
-    padding: 1.5rem 1rem 2rem;
+    padding-top: 1.5rem;
+    padding-left: max(1rem, env(safe-area-inset-left, 0px));
+    padding-right: max(1rem, env(safe-area-inset-right, 0px));
+    padding-bottom: max(2rem, calc(env(safe-area-inset-bottom, 0px) + 1rem));
   }
 }
 
@@ -907,6 +925,8 @@ input[type="range"] {
   width: 100%;
   height: 1.5rem;
   display: block;
+  /* 横向拖滑块交给控件，纵向手势仍可滚动 sheet。 */
+  touch-action: pan-y;
 }
 
 input[type="range"]::-webkit-slider-runnable-track {
@@ -983,7 +1003,9 @@ input[type="range"]::-moz-range-thumb {
 /* ===== 性能优化：视口外段落跳过布局 ===== */
 .reader-segment {
   content-visibility: auto;
-  contain-intrinsic-size: 1px 120px;
+  contain-intrinsic-size: auto var(--reader-seg-estimate, 120px);
+  /* 单行 system/subtitle 在小字号下矮于 44px 收藏热区，热区会溢出到下一段。 */
+  min-height: 2.75rem;
 }
 
 /* ===== 三种段落高亮的互斥优先级 ===== */
@@ -1174,11 +1196,19 @@ input[type="range"]::-moz-range-thumb {
      加上 content-visibility + contain 后，真正在视口里的卡片数 ≤ 10，
      合成器压力降一个数量级，导航背景就能稳定刷新。 */
   content-visibility: auto;
-  contain-intrinsic-size: 1px 88px;
+  contain-intrinsic-size: auto 88px;
   contain: layout paint style;
 }
-.story-card:hover {
-  border-color: hsl(var(--color-primary) / 0.5);
+.story-card--hero {
+  contain-intrinsic-size: auto 280px;
+}
+@media (hover: hover) and (pointer: fine) {
+  .story-card:hover {
+    border-color: hsl(var(--color-primary) / 0.5);
+  }
+}
+.story-card:active {
+  background-color: hsl(var(--color-accent) / 0.4);
 }
 .story-card-cover {
   position: relative;
@@ -1234,6 +1264,13 @@ input[type="range"]::-moz-range-thumb {
   opacity: 0.55;
   /* 让图片留在自己的合成层里，而不是每次 paint 时重算一次 blur。 */
   will-change: transform;
+}
+@media (pointer: coarse) {
+  .story-card-memory-bg .asset-image,
+  .story-card-memory-bg img {
+    filter: blur(8px) saturate(1.05);
+    will-change: auto;
+  }
 }
 /* 隐藏装饰性 fallback：
    - `.asset-image-fallback`：AssetImage（精二立绘加载中/失败）
@@ -1292,6 +1329,11 @@ input[type="range"]::-moz-range-thumb {
   will-change: backdrop-filter, transform;
   isolation: isolate;
 }
+.bottom-nav-glass--keyboard-hidden {
+  transform: translateY(calc(100% + 1.25rem));
+  pointer-events: none;
+  visibility: hidden;
+}
 @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
   .bottom-nav-glass {
     background: hsl(var(--color-background) / 0.96);
@@ -1333,9 +1375,10 @@ input[type="range"]::-moz-range-thumb {
   right: 0;
   bottom: max(
     calc(var(--bottom-nav-inset, 0px) + 12px),
-    calc(env(safe-area-inset-bottom, 0px) + 1.25rem)
+    calc(env(safe-area-inset-bottom, 0px) + 1.25rem),
+    calc(var(--keyboard-inset, 0px) + 12px)
   );
-  z-index: 100;
+  z-index: var(--toast-z, 100);
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -1345,11 +1388,26 @@ input[type="range"]::-moz-range-thumb {
   pointer-events: none;
 }
 
+/* 列表页历史上统一写 pb-24；字号放大或系统安全区抬高底栏后，固定的 6rem
+   可能不够，最后一行会沉到玻璃导航下面。保留原基线，只在实测导航更高时扩容。
+   阅读器没有 --bottom-nav-inset，仍保持原来的 6rem。 */
+[data-keepalive-active="true"] .pb-24 {
+  padding-bottom: max(6rem, calc(var(--bottom-nav-inset, 0px) + 1rem));
+}
+
 /* ===== KeepAlive 面板 =====
  * 面板常驻挂载、只切可见性（见 KeepAlive.tsx）。隐藏面板里的循环动画仍然
  * 会一帧一帧合成——四个面板的骨架屏/spinner 同时转，等于白烧一半合成预算。
  * 暂停而不是取消：切回来时接着播，不会出现「进度条从头开始」的突兀感。
+ *
+ * 后台整棵子树必须 content-visibility: hidden。各面板都是 inset-0 叠在同一
+ * 视口上，子节点的 content-visibility: auto 仍会按「在视口内」继续布局，
+ * 切换页面后首页/列表/阅读器会叠在一起抢渲染。
  */
+[data-keepalive-active="false"] {
+  content-visibility: hidden;
+  contain: strict;
+}
 [data-keepalive-active="false"],
 [data-keepalive-active="false"] *,
 [data-keepalive-active="false"] *::before,
@@ -1361,7 +1419,7 @@ input[type="range"]::-moz-range-thumb {
    没有这个会整屏 repaint；加上之后滚动几乎没额外成本。 */
 .character-grid-cell {
   content-visibility: auto;
-  contain-intrinsic-size: 1px 72px;
+  contain-intrinsic-size: auto 72px;
   contain: layout paint style;
 }
 

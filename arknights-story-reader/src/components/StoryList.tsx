@@ -38,8 +38,22 @@ import { useFavorites } from "@/hooks/useFavorites";
 import type { CatalogGroupSnapshot, FavoriteGroupType } from "@/hooks/useFavorites";
 import { useAppPreferences } from "@/hooks/useAppPreferences";
 import { StoryThumbnail } from "@/components/StoryThumbnail";
+import { applyInstantScroll } from "@/lib/appShellLogic";
+import { useToast } from "@/components/ui/toast";
 import { AssetImage } from "@/components/AssetImage";
 import { CharacterAvatar } from "@/components/CharacterAvatar";
+import {
+  createVersionedRequestCache,
+  isMissingStoryCatalogError,
+  parseReadingProgressSnapshot,
+  storySummaryKey,
+  type ReadingProgressSnapshot,
+  uniqueRefreshSections,
+} from "@/components/storyListState";
+export type {
+  ReadingProgressEntry,
+  ReadingProgressSnapshot,
+} from "@/components/storyListState";
 
 /**
  * 从干员密录类 storyTxt 路径里抠出 charId 候选。
@@ -164,56 +178,7 @@ const PROGRESS_KEY = "reading-progress";
 /** 到这个百分比就算读完。首页大卡、列表徽标共用一个口径。 */
 export const READ_FINISHED_PCT = 99;
 
-export interface ReadingProgressEntry {
-  storyPath: string;
-  /** 0~1 */
-  percentage: number;
-  updatedAt: number;
-}
-
-export interface ReadingProgressSnapshot {
-  /** storyTxt → 0~1。列表徽标按 key 查表，O(1)。 */
-  percent: Record<string, number>;
-  /** 按 updatedAt 倒序。首页「最近阅读」直接用这一份。 */
-  recent: ReadingProgressEntry[];
-}
-
 const EMPTY_PROGRESS: ReadingProgressSnapshot = { percent: {}, recent: [] };
-
-function clampRatio(value: unknown): number {
-  const num = Number(value ?? 0);
-  if (!Number.isFinite(num)) return 0;
-  return Math.min(1, Math.max(0, num));
-}
-
-function parseReadingProgress(raw: string | null): ReadingProgressSnapshot {
-  if (!raw) return EMPTY_PROGRESS;
-  try {
-    const parsed = JSON.parse(raw) as Record<
-      string,
-      { percentage?: number; updatedAt?: number } | null
-    >;
-    if (!parsed || typeof parsed !== "object") return EMPTY_PROGRESS;
-
-    const percent: Record<string, number> = {};
-    const recent: ReadingProgressEntry[] = [];
-    for (const [storyPath, value] of Object.entries(parsed)) {
-      if (!value || typeof value !== "object") continue;
-      const percentage = clampRatio(value.percentage);
-      const updatedAt = Number(value.updatedAt ?? 0);
-      if (percentage > 0) percent[storyPath] = percentage;
-      recent.push({
-        storyPath,
-        percentage,
-        updatedAt: Number.isFinite(updatedAt) ? updatedAt : 0,
-      });
-    }
-    recent.sort((a, b) => b.updatedAt - a.updatedAt);
-    return { percent, recent };
-  } catch {
-    return EMPTY_PROGRESS;
-  }
-}
 
 let progressRaw: string | null = null;
 let progressSnapshot: ReadingProgressSnapshot = EMPTY_PROGRESS;
@@ -238,7 +203,7 @@ export function getReadingProgress(): ReadingProgressSnapshot {
   if (progressParsed && raw === progressRaw) return progressSnapshot;
   progressRaw = raw;
   progressParsed = true;
-  progressSnapshot = parseReadingProgress(raw);
+  progressSnapshot = parseReadingProgressSnapshot(raw);
   return progressSnapshot;
 }
 
@@ -297,41 +262,10 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
  * 就会变成一串没必要的 IPC；有了 TTL，这些刷新几乎只是重读 localStorage。
  */
 const CATALOG_TTL_MS = 60_000;
-
-interface CatalogHit {
-  value: unknown;
-  at: number;
-}
-
-const catalogValues = new Map<string, CatalogHit>();
-const catalogInflight = new Map<string, Promise<unknown>>();
-let catalogVersion = 0;
+const catalogCache = createVersionedRequestCache(CATALOG_TTL_MS);
 
 function catalogFetch<T>(key: string, loader: () => Promise<T>, force: boolean): Promise<T> {
-  if (force) catalogValues.delete(key);
-
-  const hit = catalogValues.get(key);
-  if (hit && Date.now() - hit.at < CATALOG_TTL_MS) {
-    return Promise.resolve(hit.value as T);
-  }
-
-  const pending = catalogInflight.get(key) as Promise<T> | undefined;
-  if (pending) return pending;
-
-  const startedAt = catalogVersion;
-  const request = loader().then((value) => {
-    // 请求期间数据被重新同步过，这份结果已经过期，不能进缓存。
-    if (catalogVersion === startedAt) {
-      catalogValues.set(key, { value, at: Date.now() });
-    }
-    return value;
-  });
-  const release = () => {
-    if (catalogInflight.get(key) === request) catalogInflight.delete(key);
-  };
-  request.then(release, release);
-  catalogInflight.set(key, request);
-  return request;
+  return catalogCache.fetch(key, loader, force);
 }
 
 const GROUPED_FETCHERS: Record<GroupedKey, () => Promise<GroupedStories>> = {
@@ -352,9 +286,7 @@ export const storyCatalog = {
 
 /** 剧情数据换了一批：整体失效，下一次请求重新打 IPC。 */
 export function invalidateStoryCatalog() {
-  catalogVersion += 1;
-  catalogValues.clear();
-  catalogInflight.clear();
+  catalogCache.invalidate();
 }
 
 if (typeof window !== "undefined") {
@@ -362,11 +294,7 @@ if (typeof window !== "undefined") {
 }
 
 export function isNotInstalledError(message: string) {
-  return (
-    message.includes("NOT_INSTALLED") ||
-    message.includes("No such file") ||
-    message === "TIMEOUT"
-  );
+  return isMissingStoryCatalogError(message);
 }
 
 /**
@@ -399,7 +327,7 @@ const SUMMARY_MAX_ATTEMPTS = 2;
  * 成功结果也写不进新键、污染不了新简介。
  */
 function summaryStateKey(story: StoryEntry): string {
-  return `${story.storyId}|${story.storyInfo ?? ""}`;
+  return storySummaryKey(story);
 }
 
 function runSummaryQueue() {
@@ -767,6 +695,24 @@ export function StoryList({ onSelectStory }: StoryListProps) {
     [loadSection]
   );
 
+  /**
+   * 强制刷新当前分类及主线依赖，但每个分块只发一次。收藏分类本身包含主线，
+   * 其它分类的调用方也曾经并行调用 `loadSection("main", true)`：
+   * force 会刻意绕过 in-flight 去重，因此必须在发请求前先做集合去重。
+   */
+  const reloadCategory = useCallback(
+    (category: Category) => {
+      const sections = uniqueRefreshSections<SectionKey>(
+        "main",
+        CATEGORY_SECTIONS[category]
+      );
+      return Promise.all(sections.map((section) => loadSection(section, true))).then(
+        () => undefined
+      );
+    },
+    [loadSection]
+  );
+
   useEffect(() => {
     let cancelled = false;
 
@@ -789,17 +735,14 @@ export function StoryList({ onSelectStory }: StoryListProps) {
         // 成功会回写 installed=true）；真没装会以 NOT_INSTALLED 落进
         // handleLoadError，由那里下「未安装」的结论并给出同步入口。
         console.warn("[StoryList] isInstalled 失败，改为直接读目录判定:", e);
-        void loadSection("main", true);
-        if (activeCategoryRef.current !== "main") {
-          void loadCategory(activeCategoryRef.current, true);
-        }
+        void reloadCategory(activeCategoryRef.current);
       }
     })();
 
     return () => {
       cancelled = true;
     };
-  }, [loadCategory, loadSection, setSectionBusy]);
+  }, [reloadCategory, setSectionBusy]);
 
   // 数据就绪后：当前分类按需加载；主线始终加载（收藏分组名依赖它）。
   useEffect(() => {
@@ -859,13 +802,11 @@ export function StoryList({ onSelectStory }: StoryListProps) {
       setMemoryStories([]);
       setError(null);
       setInstalled(true);
-      // 主线不管在哪个分类都要重来一次：收藏分组名依赖它的映射表。
-      void loadSection("main", true);
-      void loadCategory(activeCategory, true);
+      void reloadCategory(activeCategory);
     };
     window.addEventListener("app:data-updated", handler);
     return () => window.removeEventListener("app:data-updated", handler);
-  }, [activeCategory, loadCategory, loadSection]);
+  }, [activeCategory, reloadCategory]);
 
   /** 把当前选中的分类 pill 滚回横向可视区。按 DOM 里的 aria-pressed 找
    *  目标，所以只能在选中态已经落进 DOM 之后调用。 */
@@ -893,15 +834,22 @@ export function StoryList({ onSelectStory }: StoryListProps) {
       // 入口语义是「去看收藏」而不是「回到上次在收藏里停的位置」。分类
       // 真的变化时下面的归顶 effect 也会跑一次；这里显式回顶是为了覆盖
       // 「本来就停在收藏分类、只是滚到了半截」的跳转。
-      const viewport = scrollRootRef.current;
-      if (viewport) viewport.scrollTop = 0;
-      // pill 行同理：本来就停在收藏分类时 activeCategory 不变，按分类
-      // 变化触发的 pill 归位 effect 不会重跑，而 pill 行可能还停在用户
-      // 上次划到的最右端——选中的收藏 pill 整个在可视区外，跳过来后
-      // pill 行看起来毫无变化。此刻 DOM 里 aria-pressed 就挂在收藏 pill
-      // 上，直接归位；分类真的变化时不在这里滚（此刻查到的还是旧 pill），
-      // 交给下面的归位 effect。
-      if (activeCategoryRef.current === "favorites") revealActivePill();
+      const apply = () => {
+        const viewport = scrollRootRef.current;
+        if (viewport) applyInstantScroll(viewport, 0, 0);
+        // pill 行同理：本来就停在收藏分类时 activeCategory 不变，按分类
+        // 变化触发的 pill 归位 effect 不会重跑，而 pill 行可能还停在用户
+        // 上次划到的最右端——选中的收藏 pill 整个在可视区外，跳过来后
+        // pill 行看起来毫无变化。此刻 DOM 里 aria-pressed 就挂在收藏 pill
+        // 上，直接归位；分类真的变化时不在这里滚（此刻查到的还是旧 pill），
+        // 交给下面的归位 effect。
+        if (activeCategoryRef.current === "favorites") revealActivePill();
+      };
+      apply();
+      // 分类没变时 setActiveCategory 会 eager bailout，微任务会排在 App
+      // 切 tab 的 React 提交之前，KeepAlive 随后灌回旧滚动。rAF 一定在
+      // 那次 layout restore 之后、绘制之前再写一次归顶。
+      requestAnimationFrame(apply);
     };
     window.addEventListener("app:open-favorites", handler);
     return () => window.removeEventListener("app:open-favorites", handler);
@@ -910,7 +858,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
   // 选中的分类 pill 必须留在横向滚动区的可视范围里。用户把 pill 行划到
   // 最右边看密录、再从首页统计格跳「收藏」时，高亮落在最左端的收藏 pill
   // 上——不滚回来的话 pill 行看起来毫无变化，像是点了没反应。KeepAlive
-  // 用 visibility 隐藏面板、布局盒还在，所以隐藏时切换也能量到真实几何。
+  // 分类变化后新的 aria-pressed 落进 DOM，此时面板已可见，能量到真实几何。
   // activeCategory 刻意留在依赖里：effect 体不读它，选中 pill 从 DOM 查，
   // 它只负责在分类变化、新的 aria-pressed 落进 DOM 之后触发归位。
   useEffect(() => {
@@ -1010,7 +958,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
     if (scrollResetRef.current === scrollResetKey) return;
     scrollResetRef.current = scrollResetKey;
     const viewport = scrollRootRef.current;
-    if (viewport && viewport.scrollTop !== 0) viewport.scrollTop = 0;
+    if (viewport && viewport.scrollTop !== 0) applyInstantScroll(viewport, 0, 0);
   }, [scrollResetKey]);
 
   const isGroupOpen = useCallback(
@@ -1344,35 +1292,17 @@ export function StoryList({ onSelectStory }: StoryListProps) {
 
   const retryActive = useCallback(() => {
     setError(null);
-    // 主线要一起重来：收藏分组名依赖它的映射表。
-    void loadSection("main", true);
-    void loadCategory(activeCategory, true);
-  }, [activeCategory, loadCategory, loadSection]);
+    void reloadCategory(activeCategory);
+  }, [activeCategory, reloadCategory]);
 
-  const handleSyncSuccess = useCallback(async () => {
+  const handleSyncSuccess = useCallback(() => {
+    // useDataSyncManager 会先同步广播 app:data-updated，再调用 onSuccess。
+    // 目录作废和强制重载已经由上面的事件处理器启动；这里若再清一次并 force，
+    // 会让刚发出的每个 IPC 立即失去归属、整套目录无谓地读取第二遍。
     setInstalled(true);
     setError(null);
-    // 同步对话框不一定广播 `app:data-updated`，这里自己把共享缓存清掉。
-    invalidateStoryCatalog();
-    loadedRef.current = initialSectionFlags(false);
-    // 同上面 data-updated 的处理：在途任务全部作废，免得旧数据回写；
-    // 旧目录的列表也一并清空，不给换包后的旧卡留展示窗口。
-    pendingRef.current = {};
-    sawNotInstalledRef.current = false;
-    summaryGenerationRef.current += 1;
-    summaryAttemptsRef.current.clear();
-    summaryInflightRef.current.clear();
-    setSummaryCache({});
-    setSummaryLoadingIds({});
-    // 同 data-updated：常驻的收藏行靠这个信号重发简介请求。
-    setSummaryEpoch((epoch) => epoch + 1);
-    setOpenGroups({});
-    setGroups(emptyGroups());
-    setMemoryStories([]);
-    // 并发发起：目录层有 in-flight 去重，主线不会打两次 IPC。
-    await Promise.all([loadSection("main", true), loadCategory(activeCategory, true)]);
     setSyncDialogOpen(false);
-  }, [activeCategory, loadCategory, loadSection]);
+  }, []);
 
   /**
    * 行组件是 `memo` 的，所以传下去的回调必须是稳定引用，否则每次父级
@@ -1578,7 +1508,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
           viewportClassName="reader-scroll"
           viewportRef={scrollRootRef}
           trackOffsetTop="calc(3.5rem + 10px)"
-          trackOffsetBottom="calc(4.5rem + env(safe-area-inset-bottom, 0px))"
+          trackOffsetBottom="calc(max(4.5rem, var(--bottom-nav-inset, 4.5rem)) + 0.5rem)"
         >
           <div className="container py-6 pb-24 space-y-6 motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-700">
             <div className="space-y-3">
@@ -1612,13 +1542,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
                     {activeSummary}
                   </span>
                   {!online && (
-                    <span
-                      title="设备当前离线，已同步的剧情仍可正常阅读"
-                      className="inline-flex flex-shrink-0 items-center gap-1 rounded-full border border-[hsl(var(--color-border))] px-2 py-0.5 text-[11px] text-[hsl(var(--color-muted-foreground))]"
-                    >
-                      <WifiOff className="h-3 w-3" aria-hidden="true" />
-                      离线
-                    </span>
+                    <OfflineBadge />
                   )}
                 </span>
                 <div className="flex flex-shrink-0 items-center gap-2">
@@ -1873,6 +1797,22 @@ export function StoryList({ onSelectStory }: StoryListProps) {
  * 把过滤压到低优先级渲染。草稿留在这里也意味着合成中的每次按键只
  * 重渲染这个输入框，不会波及整棵列表树。
  */
+export function OfflineBadge() {
+  const toast = useToast();
+  return (
+    <button
+      type="button"
+      aria-label="离线：已同步的剧情仍可正常阅读"
+      title="设备当前离线，已同步的剧情仍可正常阅读"
+      onClick={() => toast.show("已同步的剧情仍可正常阅读", { duration: 2800 })}
+      className="inline-flex flex-shrink-0 items-center gap-1 rounded-full border border-[hsl(var(--color-border))] px-2 py-0.5 text-[11px] text-[hsl(var(--color-muted-foreground))]"
+    >
+      <WifiOff className="h-3 w-3" aria-hidden="true" />
+      离线
+    </button>
+  );
+}
+
 function CatalogSearchInput({
   value,
   onCommit,
@@ -1883,6 +1823,7 @@ function CatalogSearchInput({
 }) {
   const [draft, setDraft] = useState(value);
   const composingRef = useRef(false);
+  const inputRef = useRef<HTMLInputElement | null>(null);
 
   // 已提交值在外部被改掉时把草稿对齐（渲染期 setState 是 React 认可的
   // 派生 state 写法，本组件会立刻带新值重渲染）。合成中不动草稿，
@@ -1894,35 +1835,57 @@ function CatalogSearchInput({
   }
 
   return (
-    <Input
-      type="search"
-      value={draft}
-      onChange={(event) => {
-        const next = event.target.value;
-        setDraft(next);
-        if (!composingRef.current) onCommit(next);
-      }}
-      onCompositionStart={() => {
-        composingRef.current = true;
-      }}
-      onCompositionEnd={(event) => {
-        composingRef.current = false;
-        // Safari/WKWebView 的 compositionend 排在 input 之前，部分安卓
-        // 输入法又把 change 排在 compositionend 之后——不猜顺序，直接
-        // 以事件里的最终文本为准提交一次。
-        const next = event.currentTarget.value;
-        setDraft(next);
-        onCommit(next);
-      }}
-      placeholder="搜索剧情标题或编号"
-      aria-label="搜索剧情标题或编号"
-      aria-describedby="story-list-search-hint"
-      autoComplete="off"
-      autoCorrect="off"
-      spellCheck={false}
-      enterKeyHint="search"
-      className="w-full sm:w-80 md:w-96"
-    />
+    <div className="relative w-full sm:w-80 md:w-96">
+      <Input
+        ref={inputRef}
+        type="search"
+        value={draft}
+        onChange={(event) => {
+          const next = event.target.value;
+          setDraft(next);
+          if (!composingRef.current) onCommit(next);
+        }}
+        onCompositionStart={() => {
+          composingRef.current = true;
+        }}
+        onCompositionEnd={(event) => {
+          composingRef.current = false;
+          // Safari/WKWebView 的 compositionend 排在 input 之前，部分安卓
+          // 输入法又把 change 排在 compositionend 之后——不猜顺序，直接
+          // 以事件里的最终文本为准提交一次。
+          const next = event.currentTarget.value;
+          setDraft(next);
+          onCommit(next);
+        }}
+        onKeyDown={(event) => {
+          if (event.key !== "Enter") return;
+          if (composingRef.current || event.nativeEvent.isComposing) return;
+          event.currentTarget.blur();
+        }}
+        placeholder="搜索剧情标题或编号"
+        aria-label="搜索剧情标题或编号"
+        aria-describedby="story-list-search-hint"
+        autoComplete="off"
+        autoCorrect="off"
+        spellCheck={false}
+        enterKeyHint="search"
+        className="w-full pr-12"
+      />
+      {draft ? (
+        <button
+          type="button"
+          aria-label="清除搜索"
+          className="absolute right-0.5 top-1/2 inline-flex h-11 w-11 -translate-y-1/2 items-center justify-center text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-foreground))]"
+          onClick={() => {
+            setDraft("");
+            onCommit("");
+            inputRef.current?.focus();
+          }}
+        >
+          <X className="h-4 w-4" />
+        </button>
+      ) : null}
+    </div>
   );
 }
 
@@ -2013,7 +1976,7 @@ function RevealMore({
             target?.focus();
           });
         }}
-        className="flex min-h-[44px] w-full items-center justify-center gap-2 rounded-2xl border border-dashed border-[hsl(var(--color-border))] px-3 text-xs text-[hsl(var(--color-muted-foreground))] transition-colors hover:border-[hsl(var(--color-primary)/0.5)] hover:text-[hsl(var(--color-foreground))] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-[hsl(var(--color-primary))]"
+        className="flex min-h-[44px] w-full items-center justify-center gap-2 rounded-2xl border border-dashed border-[hsl(var(--color-border))] px-3 text-xs text-[hsl(var(--color-muted-foreground))] transition-colors active:border-[hsl(var(--color-primary)/0.5)] active:text-[hsl(var(--color-foreground))] [@media(hover:hover)_and_(pointer:fine)]:hover:border-[hsl(var(--color-primary)/0.5)] [@media(hover:hover)_and_(pointer:fine)]:hover:text-[hsl(var(--color-foreground))] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-[hsl(var(--color-primary))]"
       >
         <ChevronsUpDown className="h-3.5 w-3.5" aria-hidden="true" />
         <span>
@@ -2039,7 +2002,7 @@ function BulkToggleButton({
       onClick={onToggle}
       aria-pressed={expanded}
       aria-label={label}
-      className="inline-flex min-h-[44px] flex-shrink-0 items-center gap-1.5 rounded-full border border-[hsl(var(--color-border))] px-3 py-1 text-xs text-[hsl(var(--color-muted-foreground))] transition-colors hover:bg-[hsl(var(--color-accent))] hover:text-[hsl(var(--color-foreground))]"
+      className="inline-flex min-h-[44px] flex-shrink-0 items-center gap-1.5 rounded-full border border-[hsl(var(--color-border))] px-3 py-1 text-xs text-[hsl(var(--color-muted-foreground))] transition-colors active:bg-[hsl(var(--color-accent))] [@media(hover:hover)_and_(pointer:fine)]:hover:bg-[hsl(var(--color-accent))] [@media(hover:hover)_and_(pointer:fine)]:hover:text-[hsl(var(--color-foreground))]"
     >
       <Icon className="h-3.5 w-3.5" aria-hidden="true" />
       <span className="whitespace-nowrap">{expanded ? "收起全部" : "展开全部"}</span>
@@ -2167,7 +2130,7 @@ function SummaryToggleButton({
       className={`inline-flex min-h-[44px] flex-shrink-0 items-center gap-1.5 rounded-full border px-3 py-1 text-xs transition-colors ${
         enabled
           ? "text-[hsl(var(--color-primary))] border-[hsl(var(--color-primary)/0.4)] bg-[hsl(var(--color-primary)/0.1)]"
-          : "text-[hsl(var(--color-muted-foreground))] border-[hsl(var(--color-border))] bg-transparent hover:bg-[hsl(var(--color-accent))] hover:text-[hsl(var(--color-foreground))]"
+          : "text-[hsl(var(--color-muted-foreground))] border-[hsl(var(--color-border))] bg-transparent active:bg-[hsl(var(--color-accent))] [@media(hover:hover)_and_(pointer:fine)]:hover:bg-[hsl(var(--color-accent))] [@media(hover:hover)_and_(pointer:fine)]:hover:text-[hsl(var(--color-foreground))]"
       }`}
     >
       <FileText className="h-3.5 w-3.5" />
@@ -2209,7 +2172,7 @@ function GroupFavoriteButton({
       className={`inline-flex min-h-[44px] items-center gap-2 rounded-full border px-3 py-1 text-xs transition-colors ${
         isFavorite
           ? "text-[hsl(var(--color-primary))] border-[hsl(var(--color-primary)/0.4)] bg-[hsl(var(--color-primary)/0.08)]"
-          : "text-[hsl(var(--color-muted-foreground))] border-[hsl(var(--color-border))] bg-transparent hover:bg-[hsl(var(--color-accent))] hover:text-[hsl(var(--color-foreground))]"
+          : "text-[hsl(var(--color-muted-foreground))] border-[hsl(var(--color-border))] bg-transparent active:bg-[hsl(var(--color-accent))] [@media(hover:hover)_and_(pointer:fine)]:hover:bg-[hsl(var(--color-accent))] [@media(hover:hover)_and_(pointer:fine)]:hover:text-[hsl(var(--color-foreground))]"
       }`}
     >
       <Star
@@ -2316,6 +2279,10 @@ const StoryItem = memo(function StoryItem({
 
   return (
     <div
+      className="relative"
+      style={{ contentVisibility: "auto", containIntrinsicSize: "auto 88px" }}
+    >
+    <div
       role="button"
       tabIndex={0}
       aria-label={[
@@ -2327,9 +2294,6 @@ const StoryItem = memo(function StoryItem({
         .join(" · ")}
       onClick={() => onSelectStory(story)}
       onKeyDown={(event) => {
-        // 只响应焦点在卡片自身时的按键：卡片里的收藏星标也是可聚焦按钮，
-        // 它冒泡上来的 Enter/Space 若被这里 preventDefault 掐掉原生激活，
-        // 就变成「按星标却打开了阅读器、收藏没切」，键盘用户无法收藏。
         if (event.target !== event.currentTarget) return;
         // Space 必须 preventDefault，否则会连带把滚动容器翻一页。
         if (event.key === "Enter" || event.key === " ") {
@@ -2337,11 +2301,7 @@ const StoryItem = memo(function StoryItem({
           onSelectStory(story);
         }
       }}
-      /* `content-visibility` 让滚出视口的行跳过样式/布局/绘制，长列表里
-         省下的主线程时间比什么都实在；`auto` 的固有尺寸会记住上一次的
-         真实高度，所以滚动条不会来回跳。不支持的引擎直接忽略这两条。 */
-      style={{ contentVisibility: "auto", containIntrinsicSize: "auto 88px" }}
-      className="story-card relative flex w-full gap-3 p-3 items-center text-left cursor-pointer overflow-hidden transition-all duration-200 ease-out hover:-translate-y-0.5 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[hsl(var(--color-primary))] motion-safe:animate-in motion-safe:fade-in-0"
+      className="story-card relative flex w-full gap-3 p-3 pr-12 items-center text-left cursor-pointer select-none overflow-hidden transition-all duration-200 ease-out [@media(hover:hover)_and_(pointer:fine)]:hover:-translate-y-0.5 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[hsl(var(--color-primary))] motion-safe:animate-in motion-safe:fade-in-0"
     >
       {/* 卡片底层模糊背景：密录用干员立绘，其他类别复用 StoryThumbnail
           的多级兜底链（插画 → 章节封面 → 活动 KV）。背景交给 CSS 做
@@ -2389,34 +2349,6 @@ const StoryItem = memo(function StoryItem({
             )}
             <span className="font-medium truncate">{story.storyName}</span>
           </div>
-          <button
-            type="button"
-            onClick={(event) => {
-              event.preventDefault();
-              event.stopPropagation();
-              onToggleFavorite(story);
-            }}
-            aria-pressed={isFavorite}
-            aria-label={`${isFavorite ? "取消收藏" : "收藏"} ${story.storyName}`}
-            /* 命中区固定 44×44（-my-2 抵消额外高度，避免撑开卡片行高），
-               视觉上仍是那颗小星星——外层只负责触控，内层负责外观。 */
-            className="-my-2 -mr-1 flex h-11 w-11 flex-shrink-0 items-center justify-center rounded-full"
-          >
-            <span
-              aria-hidden="true"
-              className={`inline-flex h-6 w-6 items-center justify-center rounded-full border transition-colors ${
-                isFavorite
-                  ? "text-[hsl(var(--color-primary))] border-[hsl(var(--color-primary)/0.4)] bg-[hsl(var(--color-primary)/0.08)]"
-                  : "text-[hsl(var(--color-muted-foreground))] border-transparent hover:text-[hsl(var(--color-foreground))]"
-              }`}
-            >
-              <Star
-                className="h-4 w-4"
-                fill={isFavorite ? "currentColor" : "transparent"}
-                strokeWidth={isFavorite ? 0 : 2}
-              />
-            </span>
-          </button>
         </div>
         {story.avgTag && (
           <div className="text-xs text-[hsl(var(--color-muted-foreground))] mt-0.5 truncate">{story.avgTag}</div>
@@ -2460,6 +2392,33 @@ const StoryItem = memo(function StoryItem({
           </div>
         )}
       </div>
+    </div>
+      <button
+        type="button"
+        onClick={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          onToggleFavorite(story);
+        }}
+        aria-pressed={isFavorite}
+        aria-label={`${isFavorite ? "取消收藏" : "收藏"} ${story.storyName}`}
+        className="absolute right-1 top-2 z-20 flex h-11 w-11 items-center justify-center rounded-full"
+      >
+        <span
+          aria-hidden="true"
+          className={`inline-flex h-6 w-6 items-center justify-center rounded-full border transition-colors ${
+            isFavorite
+              ? "text-[hsl(var(--color-primary))] border-[hsl(var(--color-primary)/0.4)] bg-[hsl(var(--color-primary)/0.08)]"
+              : "text-[hsl(var(--color-muted-foreground))] border-transparent [@media(hover:hover)_and_(pointer:fine)]:hover:text-[hsl(var(--color-foreground))]"
+          }`}
+        >
+          <Star
+            className="h-4 w-4"
+            fill={isFavorite ? "currentColor" : "transparent"}
+            strokeWidth={isFavorite ? 0 : 2}
+          />
+        </span>
+      </button>
     </div>
   );
 });
