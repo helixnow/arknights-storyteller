@@ -18,6 +18,13 @@ export const AUTO_SEARCH_MIN_LEN = 2;
 export const MAX_HIGHLIGHT_TERMS = 12;
 
 /**
+ * 必须与 Rust `data_service.rs::INDEX_VERSION` 同步。搜索缓存的 namespace
+ * 会带上这个版本：索引语料/解析语义升级但数据 commit 不变时，旧结果也
+ * 必须失效，不能继续以当前 commit 的名义命中。
+ */
+export const SEARCH_INDEX_VERSION = 10;
+
+/**
  * 与后端 Rust `char::is_whitespace`（Unicode White_Space 属性）逐字对齐的
  * 切词空白集，不能用 JS 的 `\s`：`\s` 比 White_Space 多收 U+FEFF（BOM，
  * 粘贴文本常见）、少收 U+0085（NEL）。差一个字符就会翻转 NOT 极性。
@@ -388,9 +395,13 @@ export function beginIndexProgress(
   };
 }
 
-/** 空数据/已是最新会发 `("完成", 0, 0)`，不能只看 current >= total。 */
+/**
+ * 只有后端明确发出的“完成”才是成功终态。最后一条“构建”事件通常已经是
+ * `current === total`，但事务此时尚未提交；若把满刻度当完成，会提前退出
+ * 忙碌态、查询到旧状态，并因游标已 terminal 而丢掉随后真正的“完成”事件。
+ */
 export function isIndexProgressTerminal(progress: SearchProgressLike): boolean {
-  return progress.phase === "完成" || (progress.total > 0 && progress.current >= progress.total);
+  return progress.phase === "完成";
 }
 
 /**

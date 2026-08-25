@@ -19,6 +19,7 @@ import {
   isIndexProgressTerminal,
   isSearchIndexTrusted,
   MAX_HIGHLIGHT_TERMS,
+  SEARCH_INDEX_VERSION,
   searchEmptyAnnouncement,
   stableVersionOf,
   trimSearchQuery,
@@ -62,6 +63,10 @@ test("stableVersionOf：相对时间文案可变但不能含嵌套括号或换�
   assert.equal(stableVersionOf("deadbee (较早前)"), "deadbee");
   assert.equal(stableVersionOf("deadbee ((刚刚))"), "");
   assert.equal(stableVersionOf("deadbee (刚刚\n伪造)"), "");
+});
+
+test("搜索缓存语料版本与后端 INDEX_VERSION 对齐", () => {
+  assert.equal(SEARCH_INDEX_VERSION, 10);
 });
 
 test("isSearchIndexTrusted：只信明确就绪且不在重建的状态", () => {
@@ -582,20 +587,23 @@ test("index progress：已知由当前 UI 发起时允许无收集的快速终�
   assert.equal(done?.terminal, true);
 });
 
-test("index progress：空数据与满刻度都是终态", () => {
+test("index progress：只有明确完成才是成功终态，满刻度仍需等待事务提交", () => {
   assert.equal(isIndexProgressTerminal(progress("完成", 0, 0)), true);
-  assert.equal(isIndexProgressTerminal(progress("构建", 10, 10)), true);
+  assert.equal(isIndexProgressTerminal(progress("完成", 10, 10)), true);
+  assert.equal(isIndexProgressTerminal(progress("构建", 10, 10)), false);
   assert.equal(isIndexProgressTerminal(progress("构建", 9, 10)), false);
 });
 
-test("index progress：current 倒退、total 变动与终态后的迟到事件拒绝", () => {
+test("index progress：满刻度构建后接收完成，倒退、变分母与终态迟到事件拒绝", () => {
   let cursor = beginIndexProgress(9);
   cursor = advanceIndexProgress(cursor, progress("收集", 0, 100), 9);
   cursor = advanceIndexProgress(cursor, progress("构建", 32, 100), 9);
   assert.ok(cursor);
   assert.equal(advanceIndexProgress(cursor, progress("构建", 16, 100), 9), null);
   assert.equal(advanceIndexProgress(cursor, progress("构建", 64, 200), 9), null);
-  const done = advanceIndexProgress(cursor, progress("完成", 100, 100), 9);
+  const full = advanceIndexProgress(cursor, progress("构建", 100, 100), 9);
+  assert.equal(full?.terminal, false, "100% 只表示语料处理完，索引事务尚未提交");
+  const done = advanceIndexProgress(full, progress("完成", 100, 100), 9);
   assert.ok(done);
   assert.equal(advanceIndexProgress(done, progress("构建", 96, 100), 9), null);
 });

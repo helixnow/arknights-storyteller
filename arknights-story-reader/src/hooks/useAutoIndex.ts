@@ -91,7 +91,10 @@ export function useAutoIndex() {
     };
 
     const broadcast = (status: StoryIndexStatus | null, reason: string) => {
-      const signature = `${status?.ready ?? false}:${status?.total ?? 0}`;
+      // “状态查询失败”不能与“明确未就绪且 0 篇”等价，否则一次真实的
+      // ready=false 广播会吞掉后续 unknown，监听方看不出确认链已经断了。
+      const signature =
+        status === null ? "unknown" : `known:${status.ready}:${status.total}`;
       if (signature === lastBroadcast) return;
       lastBroadcast = signature;
       dispatchIndexUpdated(status, reason);
@@ -169,6 +172,7 @@ export function useAutoIndex() {
         broadcast(rebuilt, "auto-rebuilt");
       } catch (err) {
         if (!buildStarted && !cancelled) {
+          broadcast(null, `${reason}-status-error`);
           if (isBackendBuilding()) {
             // 前置检查失败 + 后端重建在途：失败多半就是重建本身造成的——
             // 状态查询里的建表 DDL 没配 busy_timeout，撞上重建的写锁直接
@@ -194,12 +198,23 @@ export function useAutoIndex() {
         } else if (buildResolved && !cancelled) {
           // 构建命令已经成功返回，失败的是随后的终态探针。探针 IPC 抖动不
           // 能被误报成“构建失败”并永久停手；按前置探针同样有限重试。
+          broadcast(null, "post-build-status-error");
           devLog("自动索引终态确认失败，稍后重试", err);
           deferRetry("post-build-status");
-        } else {
+        } else if (!cancelled) {
           // 构建本身失败不重试：磁盘满、IO 错重跑一遍只会再失败一次。
           // 不影响可用性：后端搜索会退回线性扫描，UI 也有"刷新索引"入口。
           devLog("自动索引任务失败，搜索将回退到线性扫描", err);
+          // 失败事件可能发生在搜索面板尚未挂载时；不能只依赖那边的
+          // index-progress 监听。补一次真实状态并广播，探针也失败则明确
+          // 广播 unknown，绝不沿用重建前的快照冒充终态。
+          try {
+            const failedStatus = await api.getStoryIndexStatus();
+            if (!cancelled) broadcast(failedStatus, "auto-rebuild-failed");
+          } catch (statusErr) {
+            if (!cancelled) broadcast(null, "auto-rebuild-failed-status-error");
+            devLog("自动索引失败后的状态确认也失败", statusErr);
+          }
         }
       } finally {
         running = false;
@@ -235,8 +250,8 @@ export function useAutoIndex() {
         if (!next) return;
         progressCursor = next;
         lastIndexProgressAt = Date.now();
-        // 成功终态由纯函数覆盖 ("完成", total, total)、("完成", 0, 0)
-        // 与满刻度；失败终态已在上面单独收下。
+        // 只有明确的“完成”才是成功终态；“构建”满刻度后事务仍可能提交
+        // 失败。失败终态已在上面单独收下。
         backendBuilding = !next.terminal;
       })
       .then((unlisten) => {
@@ -297,7 +312,12 @@ function dispatchIndexUpdated(status: StoryIndexStatus | null, reason: string) {
   try {
     window.dispatchEvent(
       new CustomEvent("app:story-index-updated", {
-        detail: { ready: status?.ready ?? false, total: status?.total ?? 0, reason },
+        detail: {
+          ready: status?.ready ?? false,
+          total: status?.total ?? 0,
+          confirmed: status !== null,
+          reason,
+        },
       })
     );
   } catch {

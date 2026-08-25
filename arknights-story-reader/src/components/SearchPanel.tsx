@@ -32,6 +32,7 @@ import {
   highlightTerms,
   isAutoSearchable,
   isSearchIndexTrusted,
+  SEARCH_INDEX_VERSION,
   searchEmptyAnnouncement,
   stableVersionOf,
   trimSearchQuery,
@@ -64,19 +65,6 @@ interface ProgressState {
   message: string;
 }
 
-/**
- * PR #5 起搜索响应会直接说明本次是否真正使用了 FTS。兼容尚未合入该字段的
- * 后端时才退回发起请求时的可信状态快照；显式 false 绝不能被 ready 快照盖掉。
- */
-function responseUsedIndex(
-  response: { indexUsed?: boolean; index_used?: boolean },
-  legacyFallback: boolean
-): boolean {
-  if (typeof response.indexUsed === "boolean") return response.indexUsed;
-  if (typeof response.index_used === "boolean") return response.index_used;
-  return legacyFallback;
-}
-
 interface CachedPage {
   page: SearchResultsPage;
   updatedAt: number;
@@ -91,13 +79,13 @@ interface CachedSegmentPage {
 
 const HISTORY_KEY = "arknights-story-search-history";
 /**
- * 缓存键与后端 `INDEX_VERSION` 同步升级：缓存按数据 commit（stableVersionOf）命中，
- * 但 parser/索引语料变了而 commit 没变时（如 INDEX_VERSION 8→9 修复行尾 `\`
- * 续行拼接、全角标点残渣），旧缓存仍会命中脏结果。此时必须换 key 让旧条目
- * 自然失效（不再读取即被遗弃），否则用户要清站点数据才能看到正确结果。
+ * 缓存键同时带前端形状版本与后端 `INDEX_VERSION`。缓存按数据 commit
+ * （stableVersionOf）命中，但 parser/索引语料变了而 commit 没变时，旧缓存
+ * 仍会命中脏结果。PR #5 将 INDEX_VERSION 9→10，因此这里必须换 namespace，
+ * 让 v9 语料生成的篇/段结果自然失效。
  */
-const CACHE_KEY = "arknights-story-search-cache-v4";
-const SEGMENT_CACHE_KEY = "arknights-story-segment-cache-v3";
+const CACHE_KEY = `arknights-story-search-cache-v5-index${SEARCH_INDEX_VERSION}`;
+const SEGMENT_CACHE_KEY = `arknights-story-segment-cache-v4-index${SEARCH_INDEX_VERSION}`;
 const DEBUG_STATE_KEY = "arknights-story-search-debug";
 const SEARCH_MODE_KEY = "arknights-story-search-mode";
 
@@ -168,6 +156,7 @@ function dispatchIndexRebuildFinished(succeeded: boolean, status: StoryIndexStat
         detail: {
           ready: status?.ready ?? false,
           total: status?.total ?? 0,
+          confirmed: status !== null,
           reason: succeeded ? "rebuilt" : "rebuild-failed",
         },
       })
@@ -519,13 +508,11 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
    * 换包前就已在途的 getStoryIndexStatus（挂载 / app:story-index-updated
    * 广播 / index-progress 终态都会触发 refreshIndexStatus）若此刻才返回，
    * 带回的是旧库的 ready=true，会把刚掰下去的 flip 原样撤销——毒化窗口
-   * 重新放行自动搜与 indexTrusted，而此时 version 补取拿到的已是新
+   * 重新放行自动搜，而此时 version 补取拿到的已是新
    * commit，空页/残缺页照样按新版本落缓存。每次数据更新 +1，落
    * indexStatus 前核对；换包后发出的新查询代际相同，照常落值。
    */
   const indexStatusSeqRef = useRef(0);
-  /** 搜索从发起到落地期间只要出现过一次索引失信，就禁止写缓存/假空回退。 */
-  const indexTrustSeqRef = useRef(0);
   /** 数据每换一次代际 +1；旧包迟到的 index-progress 无权进入新 UI。 */
   const indexProgressEpochRef = useRef(0);
   const indexProgressCursorRef = useRef<IndexProgressCursor | null>(null);
@@ -642,15 +629,14 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
       // 后端 sync_data / import_zip 在换完数据的同一步就把索引库整个删了
       // （clear_story_index 在命令返回前执行），事件到达时 ready 事实上已是
       // false。残留的 ready=true 会在这个窗口里放行两条明确禁止的路径：
-      // 自动搜打在无索引的退化路径上（段落＝空页、整篇＝逐篇扫描），以及
-      // indexTrusted 误判可信——此时补取到的 version 已是新 commit，段落
+      // 自动搜打在无索引的退化路径上（段落＝空页、整篇＝逐篇扫描）。此时
+      // 补取到的 version 已是新 commit，段落
       // 空页按它进缓存就把查询钉死在"零命中改搜整篇"，整篇残缺页还会落盘，
       // 而就绪上升沿只补 lastQuery 一条，窗口里搜过的其他词永久毒化。
       // 置 false 后由重建收场的 app:story-index-updated / index-progress
       // 终态照常把状态刷回来。代际号先 +1：换包前在途的 getStoryIndexStatus
       // 响应描述的是旧库，迟到落地会把这个 flip 原样撤销（见 ref 注释）。
       indexStatusSeqRef.current += 1;
-      indexTrustSeqRef.current += 1;
       // 不能保留 null（“尚在确认”）或旧 total：app:data-updated 到达时数据
       // 已经换入、后端也已清掉旧索引，此刻有充分证据明确标成未就绪。
       setIndexStatus({ ready: false, total: 0, lastBuiltAt: null });
@@ -750,13 +736,6 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
       setLastQuery(raw);
       if (!auto && !opts?.skipHistory) saveHistory(raw);
     };
-    // 兼容尚未返回 indexUsed 的旧后端：发起这一刻索引是否可信仍作为快照
-    // 兜底。新后端的显式字段优先，避免 ready 状态与实际 MATCH 路径竞态。
-    const indexTrusted = indexReady;
-    const indexTrustToken = indexTrustSeqRef.current;
-    const indexStillTrusted = () =>
-      indexTrusted && indexTrustToken === indexTrustSeqRef.current;
-
     const seq = ++searchSeqRef.current;
     const isStale = () => seq !== searchSeqRef.current;
     const settle = () => {
@@ -842,7 +821,6 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
         // 空串没法证明缓存对应的是当前这份数据。
         const cached = opts?.forceRefresh || !activeVersion ? undefined : segmentCache[raw];
         if (cached && cached.version === activeVersion) {
-          const cachedIndexUsed = responseUsedIndex(cached.page, indexStillTrusted());
           setSegmentPage(cached.page);
           setPage(null);
           setSearched(true);
@@ -854,7 +832,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
           settle();
           // 旧版本可能把"零命中"写进了 localStorage；命中缓存也要照样回退，
           // 否则这条查询会永远停在空结果。
-          if (cached.page.hits.length === 0 && allowFallback && cachedIndexUsed) {
+          if (cached.page.hits.length === 0 && allowFallback && cached.page.indexUsed) {
             await fallbackToStory(raw);
           }
           return;
@@ -867,7 +845,6 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
         );
         const data = await api.searchSegments(raw);
         if (isStale()) return;
-        const responseIndexUsed = responseUsedIndex(data, indexStillTrusted());
         setSegmentPage(data);
         setPage(null);
         setFromCache({ used: false });
@@ -876,9 +853,8 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
 
         // version 没就绪前一律不写缓存：记在空版本下的条目在真实版本落地后
         // 永远不再命中，落盘后还会污染下个会话的空版本窗口期。
-        // 新后端以本次响应的 indexUsed 决定能否写缓存；旧后端才退回请求
-        // 发起时的 indexReady + 在途信任代际。
-        if (activeVersion && responseIndexUsed) {
+        // 响应里的 indexUsed 是唯一来源：ready 状态与实际 MATCH 路径可能竞态。
+        if (activeVersion && data.indexUsed) {
           const nextCache = prune({
             ...segmentCache,
             [raw]: { page: data, updatedAt: Date.now(), version: activeVersion },
@@ -890,15 +866,15 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
         }
         settle();
 
-        // 回退门槛与写缓存同一把尺（响应 indexUsed，旧后端回退可信快照）：
+        // 回退门槛与写缓存同一把尺（响应 indexUsed）：
         // 未使用索引时这个空页是退化路径伪造的"零命中"，不是真的没有。拿它触发回退，等于弹一条
         // "段级索引暂无命中"的错话、擅自把用户刚选的段落模式掰回整篇，再
         // 发起一次数秒级的整篇线性扫描——而专为此场景准备的空状态
         // （renderEmptyState 的 indexPending 分支：说明索引没建好 + 建立
         // 入口）反而永远轮不到展示。不回退时索引就绪的上升沿会按原模式把
         // 这条查询补搜完整，真零命中再交给空状态里的"改搜整篇"按钮。
-        // 缓存命中分支也读取同一字段；旧条目缺字段时才用当前可信快照。
-        if (data.hits.length === 0 && allowFallback && responseIndexUsed) {
+        // 缓存命中分支也读取同一字段；缺少该字段的畸形条目在加载时已丢弃。
+        if (data.hits.length === 0 && allowFallback && data.indexUsed) {
           await fallbackToStory(raw);
         }
         return;
@@ -930,6 +906,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
           totalMatched: data.results.length,
           truncated: false,
           facets: {},
+          indexUsed: false,
         });
         setSegmentPage(null);
         reconcileFacet({});
@@ -944,15 +921,13 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
         );
         const data = await api.searchStoriesEx(raw);
         if (isStale()) return;
-        const responseIndexUsed = responseUsedIndex(data, indexStillTrusted());
         setPage(data);
         setSegmentPage(null);
         reconcileFacet(data.facets);
         setDebugLogs([]);
         setDebugExpanded(false);
-        // 只有响应确认本次真正走过索引才缓存；旧后端缺字段时退回请求发起
-        // 时的可信状态与在途代际。
-        if (activeVersion && responseIndexUsed) {
+        // 只有响应确认本次真正走过索引才缓存。
+        if (activeVersion && data.indexUsed) {
           const nextCache = prune({
             ...cache,
             [raw]: { page: data, updatedAt: Date.now(), version: activeVersion },
@@ -1191,7 +1166,6 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
       // （app:story-index-updated 广播 / index-progress 终态）会以新代际
       // 重查。返回 null 而不是旧状态，免得调用方拿它当现状广播出去。
       if (token !== indexStatusSeqRef.current) return null;
-      if (!status.ready) indexTrustSeqRef.current += 1;
       setIndexStatus(status);
       setIndexError(null);
       return status;
@@ -1199,7 +1173,6 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
       devLog("获取索引状态失败", err);
       // 迟到的失败同样无权写状态：错误横幅描述的必须是当前数据的状态查询。
       if (token !== indexStatusSeqRef.current) return null;
-      indexTrustSeqRef.current += 1;
       setIndexError("获取索引状态失败");
       setIndexStatus(null);
       return null;
@@ -1217,7 +1190,6 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     // 已经在建（比如设置页刚派发过事件）：重复跑只会让两次写库互相拖慢。
     if (buildingIndexRef.current) return;
     buildingIndexRef.current = true;
-    indexTrustSeqRef.current += 1;
     const buildEpoch = indexProgressEpochRef.current;
     indexProgressCursorRef.current = beginIndexProgress(buildEpoch, true);
     setIndexError(null);
@@ -1300,14 +1272,18 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
       setHistory([]);
     }
     setCache(
-      loadCacheMap<CachedPage>(CACHE_KEY, (p) =>
-        Array.isArray((p as SearchResultsPage | null)?.results)
-      )
+      loadCacheMap<CachedPage>(CACHE_KEY, (p) => {
+        const cachedPage = p as SearchResultsPage | null;
+        return (
+          Array.isArray(cachedPage?.results) && typeof cachedPage?.indexUsed === "boolean"
+        );
+      })
     );
     setSegmentCache(
-      loadCacheMap<CachedSegmentPage>(SEGMENT_CACHE_KEY, (p) =>
-        Array.isArray((p as SegmentSearchPage | null)?.hits)
-      )
+      loadCacheMap<CachedSegmentPage>(SEGMENT_CACHE_KEY, (p) => {
+        const cachedPage = p as SegmentSearchPage | null;
+        return Array.isArray(cachedPage?.hits) && typeof cachedPage?.indexUsed === "boolean";
+      })
     );
   }, [refreshIndexStatus]);
 
@@ -1368,7 +1344,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
   ]);
 
   // 索引就绪的上升沿补搜。用户在重建中 / 索引未建好时回车，拿到的是退化
-  // 结果（整篇＝线性扫描残缺页、段落＝空页），且按 indexTrusted 门槛没写
+  // 结果（整篇＝线性扫描残缺页、段落＝空页），且按 indexUsed 门槛没写
   // 缓存；等索引变 ready 后，上面防抖 effect 的
   // 「raw === lastQuery && searched && !searchError」守卫会认为结果已落定
   // 而跳过重搜，界面就一直停在残缺/空结果。这里用 ref 记住上一拍的
@@ -1591,7 +1567,6 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
             indexProgressStaleTimerRef.current = null;
           }
           indexProgressCursorRef.current = null;
-          indexTrustSeqRef.current += 1;
           setIndexStatus(null);
           setIndexProgress(p);
           setIndexProgressActive(false);
@@ -1610,7 +1585,6 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
           indexProgressCursorRef.current ?? beginIndexProgress(epoch, false);
         const next = advanceIndexProgress(cursor, p, epoch);
         if (!next) return;
-        if (!cursor.started && !next.terminal) indexTrustSeqRef.current += 1;
         indexProgressCursorRef.current = next;
         setIndexProgress(p);
         setIndexProgressActive(!next.terminal);
