@@ -303,10 +303,11 @@ function App() {
          * 阅读器是盖在 tab 层之上的整屏浮层，所以整层 tab 一起从无障碍树和
          * 焦点序列里摘掉。这里必须是真正的盒子：`display: contents` 不产生
          * 层叠/裁剪边界，inert 在部分 WebView 上也不会传到子树，隐藏 tab
-         * 会和阅读器叠在同一视口里抢渲染。
+         * 会和阅读器叠在同一视口里抢渲染。不要加 isolate：那会把面板内
+         * z-50 模态封在包装层里，玻璃底栏会浮在同步框遮罩之上还能点。
          */}
         <div
-          className="absolute inset-0 overflow-hidden isolate"
+          className="absolute inset-0 overflow-hidden"
           aria-hidden={readerActive}
           inert={readerActive}
         >

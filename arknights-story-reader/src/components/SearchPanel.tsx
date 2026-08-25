@@ -1300,6 +1300,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     if (!isAutoSearchable(raw)) return cancel();
     // 已经就是当前展示的结果，或者刚刚自动搜失败过，都别再发一遍。
     if (raw === lastQuery && searched && !searchError) return cancel();
+    if (cancelledQuery === raw) return cancel();
     if (autoFailedRef.current === `${mode}:${raw}`) return cancel();
     // 当前词已经落定失败（手动回车失败也算）：自动重试只会把失败态冲掉再挂一次。
     // 用户按回车走 handleSearch，开头就清 searchError，手动重试不受影响。
@@ -1336,6 +1337,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     lastQuery,
     searched,
     searchError,
+    cancelledQuery,
     searching,
     mode,
     cache,

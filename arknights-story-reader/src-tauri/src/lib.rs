@@ -172,6 +172,7 @@ pub fn run() {
             commands::get_character_index,
             commands::get_story_neighbors,
             commands::get_story_category_name,
+            commands::fetch_update_manifest,
         ])
         .run(context)
         .expect("error while running tauri application");

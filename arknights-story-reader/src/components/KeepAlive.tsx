@@ -1,12 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, type ReactNode } from "react";
 import { cn } from "@/lib/utils";
-import {
-  collectOverflowScrollSnapshots,
-  keepAliveContentVisibility,
-  restoreOverflowScrollSnapshots,
-  type OverflowScrollSnapshot,
-  type OverflowScroller,
-} from "@/lib/appShellLogic";
+import { keepAliveContentVisibility } from "@/lib/appShellLogic";
 
 interface KeepAliveProps {
   active: boolean;
@@ -39,36 +33,36 @@ interface KeepAliveProps {
  * 后台面板必须 `content-visibility: hidden`。五个 tab 加上未卸载的阅读器
  * 都是 `absolute inset-0`，子树里的 `content-visibility: auto` 仍把它们
  * 当成在视口内，只靠 visibility 会叠在一起抢布局和合成。
+ *
+ * 滚动位置用捕获阶段的 scroll 事件按目标记账，不扫整棵子树；切后台时
+ * 不再补拍——那时 DOM 已是 hidden，读几何会把好快照盖成空的。
  */
 export function KeepAlive({ active, children, className }: KeepAliveProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const scrollSnapshotRef = useRef<Array<OverflowScrollSnapshot<OverflowScroller>>>(
-    []
-  );
+  const scrollPositionsRef = useRef(new Map<Element, { top: number; left: number }>());
 
-  /* 后台切 content-visibility:hidden 可能丢掉滚动位置，所以前台期间持续
-     记一份；切回来再灌回去。layout 阶段做，避免可见后先闪到顶部。 */
   useLayoutEffect(() => {
     const container = containerRef.current;
     if (!container || !active) return;
 
-    restoreOverflowScrollSnapshots(scrollSnapshotRef.current, (el) => {
-      return el instanceof Element && el.isConnected;
-    });
+    for (const [el, pos] of scrollPositionsRef.current) {
+      if (!el.isConnected) {
+        scrollPositionsRef.current.delete(el);
+        continue;
+      }
+      el.scrollTop = pos.top;
+      el.scrollLeft = pos.left;
+    }
 
-    const captureScroll = () => {
-      const nodes: OverflowScroller[] = [
-        container,
-        ...Array.from(container.querySelectorAll<HTMLElement>("*")),
-      ];
-      scrollSnapshotRef.current = collectOverflowScrollSnapshots(nodes);
+    const onScroll = (event: Event) => {
+      const el = event.target;
+      if (!(el instanceof Element) || !container.contains(el)) return;
+      scrollPositionsRef.current.set(el, { top: el.scrollTop, left: el.scrollLeft });
     };
 
-    captureScroll();
-    container.addEventListener("scroll", captureScroll, true);
+    container.addEventListener("scroll", onScroll, { capture: true, passive: true });
     return () => {
-      captureScroll();
-      container.removeEventListener("scroll", captureScroll, true);
+      container.removeEventListener("scroll", onScroll, true);
     };
   }, [active]);
 

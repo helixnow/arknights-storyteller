@@ -832,15 +832,21 @@ export function StoryList({ onSelectStory }: StoryListProps) {
       // 入口语义是「去看收藏」而不是「回到上次在收藏里停的位置」。分类
       // 真的变化时下面的归顶 effect 也会跑一次；这里显式回顶是为了覆盖
       // 「本来就停在收藏分类、只是滚到了半截」的跳转。
-      const viewport = scrollRootRef.current;
-      if (viewport) viewport.scrollTop = 0;
-      // pill 行同理：本来就停在收藏分类时 activeCategory 不变，按分类
-      // 变化触发的 pill 归位 effect 不会重跑，而 pill 行可能还停在用户
-      // 上次划到的最右端——选中的收藏 pill 整个在可视区外，跳过来后
-      // pill 行看起来毫无变化。此刻 DOM 里 aria-pressed 就挂在收藏 pill
-      // 上，直接归位；分类真的变化时不在这里滚（此刻查到的还是旧 pill），
-      // 交给下面的归位 effect。
-      if (activeCategoryRef.current === "favorites") revealActivePill();
+      const apply = () => {
+        const viewport = scrollRootRef.current;
+        if (viewport) viewport.scrollTop = 0;
+        // pill 行同理：本来就停在收藏分类时 activeCategory 不变，按分类
+        // 变化触发的 pill 归位 effect 不会重跑，而 pill 行可能还停在用户
+        // 上次划到的最右端——选中的收藏 pill 整个在可视区外，跳过来后
+        // pill 行看起来毫无变化。此刻 DOM 里 aria-pressed 就挂在收藏 pill
+        // 上，直接归位；分类真的变化时不在这里滚（此刻查到的还是旧 pill），
+        // 交给下面的归位 effect。
+        if (activeCategoryRef.current === "favorites") revealActivePill();
+      };
+      apply();
+      // KeepAlive 父级会在同一次提交的 layout effect 里灌回隐藏前的滚动，
+      // 微任务排在那之后，把「去看收藏」的归顶再写回去。
+      queueMicrotask(apply);
     };
     window.addEventListener("app:open-favorites", handler);
     return () => window.removeEventListener("app:open-favorites", handler);
@@ -849,7 +855,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
   // 选中的分类 pill 必须留在横向滚动区的可视范围里。用户把 pill 行划到
   // 最右边看密录、再从首页统计格跳「收藏」时，高亮落在最左端的收藏 pill
   // 上——不滚回来的话 pill 行看起来毫无变化，像是点了没反应。KeepAlive
-  // 用 visibility 隐藏面板、布局盒还在，所以隐藏时切换也能量到真实几何。
+  // 分类变化后新的 aria-pressed 落进 DOM，此时面板已可见，能量到真实几何。
   // activeCategory 刻意留在依赖里：effect 体不读它，选中 pill 从 DOM 查，
   // 它只负责在分类变化、新的 aria-pressed 落进 DOM 之后触发归位。
   useEffect(() => {

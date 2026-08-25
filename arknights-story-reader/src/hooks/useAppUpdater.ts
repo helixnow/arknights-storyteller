@@ -127,11 +127,17 @@ async function fetchAndroidManifest(options: ManifestOptions = {}): Promise<Andr
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const manifestUrl = validateAndroidFeedUrl(feed);
-    const response = await fetch(manifestUrl, { cache: "no-store", signal: controller.signal });
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
-    return parseAndroidManifest(await response.json());
+    // GitHub Releases 下载链没有 CORS 头，WebView fetch 会被浏览器拦下。
+    // 超时由原生 10s 限制和这边的 AbortController 竞态一起兜住。
+    const payload = await Promise.race([
+      invoke<unknown>("fetch_update_manifest", { url: manifestUrl }),
+      new Promise<never>((_, reject) => {
+        controller.signal.addEventListener("abort", () => {
+          reject(new DOMException("请求更新信息超时", "AbortError"));
+        });
+      }),
+    ]);
+    return parseAndroidManifest(payload);
   } catch (error) {
     const normalized =
       error instanceof DOMException && error.name === "AbortError"

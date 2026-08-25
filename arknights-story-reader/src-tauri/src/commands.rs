@@ -814,6 +814,52 @@ pub async fn get_story_neighbors(
     .await
 }
 
+fn validate_update_feed_url(url: &str) -> Result<String, String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return Err("更新源地址为空".to_string());
+    }
+    let parsed = reqwest::Url::parse(trimmed)
+        .map_err(|_| "更新源地址无效：仅支持完整的 http/https 链接".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err("更新源地址无效：仅支持 http/https 链接".to_string());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("更新源地址无效：链接不得包含用户名或密码".to_string());
+    }
+    let path = parsed.path();
+    if path != "/android-latest.json" && !path.ends_with("/android-latest.json") {
+        return Err("Android 更新必须使用 android-latest.json".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+/// 在原生层拉取 android-latest.json。WebView `fetch` 会撞上 GitHub Releases
+/// 下载链没有 CORS 头，更新检查第一步就失败。
+#[tauri::command]
+pub async fn fetch_update_manifest(url: String) -> Result<serde_json::Value, String> {
+    let url = validate_update_feed_url(&url)?;
+    run_blocking("fetch_update_manifest", move || {
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|err| format!("无法创建更新检查客户端: {err}"))?;
+        let response = client
+            .get(&url)
+            .header("Accept", "application/json")
+            .send()
+            .map_err(|err| format!("无法连接更新服务器: {err}"))?;
+        if !response.status().is_success() {
+            return Err(format!("更新源返回 HTTP {}", response.status().as_u16()));
+        }
+        response
+            .json::<serde_json::Value>()
+            .map_err(|err| format!("更新 manifest 无效: {err}"))
+    })
+    .await
+}
+
 /// 返回 storyId 所在的章节 / 活动显示名（例如 "黑暗时代·上"）。
 #[tauri::command]
 pub async fn get_story_category_name(
@@ -831,6 +877,19 @@ pub async fn get_story_category_name(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn validate_update_feed_url_accepts_github_android_feed() {
+        assert!(validate_update_feed_url(
+            "https://github.com/helixnow/arknights-storyteller/releases/latest/download/android-latest.json"
+        )
+        .is_ok());
+        assert!(validate_update_feed_url("https://example.com/android-latest.json").is_ok());
+        assert!(validate_update_feed_url("file:///tmp/android-latest.json").is_err());
+        assert!(validate_update_feed_url("https://example.com/latest.json").is_err());
+        assert!(validate_update_feed_url("https://user:pass@example.com/android-latest.json").is_err());
+        assert!(validate_update_feed_url("").is_err());
+    }
 
     #[test]
     fn join_error_message_is_unified() {
