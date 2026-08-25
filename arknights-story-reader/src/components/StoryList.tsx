@@ -39,6 +39,7 @@ import type { CatalogGroupSnapshot, FavoriteGroupType } from "@/hooks/useFavorit
 import { useAppPreferences } from "@/hooks/useAppPreferences";
 import { StoryThumbnail } from "@/components/StoryThumbnail";
 import { applyInstantScroll } from "@/lib/appShellLogic";
+import { useToast } from "@/components/ui/toast";
 import { AssetImage } from "@/components/AssetImage";
 import { CharacterAvatar } from "@/components/CharacterAvatar";
 import {
@@ -1507,7 +1508,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
           viewportClassName="reader-scroll"
           viewportRef={scrollRootRef}
           trackOffsetTop="calc(3.5rem + 10px)"
-          trackOffsetBottom="calc(4.5rem + env(safe-area-inset-bottom, 0px))"
+          trackOffsetBottom="calc(max(4.5rem, var(--bottom-nav-inset, 4.5rem)) + 0.5rem)"
         >
           <div className="container py-6 pb-24 space-y-6 motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-700">
             <div className="space-y-3">
@@ -1541,13 +1542,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
                     {activeSummary}
                   </span>
                   {!online && (
-                    <span
-                      title="设备当前离线，已同步的剧情仍可正常阅读"
-                      className="inline-flex flex-shrink-0 items-center gap-1 rounded-full border border-[hsl(var(--color-border))] px-2 py-0.5 text-[11px] text-[hsl(var(--color-muted-foreground))]"
-                    >
-                      <WifiOff className="h-3 w-3" aria-hidden="true" />
-                      离线
-                    </span>
+                    <OfflineBadge />
                   )}
                 </span>
                 <div className="flex flex-shrink-0 items-center gap-2">
@@ -1802,6 +1797,22 @@ export function StoryList({ onSelectStory }: StoryListProps) {
  * 把过滤压到低优先级渲染。草稿留在这里也意味着合成中的每次按键只
  * 重渲染这个输入框，不会波及整棵列表树。
  */
+export function OfflineBadge() {
+  const toast = useToast();
+  return (
+    <button
+      type="button"
+      aria-label="离线：已同步的剧情仍可正常阅读"
+      title="设备当前离线，已同步的剧情仍可正常阅读"
+      onClick={() => toast.show("已同步的剧情仍可正常阅读", { duration: 2800 })}
+      className="inline-flex flex-shrink-0 items-center gap-1 rounded-full border border-[hsl(var(--color-border))] px-2 py-0.5 text-[11px] text-[hsl(var(--color-muted-foreground))]"
+    >
+      <WifiOff className="h-3 w-3" aria-hidden="true" />
+      离线
+    </button>
+  );
+}
+
 function CatalogSearchInput({
   value,
   onCommit,
@@ -1812,6 +1823,7 @@ function CatalogSearchInput({
 }) {
   const [draft, setDraft] = useState(value);
   const composingRef = useRef(false);
+  const inputRef = useRef<HTMLInputElement | null>(null);
 
   // 已提交值在外部被改掉时把草稿对齐（渲染期 setState 是 React 认可的
   // 派生 state 写法，本组件会立刻带新值重渲染）。合成中不动草稿，
@@ -1823,35 +1835,57 @@ function CatalogSearchInput({
   }
 
   return (
-    <Input
-      type="search"
-      value={draft}
-      onChange={(event) => {
-        const next = event.target.value;
-        setDraft(next);
-        if (!composingRef.current) onCommit(next);
-      }}
-      onCompositionStart={() => {
-        composingRef.current = true;
-      }}
-      onCompositionEnd={(event) => {
-        composingRef.current = false;
-        // Safari/WKWebView 的 compositionend 排在 input 之前，部分安卓
-        // 输入法又把 change 排在 compositionend 之后——不猜顺序，直接
-        // 以事件里的最终文本为准提交一次。
-        const next = event.currentTarget.value;
-        setDraft(next);
-        onCommit(next);
-      }}
-      placeholder="搜索剧情标题或编号"
-      aria-label="搜索剧情标题或编号"
-      aria-describedby="story-list-search-hint"
-      autoComplete="off"
-      autoCorrect="off"
-      spellCheck={false}
-      enterKeyHint="search"
-      className="w-full sm:w-80 md:w-96"
-    />
+    <div className="relative w-full sm:w-80 md:w-96">
+      <Input
+        ref={inputRef}
+        type="search"
+        value={draft}
+        onChange={(event) => {
+          const next = event.target.value;
+          setDraft(next);
+          if (!composingRef.current) onCommit(next);
+        }}
+        onCompositionStart={() => {
+          composingRef.current = true;
+        }}
+        onCompositionEnd={(event) => {
+          composingRef.current = false;
+          // Safari/WKWebView 的 compositionend 排在 input 之前，部分安卓
+          // 输入法又把 change 排在 compositionend 之后——不猜顺序，直接
+          // 以事件里的最终文本为准提交一次。
+          const next = event.currentTarget.value;
+          setDraft(next);
+          onCommit(next);
+        }}
+        onKeyDown={(event) => {
+          if (event.key !== "Enter") return;
+          if (composingRef.current || event.nativeEvent.isComposing) return;
+          event.currentTarget.blur();
+        }}
+        placeholder="搜索剧情标题或编号"
+        aria-label="搜索剧情标题或编号"
+        aria-describedby="story-list-search-hint"
+        autoComplete="off"
+        autoCorrect="off"
+        spellCheck={false}
+        enterKeyHint="search"
+        className="w-full pr-12"
+      />
+      {draft ? (
+        <button
+          type="button"
+          aria-label="清除搜索"
+          className="absolute right-0.5 top-1/2 inline-flex h-11 w-11 -translate-y-1/2 items-center justify-center text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-foreground))]"
+          onClick={() => {
+            setDraft("");
+            onCommit("");
+            inputRef.current?.focus();
+          }}
+        >
+          <X className="h-4 w-4" />
+        </button>
+      ) : null}
+    </div>
   );
 }
 
@@ -2245,6 +2279,10 @@ const StoryItem = memo(function StoryItem({
 
   return (
     <div
+      className="relative"
+      style={{ contentVisibility: "auto", containIntrinsicSize: "auto 88px" }}
+    >
+    <div
       role="button"
       tabIndex={0}
       aria-label={[
@@ -2256,9 +2294,6 @@ const StoryItem = memo(function StoryItem({
         .join(" · ")}
       onClick={() => onSelectStory(story)}
       onKeyDown={(event) => {
-        // 只响应焦点在卡片自身时的按键：卡片里的收藏星标也是可聚焦按钮，
-        // 它冒泡上来的 Enter/Space 若被这里 preventDefault 掐掉原生激活，
-        // 就变成「按星标却打开了阅读器、收藏没切」，键盘用户无法收藏。
         if (event.target !== event.currentTarget) return;
         // Space 必须 preventDefault，否则会连带把滚动容器翻一页。
         if (event.key === "Enter" || event.key === " ") {
@@ -2266,11 +2301,7 @@ const StoryItem = memo(function StoryItem({
           onSelectStory(story);
         }
       }}
-      /* `content-visibility` 让滚出视口的行跳过样式/布局/绘制，长列表里
-         省下的主线程时间比什么都实在；`auto` 的固有尺寸会记住上一次的
-         真实高度，所以滚动条不会来回跳。不支持的引擎直接忽略这两条。 */
-      style={{ contentVisibility: "auto", containIntrinsicSize: "auto 88px" }}
-      className="story-card relative flex w-full gap-3 p-3 items-center text-left cursor-pointer overflow-hidden transition-all duration-200 ease-out [@media(hover:hover)_and_(pointer:fine)]:hover:-translate-y-0.5 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[hsl(var(--color-primary))] motion-safe:animate-in motion-safe:fade-in-0"
+      className="story-card relative flex w-full gap-3 p-3 pr-12 items-center text-left cursor-pointer select-none overflow-hidden transition-all duration-200 ease-out [@media(hover:hover)_and_(pointer:fine)]:hover:-translate-y-0.5 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[hsl(var(--color-primary))] motion-safe:animate-in motion-safe:fade-in-0"
     >
       {/* 卡片底层模糊背景：密录用干员立绘，其他类别复用 StoryThumbnail
           的多级兜底链（插画 → 章节封面 → 活动 KV）。背景交给 CSS 做
@@ -2318,34 +2349,6 @@ const StoryItem = memo(function StoryItem({
             )}
             <span className="font-medium truncate">{story.storyName}</span>
           </div>
-          <button
-            type="button"
-            onClick={(event) => {
-              event.preventDefault();
-              event.stopPropagation();
-              onToggleFavorite(story);
-            }}
-            aria-pressed={isFavorite}
-            aria-label={`${isFavorite ? "取消收藏" : "收藏"} ${story.storyName}`}
-            /* 命中区固定 44×44（-my-2 抵消额外高度，避免撑开卡片行高），
-               视觉上仍是那颗小星星——外层只负责触控，内层负责外观。 */
-            className="-my-2 -mr-1 flex h-11 w-11 flex-shrink-0 items-center justify-center rounded-full"
-          >
-            <span
-              aria-hidden="true"
-              className={`inline-flex h-6 w-6 items-center justify-center rounded-full border transition-colors ${
-                isFavorite
-                  ? "text-[hsl(var(--color-primary))] border-[hsl(var(--color-primary)/0.4)] bg-[hsl(var(--color-primary)/0.08)]"
-                  : "text-[hsl(var(--color-muted-foreground))] border-transparent [@media(hover:hover)_and_(pointer:fine)]:hover:text-[hsl(var(--color-foreground))]"
-              }`}
-            >
-              <Star
-                className="h-4 w-4"
-                fill={isFavorite ? "currentColor" : "transparent"}
-                strokeWidth={isFavorite ? 0 : 2}
-              />
-            </span>
-          </button>
         </div>
         {story.avgTag && (
           <div className="text-xs text-[hsl(var(--color-muted-foreground))] mt-0.5 truncate">{story.avgTag}</div>
@@ -2389,6 +2392,33 @@ const StoryItem = memo(function StoryItem({
           </div>
         )}
       </div>
+    </div>
+      <button
+        type="button"
+        onClick={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          onToggleFavorite(story);
+        }}
+        aria-pressed={isFavorite}
+        aria-label={`${isFavorite ? "取消收藏" : "收藏"} ${story.storyName}`}
+        className="absolute right-1 top-2 z-20 flex h-11 w-11 items-center justify-center rounded-full"
+      >
+        <span
+          aria-hidden="true"
+          className={`inline-flex h-6 w-6 items-center justify-center rounded-full border transition-colors ${
+            isFavorite
+              ? "text-[hsl(var(--color-primary))] border-[hsl(var(--color-primary)/0.4)] bg-[hsl(var(--color-primary)/0.08)]"
+              : "text-[hsl(var(--color-muted-foreground))] border-transparent [@media(hover:hover)_and_(pointer:fine)]:hover:text-[hsl(var(--color-foreground))]"
+          }`}
+        >
+          <Star
+            className="h-4 w-4"
+            fill={isFavorite ? "currentColor" : "transparent"}
+            strokeWidth={isFavorite ? 0 : 2}
+          />
+        </span>
+      </button>
     </div>
   );
 });

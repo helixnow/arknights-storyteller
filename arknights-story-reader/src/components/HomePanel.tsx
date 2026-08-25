@@ -10,6 +10,7 @@ import {
   storyCatalog,
   toReadPercent,
   useOnlineStatus,
+  OfflineBadge,
   type ReadingProgressEntry,
   type ReadingProgressSnapshot,
 } from "@/components/StoryList";
@@ -22,7 +23,6 @@ import {
   Settings2,
   Sparkles,
   TriangleAlert,
-  WifiOff,
   type LucideIcon,
 } from "lucide-react";
 import {
@@ -439,15 +439,7 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
         </div>
         <div className="mt-1 flex flex-wrap items-center gap-2">
           <h1 className="text-2xl font-semibold">欢迎回来，博士</h1>
-          {!online && (
-            <span
-              title="设备当前离线，已同步的剧情仍可正常阅读"
-              className="inline-flex items-center gap-1 rounded-full border border-[hsl(var(--color-border))] px-2 py-0.5 text-[11px] text-[hsl(var(--color-muted-foreground))]"
-            >
-              <WifiOff className="h-3 w-3" aria-hidden="true" />
-              离线
-            </span>
-          )}
+          {!online && <OfflineBadge />}
         </div>
       </header>
 
@@ -455,7 +447,7 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
         <CustomScrollArea
           className="h-full"
           viewportClassName="reader-scroll"
-          trackOffsetBottom="calc(5rem + env(safe-area-inset-bottom, 0px))"
+          trackOffsetBottom="calc(max(5rem, var(--bottom-nav-inset, 5rem)) + 0.5rem)"
         >
           <div className="pl-[max(1.25rem,env(safe-area-inset-left,0px))] pr-[max(1.25rem,env(safe-area-inset-right,0px))] pb-[calc(8rem+var(--bottom-nav-inset,0px))] space-y-6">
             {showSkeleton && <HomeSkeleton />}

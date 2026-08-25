@@ -20,6 +20,7 @@ const {
   isWithinVisualViewportEdge,
   shouldIgnorePagedTapAfterMenuClose,
   shouldSuppressRejectedTouchClick,
+  hasNonCollapsedTextSelection,
 } = await loadPureGestures();
 
 test("边缘手势：达到水平阈值且水平占优时触发", () => {
@@ -107,4 +108,11 @@ test("分页关菜单 / 关 sheet：400ms 内的同一次点击不当翻页", ()
   assert.equal(shouldIgnorePagedTapAfterMenuClose(0, 1_200), false);
   assert.equal(shouldIgnorePagedTapAfterMenuClose(1_000, 999), false);
   assert.equal(shouldIgnorePagedTapAfterMenuClose(Number.NaN, 1_200), false);
+});
+
+test("有未收起的文本选区时不接管边缘返回", () => {
+  assert.equal(hasNonCollapsedTextSelection(null), false);
+  assert.equal(hasNonCollapsedTextSelection({ isCollapsed: true, toString: () => "博士" }), false);
+  assert.equal(hasNonCollapsedTextSelection({ isCollapsed: false, toString: () => "  " }), false);
+  assert.equal(hasNonCollapsedTextSelection({ isCollapsed: false, toString: () => "博士" }), true);
 });

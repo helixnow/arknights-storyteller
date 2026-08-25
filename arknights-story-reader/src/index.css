@@ -870,6 +870,11 @@ body {
   cursor: grabbing;
 }
 
+/* 分页热区只要快速点按：禁双击缩放判定，保留捏合。连续滚动仍走 pan-y pinch-zoom。 */
+.reader-scroll--paged {
+  touch-action: manipulation;
+}
+
 .reader-scroll--paged .reader-content {
   /* --reader-chrome 由阅读器根元素发布实测值；这里不声明局部值，避免挡住
      祖先上的测量结果。12rem 只服务尚未发布变量的旧调用方。第一条保留给
@@ -998,7 +1003,9 @@ input[type="range"]::-moz-range-thumb {
 /* ===== 性能优化：视口外段落跳过布局 ===== */
 .reader-segment {
   content-visibility: auto;
-  contain-intrinsic-size: auto 120px;
+  contain-intrinsic-size: auto var(--reader-seg-estimate, 120px);
+  /* 单行 system/subtitle 在小字号下矮于 44px 收藏热区，热区会溢出到下一段。 */
+  min-height: 2.75rem;
 }
 
 /* ===== 三种段落高亮的互斥优先级 ===== */
@@ -1258,6 +1265,13 @@ input[type="range"]::-moz-range-thumb {
   /* 让图片留在自己的合成层里，而不是每次 paint 时重算一次 blur。 */
   will-change: transform;
 }
+@media (pointer: coarse) {
+  .story-card-memory-bg .asset-image,
+  .story-card-memory-bg img {
+    filter: blur(8px) saturate(1.05);
+    will-change: auto;
+  }
+}
 /* 隐藏装饰性 fallback：
    - `.asset-image-fallback`：AssetImage（精二立绘加载中/失败）
    - `.story-thumbnail-fallback`：StoryThumbnail 的纯渐变兜底
@@ -1314,6 +1328,11 @@ input[type="range"]::-moz-range-thumb {
   transform: translateZ(0);
   will-change: backdrop-filter, transform;
   isolation: isolate;
+}
+.bottom-nav-glass--keyboard-hidden {
+  transform: translateY(calc(100% + 1.25rem));
+  pointer-events: none;
+  visibility: hidden;
 }
 @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
   .bottom-nav-glass {

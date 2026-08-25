@@ -14,6 +14,7 @@ import {
   useSyncExternalStore,
 } from "react";
 import { api } from "@/services/api";
+import { shouldSampleTopAnchor } from "@/lib/appShellLogic";
 import type { ParsedStoryContent, StorySegment } from "@/types/story";
 import { Button } from "@/components/ui/button";
 import {
@@ -389,6 +390,44 @@ export function scrollTopFromAnchorGeometry(
   return Math.max(0, Math.min(Math.max(0, maxTop), target));
 }
 
+export function estimateReaderSegmentHeightPx(
+  fontSize: number,
+  lineHeight: number,
+  lines = 3
+): number {
+  const size = Number.isFinite(fontSize) && fontSize > 0 ? fontSize : 16;
+  const height = Number.isFinite(lineHeight) && lineHeight > 0 ? lineHeight : 1.7;
+  const count = Number.isFinite(lines) && lines > 0 ? lines : 3;
+  return Math.max(120, Math.ceil(size * height * count));
+}
+
+function reanchorScrollContainer(
+  container: HTMLElement,
+  anchor: { index: number; offset: number } | null,
+  fallbackRatio: number
+): void {
+  const maxTop = Math.max(container.scrollHeight - container.clientHeight, 0);
+  if (maxTop <= 0) return;
+  let nextTop: number | null = null;
+  if (anchor) {
+    const element = container.querySelector<HTMLElement>(
+      `[data-segment-index="${anchor.index}"]`
+    );
+    if (element) {
+      nextTop = scrollTopFromAnchorGeometry(
+        container.scrollTop,
+        container.getBoundingClientRect().top,
+        element.getBoundingClientRect().top,
+        anchor.offset,
+        maxTop
+      );
+    }
+  }
+  if (nextTop === null) nextTop = fallbackRatio * maxTop;
+  const clampedTop = Math.max(0, Math.min(nextTop, maxTop));
+  container.scrollTo({ top: clampedTop, behavior: "instant" });
+}
+
 /** 合计分页视口外的实际 chrome，高度向上取整避免亚像素造成固定溢出。 */
 export function readerChromeHeightFromMeasurements(
   heights: readonly number[]
@@ -555,6 +594,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   // 连续滚动模式下贴着容器顶部的段落。字号/行距一变正文整体重排，靠它把
   // 读者钉回原来那一段，而不是让百分比把人甩到别处。
   const topAnchorRef = useRef<{ index: number; offset: number } | null>(null);
+  const lastAnchorSampleAtRef = useRef(0);
   const scrollRatioRef = useRef(0);
   // 当前正文的镜像，供 loadStory 判断缓存命中时内容是否真的换了。
   const contentRef = useRef(content);
@@ -687,7 +727,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     const firstItem = panel?.querySelector<HTMLElement>("[role='menuitem']:not([disabled])");
     (firstItem ?? panel)?.focus({ preventScroll: true });
 
-    const handlePointer = (event: PointerEvent) => {
+    const handleOutside = (event: Event) => {
       const target = event.target as Node | null;
       if (target && moreMenuRef.current?.contains(target)) return;
       pageMenuCloseAtRef.current = Date.now();
@@ -703,10 +743,17 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       // 顺势关掉（不拦默认行为，焦点照常往下走）。
       if (event.key === "Tab") setMoreMenuOpen(false);
     };
-    window.addEventListener("pointerdown", handlePointer);
+    if (typeof PointerEvent === "undefined") {
+      window.addEventListener("touchstart", handleOutside);
+      window.addEventListener("mousedown", handleOutside);
+    } else {
+      window.addEventListener("pointerdown", handleOutside);
+    }
     window.addEventListener("keydown", handleKey);
     return () => {
-      window.removeEventListener("pointerdown", handlePointer);
+      window.removeEventListener("pointerdown", handleOutside);
+      window.removeEventListener("touchstart", handleOutside);
+      window.removeEventListener("mousedown", handleOutside);
       window.removeEventListener("keydown", handleKey);
       // 焦点已经被别处接走（例如 Tab 出去了）就别抢回来。
       const activeElement = document.activeElement;
@@ -887,6 +934,10 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       // Drive max-width via CSS var so it composes with the stylesheet
       // default instead of double-clipping to 48rem. (bug: double max-width)
       ["--reader-max-width" as unknown as string]: `${maxWidthPx}px`,
+      ["--reader-seg-estimate" as unknown as string]: `${estimateReaderSegmentHeightPx(
+        settings.fontSize,
+        settings.lineHeight
+      )}px`,
       width: "100%",
       ...(settings.paragraphIndent
         ? { textIndent: "2em" }
@@ -1483,7 +1534,11 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
         scrollRatioRef.current = clamped;
         progressStore.set(clamped);
         // 抽屉盖住正文时命中测试会打在遮罩上，这时保留上一次的锚点。
-        if (!textObscuredRef.current) {
+        if (
+          !textObscuredRef.current &&
+          shouldSampleTopAnchor(lastAnchorSampleAtRef.current, Date.now())
+        ) {
+          lastAnchorSampleAtRef.current = Date.now();
           const anchor = captureTopAnchor(container);
           if (anchor) topAnchorRef.current = anchor;
         }
@@ -1532,6 +1587,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
       totalPages === 0
     )
       return;
+    if (pendingScrollIndexRef.current !== null) return;
     const ratio = totalPages <= 1 ? 1 : (currentPage + 1) / totalPages;
     const clamped = Number.isFinite(ratio) ? Math.max(0, Math.min(1, ratio)) : 0;
     progressStore.set(clamped);
@@ -1630,29 +1686,47 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
 
     const container = scrollContainerRef.current;
     if (!container) return;
-    const maxTop = Math.max(container.scrollHeight - container.clientHeight, 0);
-    if (maxTop <= 0) return;
-
-    let nextTop: number | null = null;
-    const anchor = topAnchorRef.current;
-    if (anchor) {
-      const element = container.querySelector<HTMLElement>(
-        `[data-segment-index="${anchor.index}"]`
-      );
-      if (element) {
-        const delta = element.getBoundingClientRect().top - container.getBoundingClientRect().top;
-        nextTop = container.scrollTop + delta - anchor.offset;
-      }
-    }
-    if (nextTop === null) nextTop = scrollRatioRef.current * maxTop;
-
-    const clampedTop = Math.max(0, Math.min(nextTop, maxTop));
     // 排版重排是瞬时的，锚点校正也必须瞬时（instant 覆盖视口上的 CSS
     // smooth），否则正文先跳一下再缓缓滚回去，看起来像坏了。
-    container.scrollTo({ top: clampedTop, behavior: "instant" });
-    lastScrollTopRef.current = clampedTop;
-    scrollRatioRef.current = clampedTop / maxTop;
+    reanchorScrollContainer(container, topAnchorRef.current, scrollRatioRef.current);
+    lastScrollTopRef.current = container.scrollTop;
+    const maxTop = Math.max(container.scrollHeight - container.clientHeight, 0);
+    if (maxTop > 0) scrollRatioRef.current = container.scrollTop / maxTop;
   }, [active, typographySignature, settings.readingMode]);
+
+  useEffect(() => {
+    if (!active || settings.readingMode !== "scroll") return;
+    const container = scrollContainerRef.current;
+    if (!container) return;
+    let lastBox = { width: container.clientWidth, height: container.clientHeight };
+    let frame = 0;
+    const reanchor = () => {
+      if (pendingScrollIndexRef.current !== null) return;
+      const width = container.clientWidth;
+      const height = container.clientHeight;
+      if (width === lastBox.width && height === lastBox.height) return;
+      lastBox = { width, height };
+      reanchorScrollContainer(container, topAnchorRef.current, scrollRatioRef.current);
+      lastScrollTopRef.current = container.scrollTop;
+      const maxTop = Math.max(container.scrollHeight - container.clientHeight, 0);
+      if (maxTop > 0) scrollRatioRef.current = container.scrollTop / maxTop;
+    };
+    const schedule = () => {
+      if (frame) cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(reanchor);
+    };
+    const observer =
+      typeof ResizeObserver === "undefined" ? null : new ResizeObserver(schedule);
+    observer?.observe(container);
+    window.addEventListener("resize", schedule);
+    window.addEventListener("orientationchange", schedule);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", schedule);
+      window.removeEventListener("orientationchange", schedule);
+      if (frame) cancelAnimationFrame(frame);
+    };
+  }, [active, settings.readingMode]);
 
   /**
    * 分页模式翻页后把视口滚回页首。单页允许高于一屏（分页只保证 min-height），
@@ -2822,7 +2896,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     >
       <header
         ref={headerRef}
-        className="flex-shrink-0 z-20 bg-[hsl(var(--color-background)/0.95)] backdrop-blur border-b motion-safe:transition-[margin-top,opacity] motion-safe:duration-200"
+        className="flex-shrink-0 z-20 bg-[hsl(var(--color-background)/0.95)] backdrop-blur border-b motion-safe:transition-opacity motion-safe:duration-200"
         style={{
           marginTop: headerHidden ? `-${headerHeight}px` : 0,
           opacity: headerHidden ? 0 : 1,

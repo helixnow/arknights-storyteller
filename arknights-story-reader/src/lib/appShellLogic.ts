@@ -325,6 +325,27 @@ export function toastViewportZIndex(hasPresentedModal: boolean): number {
   return hasPresentedModal ? 45 : 100;
 }
 
+/** 旧 WebView 用 padding 模拟 adjustResize 时，键盘会把 fixed 底栏顶到键盘上。 */
+export const KEYBOARD_NAV_HIDE_THRESHOLD_PX = 150;
+
+export function isKeyboardOccludingNav(
+  keyboardInset: number,
+  threshold = KEYBOARD_NAV_HIDE_THRESHOLD_PX
+): boolean {
+  return Number.isFinite(keyboardInset) && keyboardInset >= threshold;
+}
+
+/** 顶部锚点不需要帧级新鲜度；滚动中按间隔采样即可。 */
+export function shouldSampleTopAnchor(
+  lastSampleAt: number,
+  now: number,
+  intervalMs = 200
+): boolean {
+  if (!Number.isFinite(now)) return false;
+  if (!Number.isFinite(lastSampleAt) || lastSampleAt <= 0) return true;
+  return now - lastSampleAt >= Math.max(0, intervalMs);
+}
+
 /** Hidden readers retain warm state for the same five-minute window as prefetch data. */
 export const READER_RETENTION_MS = 5 * 60 * 1000;
 

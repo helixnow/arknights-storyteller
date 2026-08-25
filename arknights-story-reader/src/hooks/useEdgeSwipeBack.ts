@@ -36,6 +36,14 @@ const IGNORED_ORIGINS =
 
 export type EdgeSwipeDecision = "track" | "cancel" | "trigger";
 
+/** 划词分享时左缘滑动不能把阅读器关掉。 */
+export function hasNonCollapsedTextSelection(
+  selection: { isCollapsed: boolean; toString(): string } | null
+): boolean {
+  if (!selection || selection.isCollapsed) return false;
+  return selection.toString().trim().length > 0;
+}
+
 /**
  * 边缘返回的纯判定器。事件层只负责取坐标；阈值、反向移动、垂直漂移和长按
  * 取消都在这里统一，便于用 node:test 锁住临界值。
@@ -244,6 +252,10 @@ export function useEdgeSwipeBack(
       const overlayBaseline =
         sample && Date.now() - sample.at < 500 ? sample.count : getOverlayHandlerCount();
       if (ev.touches.length !== 1) {
+        stateRef.current = null;
+        return;
+      }
+      if (hasNonCollapsedTextSelection(window.getSelection())) {
         stateRef.current = null;
         return;
       }

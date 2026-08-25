@@ -19,6 +19,7 @@ const {
   readerChromeHeightFromMeasurements,
   readerLocalDayKey,
   scrollTopFromAnchorGeometry,
+  estimateReaderSegmentHeightPx,
   shouldResetReaderPositionForContent,
   stableReaderIntentToken,
 } = await loadPureReader();
@@ -155,6 +156,14 @@ test("分页 chrome：ResizeObserver 写入变量，隐藏或卸载时清理", a
     css,
     /100dvh\s*-\s*var\(--reader-chrome, 12rem\)\s*-\s*var\(--app-shell-top-inset, 0px\)/
   );
+  assert.match(css, /\.reader-scroll--paged\s*\{\s*touch-action:\s*manipulation;/);
+  assert.match(css, /contain-intrinsic-size:\s*auto var\(--reader-seg-estimate, 120px\)/);
+});
+
+test("段落固有高度估值：随字号行距放大且不低于 120", () => {
+  assert.equal(estimateReaderSegmentHeightPx(16, 1.7), 120);
+  assert.ok(estimateReaderSegmentHeightPx(32, 3) > 120);
+  assert.equal(estimateReaderSegmentHeightPx(Number.NaN, 1.7), 120);
 });
 
 test("KeepAlive 隐藏：退出选段模式但不清空已选段落", async () => {

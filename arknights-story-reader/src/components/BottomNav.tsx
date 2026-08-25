@@ -1,7 +1,11 @@
 import { type KeyboardEvent, useCallback, useEffect, useRef } from "react";
 import { Book, Home, Search, Settings, Users2 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { calculateBottomNavInset } from "@/lib/appShellLogic";
+import {
+  calculateBottomNavInset,
+  calculateKeyboardInset,
+  isKeyboardOccludingNav,
+} from "@/lib/appShellLogic";
 
 type Tab = "home" | "stories" | "characters" | "search" | "settings";
 
@@ -57,6 +61,18 @@ export function BottomNav({ activeTab, onTabChange }: BottomNavProps) {
       // 入场动画期间导航还带着 translateY，量矩形会得到一个偏小的值，而动画
       // 结束不触发任何观察器，那个错值就会一直留着。这两个量都只看布局，
       // 不受 transform 影响；`bottom` 还顺带把 max()/env() 解析成了 px。
+      const viewport = window.visualViewport;
+      const keyboardInset = viewport
+        ? calculateKeyboardInset(window.innerHeight, viewport.height, viewport.offsetTop)
+        : 0;
+      const hideForKeyboard = isKeyboardOccludingNav(keyboardInset);
+      nav.classList.toggle("bottom-nav-glass--keyboard-hidden", hideForKeyboard);
+      nav.toggleAttribute("inert", hideForKeyboard);
+      nav.setAttribute("aria-hidden", hideForKeyboard ? "true" : "false");
+      if (hideForKeyboard) {
+        root.style.removeProperty(INSET_VAR);
+        return;
+      }
       const bottom = Number.parseFloat(window.getComputedStyle(nav).bottom);
       const inset = calculateBottomNavInset(nav.offsetHeight, bottom);
       root.style.setProperty(INSET_VAR, `${inset}px`);

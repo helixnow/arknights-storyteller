@@ -14,6 +14,8 @@ import {
   INITIAL_HISTORY_GUARD_STATE,
   calculateBottomNavInset,
   calculateKeyboardInset,
+  isKeyboardOccludingNav,
+  shouldSampleTopAnchor,
   toastViewportZIndex,
   cleanupVersionFrom,
   collectOverflowScrollSnapshots,
@@ -362,6 +364,19 @@ test("calculateKeyboardInset：无效或缺失的 visualViewport 回落到 0", (
 test("toastViewportZIndex：有呈现中的模态时降到 45", () => {
   assert.equal(toastViewportZIndex(false), 100);
   assert.equal(toastViewportZIndex(true), 45);
+});
+
+test("isKeyboardOccludingNav：达到阈值才藏底栏", () => {
+  assert.equal(isKeyboardOccludingNav(149), false);
+  assert.equal(isKeyboardOccludingNav(150), true);
+  assert.equal(isKeyboardOccludingNav(Number.NaN), false);
+});
+
+test("shouldSampleTopAnchor：首次必采，之后按间隔节流", () => {
+  assert.equal(shouldSampleTopAnchor(0, 1_000), true);
+  assert.equal(shouldSampleTopAnchor(1_000, 1_199), false);
+  assert.equal(shouldSampleTopAnchor(1_000, 1_200), true);
+  assert.equal(shouldSampleTopAnchor(1_000, Number.NaN), false);
 });
 
 // ─────────────────────────────────────────────────────────────
