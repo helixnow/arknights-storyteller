@@ -121,9 +121,12 @@ dist/                    # 前端构建产物
 CI 跑的就是这几条，提 PR 前在本地过一遍最省事：
 
 ```bash
+npm test                         # 前端单元测试
 npx tsc --noEmit                  # 类型检查
 npm run build                     # tsc + vite build
-cd src-tauri && cargo test --lib  # 解析器 / 搜索 / 数据整理的单元测试
+cd src-tauri
+cargo test --lib --locked         # 解析器 / 搜索 / 数据整理的单元测试
+cargo test --test search_recall --locked  # 自建 fixture 的搜索召回测试
 ```
 
 ### 开发
@@ -185,22 +188,22 @@ npm run tauri ios build
 
 在 `pull_request` 以及推送到 `main` 时跑，两个并行 job（`defaults.run.working-directory` 统一设成 `arknights-story-reader/`，因为应用不在仓库根目录）：
 
-- **frontend**：`npm ci` → `npm run test --if-present` → `npx tsc --noEmit` → `npm run build`
-- **rust**：`cargo test --lib`（`src-tauri/`），工具链固定 `1.89.0`
+- **frontend**：`npm ci` → `npm test` → `npx tsc --noEmit` → `npm run build`
+- **rust**：`cargo test --lib --locked` → `cargo test --test search_recall --locked`（`src-tauri/`），工具链固定 `1.89.0`
 
 几点值得记住：
 
 - Rust 版本不能往下调。`src-tauri/Cargo.lock` 已入库，CI 使用 `--locked` 保证依赖解析可复现；锁定的依赖树里已有使用 edition2024 的 crate，1.83 这类旧工具链会在解析阶段直接失败。
 - `cargo test --lib` 虽然不开窗口，仍然要装 `libwebkit2gtk-4.1-dev` 等原生依赖：Linux 上 `tauri → wry → webkit2gtk-sys` 是普通依赖，编译 lib target 就会跑它的 pkg-config build script。
-- 只跑 `--lib`。`src-tauri/tests/search_recall.rs` 需要真实剧情数据，不适合放进 PR 门禁，请本地跑。
+- `src-tauri/tests/search_recall.rs` 的自建微型 fixture 会进入 PR 门禁；依赖真实剧情数据的用例标记为 `ignored`，仅在本地有相应数据时手动运行。
 
 ### 发布：`.github/workflows/release.yml`
 
-只在推送到 `release` 分支或手动触发时跑，且**只构建 Android**：校验仓库中五处版本号一致 → 构建签名的 universal APK → 上传到 Release → 生成并上传 `android-latest.json` → 搬运上一个 Release 的桌面 `latest.json`（若存在，见下节）→ 发布 Release。工作流不会自动 bump 或推送版本；发版前必须先提交未占用的新版本，并同步更新 `package.json`、`package-lock.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml` 与 `src-tauri/Cargo.lock`。所需机密：`ANDROID_KEYSTORE_B64`、`ANDROID_KEYSTORE_PASSWORD`、`ANDROID_KEY_ALIAS`、`ANDROID_KEY_PASSWORD`。正式发布启用严格签名模式，release keystore 缺失或无效时直接失败，不会回退到 debug keystore。
+在推送到 `release` 分支或手动触发时运行，且**只构建 Android**：校验五份清单中的版本号一致 → 创建草稿 Release → 构建并上传签名的 universal APK → 生成并上传 `android-latest.json` → 搬运上一个 Release 的桌面 `latest.json`（若存在，见下节）→ 发布 Release。工作流不会自动 bump 或回推版本；发版前必须先提交未占用的新版本，并同步更新 `package.json`、`package-lock.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml` 与 `src-tauri/Cargo.lock`。
 
-注意仓库根目录的 `.github/workflows/release.yml` 才是实际生效的工作流。重组前留在 `arknights-story-reader/.github/workflows/` 的副本已删除，避免误导。
+所需机密为 `ANDROID_KEYSTORE_B64`、`ANDROID_KEYSTORE_PASSWORD`、`ANDROID_KEY_ALIAS`、`ANDROID_KEY_PASSWORD`。正式发布启用严格签名模式，release keystore 缺失、口令错误或 alias 无效时直接失败，不会回退到 debug keystore。实际工作流位于仓库根目录 `.github/workflows/release.yml`。
 
-### 桌面更新源的现状
+### 桌面更新源与手工发布
 
 `tauri.conf.json` 已经把桌面 updater 指向 GitHub Release 的 `latest.json`：
 
@@ -208,7 +211,7 @@ npm run tauri ios build
 https://github.com/helixnow/arknights-storyteller/releases/latest/download/latest.json
 ```
 
-也就是说桌面端**期望**在被标记为 latest 的 Release 里能下载到 `latest.json`。但没有任何工作流会**构建**桌面安装包或**生成**这个文件——`release.yml` 只产出 APK 和 `android-latest.json`。它对桌面 feed 只做一件事：发布新 Release 前，把上一个 Release 里已有的 `latest.json` 原样搬运过来（"Carry over desktop updater feed" 步骤）。因为工作流每次都会新建 Release 并标记为 latest，不搬运的话，手工上传过的桌面 feed 会被留在旧 Release 上，导致上面这个 URL 每次 Android 发布后都变成 404。feed 里的下载链接指向 `releases/download/app-v<旧版本>/…`，旧资产与 minisign 签名依然有效，所以搬运是安全的。但如果从来没有人上传过 `latest.json`（当前状态），这一步会直接跳过，桌面端「检查更新」仍然拿不到 feed。
+桌面端期望从被标记为 latest 的 Release 下载 `latest.json`。当前工作流不会构建桌面安装包或生成这个文件——`release.yml` 只产出 APK 和 `android-latest.json`。它只会在发布新 Release 前，把最近一个正式 Release 中已有的 `latest.json` 原样搬运过来（`Carry over desktop updater feed` 步骤）。feed 内仍指向原桌面 Release 的安装包和签名，因此不需要复制那些资产。若所有正式 Release 都没有 `latest.json`，搬运步骤会跳过，桌面端更新检查仍会得到 404；正式发布前应检查 Release 资产。
 
 **首次上传桌面 feed（或发布新的桌面版本）必须手工完成**，步骤如下：
 
@@ -226,14 +229,14 @@ https://github.com/helixnow/arknights-storyteller/releases/latest/download/lates
 
    ```json
    {
-     "version": "1.12.0",
+     "version": "X.Y.Z",
      "notes": "",
-     "pub_date": "2026-08-23T00:00:00Z",
+     "pub_date": "YYYY-MM-DDTHH:mm:ssZ",
      "platforms": {
-       "linux-x86_64":   { "signature": "<AppImage.sig 内容>",   "url": "https://github.com/helixnow/arknights-storyteller/releases/download/app-v1.12.0/arknights-story-reader_1.12.0_amd64.AppImage" },
-       "windows-x86_64": { "signature": "<setup.exe.sig 内容>",  "url": "https://github.com/helixnow/arknights-storyteller/releases/download/app-v1.12.0/arknights-story-reader_1.12.0_x64-setup.exe" },
-       "darwin-x86_64":  { "signature": "<app.tar.gz.sig 内容>", "url": "https://github.com/helixnow/arknights-storyteller/releases/download/app-v1.12.0/arknights-story-reader_x64.app.tar.gz" },
-       "darwin-aarch64": { "signature": "<app.tar.gz.sig 内容>", "url": "https://github.com/helixnow/arknights-storyteller/releases/download/app-v1.12.0/arknights-story-reader_aarch64.app.tar.gz" }
+       "linux-x86_64":   { "signature": "<AppImage.sig 内容>",   "url": "https://github.com/helixnow/arknights-storyteller/releases/download/app-vX.Y.Z/arknights-story-reader_X.Y.Z_amd64.AppImage" },
+       "windows-x86_64": { "signature": "<setup.exe.sig 内容>",  "url": "https://github.com/helixnow/arknights-storyteller/releases/download/app-vX.Y.Z/arknights-story-reader_X.Y.Z_x64-setup.exe" },
+       "darwin-x86_64":  { "signature": "<app.tar.gz.sig 内容>", "url": "https://github.com/helixnow/arknights-storyteller/releases/download/app-vX.Y.Z/arknights-story-reader_x64.app.tar.gz" },
+       "darwin-aarch64": { "signature": "<app.tar.gz.sig 内容>", "url": "https://github.com/helixnow/arknights-storyteller/releases/download/app-vX.Y.Z/arknights-story-reader_aarch64.app.tar.gz" }
      }
    }
    ```
