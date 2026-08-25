@@ -131,13 +131,28 @@ export const CustomScrollArea = forwardRef<HTMLDivElement, CustomScrollAreaProps
       // 轨道高度不只跟着 viewport 变：trackOffset* 是 CSS 变量，阅读模式
       // 切换（分页↔滚动）只改它不改容器尺寸，得单独观察轨道本身。
       if (trackRef.current) resizeObserver?.observe(trackRef.current);
+      // viewport 的边框盒不会随 scrollHeight 改变。观察直接内容根节点，图片
+      // 加载、折叠区展开或异步结果落地时，滑块比例也能跟着更新；只观察这一
+      // 层，避免给数百个列表项各挂一个 ResizeObserver 目标。
+      Array.from(viewport.children).forEach((child) => resizeObserver?.observe(child));
       // 旧 WebView 没有 ResizeObserver 时至少跟随视口/键盘尺寸变化。
       if (!resizeObserver) window.addEventListener("resize", handleResize);
 
       // 只监听 viewport 直接子节点的增删（整篇剧情/列表切换等）。
       // 早期版本用 `subtree: true`，每张图加载完都会触发一次子树变动，
       // 在人物统计这种 400+ 卡片的面板里会把主线程打爆。
-      const mutationObserver = new MutationObserver(() => {
+      const mutationObserver = new MutationObserver((records) => {
+        if (resizeObserver) {
+          for (const record of records) {
+            record.removedNodes.forEach((node) => {
+              if (node instanceof Element && !viewport.contains(node)) {
+                resizeObserver.unobserve(node);
+              }
+            });
+          }
+          // observe() 可重复调用；以最终 DOM 为准，兼容同一批变更中的移动。
+          Array.from(viewport.children).forEach((child) => resizeObserver.observe(child));
+        }
         if (frame) cancelAnimationFrame(frame);
         frame = requestAnimationFrame(updateThumbMetrics);
       });

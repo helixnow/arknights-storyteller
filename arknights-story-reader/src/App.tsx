@@ -297,7 +297,7 @@ function App() {
   ];
 
   const appContent = (
-    <div className="h-full flex flex-col overflow-hidden pt-[max(env(safe-area-inset-top,0px),12px)]">
+    <div className="app-shell h-full flex flex-col overflow-hidden">
       <div className="relative flex-1 overflow-hidden">
         {/*
          * 阅读器是盖在 tab 层之上的整屏浮层，所以整层 tab 一起从无障碍树和

@@ -366,6 +366,16 @@ html, body, #root {
   }
 }
 
+/*
+ * 应用壳统一避开状态栏，并把这段净空发布给内部的阅读器。阅读器分页高度用
+ * `100dvh - --reader-chrome` 计算，但动态 chrome 只测得到自己的顶栏/页脚；
+ * 若这里的壳层 padding 不单独扣除，每页都会固定多出一段状态栏高度。
+ */
+.app-shell {
+  --app-shell-top-inset: max(env(safe-area-inset-top, 0px), 12px);
+  padding-top: var(--app-shell-top-inset);
+}
+
 body {
   background-color: hsl(var(--color-background));
   color: hsl(var(--color-foreground));
@@ -883,12 +893,19 @@ body {
 
 .reader-scroll--paged .reader-content {
   /* --reader-chrome 由阅读器根元素发布实测值；这里不声明局部值，避免挡住
-     祖先上的测量结果。12rem 只服务尚未发布变量的旧调用方。 */
+     祖先上的测量结果。12rem 只服务尚未发布变量的旧调用方。第一条保留给
+     没有应用壳的独立调用方；应用内再扣掉壳层的状态栏安全区。 */
   min-height: calc(100vh - var(--reader-chrome, 12rem));
+  min-height: calc(
+    100vh - var(--reader-chrome, 12rem) - var(--app-shell-top-inset, 0px)
+  );
   /* 移动端浏览器工具栏展开时 100vh 比可视视口高约一条工具栏，分页模式
      每一页都会多出一截滚动、页尾沉到折叠线下。dvh 跟随实际视口；
      旧内核不认识这行会自动回落到上面的 vh。 */
   min-height: calc(100dvh - var(--reader-chrome, 12rem));
+  min-height: calc(
+    100dvh - var(--reader-chrome, 12rem) - var(--app-shell-top-inset, 0px)
+  );
 }
 
 .progress-track {
