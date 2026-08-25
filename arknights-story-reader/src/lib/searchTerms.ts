@@ -17,6 +17,20 @@ export const AUTO_SEARCH_MIN_LEN = 2;
 /** 高亮词上限：去重后仍超长的查询只取前几个，避免拼出超长正则。 */
 export const MAX_HIGHLIGHT_TERMS = 12;
 
+/** 首屏只渲这么多行；其余点「显示更多」再切片，避免一次挂几百张卡。 */
+export const SEARCH_RESULT_PAGE_SIZE = 80;
+
+export function nextSearchResultLimit(
+  current: number,
+  total: number,
+  step = SEARCH_RESULT_PAGE_SIZE
+): number {
+  const safeCurrent = Number.isFinite(current) && current > 0 ? current : 0;
+  const safeTotal = Number.isFinite(total) && total > 0 ? total : 0;
+  const safeStep = Number.isFinite(step) && step > 0 ? step : SEARCH_RESULT_PAGE_SIZE;
+  return Math.min(safeTotal, safeCurrent + safeStep);
+}
+
 /**
  * 必须与 Rust `data_service.rs::INDEX_VERSION` 同步。搜索缓存的 namespace
  * 会带上这个版本：索引语料/解析语义升级但数据 commit 不变时，旧结果也

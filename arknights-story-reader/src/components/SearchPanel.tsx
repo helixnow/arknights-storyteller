@@ -35,6 +35,8 @@ import {
   isSearchIndexTrusted,
   SEARCH_INDEX_VERSION,
   searchEmptyAnnouncement,
+  nextSearchResultLimit,
+  SEARCH_RESULT_PAGE_SIZE,
   searchHitAnnouncement,
   shouldShowSearchHistory,
   stableVersionOf,
@@ -516,7 +518,10 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
   const [cancelledQuery, setCancelledQuery] = useState<string | null>(null);
   /** 软键盘出现时收起非必要头部信息，给结果列表保留真实可视高度。 */
   const [keyboardOpen, setKeyboardOpen] = useState(false);
+  const [visibleLimit, setVisibleLimit] = useState(SEARCH_RESULT_PAGE_SIZE);
+  const [panelActive, setPanelActive] = useState(true);
 
+  const rootRef = useRef<HTMLDivElement | null>(null);
   const moreMenuRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
   // 输入法组合中：Enter 只是确认候选词，不该触发搜索。
@@ -594,6 +599,14 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
   }, [page, activeFacet]);
 
   const segmentHits = segmentPage?.hits ?? NO_HITS;
+  const displayedResults = useMemo(
+    () => visibleResults.slice(0, visibleLimit),
+    [visibleResults, visibleLimit]
+  );
+  const displayedSegments = useMemo(
+    () => segmentHits.slice(0, visibleLimit),
+    [segmentHits, visibleLimit]
+  );
 
   const facetEntries = useMemo(
     () => (page?.facets ? Object.entries(page.facets) : []),
@@ -611,7 +624,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
   const hitCount = mode === "segment" ? segmentHits.length : visibleResults.length;
   // 边打边搜时旧结果留在原地（只压暗），不然每敲一个字整页都要闪一次白。
   const listRendered = !searchError && hitCount > 0;
-  const navRows = mode === "segment" ? segmentHits : visibleResults;
+  const navRows = mode === "segment" ? displayedSegments : displayedResults;
   const navCount = listRendered ? navRows.length : 0;
 
   /**
@@ -1164,12 +1177,12 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
   const openActiveRow = () => {
     if (activeIndex < 0) return false;
     if (mode === "segment") {
-      const hit = segmentHits[activeIndex];
+      const hit = displayedSegments[activeIndex];
       if (!hit) return false;
       handleOpenSegment(hit);
       return true;
     }
-    const result = visibleResults[activeIndex];
+    const result = displayedResults[activeIndex];
     if (!result) return false;
     handleOpenResult(result);
     return true;
@@ -1397,11 +1410,15 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
   // indexReady，只在 false→true 的瞬间、且已有落定查询时补发一次：
   // forceRefresh 绕过缓存与在途去重拿新鲜结果，skipHistory 不污染历史
   // ——这不是用户的新搜索，只是把上次那条查询搜完整。
+  const pendingReadyResyncRef = useRef(false);
   const prevIndexReadyRef = useRef(indexReady);
   useEffect(() => {
     const rose = !prevIndexReadyRef.current && indexReady;
     prevIndexReadyRef.current = indexReady;
-    if (!rose) return;
+    if (rose) pendingReadyResyncRef.current = true;
+    if (!pendingReadyResyncRef.current) return;
+    if (!panelActive) return;
+    pendingReadyResyncRef.current = false;
     // 两条硬规则：
     //   1. 上升沿时若还有在途搜索，它才是用户最新的意图（比如重建期间对
     //      新词回车强搜、线性扫描跑了几秒还没回来）。此时按 lastQuery 补搜
@@ -1431,13 +1448,28 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
       skipHistory: true,
       noFallback: true,
     });
-  }, [indexReady, searched, lastQuery]);
+  }, [indexReady, searched, lastQuery, panelActive]);
 
   // 结果集换了就取消选中：行号对应的已经是另一批内容了。
   // 引用表不用在这里清——行卸载时 ref 回调会带着 null 回来自己删。
   useEffect(() => {
     setActiveIndex(-1);
+    setVisibleLimit(SEARCH_RESULT_PAGE_SIZE);
   }, [page, segmentPage, activeFacet, mode]);
+
+  useEffect(() => {
+    const el = rootRef.current;
+    if (!el) return;
+    const host = el.closest("[data-keepalive-active]");
+    const sync = () => {
+      setPanelActive(host?.getAttribute("data-keepalive-active") !== "false");
+    };
+    sync();
+    if (!host) return;
+    const observer = new MutationObserver(sync);
+    observer.observe(host, { attributes: true, attributeFilter: ["data-keepalive-active"] });
+    return () => observer.disconnect();
+  }, []);
 
   // 换了查询或模式就把结果列表滚回顶部：视口是常驻的，沿用旧结果的滚动
   // 偏移，新列表会直接从半腰、甚至被浏览器夹到的末尾开始看，且没有任何
@@ -1514,15 +1546,17 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     }
     const scope = lastQuery ? `「${lastQuery}」` : "";
     if (hitCount > 0) {
+      const displayedCount = mode === "segment" ? displayedSegments.length : displayedResults.length;
       const totalMatched =
         mode === "segment" ? segmentPage?.totalMatched ?? hitCount : page?.totalMatched ?? hitCount;
       const truncated =
-        mode === "segment" ? Boolean(segmentPage?.truncated) : Boolean(page?.truncated);
+        displayedCount < hitCount ||
+        (mode === "segment" ? Boolean(segmentPage?.truncated) : Boolean(page?.truncated));
       setAnnouncement(
         searchHitAnnouncement({
           query: lastQuery,
           mode,
-          visibleCount: hitCount,
+          visibleCount: displayedCount,
           totalMatched,
           truncated,
           facet: activeFacet,
@@ -1552,6 +1586,8 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     activeFacet,
     page,
     segmentPage,
+    displayedResults,
+    displayedSegments,
     indexStatus,
     indexError,
     indexBusy,
@@ -1977,7 +2013,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
   // 一次搜索出几百行的情况下，敲字的重渲染成本才真正压到接近零。
   const storyRowNodes = useMemo(
     () =>
-      visibleResults.map((result, index) => (
+      displayedResults.map((result, index) => (
         <StoryResultRow
           key={`${result.storyId}-${index}`}
           result={result}
@@ -1989,12 +2025,12 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
           registerRow={registerRow}
         />
       )),
-    [visibleResults, activeIndex, openingStoryId, highlight, handleOpenResult, registerRow]
+    [displayedResults, activeIndex, openingStoryId, highlight, handleOpenResult, registerRow]
   );
 
   const segmentRowNodes = useMemo(
     () =>
-      segmentHits.map((hit, index) => (
+      displayedSegments.map((hit, index) => (
         <SegmentResultRow
           key={`${hit.storyId}-${hit.segmentIndex}-${index}`}
           hit={hit}
@@ -2006,7 +2042,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
           registerRow={registerRow}
         />
       )),
-    [segmentHits, activeIndex, openingStoryId, highlight, handleOpenSegment, registerRow]
+    [displayedSegments, activeIndex, openingStoryId, highlight, handleOpenSegment, registerRow]
   );
 
   const showHistory = shouldShowSearchHistory({
@@ -2023,7 +2059,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
   );
 
   return (
-    <div className="h-full min-h-0 flex flex-col overflow-hidden">
+    <div ref={rootRef} className="h-full min-h-0 flex flex-col overflow-hidden">
       {/* 搜索栏 */}
       <header className="flex-shrink-0 z-10 bg-[hsl(var(--color-background)/0.95)] backdrop-blur border-b motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-500">
         <div className={cn("container", keyboardOpen ? "py-2" : "py-4")}>
@@ -2413,7 +2449,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
           viewportRef={resultsViewportRef}
           onTouchMove={blurSearchInput}
           trackOffsetTop="calc(3.5rem + 10px)"
-          trackOffsetBottom="calc(4.5rem + env(safe-area-inset-bottom, 0px))"
+          trackOffsetBottom="calc(max(4.5rem, var(--bottom-nav-inset, 4.5rem)) + 0.5rem)"
         >
           <div className="container py-6 pb-24 motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-700">
             {/* 结果落定后只说一句，polite 排队，不打断用户正在听的内容。 */}
@@ -2458,6 +2494,19 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
                   >
                     {segmentRowNodes}
                   </div>
+                  {displayedSegments.length < segmentHits.length && (
+                    <button
+                      type="button"
+                      className="w-full min-h-[44px] rounded-md border border-[hsl(var(--color-border))] text-sm text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-foreground))]"
+                      onClick={() =>
+                        setVisibleLimit((current) =>
+                          nextSearchResultLimit(current, segmentHits.length)
+                        )
+                      }
+                    >
+                      显示更多（还剩 {segmentHits.length - displayedSegments.length} 段）
+                    </button>
+                  )}
                 </div>
               )
             )}
@@ -2530,6 +2579,19 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
                     >
                       {storyRowNodes}
                     </div>
+                  )}
+                  {displayedResults.length < visibleResults.length && (
+                    <button
+                      type="button"
+                      className="w-full min-h-[44px] rounded-md border border-[hsl(var(--color-border))] text-sm text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-foreground))]"
+                      onClick={() =>
+                        setVisibleLimit((current) =>
+                          nextSearchResultLimit(current, visibleResults.length)
+                        )
+                      }
+                    >
+                      显示更多（还剩 {visibleResults.length - displayedResults.length} 条）
+                    </button>
                   )}
                 </div>
               )

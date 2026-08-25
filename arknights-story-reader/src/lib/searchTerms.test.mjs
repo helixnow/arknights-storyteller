@@ -22,6 +22,8 @@ import {
   MAX_HIGHLIGHT_TERMS,
   SEARCH_INDEX_VERSION,
   searchEmptyAnnouncement,
+  nextSearchResultLimit,
+  SEARCH_RESULT_PAGE_SIZE,
   searchHitAnnouncement,
   shouldShowSearchHistory,
   stableVersionOf,
@@ -429,6 +431,13 @@ test("shouldShowSearchHistory：空态键盘打开仍显示历史", () => {
     shouldShowSearchHistory({ keyboardOpen: false, searched: true, query: "博士", historyCount: 2 }),
     true
   );
+});
+
+test("nextSearchResultLimit：按步长扩到总数，不越界", () => {
+  assert.equal(nextSearchResultLimit(80, 200), 160);
+  assert.equal(nextSearchResultLimit(160, 200), 200);
+  assert.equal(nextSearchResultLimit(0, 50), 50);
+  assert.equal(nextSearchResultLimit(SEARCH_RESULT_PAGE_SIZE, 10), 10);
 });
 
 test("searchHitAnnouncement：截断页报总数而不是只报已显示条数", () => {
