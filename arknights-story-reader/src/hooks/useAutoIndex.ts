@@ -1,6 +1,11 @@
 import { useEffect } from "react";
 import { api } from "@/services/api";
 import { acquireDataJob, describeDataJob, getActiveDataJob } from "@/hooks/useDataSyncManager";
+import {
+  advanceIndexProgress,
+  beginIndexProgress,
+} from "@/lib/searchTerms";
+import type { IndexProgressCursor } from "@/lib/searchTerms";
 import type { StoryIndexStatus } from "@/types/story";
 
 /** 首屏渲染先跑完，再去碰磁盘。 */
@@ -28,7 +33,8 @@ const MAX_DEFERRALS = 6;
  *   - 等到数据已安装；
  *   - 检查索引状态；
  *   - 未就绪就触发 `build_story_index`，交给后端线程跑；
- *   - 全过程不占主线程，也不弹 toast；日志只在开发构建里打，线上保持安静。
+ *   - 全过程不占主线程，也不弹 toast；诊断说明仅开发构建输出，IPC 失败由
+ *     API 层在生产日志留命令名（不记录参数）。
  *
  * 关键是「不跟人抢」：同步/导入在跑、用户自己点了重建、后端正在发索引进度，
  * 这三种情况都直接让路——多跑一次重建不会更快，只会让两个写库任务互相拖慢，
@@ -45,6 +51,8 @@ export function useAutoIndex() {
     let running = false;
     let lastIndexProgressAt = 0;
     let backendBuilding = false;
+    let progressEpoch = 0;
+    let progressCursor: IndexProgressCursor | null = null;
     let deferrals = 0;
     /** 上一次广播出去的状态，用来去重，避免退让期间反复惊动监听方。 */
     let lastBroadcast: string | null = null;
@@ -92,8 +100,9 @@ export function useAutoIndex() {
     const ensureIndex = async (reason: string) => {
       if (cancelled || running) return;
       running = true;
-      /** 已把重建交给后端跑：这之后的失败是构建本身失败，不该盲目重跑。 */
+      /** 已把重建交给后端跑；命令失败与命令成功后的终态探针失败分开处置。 */
       let buildStarted = false;
+      let buildResolved = false;
       try {
         const installed = await api.isInstalled();
         if (cancelled || !installed) return;
@@ -132,16 +141,27 @@ export function useAutoIndex() {
         try {
           devLog(`检测到索引未就绪，自动后台重建…（${reason}）`);
           buildStarted = true;
+          progressCursor = beginIndexProgress(progressEpoch, true);
           await api.buildStoryIndex();
+          buildResolved = true;
         } finally {
           release();
         }
         if (cancelled) return;
 
-        devLog("索引重建完成");
-        deferrals = 0;
-        const rebuilt = await api.getStoryIndexStatus().catch(() => null);
+        const rebuilt = await api.getStoryIndexStatus();
         if (cancelled) return;
+        if (!rebuilt.ready) {
+          // invoke resolve 不是完整性证明：换包竞态、COUNT/MATCH 失忆或落盘
+          // 异常都可能让终态仍是 false。广播真实状态并有限重试，不能宣告
+          // 成功后整个会话放弃兜底。
+          broadcast(rebuilt, "auto-rebuild-unready");
+          devLog("自动重建命令已返回，但完整性检查仍未通过");
+          deferRetry("auto-rebuild-unready");
+          return;
+        }
+        devLog("索引重建完成且终态已确认");
+        deferrals = 0;
         // reason 不能叫 "rebuilt"：那是搜索面板重建收场广播的专用终态，
         // 设置页收到就会释放它持有的 "index" 任务锁。上面 release() 之后
         // 设置页可能立刻抢到锁发起新一轮重建，这条广播若冒用同名终态，
@@ -171,6 +191,11 @@ export function useAutoIndex() {
           // 不会无限轮询。
           devLog(`索引前置检查失败，稍后重试（${reason}）`, err);
           deferRetry(reason);
+        } else if (buildResolved && !cancelled) {
+          // 构建命令已经成功返回，失败的是随后的终态探针。探针 IPC 抖动不
+          // 能被误报成“构建失败”并永久停手；按前置探针同样有限重试。
+          devLog("自动索引终态确认失败，稍后重试", err);
+          deferRetry("post-build-status");
         } else {
           // 构建本身失败不重试：磁盘满、IO 错重跑一遍只会再失败一次。
           // 不影响可用性：后端搜索会退回线性扫描，UI 也有"刷新索引"入口。
@@ -185,12 +210,34 @@ export function useAutoIndex() {
     let disposeProgress: (() => void) | null = null;
     void api
       .onIndexProgress((p) => {
+        // 新后端会用“失败”明确结束本轮。它和“完成”一样是终态，但不符合
+        // 收集→构建的成功单调序列，必须先收下，否则 backendBuilding 会一直
+        // 卡到 60s 停更窗；后续 ensureIndex 探针仍会广播真实 ready 状态。
+        if (p.phase === "失败") {
+          const cursor = progressCursor;
+          // 与成功终态保持同一归属门槛：没有当前代起点、或已经终止的游标
+          // 收到的失败只能是挂载前/上一轮的迟到事件，不能掐掉当前忙碌态。
+          if (
+            !cursor ||
+            cursor.epoch !== progressEpoch ||
+            cursor.terminal ||
+            (!cursor.started && !cursor.allowTerminalWithoutStart)
+          ) {
+            return;
+          }
+          progressCursor = null;
+          lastIndexProgressAt = Date.now();
+          backendBuilding = false;
+          return;
+        }
+        const cursor = progressCursor ?? beginIndexProgress(progressEpoch, false);
+        const next = advanceIndexProgress(cursor, p, progressEpoch);
+        if (!next) return;
+        progressCursor = next;
         lastIndexProgressAt = Date.now();
-        // 终态判定要对齐后端契约：正常收尾发 ("完成", total, total)，但
-        // 空数据集与「索引已是最新（0 篇）」的快速返回发的是 ("完成", 0, 0)。
-        // 只看 current >= total 会漏掉后者，backendBuilding 卡在 true，
-        // 兜底检查得白等满 60s 停更窗才恢复。
-        backendBuilding = !(p.phase === "完成" || (p.total > 0 && p.current >= p.total));
+        // 成功终态由纯函数覆盖 ("完成", total, total)、("完成", 0, 0)
+        // 与满刻度；失败终态已在上面单独收下。
+        backendBuilding = !next.terminal;
       })
       .then((unlisten) => {
         if (cancelled) {
@@ -205,11 +252,16 @@ export function useAutoIndex() {
     const onUserRebuild = () => {
       lastIndexProgressAt = Date.now();
       backendBuilding = true;
+      progressCursor = beginIndexProgress(progressEpoch, true);
     };
     // 数据换过之后索引必然过期。后端通常会自己重建，这里只做兜底与状态广播。
     const onDataUpdated = () => {
       deferrals = 0;
       lastBroadcast = null;
+      progressEpoch += 1;
+      progressCursor = null;
+      backendBuilding = false;
+      lastIndexProgressAt = 0;
       later(() => void ensureIndex("data-updated"), AFTER_DATA_UPDATE_DELAY_MS);
     };
 
