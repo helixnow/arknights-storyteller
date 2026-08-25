@@ -26,7 +26,13 @@ args.push(
   path.join("src", "hooks", "dataSyncUtils.test.mjs"),
   path.join("src", "hooks", "appUpdaterUtils.test.mjs"),
   path.join("src", "hooks", "favoritesUtils.test.mjs"),
-  path.join("src", "hooks", "dataJobLock.test.mjs")
+  path.join("src", "hooks", "dataJobLock.test.mjs"),
+  path.join("src", "components", "StoryReader.test.mjs"),
+  path.join("src", "hooks", "useReaderSettings.test.mjs"),
+  path.join("src", "hooks", "useReadingProgress.test.mjs"),
+  path.join("src", "hooks", "useHighlights.test.mjs"),
+  path.join("src", "hooks", "useEdgeSwipeBack.test.mjs"),
+  path.join("src", "components", "StoryInsightsPanel.test.mjs")
 );
 
 const result = spawnSync(process.execPath, args, {

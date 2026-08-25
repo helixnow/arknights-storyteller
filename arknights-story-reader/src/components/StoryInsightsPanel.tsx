@@ -250,7 +250,7 @@ export function StoryInsightsPanel({
                 {highlightEntries.length > 0 && (
                   <button
                     type="button"
-                    className="-my-2 inline-flex min-h-[44px] items-center px-2 text-[11px] font-medium text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-destructive))] transition-colors"
+                    className="-my-2 inline-flex min-h-[44px] min-w-[44px] items-center justify-center px-2 text-[11px] font-medium text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-destructive))] transition-colors"
                     onClick={() => {
                       void (async () => {
                         const ok = await safeConfirm(
@@ -294,7 +294,7 @@ export function StoryInsightsPanel({
                 {activeCharacter && (
                   <button
                     type="button"
-                    className="-my-2 inline-flex min-h-[44px] items-center px-2 text-[11px] font-medium text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-destructive))] transition-colors"
+                    className="-my-2 inline-flex min-h-[44px] min-w-[44px] items-center justify-center px-2 text-[11px] font-medium text-[hsl(var(--color-muted-foreground))] hover:text-[hsl(var(--color-destructive))] transition-colors"
                     onClick={onClearCharacter}
                   >
                     清除高亮

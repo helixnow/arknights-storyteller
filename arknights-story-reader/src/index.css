@@ -870,11 +870,11 @@ body {
 }
 
 .reader-scroll--paged .reader-content {
-  min-height: calc(100vh - 12rem);
+  min-height: calc(100vh - var(--reader-chrome, 12rem));
   /* 移动端浏览器工具栏展开时 100vh 比可视视口高约一条工具栏，分页模式
      每一页都会多出一截滚动、页尾沉到折叠线下。dvh 跟随实际视口；
      旧内核不认识这行会自动回落到上面的 vh。 */
-  min-height: calc(100dvh - 12rem);
+  min-height: calc(100dvh - var(--reader-chrome, 12rem));
 }
 
 .progress-track {
