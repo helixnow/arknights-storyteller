@@ -253,14 +253,45 @@ export function collectOverflowScrollSnapshots<T extends OverflowScroller>(
   return snapshots;
 }
 
+export interface InstantScrollTarget {
+  scrollTop: number;
+  scrollLeft: number;
+  style?: { scrollBehavior: string };
+  scrollTo?: (options: { left: number; top: number; behavior?: ScrollBehavior }) => void;
+}
+
+/**
+ * 程序化归位必须绕开 `.reader-scroll { scroll-behavior: smooth }`。
+ * 直接写 scrollTop / 默认 scrollTo 会从顶部飞过去，KeepAlive 恢复进度
+ * 时还会把阅读器顶栏收起来。
+ */
+export function applyInstantScroll(
+  el: InstantScrollTarget,
+  left: number,
+  top: number
+): void {
+  const style = el.style;
+  const previous = style?.scrollBehavior;
+  if (style) style.scrollBehavior = "auto";
+  try {
+    if (typeof el.scrollTo === "function") {
+      el.scrollTo({ left, top, behavior: "auto" });
+    } else {
+      el.scrollLeft = left;
+      el.scrollTop = top;
+    }
+  } finally {
+    if (style) style.scrollBehavior = previous ?? "";
+  }
+}
+
 export function restoreOverflowScrollSnapshots<T extends OverflowScroller>(
   snapshots: ReadonlyArray<OverflowScrollSnapshot<T>>,
   isConnected: (el: T) => boolean = () => true
 ): void {
   for (const { el, top, left } of snapshots) {
     if (!isConnected(el)) continue;
-    el.scrollTop = top;
-    el.scrollLeft = left;
+    applyInstantScroll(el, left, top);
   }
 }
 

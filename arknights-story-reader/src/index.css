@@ -998,7 +998,7 @@ input[type="range"]::-moz-range-thumb {
 /* ===== 性能优化：视口外段落跳过布局 ===== */
 .reader-segment {
   content-visibility: auto;
-  contain-intrinsic-size: 1px 120px;
+  contain-intrinsic-size: auto 120px;
 }
 
 /* ===== 三种段落高亮的互斥优先级 ===== */
@@ -1189,11 +1189,19 @@ input[type="range"]::-moz-range-thumb {
      加上 content-visibility + contain 后，真正在视口里的卡片数 ≤ 10，
      合成器压力降一个数量级，导航背景就能稳定刷新。 */
   content-visibility: auto;
-  contain-intrinsic-size: 1px 88px;
+  contain-intrinsic-size: auto 88px;
   contain: layout paint style;
 }
-.story-card:hover {
-  border-color: hsl(var(--color-primary) / 0.5);
+.story-card--hero {
+  contain-intrinsic-size: auto 280px;
+}
+@media (hover: hover) and (pointer: fine) {
+  .story-card:hover {
+    border-color: hsl(var(--color-primary) / 0.5);
+  }
+}
+.story-card:active {
+  background-color: hsl(var(--color-accent) / 0.4);
 }
 .story-card-cover {
   position: relative;
@@ -1391,7 +1399,7 @@ input[type="range"]::-moz-range-thumb {
    没有这个会整屏 repaint；加上之后滚动几乎没额外成本。 */
 .character-grid-cell {
   content-visibility: auto;
-  contain-intrinsic-size: 1px 72px;
+  contain-intrinsic-size: auto 72px;
   contain: layout paint style;
 }
 

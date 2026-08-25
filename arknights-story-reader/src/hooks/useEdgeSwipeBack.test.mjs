@@ -18,6 +18,7 @@ const {
   evaluateEdgeSwipe,
   isUnambiguousPageTap,
   isWithinVisualViewportEdge,
+  shouldIgnorePagedTapAfterMenuClose,
   shouldSuppressRejectedTouchClick,
 } = await loadPureGestures();
 
@@ -97,4 +98,13 @@ test("触摸拒绝：超时、时钟回拨和已接受轻点都不吞鼠标 clic
     shouldSuppressRejectedTouchClick({ ...rejected, accepted: true }, 20, 40, 1_100),
     false
   );
+});
+
+test("分页关菜单：400ms 内的同一次点击不当翻页", () => {
+  assert.equal(shouldIgnorePagedTapAfterMenuClose(1_000, 1_200), true);
+  assert.equal(shouldIgnorePagedTapAfterMenuClose(1_000, 1_399), true);
+  assert.equal(shouldIgnorePagedTapAfterMenuClose(1_000, 1_400), false);
+  assert.equal(shouldIgnorePagedTapAfterMenuClose(0, 1_200), false);
+  assert.equal(shouldIgnorePagedTapAfterMenuClose(1_000, 999), false);
+  assert.equal(shouldIgnorePagedTapAfterMenuClose(Number.NaN, 1_200), false);
 });

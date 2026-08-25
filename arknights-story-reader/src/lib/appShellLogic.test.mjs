@@ -25,6 +25,7 @@ import {
   pendingCleanupKeys,
   reduceHistoryGuard,
   restoreOverflowScrollSnapshots,
+  applyInstantScroll,
 } from "./appShellLogic.ts";
 
 const CURRENT_KEY = "prefs-v2";
@@ -615,4 +616,35 @@ test("restoreOverflowScrollSnapshots：跳过已卸载节点，其余原样灌�
   assert.equal(live.scrollTop, 120);
   assert.equal(live.scrollLeft, 6);
   assert.equal(dead.scrollTop, 0);
+});
+
+test("applyInstantScroll：有 scrollTo 时用 auto，并暂时关掉 CSS smooth", () => {
+  const calls = [];
+  const el = {
+    scrollTop: 10,
+    scrollLeft: 2,
+    style: { scrollBehavior: "smooth" },
+    scrollTo(options) {
+      calls.push({ ...options });
+      this.scrollLeft = options.left;
+      this.scrollTop = options.top;
+    },
+  };
+  applyInstantScroll(el, 4, 80);
+  assert.deepEqual(calls, [{ left: 4, top: 80, behavior: "auto" }]);
+  assert.equal(el.scrollTop, 80);
+  assert.equal(el.scrollLeft, 4);
+  assert.equal(el.style.scrollBehavior, "smooth");
+});
+
+test("applyInstantScroll：没有 scrollTo 时直接写偏移，并恢复原 scroll-behavior", () => {
+  const el = {
+    scrollTop: 40,
+    scrollLeft: 8,
+    style: { scrollBehavior: "" },
+  };
+  applyInstantScroll(el, 1, 0);
+  assert.equal(el.scrollTop, 0);
+  assert.equal(el.scrollLeft, 1);
+  assert.equal(el.style.scrollBehavior, "");
 });

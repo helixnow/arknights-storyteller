@@ -277,12 +277,12 @@ function persistSegmentCache(map: Record<string, CachedSegmentPage>) {
 // ─────────────────────────────────────────────────────────
 
 const ROW_BASE_CLASS =
-  "w-full p-4 rounded-lg border text-left transition-all duration-200 motion-safe:animate-in motion-safe:fade-in-0 disabled:opacity-60 disabled:cursor-wait";
+  "w-full p-4 rounded-lg border text-left transition-all duration-200 motion-safe:animate-in motion-safe:fade-in-0 disabled:opacity-60 disabled:cursor-wait [content-visibility:auto] [contain-intrinsic-size:auto_96px]";
 /** 键盘选中的那一行必须自己看得见，不能只靠鼠标 hover 的背景色。 */
 const ROW_ACTIVE_CLASS =
   "border-[hsl(var(--color-primary))] bg-[hsl(var(--color-accent))] ring-2 ring-[hsl(var(--color-ring))]";
 const ROW_IDLE_CLASS =
-  "border-[hsl(var(--color-border))] hover:bg-[hsl(var(--color-accent))] hover:-translate-y-0.5";
+  "border-[hsl(var(--color-border))] active:bg-[hsl(var(--color-accent)/0.55)] [@media(hover:hover)_and_(pointer:fine)]:hover:bg-[hsl(var(--color-accent))] [@media(hover:hover)_and_(pointer:fine)]:hover:-translate-y-0.5";
 
 interface StoryRowProps {
   result: SearchResult;
@@ -472,6 +472,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
   // 输入法组合态同时存 state 和 ref：ref 给同步的按键判断用，
   // state 让防抖 effect 能在组合开始/结束时重新决策。
   const [composing, setComposing] = useState(false);
+  const [composeHint, setComposeHint] = useState(false);
   /** 防抖计时器已排上但还没发请求——用来立刻给一点"收到了"的反馈。 */
   const [autoPending, setAutoPending] = useState(false);
   /** 键盘上下键选中的行号，-1 表示焦点还停在输入框上。 */
@@ -967,8 +968,13 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
 
   const submitManualSearch = (opts?: Parameters<typeof handleSearch>[0]) => {
     // 点击搜索按钮时 pointerdown 已被拦下，组合态不会被浏览器先行 blur；
-    // 这里继续拒绝提交，等 compositionend 后由用户再次确认。
-    if (composingRef.current) return;
+    // 这里继续拒绝提交，但必须告诉用户为什么没搜，不能静默 return。
+    // 历史词 / 刷新缓存带了 queryOverride，不依赖当前组字，可以放行。
+    if (composingRef.current && !opts?.queryOverride) {
+      setComposeHint(true);
+      return;
+    }
+    setComposeHint(false);
     blurSearchInputForCoarsePointer();
     void handleSearch(opts);
   };
@@ -995,12 +1001,16 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
     setActiveFacet(null);
     setActiveIndex(-1);
     setSearchError(null);
-    setCancelledQuery(null);
+    // 保留 cancelledQuery：切模式不应把刚取消的查询立刻重发。
     const pending = trimSearchQuery(query) || lastQuery;
     // 手动切模式时不自动回退，否则刚点"段落"就被弹回"整篇"，像是按钮失灵。
     // 也不写历史：pending 可能是输入框里打到一半、只被自动搜碰过的词，
     // 用户真正回车过的词早在那次手动搜索时就进了历史。
-    if ((searched || wasSearching || hadFailure) && pending) {
+    if (
+      (searched || wasSearching || hadFailure) &&
+      pending &&
+      pending !== cancelledQuery
+    ) {
       void handleSearch({
         queryOverride: pending,
         modeOverride: next,
@@ -1974,6 +1984,7 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
                 onCompositionEnd={(e) => {
                   composingRef.current = false;
                   setComposing(false);
+                  setComposeHint(false);
                   // Safari/WKWebView 的 compositionend 在 input 之前触发，
                   // 光靠 onChange 会漏掉上屏的最后一段，这里补一次。
                   setQuery(e.currentTarget.value);
@@ -2002,10 +2013,19 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
             <Button
               // 阻止按钮在 click 前抢走焦点：桌面保持输入框持焦；粗指针会在
               // submitManualSearch 中显式 blur，组合态则两边都不 blur。
+              // 取消必须在 pointerdown 就落地：部分 WebView 上 click 会丢，
+              // 或与随后合成的 click 再发一次搜索。
               onPointerDown={(event) => {
-                if (!searching) event.preventDefault();
+                event.preventDefault();
+                if (searching) cancelActiveSearch();
               }}
-              onClick={() => (searching ? cancelActiveSearch() : submitManualSearch())}
+              onClick={() => {
+                if (searching) {
+                  cancelActiveSearch();
+                  return;
+                }
+                submitManualSearch();
+              }}
               disabled={!searching && !trimSearchQuery(query)}
               aria-busy={searching}
               className="min-h-[44px]"
@@ -2158,9 +2178,14 @@ export function SearchPanel({ onSelectResult, onSelectSegment }: SearchPanelProp
             </div>
           )}
 
-          {!keyboardOpen && <div className="mt-3">{renderIndexStatusRow()}</div>}
+          <div className={keyboardOpen ? "mt-2" : "mt-3"}>{renderIndexStatusRow()}</div>
+          {composeHint && (
+            <div className="mt-2 text-[11px] text-[hsl(var(--color-muted-foreground))]">
+              请先确认输入法组字（按空格或选定候选），再点搜索
+            </div>
+          )}
 
-          {!keyboardOpen && indexBusy && indexProgress && indexProgress.total > 0 && (
+          {indexBusy && indexProgress && indexProgress.total > 0 && (
             <div
               className="mt-2 h-1 w-full overflow-hidden rounded-full bg-[hsl(var(--color-secondary))]"
               role="progressbar"

@@ -457,7 +457,7 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
           viewportClassName="reader-scroll"
           trackOffsetBottom="calc(5rem + env(safe-area-inset-bottom, 0px))"
         >
-          <div className="pl-[max(1.25rem,env(safe-area-inset-left,0px))] pr-[max(1.25rem,env(safe-area-inset-right,0px))] pb-32 space-y-6">
+          <div className="pl-[max(1.25rem,env(safe-area-inset-left,0px))] pr-[max(1.25rem,env(safe-area-inset-right,0px))] pb-[calc(8rem+var(--bottom-nav-inset))] space-y-6">
             {showSkeleton && <HomeSkeleton />}
 
             {/* 读取失败：明确说是「读不出来」而不是「没同步」，并且第一动作
@@ -491,7 +491,7 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
                 title="还没有同步剧情数据"
                 description={
                   online
-                    ? "去设置里同步一次（约几十 MB），之后首页会记住你读到哪里，也可以完全离线阅读。"
+                    ? "去设置里同步一次（完整数据包通常几百 MB，建议连 Wi-Fi），之后首页会记住你读到哪里，也可以完全离线阅读。"
                     : "设备当前离线，无法从远端下载。可以在设置里导入一份离线 ZIP 数据包。"
                 }
                 actions={[
@@ -573,7 +573,7 @@ function HomeSkeleton() {
     <div className="space-y-4">
       <div
         aria-hidden="true"
-        className="story-card h-44 w-full motion-safe:animate-pulse bg-[hsl(var(--color-secondary)/0.5)]"
+        className="story-card story-card--hero h-44 w-full motion-safe:animate-pulse bg-[hsl(var(--color-secondary)/0.5)]"
       />
       <div aria-hidden="true" className="grid grid-cols-3 gap-2">
         {[0, 1, 2].map((i) => (
@@ -704,7 +704,7 @@ function ContinueReadingCard({
   return (
     <button
       onClick={onOpen}
-      className="story-card group relative block w-full overflow-hidden text-left transition-transform active:scale-[0.995]"
+      className="story-card story-card--hero group relative block w-full overflow-hidden text-left transition-transform active:scale-[0.995]"
       aria-label={`继续阅读 ${entry.storyName}，已读 ${pct}%`}
     >
       <div className="story-card-cover aspect-[16/9]">
@@ -820,7 +820,7 @@ function StreakStrip({
             type="button"
             onClick={onClick}
             aria-label={`${label} ${value}，${hint ?? ""}`}
-            className={`${shared} transition-colors active:scale-[0.98] hover:border-[hsl(var(--color-primary)/0.5)] hover:bg-[hsl(var(--color-accent))]`}
+            className={`${shared} transition-colors active:scale-[0.98] [@media(hover:hover)_and_(pointer:fine)]:hover:border-[hsl(var(--color-primary)/0.5)] [@media(hover:hover)_and_(pointer:fine)]:hover:bg-[hsl(var(--color-accent))]`}
           >
             {content}
           </button>

@@ -44,6 +44,7 @@ import { trimHighlightPreview, useHighlights } from "@/hooks/useHighlights";
 import { useBackHandler } from "@/hooks/useBackHandler";
 import {
   isUnambiguousPageTap,
+  shouldIgnorePagedTapAfterMenuClose,
   shouldSuppressRejectedTouchClick,
   useEdgeSwipeBack,
   type TouchClickOutcome,
@@ -618,6 +619,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   const moreMenuPanelRef = useRef<HTMLDivElement | null>(null);
   const pageTouchRef = useRef<PageTouchState | null>(null);
   const lastTouchOutcomeRef = useRef<TouchClickOutcome | null>(null);
+  const pageMenuCloseAtRef = useRef(0);
 
   // 抽屉 / 选段工具栏是否占据了界面。滚动监听里用 ref 读取，避免因为这些
   // 状态变化而反复重建 scroll listener。
@@ -680,6 +682,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     const handlePointer = (event: PointerEvent) => {
       const target = event.target as Node | null;
       if (target && moreMenuRef.current?.contains(target)) return;
+      pageMenuCloseAtRef.current = Date.now();
       setMoreMenuOpen(false);
     };
     const handleKey = (event: KeyboardEvent) => {
@@ -1846,6 +1849,9 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   const handleReaderTap = useCallback(
     (event: ReactMouseEvent<HTMLElement>) => {
       if (!pageTapEnabled) return;
+      if (shouldIgnorePagedTapAfterMenuClose(pageMenuCloseAtRef.current, Date.now())) {
+        return;
+      }
 
       // 触摸结束后浏览器会再合成 click。拒绝的触摸只吞同一落点附近的合成
       // click；用户 800ms 内移鼠标点到远处时不能被上一轮捏合误伤。

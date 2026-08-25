@@ -25,6 +25,7 @@ import {
   isCharacterStatsEpochCurrent,
   planCharacterStatsDataUpdate,
 } from "@/lib/characterStatsRefresh";
+import { applyInstantScroll } from "@/lib/appShellLogic";
 
 interface CharactersPanelProps {
   active?: boolean;
@@ -824,11 +825,11 @@ export function CharactersPanel({
     const viewport = scrollViewportRef.current;
     if (!viewport) return;
     if (selected !== null) {
-      viewport.scrollTop = 0;
+      applyInstantScroll(viewport, 0, 0);
     } else {
       // 卡片有 contain-intrinsic-size，本次提交里 scrollHeight 已就位，
       // 直接还原不会被夹回 0。
-      viewport.scrollTop = gridScrollTopRef.current;
+      applyInstantScroll(viewport, 0, gridScrollTopRef.current);
     }
   }, [selected]);
 
@@ -843,7 +844,7 @@ export function CharactersPanel({
     // 详情盖着时网格没渲染，滚动位置是详情的，别动。
     if (selected !== null) return;
     const viewport = scrollViewportRef.current;
-    if (viewport && viewport.scrollTop !== 0) viewport.scrollTop = 0;
+    if (viewport && viewport.scrollTop !== 0) applyInstantScroll(viewport, 0, 0);
   }, [normalizedDeferredSearch, selected]);
 
   // 人物详情是盖在网格上的全屏二级视图，必须占一层返回栈：否则 Android

@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, type ReactNode } from "react";
 import { cn } from "@/lib/utils";
-import { keepAliveContentVisibility } from "@/lib/appShellLogic";
+import { applyInstantScroll, keepAliveContentVisibility } from "@/lib/appShellLogic";
 
 interface KeepAliveProps {
   active: boolean;
@@ -39,7 +39,7 @@ interface KeepAliveProps {
  */
 export function KeepAlive({ active, children, className }: KeepAliveProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const scrollPositionsRef = useRef(new Map<Element, { top: number; left: number }>());
+  const scrollPositionsRef = useRef(new Map<HTMLElement, { top: number; left: number }>());
 
   useLayoutEffect(() => {
     const container = containerRef.current;
@@ -50,13 +50,12 @@ export function KeepAlive({ active, children, className }: KeepAliveProps) {
         scrollPositionsRef.current.delete(el);
         continue;
       }
-      el.scrollTop = pos.top;
-      el.scrollLeft = pos.left;
+      applyInstantScroll(el, pos.left, pos.top);
     }
 
     const onScroll = (event: Event) => {
       const el = event.target;
-      if (!(el instanceof Element) || !container.contains(el)) return;
+      if (!(el instanceof HTMLElement) || !container.contains(el)) return;
       scrollPositionsRef.current.set(el, { top: el.scrollTop, left: el.scrollLeft });
     };
 

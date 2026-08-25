@@ -38,6 +38,7 @@ import { useFavorites } from "@/hooks/useFavorites";
 import type { CatalogGroupSnapshot, FavoriteGroupType } from "@/hooks/useFavorites";
 import { useAppPreferences } from "@/hooks/useAppPreferences";
 import { StoryThumbnail } from "@/components/StoryThumbnail";
+import { applyInstantScroll } from "@/lib/appShellLogic";
 import { AssetImage } from "@/components/AssetImage";
 import { CharacterAvatar } from "@/components/CharacterAvatar";
 import {
@@ -834,7 +835,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
       // 「本来就停在收藏分类、只是滚到了半截」的跳转。
       const apply = () => {
         const viewport = scrollRootRef.current;
-        if (viewport) viewport.scrollTop = 0;
+        if (viewport) applyInstantScroll(viewport, 0, 0);
         // pill 行同理：本来就停在收藏分类时 activeCategory 不变，按分类
         // 变化触发的 pill 归位 effect 不会重跑，而 pill 行可能还停在用户
         // 上次划到的最右端——选中的收藏 pill 整个在可视区外，跳过来后
@@ -956,7 +957,7 @@ export function StoryList({ onSelectStory }: StoryListProps) {
     if (scrollResetRef.current === scrollResetKey) return;
     scrollResetRef.current = scrollResetKey;
     const viewport = scrollRootRef.current;
-    if (viewport && viewport.scrollTop !== 0) viewport.scrollTop = 0;
+    if (viewport && viewport.scrollTop !== 0) applyInstantScroll(viewport, 0, 0);
   }, [scrollResetKey]);
 
   const isGroupOpen = useCallback(
@@ -1941,7 +1942,7 @@ function RevealMore({
             target?.focus();
           });
         }}
-        className="flex min-h-[44px] w-full items-center justify-center gap-2 rounded-2xl border border-dashed border-[hsl(var(--color-border))] px-3 text-xs text-[hsl(var(--color-muted-foreground))] transition-colors hover:border-[hsl(var(--color-primary)/0.5)] hover:text-[hsl(var(--color-foreground))] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-[hsl(var(--color-primary))]"
+        className="flex min-h-[44px] w-full items-center justify-center gap-2 rounded-2xl border border-dashed border-[hsl(var(--color-border))] px-3 text-xs text-[hsl(var(--color-muted-foreground))] transition-colors active:border-[hsl(var(--color-primary)/0.5)] active:text-[hsl(var(--color-foreground))] [@media(hover:hover)_and_(pointer:fine)]:hover:border-[hsl(var(--color-primary)/0.5)] [@media(hover:hover)_and_(pointer:fine)]:hover:text-[hsl(var(--color-foreground))] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-[hsl(var(--color-primary))]"
       >
         <ChevronsUpDown className="h-3.5 w-3.5" aria-hidden="true" />
         <span>
@@ -1967,7 +1968,7 @@ function BulkToggleButton({
       onClick={onToggle}
       aria-pressed={expanded}
       aria-label={label}
-      className="inline-flex min-h-[44px] flex-shrink-0 items-center gap-1.5 rounded-full border border-[hsl(var(--color-border))] px-3 py-1 text-xs text-[hsl(var(--color-muted-foreground))] transition-colors hover:bg-[hsl(var(--color-accent))] hover:text-[hsl(var(--color-foreground))]"
+      className="inline-flex min-h-[44px] flex-shrink-0 items-center gap-1.5 rounded-full border border-[hsl(var(--color-border))] px-3 py-1 text-xs text-[hsl(var(--color-muted-foreground))] transition-colors active:bg-[hsl(var(--color-accent))] [@media(hover:hover)_and_(pointer:fine)]:hover:bg-[hsl(var(--color-accent))] [@media(hover:hover)_and_(pointer:fine)]:hover:text-[hsl(var(--color-foreground))]"
     >
       <Icon className="h-3.5 w-3.5" aria-hidden="true" />
       <span className="whitespace-nowrap">{expanded ? "收起全部" : "展开全部"}</span>
@@ -2095,7 +2096,7 @@ function SummaryToggleButton({
       className={`inline-flex min-h-[44px] flex-shrink-0 items-center gap-1.5 rounded-full border px-3 py-1 text-xs transition-colors ${
         enabled
           ? "text-[hsl(var(--color-primary))] border-[hsl(var(--color-primary)/0.4)] bg-[hsl(var(--color-primary)/0.1)]"
-          : "text-[hsl(var(--color-muted-foreground))] border-[hsl(var(--color-border))] bg-transparent hover:bg-[hsl(var(--color-accent))] hover:text-[hsl(var(--color-foreground))]"
+          : "text-[hsl(var(--color-muted-foreground))] border-[hsl(var(--color-border))] bg-transparent active:bg-[hsl(var(--color-accent))] [@media(hover:hover)_and_(pointer:fine)]:hover:bg-[hsl(var(--color-accent))] [@media(hover:hover)_and_(pointer:fine)]:hover:text-[hsl(var(--color-foreground))]"
       }`}
     >
       <FileText className="h-3.5 w-3.5" />
@@ -2137,7 +2138,7 @@ function GroupFavoriteButton({
       className={`inline-flex min-h-[44px] items-center gap-2 rounded-full border px-3 py-1 text-xs transition-colors ${
         isFavorite
           ? "text-[hsl(var(--color-primary))] border-[hsl(var(--color-primary)/0.4)] bg-[hsl(var(--color-primary)/0.08)]"
-          : "text-[hsl(var(--color-muted-foreground))] border-[hsl(var(--color-border))] bg-transparent hover:bg-[hsl(var(--color-accent))] hover:text-[hsl(var(--color-foreground))]"
+          : "text-[hsl(var(--color-muted-foreground))] border-[hsl(var(--color-border))] bg-transparent active:bg-[hsl(var(--color-accent))] [@media(hover:hover)_and_(pointer:fine)]:hover:bg-[hsl(var(--color-accent))] [@media(hover:hover)_and_(pointer:fine)]:hover:text-[hsl(var(--color-foreground))]"
       }`}
     >
       <Star
@@ -2269,7 +2270,7 @@ const StoryItem = memo(function StoryItem({
          省下的主线程时间比什么都实在；`auto` 的固有尺寸会记住上一次的
          真实高度，所以滚动条不会来回跳。不支持的引擎直接忽略这两条。 */
       style={{ contentVisibility: "auto", containIntrinsicSize: "auto 88px" }}
-      className="story-card relative flex w-full gap-3 p-3 items-center text-left cursor-pointer overflow-hidden transition-all duration-200 ease-out hover:-translate-y-0.5 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[hsl(var(--color-primary))] motion-safe:animate-in motion-safe:fade-in-0"
+      className="story-card relative flex w-full gap-3 p-3 items-center text-left cursor-pointer overflow-hidden transition-all duration-200 ease-out [@media(hover:hover)_and_(pointer:fine)]:hover:-translate-y-0.5 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[hsl(var(--color-primary))] motion-safe:animate-in motion-safe:fade-in-0"
     >
       {/* 卡片底层模糊背景：密录用干员立绘，其他类别复用 StoryThumbnail
           的多级兜底链（插画 → 章节封面 → 活动 KV）。背景交给 CSS 做
@@ -2335,7 +2336,7 @@ const StoryItem = memo(function StoryItem({
               className={`inline-flex h-6 w-6 items-center justify-center rounded-full border transition-colors ${
                 isFavorite
                   ? "text-[hsl(var(--color-primary))] border-[hsl(var(--color-primary)/0.4)] bg-[hsl(var(--color-primary)/0.08)]"
-                  : "text-[hsl(var(--color-muted-foreground))] border-transparent hover:text-[hsl(var(--color-foreground))]"
+                  : "text-[hsl(var(--color-muted-foreground))] border-transparent [@media(hover:hover)_and_(pointer:fine)]:hover:text-[hsl(var(--color-foreground))]"
               }`}
             >
               <Star

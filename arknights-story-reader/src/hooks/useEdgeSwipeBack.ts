@@ -102,6 +102,26 @@ export interface TouchClickOutcome {
  * 拒绝过的触摸只吞掉同一落点附近的合成 click；800ms 内来自鼠标的远处点击
  * 必须放行，否则一次捏合会让用户紧接着点的按钮/翻页区看似失灵。
  */
+/** 点外部关菜单的 pointerdown 与随后合成的 click 间隔通常远小于 400ms。 */
+export const PAGED_TAP_MENU_CLOSE_GUARD_MS = 400;
+
+/**
+ * 分页模式里，关 ⋯ 菜单的那一次点击不能再当成翻页。
+ * pointerdown 先把菜单关掉，pageTapEnabled 立刻变 true，同一次手势的
+ * click 会落到左右 20% 热区上。
+ */
+export function shouldIgnorePagedTapAfterMenuClose(
+  closedAt: number,
+  now: number,
+  windowMs = PAGED_TAP_MENU_CLOSE_GUARD_MS
+): boolean {
+  if (!Number.isFinite(closedAt) || !Number.isFinite(now) || closedAt <= 0) {
+    return false;
+  }
+  const age = now - closedAt;
+  return age >= 0 && age < Math.max(0, windowMs);
+}
+
 export function shouldSuppressRejectedTouchClick(
   outcome: TouchClickOutcome | null,
   clientX: number,
