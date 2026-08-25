@@ -80,6 +80,20 @@ KEY_ALIAS="${ANDROID_KEY_ALIAS:-release}"
 KEYSTORE_PASSWORD="${ANDROID_KEYSTORE_PASSWORD:-}"
 KEY_PASSWORD="${ANDROID_KEY_PASSWORD:-$KEYSTORE_PASSWORD}"
 USING_RELEASE_KEYSTORE=false
+STRICT_RELEASE=false
+
+if [ "${RELEASE_STRICT:-0}" = "1" ] \
+  || { [ "${CI:-false}" = "true" ] && [ "${RELEASE_JOB:-false}" = "true" ]; }; then
+  STRICT_RELEASE=true
+fi
+
+handle_release_keystore_failure() {
+  local reason="$1"
+  if [ "$STRICT_RELEASE" = true ]; then
+    fail "$reason Debug keystore fallback is disabled for release builds."
+  fi
+  warn "$reason Falling back to debug keystore."
+}
 
 check_keystore_entry() {
   local keystore="$1"
@@ -106,13 +120,13 @@ if [ -f "$KEYSTORE_PATH" ] && [ -n "$KEYSTORE_PASSWORD" ] && [ -n "$KEY_PASSWORD
     info "Using release keystore: $KEYSTORE_PATH (alias $KEY_ALIAS)"
     USING_RELEASE_KEYSTORE=true
   else
-    warn "Release keystore '$KEYSTORE_PATH' alias '$KEY_ALIAS' is invalid, falling back to debug keystore."
+    handle_release_keystore_failure "Release keystore '$KEYSTORE_PATH' alias '$KEY_ALIAS' is invalid."
   fi
 else
   if [ ! -f "$KEYSTORE_PATH" ]; then
-    warn "Release keystore '$KEYSTORE_PATH' not found; falling back to debug keystore."
+    handle_release_keystore_failure "Release keystore '$KEYSTORE_PATH' not found."
   else
-    warn "Release keystore passwords not provided; falling back to debug keystore."
+    handle_release_keystore_failure "Release keystore passwords not provided."
   fi
 fi
 

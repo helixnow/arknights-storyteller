@@ -190,13 +190,13 @@ npm run tauri ios build
 
 几点值得记住：
 
-- Rust 版本不能往下调。`src-tauri/Cargo.lock` 没有入库，CI 每次重新解析依赖，依赖树里已经有使用 edition2024 的 crate，1.83 这类旧工具链会在解析阶段直接失败。
+- Rust 版本不能往下调。`src-tauri/Cargo.lock` 已入库，CI 使用 `--locked` 保证依赖解析可复现；锁定的依赖树里已有使用 edition2024 的 crate，1.83 这类旧工具链会在解析阶段直接失败。
 - `cargo test --lib` 虽然不开窗口，仍然要装 `libwebkit2gtk-4.1-dev` 等原生依赖：Linux 上 `tauri → wry → webkit2gtk-sys` 是普通依赖，编译 lib target 就会跑它的 pkg-config build script。
 - 只跑 `--lib`。`src-tauri/tests/search_recall.rs` 需要真实剧情数据，不适合放进 PR 门禁，请本地跑。
 
 ### 发布：`.github/workflows/release.yml`
 
-只在推送到 `release` 分支或手动触发时跑，且**只构建 Android**：bump 版本 → 构建签名的 universal APK → 上传到 Release → 生成并上传 `android-latest.json` → 搬运上一个 Release 的桌面 `latest.json`（若存在，见下节）→ 发布 Release。所需机密：`ANDROID_KEYSTORE_B64`、`ANDROID_KEYSTORE_PASSWORD`、`ANDROID_KEY_ALIAS`、`ANDROID_KEY_PASSWORD`。
+只在推送到 `release` 分支或手动触发时跑，且**只构建 Android**：校验仓库中五处版本号一致 → 构建签名的 universal APK → 上传到 Release → 生成并上传 `android-latest.json` → 搬运上一个 Release 的桌面 `latest.json`（若存在，见下节）→ 发布 Release。工作流不会自动 bump 或推送版本；发版前必须先提交未占用的新版本，并同步更新 `package.json`、`package-lock.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml` 与 `src-tauri/Cargo.lock`。所需机密：`ANDROID_KEYSTORE_B64`、`ANDROID_KEYSTORE_PASSWORD`、`ANDROID_KEY_ALIAS`、`ANDROID_KEY_PASSWORD`。正式发布启用严格签名模式，release keystore 缺失或无效时直接失败，不会回退到 debug keystore。
 
 注意仓库根目录的 `.github/workflows/release.yml` 才是实际生效的工作流。重组前留在 `arknights-story-reader/.github/workflows/` 的副本已删除，避免误导。
 
@@ -226,14 +226,14 @@ https://github.com/helixnow/arknights-storyteller/releases/latest/download/lates
 
    ```json
    {
-     "version": "1.10.52",
+     "version": "1.12.0",
      "notes": "",
      "pub_date": "2026-08-23T00:00:00Z",
      "platforms": {
-       "linux-x86_64":   { "signature": "<AppImage.sig 内容>",   "url": "https://github.com/helixnow/arknights-storyteller/releases/download/app-v1.10.52/arknights-story-reader_1.10.52_amd64.AppImage" },
-       "windows-x86_64": { "signature": "<setup.exe.sig 内容>",  "url": "https://github.com/helixnow/arknights-storyteller/releases/download/app-v1.10.52/arknights-story-reader_1.10.52_x64-setup.exe" },
-       "darwin-x86_64":  { "signature": "<app.tar.gz.sig 内容>", "url": "https://github.com/helixnow/arknights-storyteller/releases/download/app-v1.10.52/arknights-story-reader_x64.app.tar.gz" },
-       "darwin-aarch64": { "signature": "<app.tar.gz.sig 内容>", "url": "https://github.com/helixnow/arknights-storyteller/releases/download/app-v1.10.52/arknights-story-reader_aarch64.app.tar.gz" }
+       "linux-x86_64":   { "signature": "<AppImage.sig 内容>",   "url": "https://github.com/helixnow/arknights-storyteller/releases/download/app-v1.12.0/arknights-story-reader_1.12.0_amd64.AppImage" },
+       "windows-x86_64": { "signature": "<setup.exe.sig 内容>",  "url": "https://github.com/helixnow/arknights-storyteller/releases/download/app-v1.12.0/arknights-story-reader_1.12.0_x64-setup.exe" },
+       "darwin-x86_64":  { "signature": "<app.tar.gz.sig 内容>", "url": "https://github.com/helixnow/arknights-storyteller/releases/download/app-v1.12.0/arknights-story-reader_x64.app.tar.gz" },
+       "darwin-aarch64": { "signature": "<app.tar.gz.sig 内容>", "url": "https://github.com/helixnow/arknights-storyteller/releases/download/app-v1.12.0/arknights-story-reader_aarch64.app.tar.gz" }
      }
    }
    ```
