@@ -11,6 +11,26 @@ val tauriProperties = Properties().apply {
     if (propFile.exists()) {
         propFile.inputStream().use { load(it) }
     }
+    // CLI 2.8.x / tauri-build 2.6.x 可能不写 tauri.properties，回退成 1/1.0。
+    // 缺字段时从 tauri.conf.json 按 major*1_000_000+minor*1000+patch 补上。
+    if (getProperty("tauri.android.versionName").isNullOrBlank() ||
+        getProperty("tauri.android.versionCode").isNullOrBlank()
+    ) {
+        val conf = file("../../tauri.conf.json")
+        if (conf.exists()) {
+            val match = Regex(""""version"\s*:\s*"(\d+)\.(\d+)\.(\d+)"""").find(conf.readText())
+            if (match != null) {
+                val (major, minor, patch) = match.destructured
+                if (getProperty("tauri.android.versionName").isNullOrBlank()) {
+                    setProperty("tauri.android.versionName", "$major.$minor.$patch")
+                }
+                if (getProperty("tauri.android.versionCode").isNullOrBlank()) {
+                    val code = major.toInt() * 1_000_000 + minor.toInt() * 1_000 + patch.toInt()
+                    setProperty("tauri.android.versionCode", code.toString())
+                }
+            }
+        }
+    }
 }
 
 android {

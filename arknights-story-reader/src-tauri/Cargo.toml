@@ -1,6 +1,6 @@
 [package]
 name = "story-teller"
-version = "2.0.0"
+version = "2.0.1"
 description = "Story Teller - A beautiful story reader app"
 authors = ["you"]
 edition = "2021"

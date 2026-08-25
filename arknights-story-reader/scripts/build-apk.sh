@@ -58,6 +58,21 @@ fi
 info "Building web assets..."
 npm run build
 
+# CLI 2.8.4 + tauri-build 2.6.3 都不会写 tauri.properties，Gradle 会回退成
+# versionCode=1 / versionName=1.0。构建前按清单算出正式 versionCode。
+APP_VERSION="$(node -p "require('./package.json').version")"
+if [[ ! "$APP_VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+  fail "Invalid package.json version: $APP_VERSION"
+fi
+VERSION_CODE=$(( ${BASH_REMATCH[1]} * 1000000 + ${BASH_REMATCH[2]} * 1000 + ${BASH_REMATCH[3]} ))
+TAURI_PROPS="src-tauri/gen/android/app/tauri.properties"
+mkdir -p "$(dirname "$TAURI_PROPS")"
+cat > "$TAURI_PROPS" <<EOF
+tauri.android.versionName=$APP_VERSION
+tauri.android.versionCode=$VERSION_CODE
+EOF
+info "Wrote $TAURI_PROPS ($APP_VERSION / $VERSION_CODE)"
+
 info "Building Android APK via Tauri (release profile)..."
 
 # Clean up stale tauri plugin cache directories to avoid "File exists" conflicts
