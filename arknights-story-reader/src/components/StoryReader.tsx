@@ -1,9 +1,11 @@
 import {
+  createContext,
   type CSSProperties,
   type MouseEvent as ReactMouseEvent,
   type TouchEvent as ReactTouchEvent,
   memo,
   useCallback,
+  useContext,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -110,6 +112,13 @@ type SegmentRenderer = (
   isLast: boolean,
   state: SegmentRowState
 ) => React.ReactNode;
+
+/**
+ * 只让真正需要全局健康度订阅的失败插画跟随阅读器前后台状态。若把 `active`
+ * 塞进 renderSegment 依赖，KeepAlive 每次显隐都会让上千个段落因 renderer
+ * 换身份而重画；context 只唤醒少量 ReaderImageSegment 消费者。
+ */
+const ReaderActivityContext = createContext(true);
 
 const BASE_MAX_WIDTH = 768; // px
 const TARGET_CHARS_PER_PAGE = 900; // approximate characters we aim to fit per page
@@ -1745,6 +1754,17 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
     !shareDialogOpen &&
     !moreMenuOpen;
 
+  // 手指按下后可能立刻点返回、开抽屉或切阅读模式，此时 touchend 不一定还会
+  // 派发给已被 KeepAlive 设为 inert 的正文。若把旧触点留在 ref，重新激活后
+  // 下一次 touchstart 会被误认成「同一手势的第二根手指」，分页点击失灵；
+  // 更糟时还会拿旧坐标生成一份拒绝记录，吞掉新点击。布局阶段同步清空，确保
+  // 页面一旦不可翻就不携带任何跨会话触摸状态。
+  useLayoutEffect(() => {
+    if (pageTapEnabled) return;
+    pageTouchRef.current = null;
+    lastTouchOutcomeRef.current = null;
+  }, [pageTapEnabled]);
+
   // 「上一话 / 下一话」栏在底部时是最下面的一层，安全区内边距只由它来吃；
   // 否则进度条 / 分页页脚会再叠一份，底部凭空多出一条空白。
   const showNeighborBar =
@@ -2710,6 +2730,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   if (loading) {
     return (
       <div
+        ref={readerRootRef}
         className="h-full flex flex-col overflow-hidden reader-surface"
         data-reader-theme={settings.theme}
         aria-busy="true"
@@ -2748,6 +2769,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   if (error) {
     return (
       <ReaderStatusScreen
+        rootRef={readerRootRef}
         theme={settings.theme}
         storyName={storyName}
         onBack={onBack}
@@ -2764,6 +2786,7 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   if (!content || processedSegments.length === 0) {
     return (
       <ReaderStatusScreen
+        rootRef={readerRootRef}
         theme={settings.theme}
         storyName={storyName}
         onBack={onBack}
@@ -2982,15 +3005,17 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
                   </div>
                 </div>
               )}
-              <ReaderSegmentList
-                segments={renderableSegments}
-                render={renderSegment}
-                isHighlighted={isHighlighted}
-                selectedSet={selectedSegmentSet}
-                searchIndex={highlightSegmentIndex}
-                searchPulseActive={searchPulseToken > 0}
-                activeCharacter={activeCharacter}
-              />
+              <ReaderActivityContext.Provider value={active}>
+                <ReaderSegmentList
+                  segments={renderableSegments}
+                  render={renderSegment}
+                  isHighlighted={isHighlighted}
+                  selectedSet={selectedSegmentSet}
+                  searchIndex={highlightSegmentIndex}
+                  searchPulseActive={searchPulseToken > 0}
+                  activeCharacter={activeCharacter}
+                />
+              </ReaderActivityContext.Provider>
             </div>
           </div>
         </CustomScrollArea>
@@ -3294,6 +3319,7 @@ const ReaderScrollProgress = memo(function ReaderScrollProgress({
 });
 
 interface ReaderStatusScreenProps {
+  rootRef: React.RefObject<HTMLDivElement | null>;
   theme: string;
   storyName: string;
   onBack: () => void;
@@ -3312,6 +3338,7 @@ interface ReaderStatusScreenProps {
  * 整个塌一次；返回入口也始终在同一个位置，不必靠正中间那颗按钮找路。
  */
 function ReaderStatusScreen({
+  rootRef,
   theme,
   storyName,
   onBack,
@@ -3324,6 +3351,7 @@ function ReaderStatusScreen({
 }: ReaderStatusScreenProps) {
   return (
     <div
+      ref={rootRef}
       className="h-full flex flex-col overflow-hidden reader-surface"
       data-reader-theme={theme}
     >
@@ -3526,14 +3554,16 @@ function ReaderImageSegment({
   selectionClass,
 }: ReaderImageSegmentProps) {
   const [failed, setFailed] = useState(false);
+  const readerActive = useContext(ReaderActivityContext);
   // exhausted 不一定是「素材真没了」：断网/源被墙时，一段插画只有 3 条
   // 候选，会在主机熔断阈值（8 次）攒够之前就逐条 onerror，AssetImage 只能
   // 上报 exhausted。此时若把段落永久删掉，等网络恢复（markAssetUrlAlive
   // 撤销那批不可靠的失败记录）插画也回不来了——AssetImage 已被卸载，谁都
-  // 收不到健康事件。所以隐藏期间订阅健康度：事件到来（源首次被证明可达 /
-  // 熔断窗口到期）时撤销 failed、重挂 AssetImage 再试一次；真正 404 的
-  // 段落会立刻再次 exhausted，照旧隐藏。
-  const healthNonce = useAssetHealthNonce(failed);
+  // 收不到健康事件。所以插画因失败隐藏、且阅读器仍在前台时订阅健康度：
+  // 事件到来（源首次被证明可达 / 熔断窗口到期）时撤销 failed、重挂
+  // AssetImage 再试一次；真正 404 的段落会立刻再次 exhausted，照旧隐藏。
+  // KeepAlive 退到后台时暂停订阅，重新激活会从外部 store 的最新快照对账。
+  const healthNonce = useAssetHealthNonce(failed && readerActive);
   const seenHealthNonceRef = useRef(healthNonce);
   if (seenHealthNonceRef.current !== healthNonce) {
     seenHealthNonceRef.current = healthNonce;

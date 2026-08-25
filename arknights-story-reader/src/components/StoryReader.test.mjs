@@ -159,6 +159,34 @@ test("KeepAlive 隐藏：退出选段模式但不清空已选段落", async () =
   assert.doesNotMatch(effect, /setSelectedSegments/);
 });
 
+test("KeepAlive 隐藏：同步清掉未结束的分页触摸，恢复后不沿用旧手势", async () => {
+  const source = await readFile(new URL("./StoryReader.tsx", import.meta.url), "utf8");
+  const start = source.indexOf("if (pageTapEnabled) return;");
+  const end = source.indexOf("}, [pageTapEnabled]);", start);
+  const effect = source.slice(start, end);
+  assert.notEqual(start, -1);
+  assert.match(effect, /pageTouchRef\.current = null/);
+  assert.match(effect, /lastTouchOutcomeRef\.current = null/);
+});
+
+test("KeepAlive 隐藏：失败插画暂停健康度订阅，仅在前台重试", async () => {
+  const source = await readFile(new URL("./StoryReader.tsx", import.meta.url), "utf8");
+  assert.match(source, /<ReaderActivityContext\.Provider value=\{active\}>/);
+  assert.match(source, /useAssetHealthNonce\(failed && readerActive\)/);
+});
+
+test("边缘返回：加载、错误和空内容状态同样挂载手势目标", async () => {
+  const source = await readFile(new URL("./StoryReader.tsx", import.meta.url), "utf8");
+  const loadingStart = source.indexOf("if (loading) {");
+  const errorStart = source.indexOf("if (error) {", loadingStart);
+  assert.match(source.slice(loadingStart, errorStart), /ref=\{readerRootRef\}/);
+  assert.equal(
+    source.match(/<ReaderStatusScreen\s+rootRef=\{readerRootRef\}/g)?.length,
+    2
+  );
+  assert.match(source, /function ReaderStatusScreen[\s\S]*?<div\s+ref=\{rootRef\}/);
+});
+
 test("正文后处理：清理空白并合并连续同角色台词", () => {
   const result = postProcessSegments([
     { type: "dialogue", characterName: "阿米娅", text: "  第一行 \r\n\n 第二行 " },
