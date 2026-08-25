@@ -304,6 +304,27 @@ export function calculateBottomNavInset(offsetHeight: number, computedBottom: nu
   return Math.ceil(Math.max(0, height + bottom));
 }
 
+/**
+ * iOS / WKWebView 软键盘只压缩 visualViewport，不改 layout viewport。
+ * toast 是 `position: fixed`，必须按 visualViewport 与 innerHeight 的差值
+ * 再抬一次，否则会整块留在键盘后面。
+ */
+export function calculateKeyboardInset(
+  innerHeight: number,
+  visualHeight: number,
+  visualOffsetTop: number
+): number {
+  const inner = Number.isFinite(innerHeight) && innerHeight > 0 ? innerHeight : 0;
+  const height = Number.isFinite(visualHeight) && visualHeight > 0 ? visualHeight : inner;
+  const offsetTop = Number.isFinite(visualOffsetTop) ? Math.max(0, visualOffsetTop) : 0;
+  return Math.max(0, Math.ceil(inner - height - offsetTop));
+}
+
+/** 有呈现中的 `aria-modal` 时 toast 降到模态之下、底栏之上，避免挡住按钮。 */
+export function toastViewportZIndex(hasPresentedModal: boolean): number {
+  return hasPresentedModal ? 45 : 100;
+}
+
 /** Hidden readers retain warm state for the same five-minute window as prefetch data. */
 export const READER_RETENTION_MS = 5 * 60 * 1000;
 
@@ -511,6 +532,12 @@ export function reduceHistoryGuard(
               state: { phase: "idle", rearmAfterNavigation: false },
               effects: [],
             };
+      }
+      if (state.phase === "idle" && event.hasHandlers) {
+        return {
+          state: { phase: "idle", rearmAfterNavigation: false },
+          effects: ["dispatch-back"],
+        };
       }
       return { state, effects: [] };
     }

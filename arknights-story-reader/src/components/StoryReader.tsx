@@ -621,6 +621,14 @@ export function StoryReader({ storyId, storyPath, storyName, active = true, onBa
   const lastTouchOutcomeRef = useRef<TouchClickOutcome | null>(null);
   const pageMenuCloseAtRef = useRef(0);
 
+  useEffect(() => {
+    const onOverlayClosed = () => {
+      pageMenuCloseAtRef.current = Date.now();
+    };
+    window.addEventListener("app:overlay-closed", onOverlayClosed);
+    return () => window.removeEventListener("app:overlay-closed", onOverlayClosed);
+  }, []);
+
   // 抽屉 / 选段工具栏是否占据了界面。滚动监听里用 ref 读取，避免因为这些
   // 状态变化而反复重建 scroll listener。
   const overlayOpenRef = useRef(false);

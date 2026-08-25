@@ -457,7 +457,7 @@ export function HomePanel({ onSelectStory, onGoToTab, onGoToFavorites }: HomePan
           viewportClassName="reader-scroll"
           trackOffsetBottom="calc(5rem + env(safe-area-inset-bottom, 0px))"
         >
-          <div className="pl-[max(1.25rem,env(safe-area-inset-left,0px))] pr-[max(1.25rem,env(safe-area-inset-right,0px))] pb-[calc(8rem+var(--bottom-nav-inset))] space-y-6">
+          <div className="pl-[max(1.25rem,env(safe-area-inset-left,0px))] pr-[max(1.25rem,env(safe-area-inset-right,0px))] pb-[calc(8rem+var(--bottom-nav-inset,0px))] space-y-6">
             {showSkeleton && <HomeSkeleton />}
 
             {/* 读取失败：明确说是「读不出来」而不是「没同步」，并且第一动作

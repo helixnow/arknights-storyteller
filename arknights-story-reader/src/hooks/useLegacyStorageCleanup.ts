@@ -62,6 +62,16 @@ const CLEANUP_STEPS: CleanupStep[] = [
       "arknights-story-search-cache-v1",
     ],
   },
+  {
+    version: 5,
+    keys: [
+      // 2026-08：INDEX_VERSION 9→10 后缓存键带上 index 后缀
+      // （…-v5-index10 / …-v4-index10）。换代时漏删了无后缀的上一代死键，
+      // 每条最多压 40 页结果，继续占配额。
+      "arknights-story-search-cache-v4",
+      "arknights-story-segment-cache-v3",
+    ],
+  },
 ];
 
 const CLEANUP_VERSION = CLEANUP_STEPS[CLEANUP_STEPS.length - 1]?.version ?? 0;

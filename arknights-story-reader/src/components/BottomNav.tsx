@@ -72,9 +72,10 @@ export function BottomNav({ activeTab, onTabChange }: BottomNavProps) {
     sync();
 
     // 导航自身高度变化（字号、换行）用 ResizeObserver；视口高度变化时导航
-    // 尺寸没变、但它离底边的距离变了，得靠 resize/旋转事件兜住。软键盘在
-    // iOS/WKWebView 上有时只改变 visualViewport，不派发 window.resize；
-    // resize + scroll 都监听，键盘展开时导航被视觉视口平移也能及时重算。
+    // 尺寸没变、但它离底边的距离变了，得靠 resize/旋转事件兜住。
+    // visualViewport 的 resize/scroll 在部分 Android 上会跟着旋转一起到；
+    // 软键盘本身不改 offsetHeight / computed bottom，inset 不会被键盘抬起
+    // ——toast 的避让走 `--keyboard-inset`，不依赖这里。
     const observer =
       typeof ResizeObserver === "undefined" ? null : new ResizeObserver(scheduleSync);
     observer?.observe(nav);
@@ -178,7 +179,7 @@ export function BottomNav({ activeTab, onTabChange }: BottomNavProps) {
               )}
             >
               <Icon className="h-5 w-5" strokeWidth={active ? 2.4 : 2} />
-              <span className="text-[11px] leading-tight">{label}</span>
+              <span className="text-[0.6875rem] leading-tight">{label}</span>
               <span
                 aria-hidden="true"
                 className={cn(

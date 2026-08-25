@@ -21,6 +21,9 @@ export const MAX_HIGHLIGHT_TERMS = 12;
  * 必须与 Rust `data_service.rs::INDEX_VERSION` 同步。搜索缓存的 namespace
  * 会带上这个版本：索引语料/解析语义升级但数据 commit 不变时，旧结果也
  * 必须失效，不能继续以当前 commit 的名义命中。
+ * bump 时必须同步在 useLegacyStorageCleanup 加清理步骤，旧键为
+ * `arknights-story-search-cache-v5-index<旧值>` 与
+ * `arknights-story-segment-cache-v4-index<旧值>`。
  */
 export const SEARCH_INDEX_VERSION = 10;
 
@@ -85,6 +88,35 @@ export function isSearchIndexTrusted(
  * 零命中播报必须和可见空态共用同一套三分法。尤其 `status == null` 只表示
  * 状态尚未确认，不能借 `!indexReady` 把它说成“索引还没建好”。
  */
+export function shouldShowSearchHistory(input: {
+  keyboardOpen: boolean;
+  searched: boolean;
+  query: string;
+  historyCount: number;
+}): boolean {
+  if (input.historyCount <= 0) return false;
+  if (!input.keyboardOpen) return true;
+  return !input.searched && trimSearchQuery(input.query).length === 0;
+}
+
+export function searchHitAnnouncement(input: {
+  query: string;
+  mode: "story" | "segment";
+  visibleCount: number;
+  totalMatched: number;
+  truncated: boolean;
+  facet?: string | null;
+}): string {
+  const scope = input.query ? `「${input.query}」` : "";
+  const unit = input.mode === "segment" ? "段" : "条";
+  const facetScope =
+    input.mode === "story" && input.facet ? `，当前“${input.facet}”分类` : "";
+  if (input.truncated && input.totalMatched > input.visibleCount) {
+    return `${scope}共 ${input.totalMatched} ${unit}命中${facetScope}，已显示前 ${input.visibleCount} ${unit}，可用上下方向键浏览，回车打开`;
+  }
+  return `${scope}找到 ${input.visibleCount} ${unit}结果${facetScope}，可用上下方向键浏览，回车打开`;
+}
+
 export function searchEmptyAnnouncement(
   status: { ready: boolean } | null,
   buildingIndex: boolean
@@ -123,9 +155,27 @@ export function isAutoSearchable(raw: string): boolean {
   for (const term of parseQueryTerms(query)) {
     if (term.isNot) continue;
     positiveAtoms += atomLengthOf(term.text);
-    if (positiveAtoms >= AUTO_SEARCH_MIN_LEN) return true;
   }
-  return false;
+  if (positiveAtoms < AUTO_SEARCH_MIN_LEN) return false;
+  // OR 是并集：`凯 or 希` 两边都是单原子，命中面比被拦下的 `凯` 还大，
+  // 不能因为加总够 2 就自动发。每一侧都要独立达到门槛。
+  return orSidesMeetAutoThreshold(query);
+}
+
+function orSidesMeetAutoThreshold(query: string): boolean {
+  if (!/(?:^|[ \t\n\r\u0085\u00a0\u3000])or(?:$|[ \t\n\r\u0085\u00a0\u3000])/i.test(query)) {
+    return true;
+  }
+  const sides = query.split(/(?:^|[ \t\n\r\u0085\u00a0\u3000])or(?:$|[ \t\n\r\u0085\u00a0\u3000])/i);
+  if (sides.length < 2) return true;
+  return sides.every((side) => {
+    let atoms = 0;
+    for (const term of parseQueryTerms(side)) {
+      if (term.isNot) continue;
+      atoms += atomLengthOf(term.text);
+    }
+    return atoms >= AUTO_SEARCH_MIN_LEN;
+  });
 }
 
 /**
@@ -259,7 +309,7 @@ const EDGE_TRIM_RE = /^[\p{P}\p{S}\p{Z}\p{C}]+|[\p{P}\p{S}\p{Z}\p{C}]+$/gu;
  *     排除词。段落模式的排除只看段落文本，剧情标题里仍可能出现该词——
  *     不跳过的话，用户明确排除的词会在标题里被标成"命中"；
  *   - `"短语"` 去掉引号整体高亮，引号粘在词后也按后端规则切开；
- *   - 纯中文长词后端按二元组匹配，顺带把单字也标出来，让用户看得出命中原因。
+ *   - 纯中文长词后端按单字 AND 匹配，顺带把单字也标出来，让用户看得出命中原因。
  */
 export function highlightTerms(query: string): string[] {
   const trimmed = normalizeQuery(query);
@@ -273,9 +323,15 @@ export function highlightTerms(query: string): string[] {
     // 它们虽然不是索引原子，但仍是用户想找的字面内容的一部分。
     const stripped = parsed.text.replace(EDGE_TRIM_RE, "");
     if (!stripped || !ATOM_CHAR_RE.test(stripped)) continue;
-    terms.push(stripped);
-    if (stripped.length >= 4 && /^[\u4e00-\u9fff\u3400-\u4dbf]+$/.test(stripped)) {
-      terms.push(...stripped.split(""));
+    // 后端 sanitize 把这些 FTS 特殊字符当空格切原子；词内 `凯*希` 若整串
+    // 高亮，原文对不上，结果页会零高亮。
+    const pieces = stripped.split(/[*:\\^()+]+/g).filter((piece) => piece.length > 0);
+    for (const piece of pieces.length > 0 ? pieces : [stripped]) {
+      if (!ATOM_CHAR_RE.test(piece)) continue;
+      terms.push(piece);
+      if (piece.length >= 4 && /^[\u4e00-\u9fff\u3400-\u4dbf]+$/.test(piece)) {
+        terms.push(...piece.split(""));
+      }
     }
   }
   // 长词优先，保证「凯尔希」整体先于单字命中；去重后限量，避免超长正则。

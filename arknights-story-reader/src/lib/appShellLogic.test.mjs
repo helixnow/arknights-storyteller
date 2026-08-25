@@ -13,6 +13,8 @@ import {
   DEFAULT_APP_PREFS,
   INITIAL_HISTORY_GUARD_STATE,
   calculateBottomNavInset,
+  calculateKeyboardInset,
+  toastViewportZIndex,
   cleanupVersionFrom,
   collectOverflowScrollSnapshots,
   enqueueToast,
@@ -346,6 +348,22 @@ test("calculateBottomNavInset：异常负总量钳到 0", () => {
   assert.equal(calculateBottomNavInset(4, -8), 0);
 });
 
+test("calculateKeyboardInset：按 visualViewport 与 innerHeight 的差值抬升", () => {
+  assert.equal(calculateKeyboardInset(800, 500, 0), 300);
+  assert.equal(calculateKeyboardInset(800, 500, 40), 260);
+});
+
+test("calculateKeyboardInset：无效或缺失的 visualViewport 回落到 0", () => {
+  assert.equal(calculateKeyboardInset(800, Number.NaN, 0), 0);
+  assert.equal(calculateKeyboardInset(Number.NaN, 500, 0), 0);
+  assert.equal(calculateKeyboardInset(800, 900, 0), 0);
+});
+
+test("toastViewportZIndex：有呈现中的模态时降到 45", () => {
+  assert.equal(toastViewportZIndex(false), 100);
+  assert.equal(toastViewportZIndex(true), 45);
+});
+
 // ─────────────────────────────────────────────────────────────
 // Browser history sentinel state machine
 // ─────────────────────────────────────────────────────────────
@@ -496,6 +514,15 @@ test("history guard：阅读器→非首页 tab 的 effect 交接保持单层哨
   state = transition(state, { type: "popstate", hasHandlers: true }, ["push-guard"]);
   assert.equal(state.phase, "armed");
   assert.equal(state.rearmAfterNavigation, false);
+});
+
+test("history guard：idle 阶段仍有处理器时 popstate 要派发返回", () => {
+  const next = reduceHistoryGuard(
+    { ...INITIAL_HISTORY_GUARD_STATE },
+    { type: "popstate", hasHandlers: true }
+  );
+  assert.deepEqual(next.effects, ["dispatch-back"]);
+  assert.equal(next.state.phase, "idle");
 });
 
 test("history guard：非首页 tab→首页 完成后没有退出哨兵", () => {

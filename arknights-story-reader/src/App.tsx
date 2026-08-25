@@ -69,6 +69,7 @@ function App() {
   // 用 ref 而不是把 `readerVisible` 写进 useCallback 依赖：那样每次开合阅读器
   // 都会换掉 `handleGoToTab` 的引用，连带把 memo 过的首页视图重算一遍。
   const readerVisibleRef = useRef(readerVisible);
+  const readerFocusRestoreRef = useRef<HTMLElement | null>(null);
   const readerEvictionTimerRef = useRef<number | null>(null);
   useEffect(() => {
     readerVisibleRef.current = readerVisible;
@@ -114,8 +115,23 @@ function App() {
     return true;
   }, [scheduleReaderEviction]);
 
+  useEffect(() => {
+    if (readerVisible) return;
+    const previous = readerFocusRestoreRef.current;
+    readerFocusRestoreRef.current = null;
+    if (!previous) return;
+    if (previous.isConnected) {
+      previous.focus({ preventScroll: true });
+      return;
+    }
+    document.getElementById(tabButtonId(activeTabRef.current))?.focus({ preventScroll: true });
+  }, [readerVisible]);
+
   /** 打开阅读器的唯一入口：意图之间互斥，没带的一律清空。 */
   const openReader = useCallback((story: StoryEntry, intent: ReaderIntent = {}) => {
+    const active = document.activeElement;
+    readerFocusRestoreRef.current =
+      active instanceof HTMLElement && active !== document.body ? active : null;
     cancelReaderEviction();
     setReaderStory(story);
     setReaderFocus(intent.focus ?? null);

@@ -10,7 +10,7 @@ import {
 } from "react";
 import { cn } from "@/lib/utils";
 import { CheckCircle2, Info, X, XCircle, AlertTriangle } from "lucide-react";
-import { enqueueToast } from "@/lib/appShellLogic";
+import { calculateKeyboardInset, enqueueToast, toastViewportZIndex } from "@/lib/appShellLogic";
 
 export type ToastKind = "default" | "success" | "warning" | "error";
 
@@ -68,9 +68,56 @@ const ICON_CLASSES: Record<ToastKind, string> = {
   error: "text-[hsl(var(--color-status-error))]",
 };
 
+const KEYBOARD_INSET_VAR = "--keyboard-inset";
+const TOAST_Z_VAR = "--toast-z";
+
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [toasts, setToasts] = useState<ToastPayload[]>([]);
   const nextId = useRef(1);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    const syncKeyboard = () => {
+      const viewport = window.visualViewport;
+      const inset = viewport
+        ? calculateKeyboardInset(window.innerHeight, viewport.height, viewport.offsetTop)
+        : 0;
+      root.style.setProperty(KEYBOARD_INSET_VAR, `${inset}px`);
+    };
+    syncKeyboard();
+    window.visualViewport?.addEventListener("resize", syncKeyboard);
+    window.visualViewport?.addEventListener("scroll", syncKeyboard);
+    window.addEventListener("resize", syncKeyboard);
+    return () => {
+      window.visualViewport?.removeEventListener("resize", syncKeyboard);
+      window.visualViewport?.removeEventListener("scroll", syncKeyboard);
+      window.removeEventListener("resize", syncKeyboard);
+      root.style.removeProperty(KEYBOARD_INSET_VAR);
+    };
+  }, []);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    const syncModal = () => {
+      const hasModal = Boolean(document.querySelector('[aria-modal="true"]'));
+      root.style.setProperty(TOAST_Z_VAR, String(toastViewportZIndex(hasModal)));
+    };
+    syncModal();
+    const observer =
+      typeof MutationObserver === "undefined"
+        ? null
+        : new MutationObserver(syncModal);
+    observer?.observe(document.body, {
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["aria-modal"],
+      childList: true,
+    });
+    return () => {
+      observer?.disconnect();
+      root.style.removeProperty(TOAST_Z_VAR);
+    };
+  }, []);
 
   const remove = useCallback((id: number) => {
     setToasts((prev) => prev.filter((t) => t.id !== id));
@@ -108,9 +155,9 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   return (
     <ToastContext.Provider value={value}>
       {children}
-      {/* 抬升高度由 `.toast-viewport` 读 BottomNav 发布的 --bottom-nav-inset
-          决定：底栏在就贴着它上沿，阅读器全屏时自动落回只避开 home indicator
-          的安全间距，不需要在这里测量布局。 */}
+      {/* 抬升高度由 `.toast-viewport` 读 --bottom-nav-inset 与 --keyboard-inset
+          决定：底栏在就贴着它上沿，键盘展开再抬一次，阅读器全屏时自动落回
+          只避开 home indicator 的安全间距。有 aria-modal 时 --toast-z 降到 45。 */}
       <div className="toast-viewport">
         {toasts.slice(0, MAX_VISIBLE).map((t) => (
           <ToastItem key={t.id} toast={t} onDismiss={remove} />

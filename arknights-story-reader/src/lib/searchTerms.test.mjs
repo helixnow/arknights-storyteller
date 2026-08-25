@@ -22,6 +22,8 @@ import {
   MAX_HIGHLIGHT_TERMS,
   SEARCH_INDEX_VERSION,
   searchEmptyAnnouncement,
+  searchHitAnnouncement,
+  shouldShowSearchHistory,
   stableVersionOf,
   trimSearchQuery,
 } from "./searchTerms.ts";
@@ -286,7 +288,7 @@ test("highlightTerms：长词排在前面，保证整词先于单字命中", () 
   assert.deepEqual(highlightTerms("博士 凯尔希"), ["凯尔希", "博士"]);
 });
 
-test("highlightTerms：4 字以上纯中文词补出单字（二元组匹配的可见化）", () => {
+test("highlightTerms：4 字以上纯中文词补出单字（单字 AND 的可见化）", () => {
   assert.deepEqual(highlightTerms("罗德岛制药"), [
     "罗德岛制药",
     "罗",
@@ -411,6 +413,35 @@ test("isAutoSearchable：少于两个字符返回 false，普通查询返回 tru
   assert.equal(isAutoSearchable("凯"), false);
   assert.equal(isAutoSearchable("博士"), true);
   assert.equal(isAutoSearchable("凯尔希 OR 博士"), true);
+  assert.equal(isAutoSearchable("凯 or 希"), false);
+});
+
+test("shouldShowSearchHistory：空态键盘打开仍显示历史", () => {
+  assert.equal(
+    shouldShowSearchHistory({ keyboardOpen: true, searched: false, query: "", historyCount: 2 }),
+    true
+  );
+  assert.equal(
+    shouldShowSearchHistory({ keyboardOpen: true, searched: true, query: "博士", historyCount: 2 }),
+    false
+  );
+  assert.equal(
+    shouldShowSearchHistory({ keyboardOpen: false, searched: true, query: "博士", historyCount: 2 }),
+    true
+  );
+});
+
+test("searchHitAnnouncement：截断页报总数而不是只报已显示条数", () => {
+  assert.match(
+    searchHitAnnouncement({
+      query: "博士",
+      mode: "segment",
+      visibleCount: 200,
+      totalMatched: 3000,
+      truncated: true,
+    }),
+    /共 3000 段命中.*已显示前 200/
+  );
 });
 
 test("isAutoSearchable：门槛按索引原子数量，标点撑不起长度", () => {
@@ -437,6 +468,7 @@ test("查询解析：NOT、减号、空词与引号粘连组合保持正向极�
 });
 
 test("查询解析：ASCII 前缀星号只作语法边缘，不进入高亮", () => {
+  assert.deepEqual(highlightTerms("凯*希"), ["凯", "希"]);
   assert.deepEqual(highlightTerms("doctor*"), ["doctor"]);
   assert.deepEqual(highlightTerms("-doctor* medic*"), ["medic"]);
   assert.equal(isAutoSearchable("doctor*"), true);

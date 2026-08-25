@@ -306,7 +306,9 @@ export function SheetShell({
         )}
       >
         {/* 整个 flex 内容区先避开 home indicator：有 footer 时安全区落在
-            footer 外侧；没有 footer 时滚动区本身也不会沉到手势条下面。 */}
+            footer 外侧；没有 footer 时滚动区本身也不会沉到手势条下面。
+            横屏刘海在右侧时还要避开 safe-area-inset-right，否则关闭按钮和
+            footer 右侧会被圆角/刘海裁掉（与 SheetHeader 顶部安全区同一套）。 */}
         <div
           ref={panelRef}
           data-state={state}
@@ -316,7 +318,10 @@ export function SheetShell({
           inert={state === "closed"}
           aria-label={ariaLabel}
           tabIndex={-1}
-          style={{ paddingBottom: "env(safe-area-inset-bottom, 0px)" }}
+          style={{
+            paddingBottom: "env(safe-area-inset-bottom, 0px)",
+            paddingRight: "env(safe-area-inset-right, 0px)",
+          }}
           className={cn(
             // 同 scrim：退场中的面板不再接收输入，避免用户点中一个正在
             // 滑出、状态即将被卸载的控件。
