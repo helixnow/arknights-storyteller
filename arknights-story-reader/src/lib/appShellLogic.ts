@@ -206,6 +206,64 @@ export function enqueueToast<T extends ToastQueueItem>(
   return [...queue.slice(0, evict), ...queue.slice(evict + 1), payload];
 }
 
+/**
+ * KeepAlive 隐藏策略：后台面板与前台叠在同一视口盒上。
+ * 只用 visibility:hidden 挡不住绘制——子树里的 content-visibility:auto
+ * 仍按「在视口内」继续布局/合成，切换 tab 后几页会叠在一起抢渲染。
+ * 后台必须跳过整棵子树的内容绘制。
+ */
+export function keepAliveContentVisibility(
+  active: boolean
+): "visible" | "hidden" {
+  return active ? "visible" : "hidden";
+}
+
+export interface OverflowScroller {
+  scrollTop: number;
+  scrollLeft: number;
+  scrollHeight: number;
+  scrollWidth: number;
+  clientHeight: number;
+  clientWidth: number;
+}
+
+export interface OverflowScrollSnapshot<T extends OverflowScroller = OverflowScroller> {
+  el: T;
+  top: number;
+  left: number;
+}
+
+export function hasPreservableOverflow(el: OverflowScroller): boolean {
+  return (
+    el.scrollTop !== 0 ||
+    el.scrollLeft !== 0 ||
+    el.scrollHeight > el.clientHeight ||
+    el.scrollWidth > el.clientWidth
+  );
+}
+
+export function collectOverflowScrollSnapshots<T extends OverflowScroller>(
+  elements: Iterable<T>
+): Array<OverflowScrollSnapshot<T>> {
+  const snapshots: Array<OverflowScrollSnapshot<T>> = [];
+  for (const el of elements) {
+    if (!hasPreservableOverflow(el)) continue;
+    snapshots.push({ el, top: el.scrollTop, left: el.scrollLeft });
+  }
+  return snapshots;
+}
+
+export function restoreOverflowScrollSnapshots<T extends OverflowScroller>(
+  snapshots: ReadonlyArray<OverflowScrollSnapshot<T>>,
+  isConnected: (el: T) => boolean = () => true
+): void {
+  for (const { el, top, left } of snapshots) {
+    if (!isConnected(el)) continue;
+    el.scrollTop = top;
+    el.scrollLeft = left;
+  }
+}
+
 /** Layout-only bottom inset; transformed entrance rectangles never participate. */
 export function calculateBottomNavInset(offsetHeight: number, computedBottom: number): number {
   const height = Number.isFinite(offsetHeight) ? offsetHeight : 0;

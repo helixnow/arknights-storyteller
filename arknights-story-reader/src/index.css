@@ -1371,7 +1371,15 @@ input[type="range"]::-moz-range-thumb {
  * 面板常驻挂载、只切可见性（见 KeepAlive.tsx）。隐藏面板里的循环动画仍然
  * 会一帧一帧合成——四个面板的骨架屏/spinner 同时转，等于白烧一半合成预算。
  * 暂停而不是取消：切回来时接着播，不会出现「进度条从头开始」的突兀感。
+ *
+ * 后台整棵子树必须 content-visibility: hidden。各面板都是 inset-0 叠在同一
+ * 视口上，子节点的 content-visibility: auto 仍会按「在视口内」继续布局，
+ * 切换页面后首页/列表/阅读器会叠在一起抢渲染。
  */
+[data-keepalive-active="false"] {
+  content-visibility: hidden;
+  contain: strict;
+}
 [data-keepalive-active="false"],
 [data-keepalive-active="false"] *,
 [data-keepalive-active="false"] *::before,

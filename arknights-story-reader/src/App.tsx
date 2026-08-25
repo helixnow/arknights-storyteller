@@ -301,10 +301,15 @@ function App() {
       <div className="relative flex-1 overflow-hidden">
         {/*
          * 阅读器是盖在 tab 层之上的整屏浮层，所以整层 tab 一起从无障碍树和
-         * 焦点序列里摘掉，而不是逐个面板去摘：`display: contents` 不产生盒子，
-         * 里面的绝对定位面板照旧相对外层的 relative 容器排布。
+         * 焦点序列里摘掉。这里必须是真正的盒子：`display: contents` 不产生
+         * 层叠/裁剪边界，inert 在部分 WebView 上也不会传到子树，隐藏 tab
+         * 会和阅读器叠在同一视口里抢渲染。
          */}
-        <div className="contents" aria-hidden={readerActive} inert={readerActive}>
+        <div
+          className="absolute inset-0 overflow-hidden isolate"
+          aria-hidden={readerActive}
+          inert={readerActive}
+        >
           {panels.map(({ tab, content }) => (
             <KeepAlive
               key={tab}

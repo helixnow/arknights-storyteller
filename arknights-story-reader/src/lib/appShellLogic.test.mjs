@@ -14,13 +14,17 @@ import {
   INITIAL_HISTORY_GUARD_STATE,
   calculateBottomNavInset,
   cleanupVersionFrom,
+  collectOverflowScrollSnapshots,
   enqueueToast,
+  hasPreservableOverflow,
   hydrateAppPrefs,
+  keepAliveContentVisibility,
   normalizeAppPrefs,
   parseAppPrefs,
   parseLegacyAppPrefs,
   pendingCleanupKeys,
   reduceHistoryGuard,
+  restoreOverflowScrollSnapshots,
 } from "./appShellLogic.ts";
 
 const CURRENT_KEY = "prefs-v2";
@@ -556,4 +560,59 @@ test("pendingCleanupKeys：未来版本 sentinel 不会被旧应用倒退重跑"
     { version: 4, keys: ["d"] },
   ];
   assert.deepEqual(pendingCleanupKeys(99, steps, "sentinel"), []);
+});
+
+// ─────────────────────────────────────────────────────────────
+// KeepAlive hidden-layer isolation
+// ─────────────────────────────────────────────────────────────
+
+test("keepAliveContentVisibility：后台面板必须 hidden，前台才 visible", () => {
+  assert.equal(keepAliveContentVisibility(true), "visible");
+  assert.equal(keepAliveContentVisibility(false), "hidden");
+});
+
+function scroller(values) {
+  return {
+    scrollTop: 0,
+    scrollLeft: 0,
+    scrollHeight: 100,
+    scrollWidth: 100,
+    clientHeight: 100,
+    clientWidth: 100,
+    ...values,
+  };
+}
+
+test("hasPreservableOverflow：无溢出且未滚动的盒子可以跳过", () => {
+  assert.equal(hasPreservableOverflow(scroller()), false);
+});
+
+test("hasPreservableOverflow：已滚动或可滚动的盒子都要记下来", () => {
+  assert.equal(hasPreservableOverflow(scroller({ scrollTop: 40 })), true);
+  assert.equal(hasPreservableOverflow(scroller({ scrollLeft: 12 })), true);
+  assert.equal(hasPreservableOverflow(scroller({ scrollHeight: 400, clientHeight: 80 })), true);
+});
+
+test("collectOverflowScrollSnapshots：只收集真正有溢出的节点", () => {
+  const idle = scroller();
+  const moved = scroller({ scrollTop: 88, scrollHeight: 400, clientHeight: 80 });
+  const snapshots = collectOverflowScrollSnapshots([idle, moved]);
+  assert.equal(snapshots.length, 1);
+  assert.equal(snapshots[0].el, moved);
+  assert.equal(snapshots[0].top, 88);
+});
+
+test("restoreOverflowScrollSnapshots：跳过已卸载节点，其余原样灌回", () => {
+  const live = scroller({ scrollTop: 0, scrollHeight: 400, clientHeight: 80 });
+  const dead = scroller({ scrollTop: 0, scrollHeight: 400, clientHeight: 80 });
+  restoreOverflowScrollSnapshots(
+    [
+      { el: live, top: 120, left: 6 },
+      { el: dead, top: 50, left: 0 },
+    ],
+    (el) => el === live
+  );
+  assert.equal(live.scrollTop, 120);
+  assert.equal(live.scrollLeft, 6);
+  assert.equal(dead.scrollTop, 0);
 });

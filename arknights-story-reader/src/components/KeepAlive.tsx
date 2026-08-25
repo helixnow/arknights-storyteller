@@ -1,5 +1,12 @@
-import { useEffect, useRef, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useRef, type ReactNode } from "react";
 import { cn } from "@/lib/utils";
+import {
+  collectOverflowScrollSnapshots,
+  keepAliveContentVisibility,
+  restoreOverflowScrollSnapshots,
+  type OverflowScrollSnapshot,
+  type OverflowScroller,
+} from "@/lib/appShellLogic";
 
 interface KeepAliveProps {
   active: boolean;
@@ -28,10 +35,42 @@ interface KeepAliveProps {
  * 后果有两个——面板整体盖住了 z-index:auto 的底部导航（导航因此完全点不动），
  * 面板内部 `fixed inset-0 z-50` 的弹窗又被封在面板这一层里出不来。去掉之后
  * 层叠顺序回到「面板 < 导航(z-40) < 弹窗(z-50) < toast(z-100)」。
- * 面板之间不需要 z-index 分先后：非活动面板已经 hidden + inert，谁画在上面都一样。
+ *
+ * 后台面板必须 `content-visibility: hidden`。五个 tab 加上未卸载的阅读器
+ * 都是 `absolute inset-0`，子树里的 `content-visibility: auto` 仍把它们
+ * 当成在视口内，只靠 visibility 会叠在一起抢布局和合成。
  */
 export function KeepAlive({ active, children, className }: KeepAliveProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const scrollSnapshotRef = useRef<Array<OverflowScrollSnapshot<OverflowScroller>>>(
+    []
+  );
+
+  /* 后台切 content-visibility:hidden 可能丢掉滚动位置，所以前台期间持续
+     记一份；切回来再灌回去。layout 阶段做，避免可见后先闪到顶部。 */
+  useLayoutEffect(() => {
+    const container = containerRef.current;
+    if (!container || !active) return;
+
+    restoreOverflowScrollSnapshots(scrollSnapshotRef.current, (el) => {
+      return el instanceof Element && el.isConnected;
+    });
+
+    const captureScroll = () => {
+      const nodes: OverflowScroller[] = [
+        container,
+        ...Array.from(container.querySelectorAll<HTMLElement>("*")),
+      ];
+      scrollSnapshotRef.current = collectOverflowScrollSnapshots(nodes);
+    };
+
+    captureScroll();
+    container.addEventListener("scroll", captureScroll, true);
+    return () => {
+      captureScroll();
+      container.removeEventListener("scroll", captureScroll, true);
+    };
+  }, [active]);
 
   /* 面板转入后台时，焦点可能还停在里面。inert 会让浏览器把焦点丢回
      document.body，但各引擎时机不一致（有的要等一帧，有的干脆留着一个
@@ -68,6 +107,7 @@ export function KeepAlive({ active, children, className }: KeepAliveProps) {
       style={{
         visibility: active ? "visible" : "hidden",
         pointerEvents: active ? "auto" : "none",
+        contentVisibility: keepAliveContentVisibility(active),
       }}
       inert={!active}
       aria-hidden={!active}
