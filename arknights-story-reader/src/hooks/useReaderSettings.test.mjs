@@ -59,6 +59,21 @@ test("设置：NaN 与 Infinity 回落默认值", () => {
   assert.equal(value.lineHeight, DEFAULT_READER_SETTINGS.lineHeight);
 });
 
+test("设置：存储值吸附到滑杆步进，显示与实际排版保持一致", () => {
+  const value = sanitizeReaderSettings({
+    fontSize: 18.6,
+    lineHeight: 1.73,
+    letterSpacing: 0.3,
+    paragraphSpacing: 0.34,
+    pageWidth: 73,
+  });
+  assert.equal(value.fontSize, 19);
+  assert.equal(value.lineHeight, 1.7);
+  assert.equal(value.letterSpacing, 0.5);
+  assert.equal(value.paragraphSpacing, 0.3);
+  assert.equal(value.pageWidth, 75);
+});
+
 test("设置：非法枚举与未知字体不能进入正文样式", () => {
   const value = sanitizeReaderSettings({
     fontFamily: "url(javascript:bad)",

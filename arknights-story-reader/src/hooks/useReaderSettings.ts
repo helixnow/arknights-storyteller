@@ -56,19 +56,19 @@ export const DEFAULT_READER_SETTINGS: ReaderSettings = {
 
 const STORAGE_KEY = "reader-settings";
 
-/** 各数值项的合法区间，和设置面板里滑杆的 min/max 保持一致。 */
-const NUMERIC_RANGES: Record<
+/** 各数值项的合法区间与步进，和设置面板里的 range 控件保持一致。 */
+const NUMERIC_SPECS: Record<
   "fontSize" | "lineHeight" | "letterSpacing" | "paragraphSpacing" | "pageWidth",
-  [number, number]
+  readonly [min: number, max: number, step: number]
 > = {
-  fontSize: [14, 32],
+  fontSize: [14, 32, 1],
   // 滑杆最小值是 1.4。早前这里写成 1.2：落在 [1.2, 1.4) 的旧值能通过校验，
   // 但 range 元素会把 value 钳到 min 显示——滑块停在 1.4、数字标签却显示
   // 1.2/1.3，「调小」按钮还被误禁用。区间必须与滑杆完全一致。
-  lineHeight: [1.4, 3.4],
-  letterSpacing: [0, 4],
-  paragraphSpacing: [0.3, 3],
-  pageWidth: [60, 100],
+  lineHeight: [1.4, 3.4, 0.1],
+  letterSpacing: [0, 4, 0.5],
+  paragraphSpacing: [0.3, 3, 0.1],
+  pageWidth: [60, 100, 5],
 };
 
 const THEMES = new Set<ReaderSettings["theme"]>([
@@ -81,7 +81,11 @@ const THEMES = new Set<ReaderSettings["theme"]>([
 const READING_MODES = new Set<ReaderSettings["readingMode"]>(["paged", "scroll"]);
 const TEXT_ALIGNS = new Set<ReaderSettings["textAlign"]>(["left", "justify"]);
 
-function clampNumber(value: unknown, [min, max]: [number, number], fallback: number): number {
+function clampSteppedNumber(
+  value: unknown,
+  [min, max, step]: readonly [number, number, number],
+  fallback: number
+): number {
   // 只接受数字和非空数字字符串（老版本可能把滑杆值序列化成字符串）。
   // 其余形状（null / 布尔 / 数组等）一律回落默认值：直接 Number(null) === 0
   // 会把缺失值钳到区间下限——pageWidth 变 60%、字号变 14，页面明显不对。
@@ -92,7 +96,14 @@ function clampNumber(value: unknown, [min, max]: [number, number], fallback: num
         ? Number(value)
         : Number.NaN;
   if (!Number.isFinite(parsed)) return fallback;
-  return Math.min(max, Math.max(min, parsed));
+  const clamped = Math.min(max, Math.max(min, parsed));
+  // localStorage 可能来自旧版本或手工编辑。只钳区间还不够：pageWidth=73
+  // 会让正文按 73% 生效，但 step=5 的滑杆只能显示在 75% 附近；行距 1.73
+  // 同样会显示成 1.7、实际却按 1.73 排版。统一吸附到以 min 为基准的步进格，
+  // 保证「存的值、标签显示、滑块位置、正文样式」四者一致。
+  const snapped = min + Math.round((clamped - min) / step) * step;
+  const decimals = (String(step).split(".")[1] ?? "").length;
+  return Number(Math.min(max, Math.max(min, snapped)).toFixed(decimals));
 }
 
 /**
@@ -109,29 +120,29 @@ export function sanitizeReaderSettings(
       : DEFAULT_READER_SETTINGS.fontFamily;
   return {
     fontFamily,
-    fontSize: clampNumber(
+    fontSize: clampSteppedNumber(
       source.fontSize,
-      NUMERIC_RANGES.fontSize,
+      NUMERIC_SPECS.fontSize,
       DEFAULT_READER_SETTINGS.fontSize
     ),
-    lineHeight: clampNumber(
+    lineHeight: clampSteppedNumber(
       source.lineHeight,
-      NUMERIC_RANGES.lineHeight,
+      NUMERIC_SPECS.lineHeight,
       DEFAULT_READER_SETTINGS.lineHeight
     ),
-    letterSpacing: clampNumber(
+    letterSpacing: clampSteppedNumber(
       source.letterSpacing,
-      NUMERIC_RANGES.letterSpacing,
+      NUMERIC_SPECS.letterSpacing,
       DEFAULT_READER_SETTINGS.letterSpacing
     ),
-    paragraphSpacing: clampNumber(
+    paragraphSpacing: clampSteppedNumber(
       source.paragraphSpacing,
-      NUMERIC_RANGES.paragraphSpacing,
+      NUMERIC_SPECS.paragraphSpacing,
       DEFAULT_READER_SETTINGS.paragraphSpacing
     ),
-    pageWidth: clampNumber(
+    pageWidth: clampSteppedNumber(
       source.pageWidth,
-      NUMERIC_RANGES.pageWidth,
+      NUMERIC_SPECS.pageWidth,
       DEFAULT_READER_SETTINGS.pageWidth
     ),
     textAlign: TEXT_ALIGNS.has(source.textAlign as ReaderSettings["textAlign"])
