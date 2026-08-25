@@ -59,6 +59,30 @@ export function hasNpcAvatarOverride(name: string | null | undefined): boolean {
   return npcOverride(name.trim()) !== null;
 }
 
+/**
+ * 分享图等非 React 渲染路径使用的头像身份键。
+ *
+ * 同一个角色在剧情里可能先显示「？？？」、之后才显示真名，或携带不同的
+ * `#skin` 后缀；只要 `char_` id 相同，最终请求的就是同一组头像候选。身份
+ * 键因此优先使用规范化 id，避免重复下载、解码同一张图。NPC 覆盖名仍然
+ * 优先，因为它们随行的 charId 可能是解析器继承来的上一位干员。
+ */
+export function characterAvatarIdentityKey(
+  name: string | null | undefined,
+  charId: string | null | undefined
+): string {
+  const cleanName = (name ?? "").trim();
+  if (npcOverride(cleanName)) return `npc:${cleanName}`;
+
+  const directId = charId ? directCharacterId(charId) : null;
+  if (directId) return `char:${directId}`;
+
+  // 非 char_ alias 只有和显示名一起才能安全确定身份：未知 alias 可能被
+  // 多位角色共用，实际候选会回退到 name，不能只按 alias 合并。
+  const cleanAlias = (charId ?? "").trim().split("#", 1)[0]?.toLowerCase() ?? "";
+  return `name:${simplifyCharacterToken(cleanName)}::alias:${cleanAlias}`;
+}
+
 export interface CharacterResolverSnapshot {
   hasIndex: boolean;
   resolveCharId: (name: string | null | undefined) => string | null;

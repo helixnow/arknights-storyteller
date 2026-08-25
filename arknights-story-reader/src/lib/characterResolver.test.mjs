@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  characterAvatarIdentityKey,
   createCharacterResolver,
   resolveAssetCandidatesLocal,
   resolveCharacterIdLocal,
@@ -151,4 +152,29 @@ test("NPC override remains authoritative even if an index contains the same name
   assert.deepEqual(resolveAssetCandidatesLocal("avatar", "普瑞赛斯", index), [
     "/avatars/npc/priestess.png",
   ]);
+});
+
+test("share avatar identity deduplicates display-name and skin variants of one charId", () => {
+  const expected = characterAvatarIdentityKey("？？？", "char_002_amiya#1");
+  assert.equal(expected, "char:char_002_amiya");
+  assert.equal(characterAvatarIdentityKey("阿米娅", "CHAR_002_AMIYA#2"), expected);
+  assert.notEqual(
+    characterAvatarIdentityKey("近卫阿米娅", "char_1001_amiya2"),
+    expected
+  );
+});
+
+test("share avatar identity keeps NPC names authoritative and unknown aliases name-scoped", () => {
+  assert.equal(
+    characterAvatarIdentityKey(" 普瑞赛斯 ", "char_002_amiya"),
+    characterAvatarIdentityKey("普瑞赛斯", "char_999_wrong")
+  );
+  assert.notEqual(
+    characterAvatarIdentityKey("甲", "unknown_alias"),
+    characterAvatarIdentityKey("乙", "unknown_alias")
+  );
+  assert.equal(
+    characterAvatarIdentityKey("玛恩纳·临光", null),
+    characterAvatarIdentityKey(" 玛恩纳 ‧ 临光 ", null)
+  );
 });

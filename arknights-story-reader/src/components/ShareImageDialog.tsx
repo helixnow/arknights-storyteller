@@ -30,6 +30,7 @@ import {
 } from "@/hooks/useImageSharer";
 import { peekAssetCandidates } from "@/hooks/useAsset";
 import {
+  characterAvatarIdentityKey,
   getAssetHealthVersion,
   hasNpcAvatarOverride,
   isAssetUrlDead,
@@ -286,13 +287,7 @@ const canvasFailedUrls = new Set<string>();
 const AVATAR_CACHE_LIMIT = 200;
 
 function avatarCacheKey(name: string | null | undefined, charId: string | null | undefined): string {
-  const cleanName = (name ?? "").trim();
-  // NPC 台词可能继承不同的陈旧 charId，但覆盖表里的显示名才是唯一身份。
-  // key 若仍带错 id，同一张本地 NPC 图会被并发下载 / 解码很多遍。
-  if (hasNpcAvatarOverride(cleanName)) return `npc:${cleanName}`;
-  const rawId = (charId ?? "").trim().split("#", 1)[0] ?? "";
-  const cleanId = /^char_/i.test(rawId) ? rawId.toLowerCase() : rawId;
-  return `${cleanName}::${cleanId}`;
+  return characterAvatarIdentityKey(name, charId);
 }
 
 function rememberAvatar(key: string, img: HTMLImageElement | null): void {
