@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   getStoryThumbnailSources,
+  isThumbnailVisuallyLoaded,
   thumbnailCandidateTransition,
 } from "./storyThumbnailSources.ts";
 
@@ -94,4 +95,11 @@ test("换包移除旧 URL 时立刻丢弃旧图", () => {
     loaded: false,
     bridgeUrl: null,
   });
+});
+
+test("已加载状态不能沿用到刚切换的新候选 URL", () => {
+  assert.equal(isThumbnailVisuallyLoaded(true, "old-cover", "new-cover"), false);
+  assert.equal(isThumbnailVisuallyLoaded(true, "same-cover", "same-cover"), true);
+  assert.equal(isThumbnailVisuallyLoaded(false, "same-cover", "same-cover"), false);
+  assert.equal(isThumbnailVisuallyLoaded(true, "same-cover", null), false);
 });

@@ -7,6 +7,65 @@ export interface VersionedRequestCache {
   invalidate(): void;
 }
 
+export interface ReadingProgressEntry {
+  storyPath: string;
+  /** 0~1 */
+  percentage: number;
+  updatedAt: number;
+}
+
+export interface ReadingProgressSnapshot {
+  /** storyTxt → 0~1。列表徽标按 key 查表，O(1)。 */
+  percent: Record<string, number>;
+  /** 按 updatedAt 倒序。首页「最近阅读」直接用这一份。 */
+  recent: ReadingProgressEntry[];
+}
+
+const EMPTY_READING_PROGRESS: ReadingProgressSnapshot = { percent: {}, recent: [] };
+
+/** 强制刷新会绕过在途去重，发请求前先把共享依赖与分类分块去重。 */
+export function uniqueRefreshSections<T extends string>(
+  shared: T,
+  categorySections: readonly T[]
+): T[] {
+  return Array.from(new Set<T>([shared, ...categorySections]));
+}
+
+/**
+ * 与阅读器的持久化校验保持同一口径。localStorage 是不可信输入：旧版本、
+ * 手工编辑或损坏值都不能让列表显示一份阅读器实际不会恢复的进度。
+ */
+export function parseReadingProgressSnapshot(raw: string | null): ReadingProgressSnapshot {
+  if (!raw) return EMPTY_READING_PROGRESS;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return EMPTY_READING_PROGRESS;
+    }
+
+    const percent: Record<string, number> = {};
+    const recent: ReadingProgressEntry[] = [];
+    for (const [storyPath, value] of Object.entries(parsed as Record<string, unknown>)) {
+      if (!storyPath || !value || typeof value !== "object" || Array.isArray(value)) continue;
+      const candidate = value as { percentage?: unknown; updatedAt?: unknown };
+      const percentage =
+        typeof candidate.percentage === "number" && Number.isFinite(candidate.percentage)
+          ? Math.min(1, Math.max(0, candidate.percentage))
+          : 0;
+      const updatedAt =
+        typeof candidate.updatedAt === "number" && Number.isFinite(candidate.updatedAt)
+          ? candidate.updatedAt
+          : 0;
+      if (percentage > 0) percent[storyPath] = percentage;
+      recent.push({ storyPath, percentage, updatedAt });
+    }
+    recent.sort((a, b) => b.updatedAt - a.updatedAt);
+    return { percent, recent };
+  } catch {
+    return EMPTY_READING_PROGRESS;
+  }
+}
+
 interface CacheHit {
   value: unknown;
   at: number;

@@ -8,6 +8,7 @@ import {
   PreviewLruCache,
   isPreviewCacheEntryExpired,
   isPreviewTaskCurrent,
+  nextPreviewDataVersion,
   previewCacheKey,
   previewCachePrefix,
   previewRequestKey,
@@ -52,7 +53,7 @@ function readDataVersion(): number {
   try {
     const raw = window.localStorage.getItem(PREVIEW_DATA_VERSION_KEY);
     const parsed = raw ? Number.parseInt(raw, 10) : 0;
-    return Number.isFinite(parsed) ? parsed : 0;
+    return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : 0;
   } catch {
     return 0;
   }
@@ -82,21 +83,28 @@ function lsKey(path: string) {
   return previewCacheKey(dataVersion, path);
 }
 
-/** 清掉所有不属于当前 schema + 数据版本的旧条目。 */
-function purgeStaleCache() {
+/** 删除 preview 持久条目；keepPrefix 为 null 时全删，否则保留该版本。 */
+function purgePreviewCache(keepPrefix: string | null) {
   if (typeof window === "undefined") return;
   try {
-    const current = keyPrefix();
     const stale: string[] = [];
     for (let i = 0; i < window.localStorage.length; i += 1) {
       const key = window.localStorage.key(i);
       if (!key || key === PREVIEW_DATA_VERSION_KEY) continue;
-      if (key.startsWith(PREVIEW_CACHE_PREFIX) && !key.startsWith(current)) {
+      if (
+        key.startsWith(PREVIEW_CACHE_PREFIX) &&
+        (keepPrefix === null || !key.startsWith(keepPrefix))
+      ) {
         stale.push(key);
       }
     }
     stale.forEach((key) => window.localStorage.removeItem(key));
   } catch {}
+}
+
+/** 清掉所有不属于当前 schema + 数据版本的旧条目。 */
+function purgeStaleCache() {
+  purgePreviewCache(keyPrefix());
 }
 
 function isExpired(entry: CacheEntry): boolean {
@@ -324,7 +332,14 @@ const NOOP = () => {};
  */
 function invalidateAll() {
   MEMO.clear();
-  dataVersion += 1;
+  const persistedVersion = readDataVersion();
+  const nextVersion = nextPreviewDataVersion(dataVersion, persistedVersion);
+  // 安全整数耗尽时版本回卷到 1；先清掉所有 preview key，不能把远古的 v1
+  // 条目误认成新包缓存。正常递增时下面的按前缀 purge 已足够。
+  if (nextVersion <= Math.max(dataVersion, persistedVersion)) {
+    purgePreviewCache(null);
+  }
+  dataVersion = nextVersion;
   try {
     window.localStorage.setItem(PREVIEW_DATA_VERSION_KEY, String(dataVersion));
   } catch {}

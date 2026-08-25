@@ -44,6 +44,10 @@ function safeCount(value: unknown): number {
   return Math.min(Number.MAX_SAFE_INTEGER, Math.trunc(value));
 }
 
+function incrementCount(value: number): number {
+  return value >= Number.MAX_SAFE_INTEGER ? Number.MAX_SAFE_INTEGER : value + 1;
+}
+
 /** localStorage 可能被旧版本或用户手改过，先恢复成可展示的有限非负整数。 */
 export function normalizeStreakInfo(value: unknown): ReadingStreakInfo {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -104,14 +108,14 @@ export function nextReadingStreak(
   }
   if (relation === "yesterday") {
     return {
-      currentStreak: current.currentStreak + 1,
+      currentStreak: incrementCount(current.currentStreak),
       lastReadOn: today,
-      totalDays: current.totalDays + 1,
+      totalDays: incrementCount(current.totalDays),
     };
   }
   return {
     currentStreak: 1,
     lastReadOn: today,
-    totalDays: current.totalDays + 1,
+    totalDays: incrementCount(current.totalDays),
   };
 }

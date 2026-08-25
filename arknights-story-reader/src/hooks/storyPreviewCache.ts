@@ -83,6 +83,18 @@ export function previewRequestKey(version: number, storyPath: string): string {
 }
 
 /**
+ * 跨窗口同步时模块内版本可能落后于 localStorage。递增前同时参考两者，
+ * 避免旧窗口把 5 再写成 5：值没变化不会触发 storage 事件，别的窗口便会
+ * 继续使用上一份数据的 preview MEMO。
+ */
+export function nextPreviewDataVersion(current: number, persisted: number): number {
+  const normalize = (value: number) =>
+    Number.isSafeInteger(value) && value >= 0 ? value : 0;
+  const base = Math.max(normalize(current), normalize(persisted));
+  return base >= Number.MAX_SAFE_INTEGER ? 1 : base + 1;
+}
+
+/**
  * 明确「无图」永久有效；只有请求失败才走短 TTL。墙钟回拨、坏时间戳和
  * 恰好到达边界都按过期处理，避免一次暂态失败被无限缓存。
  */

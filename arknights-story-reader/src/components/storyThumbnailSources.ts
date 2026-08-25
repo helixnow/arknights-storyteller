@@ -55,6 +55,18 @@ export interface ThumbnailCandidateTransition {
 }
 
 /**
+ * `loaded` 只说明某次解码曾成功；共享失败表可能已经让当前候选换成另一条。
+ * URL 也一致时才能把新 `<img>` 当成已有像素，避免一帧空白或无过渡闪现。
+ */
+export function isThumbnailVisuallyLoaded(
+  loaded: boolean,
+  loadedUrl: string | null,
+  liveUrl: string | null
+): boolean {
+  return loaded && liveUrl !== null && loadedUrl === liveUrl;
+}
+
+/**
  * 候选表改变时的同步状态迁移。旧图仍是第一候选才原位保留；若只是因为篇内
  * 插画晚到而退居后面，就从新首选开始加载、同时拿旧图垫底，避免永远停在
  * 章节封面或闪回渐变色。换包后旧 URL 已不在候选表时则立刻丢弃。

@@ -108,3 +108,21 @@ test("一日时钟回拨只校正日期，不虚增累计天数", () => {
     { currentStreak: 4, lastReadOn: "2026-08-24", totalDays: 9 }
   );
 });
+
+test("连签与累计天数在安全整数上限饱和", () => {
+  assert.deepEqual(
+    nextReadingStreak(
+      {
+        currentStreak: Number.MAX_SAFE_INTEGER,
+        lastReadOn: "2026-08-24",
+        totalDays: Number.MAX_SAFE_INTEGER,
+      },
+      "2026-08-25"
+    ),
+    {
+      currentStreak: Number.MAX_SAFE_INTEGER,
+      lastReadOn: "2026-08-25",
+      totalDays: Number.MAX_SAFE_INTEGER,
+    }
+  );
+});

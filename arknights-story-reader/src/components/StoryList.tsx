@@ -43,7 +43,14 @@ import { CharacterAvatar } from "@/components/CharacterAvatar";
 import {
   createVersionedRequestCache,
   isMissingStoryCatalogError,
+  parseReadingProgressSnapshot,
   storySummaryKey,
+  type ReadingProgressSnapshot,
+  uniqueRefreshSections,
+} from "@/components/storyListState";
+export type {
+  ReadingProgressEntry,
+  ReadingProgressSnapshot,
 } from "@/components/storyListState";
 
 /**
@@ -169,56 +176,7 @@ const PROGRESS_KEY = "reading-progress";
 /** 到这个百分比就算读完。首页大卡、列表徽标共用一个口径。 */
 export const READ_FINISHED_PCT = 99;
 
-export interface ReadingProgressEntry {
-  storyPath: string;
-  /** 0~1 */
-  percentage: number;
-  updatedAt: number;
-}
-
-export interface ReadingProgressSnapshot {
-  /** storyTxt → 0~1。列表徽标按 key 查表，O(1)。 */
-  percent: Record<string, number>;
-  /** 按 updatedAt 倒序。首页「最近阅读」直接用这一份。 */
-  recent: ReadingProgressEntry[];
-}
-
 const EMPTY_PROGRESS: ReadingProgressSnapshot = { percent: {}, recent: [] };
-
-function clampRatio(value: unknown): number {
-  const num = Number(value ?? 0);
-  if (!Number.isFinite(num)) return 0;
-  return Math.min(1, Math.max(0, num));
-}
-
-function parseReadingProgress(raw: string | null): ReadingProgressSnapshot {
-  if (!raw) return EMPTY_PROGRESS;
-  try {
-    const parsed = JSON.parse(raw) as Record<
-      string,
-      { percentage?: number; updatedAt?: number } | null
-    >;
-    if (!parsed || typeof parsed !== "object") return EMPTY_PROGRESS;
-
-    const percent: Record<string, number> = {};
-    const recent: ReadingProgressEntry[] = [];
-    for (const [storyPath, value] of Object.entries(parsed)) {
-      if (!value || typeof value !== "object") continue;
-      const percentage = clampRatio(value.percentage);
-      const updatedAt = Number(value.updatedAt ?? 0);
-      if (percentage > 0) percent[storyPath] = percentage;
-      recent.push({
-        storyPath,
-        percentage,
-        updatedAt: Number.isFinite(updatedAt) ? updatedAt : 0,
-      });
-    }
-    recent.sort((a, b) => b.updatedAt - a.updatedAt);
-    return { percent, recent };
-  } catch {
-    return EMPTY_PROGRESS;
-  }
-}
 
 let progressRaw: string | null = null;
 let progressSnapshot: ReadingProgressSnapshot = EMPTY_PROGRESS;
@@ -243,7 +201,7 @@ export function getReadingProgress(): ReadingProgressSnapshot {
   if (progressParsed && raw === progressRaw) return progressSnapshot;
   progressRaw = raw;
   progressParsed = true;
-  progressSnapshot = parseReadingProgress(raw);
+  progressSnapshot = parseReadingProgressSnapshot(raw);
   return progressSnapshot;
 }
 
@@ -735,6 +693,24 @@ export function StoryList({ onSelectStory }: StoryListProps) {
     [loadSection]
   );
 
+  /**
+   * 强制刷新当前分类及主线依赖，但每个分块只发一次。收藏分类本身包含主线，
+   * 其它分类的调用方也曾经并行调用 `loadSection("main", true)`：
+   * force 会刻意绕过 in-flight 去重，因此必须在发请求前先做集合去重。
+   */
+  const reloadCategory = useCallback(
+    (category: Category) => {
+      const sections = uniqueRefreshSections<SectionKey>(
+        "main",
+        CATEGORY_SECTIONS[category]
+      );
+      return Promise.all(sections.map((section) => loadSection(section, true))).then(
+        () => undefined
+      );
+    },
+    [loadSection]
+  );
+
   useEffect(() => {
     let cancelled = false;
 
@@ -757,17 +733,14 @@ export function StoryList({ onSelectStory }: StoryListProps) {
         // 成功会回写 installed=true）；真没装会以 NOT_INSTALLED 落进
         // handleLoadError，由那里下「未安装」的结论并给出同步入口。
         console.warn("[StoryList] isInstalled 失败，改为直接读目录判定:", e);
-        void loadSection("main", true);
-        if (activeCategoryRef.current !== "main") {
-          void loadCategory(activeCategoryRef.current, true);
-        }
+        void reloadCategory(activeCategoryRef.current);
       }
     })();
 
     return () => {
       cancelled = true;
     };
-  }, [loadCategory, loadSection, setSectionBusy]);
+  }, [reloadCategory, setSectionBusy]);
 
   // 数据就绪后：当前分类按需加载；主线始终加载（收藏分组名依赖它）。
   useEffect(() => {
@@ -827,13 +800,11 @@ export function StoryList({ onSelectStory }: StoryListProps) {
       setMemoryStories([]);
       setError(null);
       setInstalled(true);
-      // 主线不管在哪个分类都要重来一次：收藏分组名依赖它的映射表。
-      void loadSection("main", true);
-      void loadCategory(activeCategory, true);
+      void reloadCategory(activeCategory);
     };
     window.addEventListener("app:data-updated", handler);
     return () => window.removeEventListener("app:data-updated", handler);
-  }, [activeCategory, loadCategory, loadSection]);
+  }, [activeCategory, reloadCategory]);
 
   /** 把当前选中的分类 pill 滚回横向可视区。按 DOM 里的 aria-pressed 找
    *  目标，所以只能在选中态已经落进 DOM 之后调用。 */
@@ -1312,35 +1283,17 @@ export function StoryList({ onSelectStory }: StoryListProps) {
 
   const retryActive = useCallback(() => {
     setError(null);
-    // 主线要一起重来：收藏分组名依赖它的映射表。
-    void loadSection("main", true);
-    void loadCategory(activeCategory, true);
-  }, [activeCategory, loadCategory, loadSection]);
+    void reloadCategory(activeCategory);
+  }, [activeCategory, reloadCategory]);
 
-  const handleSyncSuccess = useCallback(async () => {
+  const handleSyncSuccess = useCallback(() => {
+    // useDataSyncManager 会先同步广播 app:data-updated，再调用 onSuccess。
+    // 目录作废和强制重载已经由上面的事件处理器启动；这里若再清一次并 force，
+    // 会让刚发出的每个 IPC 立即失去归属、整套目录无谓地读取第二遍。
     setInstalled(true);
     setError(null);
-    // 同步对话框不一定广播 `app:data-updated`，这里自己把共享缓存清掉。
-    invalidateStoryCatalog();
-    loadedRef.current = initialSectionFlags(false);
-    // 同上面 data-updated 的处理：在途任务全部作废，免得旧数据回写；
-    // 旧目录的列表也一并清空，不给换包后的旧卡留展示窗口。
-    pendingRef.current = {};
-    sawNotInstalledRef.current = false;
-    summaryGenerationRef.current += 1;
-    summaryAttemptsRef.current.clear();
-    summaryInflightRef.current.clear();
-    setSummaryCache({});
-    setSummaryLoadingIds({});
-    // 同 data-updated：常驻的收藏行靠这个信号重发简介请求。
-    setSummaryEpoch((epoch) => epoch + 1);
-    setOpenGroups({});
-    setGroups(emptyGroups());
-    setMemoryStories([]);
-    // 并发发起：目录层有 in-flight 去重，主线不会打两次 IPC。
-    await Promise.all([loadSection("main", true), loadCategory(activeCategory, true)]);
     setSyncDialogOpen(false);
-  }, [activeCategory, loadCategory, loadSection]);
+  }, []);
 
   /**
    * 行组件是 `memo` 的，所以传下去的回调必须是稳定引用，否则每次父级

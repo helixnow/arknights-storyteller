@@ -19,6 +19,7 @@ import {
 import type { StoryEntry } from "@/types/story";
 import {
   getStoryThumbnailSources,
+  isThumbnailVisuallyLoaded,
   thumbnailCandidateTransition,
 } from "@/components/storyThumbnailSources";
 
@@ -93,7 +94,11 @@ export function StoryThumbnail({
   // 渐变兜底上。真正失败过的 URL 仍被 deadUrls 跳过，不会原地打转；
   // 图片正常显示时不订阅，零开销。
   const stuck = live === null && candidates.length > 0;
-  const visuallyLoaded = Boolean(live && loadedUrlRef.current === live.url) || loaded;
+  const visuallyLoaded = isThumbnailVisuallyLoaded(
+    loaded,
+    loadedUrlRef.current,
+    live?.url ?? null
+  );
   const healthNonce = useAssetHealthNonce(stuck);
   const healthNonceRef = useRef(healthNonce);
   const healthRecoveryAction = getAssetRecoveryAction(

@@ -6,6 +6,7 @@ import {
   PreviewLruCache,
   isPreviewCacheEntryExpired,
   isPreviewTaskCurrent,
+  nextPreviewDataVersion,
   parsePreviewCacheEntry,
   previewCacheKey,
   previewCachePrefix,
@@ -37,6 +38,16 @@ test("preview 持久缓存键绑定 schema、数据版本和完整剧情路径",
   );
   assert.notEqual(previewCacheKey(7, "same"), previewCacheKey(8, "same"));
   assert.equal(previewRequestKey(8, "obt/main/a"), "8:obt/main/a");
+});
+
+test("preview 数据版本递增会参考跨窗口持久值，避免版本碰撞", () => {
+  assert.equal(nextPreviewDataVersion(4, 7), 8);
+  assert.equal(nextPreviewDataVersion(9, 7), 10);
+  assert.equal(nextPreviewDataVersion(Number.NaN, -1), 1);
+  assert.equal(
+    nextPreviewDataVersion(Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER),
+    1
+  );
 });
 
 test("MEMO 命中会续到 MRU，扩容时淘汰真正最久未使用项", () => {

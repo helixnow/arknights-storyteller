@@ -4,7 +4,9 @@ import test from "node:test";
 import {
   createVersionedRequestCache,
   isMissingStoryCatalogError,
+  parseReadingProgressSnapshot,
   storySummaryKey,
+  uniqueRefreshSections,
 } from "./storyListState.ts";
 
 function deferred() {
@@ -28,6 +30,55 @@ test("简介缓存键同时绑定 storyId 与 storyInfo 路径", () => {
   assert.equal(storySummaryKey({ storyId: "s1", storyInfo: "info/old" }), "s1|info/old");
   assert.equal(storySummaryKey({ storyId: "s1", storyInfo: "info/new" }), "s1|info/new");
   assert.equal(storySummaryKey({ storyId: "s1", storyInfo: null }), "s1|");
+});
+
+test("列表与首页按阅读器口径解析、钳制并排序进度", () => {
+  assert.deepEqual(
+    parseReadingProgressSnapshot(
+      JSON.stringify({
+        older: { percentage: 2, updatedAt: 10 },
+        newer: { percentage: 0.25, updatedAt: 20 },
+        negative: { percentage: -1, updatedAt: 30 },
+      })
+    ),
+    {
+      percent: { older: 1, newer: 0.25 },
+      recent: [
+        { storyPath: "negative", percentage: 0, updatedAt: 30 },
+        { storyPath: "newer", percentage: 0.25, updatedAt: 20 },
+        { storyPath: "older", percentage: 1, updatedAt: 10 },
+      ],
+    }
+  );
+});
+
+test("损坏进度不会制造虚假的继续阅读位置", () => {
+  assert.deepEqual(
+    parseReadingProgressSnapshot(
+      JSON.stringify({
+        stringRatio: { percentage: "0.8", updatedAt: "999" },
+        nanRatio: { percentage: null, updatedAt: null },
+        arrayValue: [{ percentage: 0.5, updatedAt: 500 }],
+      })
+    ),
+    {
+      percent: {},
+      recent: [
+        { storyPath: "stringRatio", percentage: 0, updatedAt: 0 },
+        { storyPath: "nanRatio", percentage: 0, updatedAt: 0 },
+      ],
+    }
+  );
+  assert.deepEqual(parseReadingProgressSnapshot("[]"), { percent: {}, recent: [] });
+  assert.deepEqual(parseReadingProgressSnapshot("{broken"), { percent: {}, recent: [] });
+});
+
+test("目录强制刷新会去重主线与分类自身的重叠分块", () => {
+  assert.deepEqual(uniqueRefreshSections("main", ["main"]), ["main"]);
+  assert.deepEqual(
+    uniqueRefreshSections("main", ["main", "activity", "main", "memory"]),
+    ["main", "activity", "memory"]
+  );
 });
 
 test("目录缓存合并同 key 的并发请求", async () => {
