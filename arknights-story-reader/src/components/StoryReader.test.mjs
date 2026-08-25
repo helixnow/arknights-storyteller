@@ -147,7 +147,14 @@ test("分页 chrome：ResizeObserver 写入变量，隐藏或卸载时清理", a
   assert.match(source, /ref=\{neighborBarRef\}/);
 
   const css = await readFile(new URL("../index.css", import.meta.url), "utf8");
-  assert.match(css, /calc\(100dvh - var\(--reader-chrome, 12rem\)\)/);
+  assert.match(
+    css,
+    /\.app-shell\s*\{[\s\S]*?--app-shell-top-inset:\s*max\(env\(safe-area-inset-top, 0px\), 12px\);[\s\S]*?padding-top:\s*var\(--app-shell-top-inset\)/
+  );
+  assert.match(
+    css,
+    /100dvh\s*-\s*var\(--reader-chrome, 12rem\)\s*-\s*var\(--app-shell-top-inset, 0px\)/
+  );
 });
 
 test("KeepAlive 隐藏：退出选段模式但不清空已选段落", async () => {

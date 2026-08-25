@@ -116,8 +116,6 @@ fn avatar_candidates(token: &str) -> Vec<String> {
     }
     let mut out = Vec::new();
     if let Some(cid) = resolve_char_id(token) {
-        // 打包进 public/bundled/avatar/ 的内置头像，零网络开销，优先命中。
-        out.push(format!("/bundled/avatar/{}.png", cid));
         // yuanyan3060 的 avatar 是 char_xxx.png
         out.push(format!("{}/avatar/{}.png", YUANYAN, cid));
         // fexli 的 charpor（半身像）可用作备胎，但该目录所有文件都带
@@ -267,8 +265,6 @@ fn chapter_cover_candidates(token: &str) -> Vec<String> {
         raw.to_string()
     };
     dedup(vec![
-        // 打包进 public/bundled/mapreview/ 的内置章节封面。
-        format!("/bundled/mapreview/main_{}-01.png", padded),
         format!("{}/mapreview/main_{}-01.png", FEXLI, padded),
         format!("{}/avgs/bg_main_{}.png", FEXLI, raw),
         format!("{}/avgs/{}_i01.png", FEXLI, raw),
@@ -288,15 +284,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bundled_assets_come_first() {
-        // 内置素材零网络开销，必须排在任何远端源前面；前缀也得跟前端
-        // `public/` 下的实际布局一致。
+    fn removed_bundled_assets_are_not_returned_as_candidates() {
+        // 发布包不再携带大体积头像和章节封面；候选不能继续返回必然 404
+        // 的本地路径，否则每张图都会先白跑一次请求。
         let avatars = avatar_candidates("char_002_amiya");
-        assert_eq!(avatars[0], "/bundled/avatar/char_002_amiya.png");
+        assert!(avatars.iter().all(|url| !url.starts_with("/bundled/")));
+        assert!(avatars[0].ends_with("/avatar/char_002_amiya.png"));
 
         let covers = chapter_cover_candidates("main_8");
-        assert_eq!(covers[0], "/bundled/mapreview/main_08-01.png");
-        assert!(covers[1].ends_with("/mapreview/main_08-01.png"));
+        assert!(covers.iter().all(|url| !url.starts_with("/bundled/")));
+        assert!(covers[0].ends_with("/mapreview/main_08-01.png"));
     }
 
     #[test]
