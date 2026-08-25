@@ -844,9 +844,10 @@ export function StoryList({ onSelectStory }: StoryListProps) {
         if (activeCategoryRef.current === "favorites") revealActivePill();
       };
       apply();
-      // KeepAlive 父级会在同一次提交的 layout effect 里灌回隐藏前的滚动，
-      // 微任务排在那之后，把「去看收藏」的归顶再写回去。
-      queueMicrotask(apply);
+      // 分类没变时 setActiveCategory 会 eager bailout，微任务会排在 App
+      // 切 tab 的 React 提交之前，KeepAlive 随后灌回旧滚动。rAF 一定在
+      // 那次 layout restore 之后、绘制之前再写一次归顶。
+      requestAnimationFrame(apply);
     };
     window.addEventListener("app:open-favorites", handler);
     return () => window.removeEventListener("app:open-favorites", handler);
