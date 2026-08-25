@@ -222,7 +222,11 @@ export function AssetImage({
   // 窗口内，判决不可靠），候选全部标死的组件也要被叫醒重试，否则断网
   // 期间打开过的头像/封面在网络恢复后永远停在兜底上。
   const stuck = currentUrl === null && candidates.length > 0;
-  const recoverable = stuck && hasRecoverableCandidate(candidates, currentIdx);
+  // 游标到末尾只表示本轮已经扫完。链首可能有一条因 host 熔断而被跳过、
+  // 从未真正请求过的候选；恢复检查若也从 currentIdx 开始，在
+  // currentIdx===length 时必然误判「没救了」。stuck 后必须检查整条链，
+  // 真正恢复时本来也会把游标拨回 0。
+  const recoverable = stuck && hasRecoverableCandidate(candidates);
   const healthNonce = useAssetHealthNonce(stuck);
   // 健康事件到来时把游标拨回 0 重扫整条候选链：被撤销失败记录的 URL 可能
   // 排在游标之前；真正失败过的仍会被 deadUrls 跳过，不会原地打转。
