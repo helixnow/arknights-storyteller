@@ -8,6 +8,10 @@ const syncDialogSource = readFileSync(
   new URL("../components/SyncDialog.tsx", import.meta.url),
   "utf8"
 );
+const settingsSource = readFileSync(
+  new URL("../components/Settings.tsx", import.meta.url),
+  "utf8"
+);
 
 test("同步、导入、索引和更新共用一把互斥锁", () => {
   const store = createDataJobLockStore();
@@ -92,10 +96,10 @@ test("多个等待者被同一次释放唤醒时只有一个拿到锁", async ()
 });
 
 test("文件选择器 cancel 事件立即释放寄存导入锁与准备态", () => {
-  assert.match(
-    syncDialogSource,
-    /onCancel=\{\(\) => \{\s*takePendingImportJob\(\)\?\.\(\);\s*setPreparingImport\(false\);/
-  );
+  const cancelHandler =
+    /onCancel=\{\(\) => \{\s*takePendingImportJob\(\)\?\.\(\);\s*setPreparingImport\(false\);/;
+  assert.match(syncDialogSource, cancelHandler);
+  assert.match(settingsSource, cancelHandler);
 });
 
 test("等待文件期间关闭会收尾寄存锁，真实导入仍禁止关闭", () => {
