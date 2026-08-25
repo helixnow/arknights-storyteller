@@ -16,7 +16,8 @@ use zip::ZipArchive;
 
 use crate::models::{
     Activity, Chapter, SearchDebugResponse, SearchResult, SearchResultsPage, SegmentHit,
-    SegmentSearchPage, StoryCategory, StoryEntry, StoryIndexStatus, StoryPreviewToken, StorySegment,
+    SegmentSearchPage, StoryCategory, StoryEntry, StoryIndexStatus, StoryPreviewToken,
+    StorySegment,
 };
 use crate::parser::parse_story_text;
 
@@ -33,8 +34,9 @@ const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// 一分钟内报错，而不是永远挂着。
 const HTTP_OP_TIMEOUT: Duration = Duration::from_secs(60);
 /// Bump when any of: FTS schema, tokenizer rules, `searchable_text` format,
-/// or the set of stories that gets indexed. A bump drops both FTS tables at
-/// open time, so the next `rebuild_story_index_*` starts from scratch.
+/// or the set of stories that gets indexed. A bump makes readers report the
+/// index as unavailable; the next `rebuild_story_index_*` drops both FTS
+/// tables and starts from scratch.
 ///
 /// v4 = added the segment-level FTS table `story_segment_index`, so hits can
 ///      carry a `(story_id, segment_index)` pair instead of story-only.
@@ -59,7 +61,9 @@ const HTTP_OP_TIMEOUT: Duration = Duration::from_secs(60);
 ///      speaker), and a lone full-width punctuation mark left after a command
 ///      (`[Character(...)]。`) is dropped like its ASCII counterpart; both
 ///      change stored text and shift stored segment indices.
-const INDEX_VERSION: i32 = 9;
+/// v10 = 富文本标签白名单化保留混排尖括号正文；charId/说话人按三段本体
+///       归一。两项都会改变入库的 searchable_text / character_name。
+const INDEX_VERSION: i32 = 10;
 
 const META_TOTAL_COUNT: &str = "total_count";
 const META_SEGMENT_TOTAL: &str = "segment_total";
@@ -254,6 +258,18 @@ fn emit_search_progress(
         message: message.into(),
     };
     let _ = app.emit("search-progress", progress);
+}
+
+/// Resolve an authoritative total after a query returned exactly its LIMIT.
+///
+/// `counted = None` means the follow-up COUNT failed. The returned rows are
+/// still useful, but claiming `truncated = false` would assert knowledge we
+/// do not have, so the boolean records that uncertainty for the caller.
+fn resolve_limited_match_total(returned: usize, counted: Option<usize>) -> (usize, bool) {
+    match counted {
+        Some(total) => (returned.max(total), false),
+        None => (returned, true),
+    }
 }
 
 fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), String> {
@@ -761,7 +777,9 @@ impl DataService {
     /// 返回运行时 character_table.json 路径（若已同步），供 character_table
     /// 模块刷新嵌入映射。
     pub fn character_table_path(&self) -> Option<PathBuf> {
-        let p = self.data_dir.join("zh_CN/gamedata/excel/character_table.json");
+        let p = self
+            .data_dir
+            .join("zh_CN/gamedata/excel/character_table.json");
         if p.exists() {
             Some(p)
         } else {
@@ -779,29 +797,51 @@ impl DataService {
         // setup 里跑一次，任何命令（包括同步换入）都还没机会启动，此时
         // 动这些目录没有并发之忧。
         service.restore_data_dir_from_aside();
-        // 分块导入半途而废（WebView 重载 / 直接杀进程）留下的 `.part`
-        // 暂存和数据集一个量级，重启后没人会再续上——协议规定重传从
-        // offset 0 原地重开。开机顺手删掉，免得几百 MB 白占到用户手动
-        // 清数据。同上，此刻不可能有传输在途。
-        service.discard_stale_import_staging();
+        // 导入或同步在下载、转正、校验、解压途中崩溃，都会留下与数据集
+        // 同量级的临时文件/目录。重启后协议不会续用任何一个；开机统一
+        // 清掉。同上，此刻不可能有传输在途。
+        service.discard_stale_import_artifacts();
         service
     }
 
-    /// 删除上一次运行遗留的分块导入暂存文件。删不掉只记日志：顶多多占
-    /// 一阵磁盘，下一轮传输的首块仍会原地截断重写，不影响功能。
-    fn discard_stale_import_staging(&self) {
-        let Ok(staging) = self.import_staging_path() else {
+    /// 删除上一次运行遗留的导入/同步临时产物。除分块 `.part` 与已转正
+    /// 导入 ZIP 外，同步可能在下载完 `ArknightsGameData.zip` 后、或解压到
+    /// `ArknightsGameData_extract` 途中被杀；这两份残骸没有启动续传协议，
+    /// 若只等下一次同步覆盖会永久占盘。这里只在 `DataService::new` 调用，
+    /// 尚无任务并发；删不掉只记日志，下一轮仍会安全地截断/替换。
+    fn discard_stale_import_artifacts(&self) {
+        let parent = self.data_dir.parent();
+        let files = [
+            self.import_staging_path().ok().map(|path| ("IMPORT", path)),
+            self.import_temp_zip_path()
+                .ok()
+                .map(|path| ("IMPORT", path)),
+            parent.map(|dir| ("SYNC", dir.join("ArknightsGameData.zip"))),
+        ];
+        for (kind, path) in files.into_iter().flatten() {
+            match fs::remove_file(&path) {
+                Ok(()) => {
+                    eprintln!("[{}] 已清理上次中断的临时文件 {:?}", kind, path);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    eprintln!("[{}] 清理临时文件 {:?} 失败（忽略）: {}", kind, path, err);
+                }
+            }
+        }
+
+        let Some(extract_root) = parent.map(|dir| dir.join("ArknightsGameData_extract")) else {
             return;
         };
-        match fs::remove_file(&staging) {
+        match fs::remove_dir_all(&extract_root) {
             Ok(()) => {
-                eprintln!("[IMPORT] 已清理上次中断的导入暂存文件 {:?}", staging);
+                eprintln!("[SYNC] 已清理上次中断的解压目录 {:?}", extract_root);
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => {
                 eprintln!(
-                    "[IMPORT] 清理导入暂存文件 {:?} 失败（忽略）: {}",
-                    staging, err
+                    "[SYNC] 清理解压目录 {:?} 失败（忽略）: {}",
+                    extract_root, err
                 );
             }
         }
@@ -816,6 +856,7 @@ impl DataService {
             .map_err(|e| format!("Failed to open story index database: {}", e))?;
         conn.execute_batch(
             "
+            PRAGMA busy_timeout = 5000;
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
             ",
@@ -860,7 +901,13 @@ impl DataService {
             .and_then(|s| s.parse::<i32>().ok())
             .unwrap_or(0);
 
-        let should_recreate = current_version < INDEX_VERSION;
+        // Schema compatibility is exact, not monotonic. A database written
+        // by a newer binary may have removed/reordered columns or changed its
+        // tokenizer contract; keeping it merely because its version is
+        // numerically larger makes this older binary issue SQL against an
+        // unknown schema. The index is derived data, so both upgrades and
+        // downgrades must recreate it.
+        let should_recreate = current_version != INDEX_VERSION;
 
         if should_recreate {
             // Drop and recreate virtual tables with current schema.
@@ -988,16 +1035,21 @@ impl DataService {
     /// carry a null `storyPic`, in which case the活动/章节 level art is the
     /// only thing we can hand the frontend.
     fn group_story_pic(value: &Value) -> Option<String> {
-        ["storyPic", "storyEntryPicId", "storyPicId", "storyMainPicId"]
-            .iter()
-            .find_map(|key| {
-                value
-                    .get(key)
-                    .and_then(|v| v.as_str())
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
-            })
+        [
+            "storyPic",
+            "storyEntryPicId",
+            "storyPicId",
+            "storyMainPicId",
+        ]
+        .iter()
+        .find_map(|key| {
+            value
+                .get(key)
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        })
     }
 
     /// Deserialize a group's `infoUnlockDatas`, backfilling the cover token
@@ -1516,7 +1568,11 @@ impl DataService {
                 return;
             }
             let is_not = t.starts_with('-');
-            let content = if is_not { t.trim_start_matches('-').to_string() } else { t };
+            let content = if is_not {
+                t.trim_start_matches('-').to_string()
+            } else {
+                t
+            };
             if !content.is_empty() {
                 // 悬挂的 `not` 只被真正成词的 token 消费；纯减号串跟
                 // `or` 一样让它顺延给下一个词。消费必须无条件 take——
@@ -1588,7 +1644,13 @@ impl DataService {
 
         fn sanitize(s: &str) -> String {
             s.chars()
-                .map(|c| if is_fts_special(c) || c.is_control() { ' ' } else { c })
+                .map(|c| {
+                    if is_fts_special(c) || c.is_control() {
+                        ' '
+                    } else {
+                        c
+                    }
+                })
                 .collect::<String>()
                 .trim()
                 .to_string()
@@ -1644,7 +1706,9 @@ impl DataService {
             if s.is_empty() {
                 return String::new();
             }
-            if s.chars().all(|c| c.is_ascii_alphanumeric() || c.is_whitespace()) {
+            if s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c.is_whitespace())
+            {
                 // ASCII phrase: `"foo bar"` → `"foo bar"` (FTS keeps order).
                 return format!("\"{}\"", s);
             }
@@ -1824,7 +1888,7 @@ impl DataService {
     }
 
     /// 把数据集身份与目录篇数压成一行文本存进索引元数据。任一项对不上都
-    /// 必须重建。格式保持不变；`INDEX_VERSION` 仍为 9。
+    /// 必须重建。格式保持不变；`INDEX_VERSION` 现为 10。
     fn index_dataset_fingerprint(&self, story_count: usize) -> String {
         format!("{}|{}", self.index_dataset_identity(), story_count)
     }
@@ -1862,11 +1926,28 @@ impl DataService {
         Some((stories as usize, segments as usize))
     }
 
+    /// Read paths must never migrate the schema. In particular, calling
+    /// `init_index_tables` from a status/search request could turn a harmless
+    /// version mismatch into DROP/CREATE work and then surface SQLITE_BUSY
+    /// while a rebuild transaction was in flight. Only the rebuild path may
+    /// migrate; readers treat every missing, malformed, older, or newer
+    /// version as unavailable.
+    fn index_schema_is_current(conn: &Connection) -> bool {
+        Self::extract_meta_value(conn, "index_version")
+            .ok()
+            .flatten()
+            .and_then(|value| value.parse::<i32>().ok())
+            == Some(INDEX_VERSION)
+    }
+
     /// 读路径使用的完整可用性判定。重建路径手里有解析后的篇数，可以直接
     /// 用完整 fingerprint；搜索/状态不该为此冷启动解析整张目录表，故拆掉
     /// fingerprint 最后一个 `|篇数`，用其余身份与当前包精确比较，再复用
     /// `index_current_totals` 校验元数据行数、实际行数及失忆探针。
     fn current_dataset_index_totals(&self, conn: &Connection) -> Option<(usize, usize)> {
+        if !Self::index_schema_is_current(conn) {
+            return None;
+        }
         let stored = Self::extract_meta_value(conn, META_DATASET_FINGERPRINT).ok()??;
         let (stored_identity, _) = stored.rsplit_once('|')?;
         if stored_identity != self.index_dataset_identity() {
@@ -1941,7 +2022,13 @@ impl DataService {
         std::thread::spawn(move || {
             if let Err(err) = index_service.rebuild_story_index_with_progress(&index_app) {
                 eprintln!("[SYNC] auto rebuild index failed: {}", err);
-                emit_progress(&index_app, "索引", 1, 1, "索引重建失败，可稍后在设置中手动重试");
+                emit_progress(
+                    &index_app,
+                    "索引",
+                    1,
+                    1,
+                    "索引重建失败，可稍后在设置中手动重试",
+                );
             } else {
                 emit_progress(&index_app, "索引", 1, 1, "全文索引已重建");
             }
@@ -2232,28 +2319,37 @@ impl DataService {
 
         // 定位数据集根不能盲选第一个子目录：macOS 打出来的包常带
         // __MACOSX 伴生目录，有的包则把 zh_CN 直接放在压缩包根部（此时
-        // 根本没有「顶层目录」可选）。以 holds_valid_dataset 为准——解压
-        // 根本身或某个子目录，谁装着非空 story_review_table.json 谁就是根。
+        // 根本没有「顶层目录」可选）。非空 review 表只够筛候选，不够验收：
+        // 非空但截断的 JSON、或只有目录表没有任何脚本的包都不能替掉旧数据。
         //
-        // 选根同时就是验收，先验收再动旧数据：整个包里都找不到有效数据
-        // 集时换进去应用就是空的，必须保留已有 data_dir 让用户继续用旧
-        // 数据。空文件同样算校验失败——半截下载解出来的壳子比旧数据更
-        // 没用。
-        let extracted_root = if Self::holds_valid_dataset(extract_root) {
-            extract_root.to_path_buf()
-        } else {
-            fs::read_dir(extract_root)
-                .map_err(|e| format!("Failed to read extracted directory: {}", e))?
-                .filter_map(|entry| entry.ok())
-                .map(|entry| entry.path())
-                .find(|path| path.is_dir() && Self::holds_valid_dataset(path))
-                .ok_or_else(|| {
-                    format!(
-                        "ZIP 校验失败：缺少或为空 {}，已保留原有数据",
-                        REVIEW_TABLE_REL
-                    )
-                })?
-        };
+        // 候选顺序固定：压缩包根优先，其余顶层目录按路径排序。read_dir 的
+        // 文件系统顺序不稳定，若包里意外有两棵候选树，不能每次随机换一棵。
+        let mut candidates = Vec::new();
+        if Self::holds_valid_dataset(extract_root) {
+            candidates.push(extract_root.to_path_buf());
+        }
+        let mut child_candidates: Vec<PathBuf> = fs::read_dir(extract_root)
+            .map_err(|e| format!("Failed to read extracted directory: {}", e))?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir() && Self::holds_valid_dataset(path))
+            .collect();
+        child_candidates.sort();
+        candidates.extend(child_candidates);
+
+        let mut rejection = format!("缺少或为空 {}", REVIEW_TABLE_REL);
+        let mut extracted_root = None;
+        for candidate in candidates {
+            match Self::validate_dataset_for_install(&candidate) {
+                Ok(()) => {
+                    extracted_root = Some(candidate);
+                    break;
+                }
+                Err(err) => rejection = err,
+            }
+        }
+        let extracted_root =
+            extracted_root.ok_or_else(|| format!("ZIP 校验失败：{}，已保留原有数据", rejection))?;
 
         // 阅读器只需要 story / excel 数据；关卡、战斗、美术等目录加起来
         // 是数据集的大头，移动前先剪掉，省磁盘也省一次拷贝。
@@ -2302,6 +2398,42 @@ impl DataService {
         fs::metadata(dir.join(REVIEW_TABLE_REL))
             .map(|meta| meta.is_file() && meta.len() > 0)
             .unwrap_or(false)
+    }
+
+    /// 安装前的强校验。`holds_valid_dataset` 是每次状态查询都会走的廉价
+    /// stat，不能在那里解析数 MB JSON；解压换包是低频路径，必须在旧数据
+    /// 还未挪开时确认目录表可解析、至少有一个完整条目，并且至少一篇对应
+    /// 脚本真实存在且非空。否则一个非空的半截 JSON 或“只有 excel 没有
+    /// story”的残包会通过旧验收，原子地把可用数据替换成不可用数据。
+    fn validate_dataset_for_install(dir: &Path) -> Result<(), String> {
+        let review_path = dir.join(REVIEW_TABLE_REL);
+        let content = fs::read_to_string(&review_path)
+            .map_err(|err| format!("无法读取 {}: {}", REVIEW_TABLE_REL, err))?;
+        let data: HashMap<String, Value> = serde_json::from_str(&content)
+            .map_err(|err| format!("{} 不是完整 JSON: {}", REVIEW_TABLE_REL, err))?;
+        if data.is_empty() {
+            return Err(format!("{} 没有剧情分组", REVIEW_TABLE_REL));
+        }
+
+        let stories: Vec<StoryEntry> = data
+            .values()
+            .flat_map(Self::parse_group_entries)
+            .filter(|story| !story.story_id.trim().is_empty() && !story.story_txt.trim().is_empty())
+            .collect();
+        if stories.is_empty() {
+            return Err(format!("{} 没有可用剧情条目", REVIEW_TABLE_REL));
+        }
+
+        let story_root = dir.join("zh_CN/gamedata/story");
+        let has_readable_script = stories.iter().any(|story| {
+            fs::metadata(story_root.join(format!("{}.txt", story.story_txt)))
+                .map(|meta| meta.is_file() && meta.len() > 0)
+                .unwrap_or(false)
+        });
+        if !has_readable_script {
+            return Err("剧情目录缺少与目录表对应的非空脚本".to_string());
+        }
+        Ok(())
     }
 
     /// `swap_in_extracted` 若恰好在「旧目录挪开」和「新目录落位」两次改名
@@ -2535,7 +2667,13 @@ impl DataService {
         std::thread::spawn(move || {
             if let Err(err) = index_service.rebuild_story_index_with_progress(&index_app) {
                 eprintln!("[IMPORT] auto rebuild index failed: {}", err);
-                emit_progress(&index_app, "索引", 1, 1, "索引重建失败，可稍后在设置中手动重试");
+                emit_progress(
+                    &index_app,
+                    "索引",
+                    1,
+                    1,
+                    "索引重建失败，可稍后在设置中手动重试",
+                );
             } else {
                 emit_progress(&index_app, "索引", 1, 1, "全文索引已重建");
             }
@@ -2572,7 +2710,7 @@ impl DataService {
     /// 分块导入的暂存文件路径。放在导入临时 ZIP 同一个目录里，收尾改名
     /// 时保证不跨文件系统；`.part` 后缀表明它随时可能是半截文件。半途
     /// 而废的暂存运行期不必专门清理——下一轮传输的首块会原地截断重
-    /// 写；跨次启动的残留由 `discard_stale_import_staging` 在开机时删掉。
+    /// 写；跨次启动的残留由 `discard_stale_import_artifacts` 在开机时删掉。
     pub fn import_staging_path(&self) -> Result<PathBuf, String> {
         let parent_dir = self
             .data_dir
@@ -2867,11 +3005,7 @@ impl DataService {
     }
 
     fn rebuild_story_index_inner(&self, app: Option<&AppHandle>) -> Result<(), String> {
-        if !self.is_installed() {
-            return Err("NOT_INSTALLED".to_string());
-        }
-
-        let emit = |phase: &str, cur: usize, total: usize, msg: &str| {
+        self.rebuild_story_index_emitting(|phase, cur, total, msg| {
             if let Some(app) = app {
                 let progress = IndexProgress {
                     phase: phase.to_string(),
@@ -2881,7 +3015,33 @@ impl DataService {
                 };
                 let _ = app.emit("index-progress", progress);
             }
-        };
+        })
+    }
+
+    /// Run a rebuild through one progress sink and guarantee that every error
+    /// leaves the consumer in a terminal state. `useAutoIndex` deliberately
+    /// keys off the stable phase literal "失败", so callers must not have to
+    /// infer failure from a dropped command future or from the last nonterminal
+    /// "收集"/"构建" event.
+    fn rebuild_story_index_emitting(
+        &self,
+        emit: impl Fn(&str, usize, usize, &str),
+    ) -> Result<(), String> {
+        let result = self.rebuild_story_index_attempt(&emit);
+        if let Err(err) = &result {
+            let message = format!("索引重建失败：{}", err);
+            emit("失败", 0, 0, &message);
+        }
+        result
+    }
+
+    fn rebuild_story_index_attempt(
+        &self,
+        emit: &impl Fn(&str, usize, usize, &str),
+    ) -> Result<(), String> {
+        if !self.is_installed() {
+            return Err("NOT_INSTALLED".to_string());
+        }
 
         // 同一份索引同时只允许一次重建。同步/导入完成后后台线程会自动重建，
         // 而前端的 `useAutoIndex`（以及设置页的手动按钮）可能同时也发起一次；
@@ -2936,40 +3096,35 @@ impl DataService {
                 .or_insert(0) += 1;
         }
 
-        let (total, segment_total) = match self.build_index_once(
-            &mut conn,
-            &catalog,
-            &dataset_probe,
-            &fingerprint,
-            &emit,
-        ) {
-            Ok(Some(totals)) => totals,
-            Ok(None) => return Err(DATASET_SWAPPED_DURING_REBUILD.to_string()),
-            Err(err) => {
-                // 与「打不开 / 建不了表」同一条自愈路的另一半：坏块只落在
-                // FTS 内容页上时，open、建表、甚至剧情表的查询都探不出病，
-                // 损坏要到清表/灌入/提交才第一次暴露（vtable constructor
-                // failed）。不清库的话这里每次都失败在同一处，「重建索引」
-                // 按钮从此永远失败，和当初 open 失败的死局一模一样。库里
-                // 只有派生数据：关连接、清库、重开、从头再试一次；再失败
-                // （磁盘满这类环境问题）才把错误抛给调用方。
-                eprintln!("[INDEX] 索引写入失败（{}），清空索引库后从头重试", err);
-                drop(conn);
-                self.clear_story_index()?;
-                let mut fresh = self.open_index_connection()?;
-                Self::init_index_tables(&fresh)?;
-                match self.build_index_once(
-                    &mut fresh,
-                    &catalog,
-                    &dataset_probe,
-                    &fingerprint,
-                    &emit,
-                )? {
-                    Some(totals) => totals,
-                    None => return Err(DATASET_SWAPPED_DURING_REBUILD.to_string()),
+        let (total, segment_total) =
+            match self.build_index_once(&mut conn, &catalog, &dataset_probe, &fingerprint, emit) {
+                Ok(Some(totals)) => totals,
+                Ok(None) => return Err(DATASET_SWAPPED_DURING_REBUILD.to_string()),
+                Err(err) => {
+                    // 与「打不开 / 建不了表」同一条自愈路的另一半：坏块只落在
+                    // FTS 内容页上时，open、建表、甚至剧情表的查询都探不出病，
+                    // 损坏要到清表/灌入/提交才第一次暴露（vtable constructor
+                    // failed）。不清库的话这里每次都失败在同一处，「重建索引」
+                    // 按钮从此永远失败，和当初 open 失败的死局一模一样。库里
+                    // 只有派生数据：关连接、清库、重开、从头再试一次；再失败
+                    // （磁盘满这类环境问题）才把错误抛给调用方。
+                    eprintln!("[INDEX] 索引写入失败（{}），清空索引库后从头重试", err);
+                    drop(conn);
+                    self.clear_story_index()?;
+                    let mut fresh = self.open_index_connection()?;
+                    Self::init_index_tables(&fresh)?;
+                    match self.build_index_once(
+                        &mut fresh,
+                        &catalog,
+                        &dataset_probe,
+                        &fingerprint,
+                        emit,
+                    )? {
+                        Some(totals) => totals,
+                        None => return Err(DATASET_SWAPPED_DURING_REBUILD.to_string()),
+                    }
                 }
-            }
-        };
+            };
 
         emit(
             "完成",
@@ -3095,7 +3250,11 @@ impl DataService {
                 // 都 `clone()`，相当于把整部语料在重建过程中又复制了一遍。
                 let (seg_type, character_name, raw_text): (&str, Option<&str>, Cow<'_, str>) =
                     match segment {
-                        StorySegment::Dialogue { character_name, text, .. } => (
+                        StorySegment::Dialogue {
+                            character_name,
+                            text,
+                            ..
+                        } => (
                             "dialogue",
                             Some(character_name.as_str()),
                             Cow::Borrowed(text.as_str()),
@@ -3120,7 +3279,11 @@ impl DataService {
                         }
                         StorySegment::Image { caption, .. } => {
                             // 插画段 caption 如有文字可索引；否则跳过。
-                            ("image", None, Cow::Borrowed(caption.as_deref().unwrap_or("")))
+                            (
+                                "image",
+                                None,
+                                Cow::Borrowed(caption.as_deref().unwrap_or("")),
+                            )
                         }
                         StorySegment::Music { .. } => ("music", None, Cow::Borrowed("")),
                     };
@@ -3149,12 +3312,7 @@ impl DataService {
 
             // Batch progress events to avoid flooding the frontend bus.
             if (idx + 1) % 16 == 0 || idx + 1 == indexed_stories.len() {
-                emit(
-                    "构建",
-                    idx + 1,
-                    indexed_stories.len(),
-                    story_name,
-                );
+                emit("构建", idx + 1, indexed_stories.len(), story_name);
             }
         }
 
@@ -3210,24 +3368,30 @@ impl DataService {
             });
         };
 
-        Self::init_index_tables(&conn)?;
-
-        let total: i64 = conn
-            .query_row("SELECT COUNT(*) FROM story_index", [], |row| row.get(0))
-            .unwrap_or(0);
-
         // ready 必须同时回答三件事：索引属于当前数据包、两表行数与建库
         // 元数据一致、倒排索引仍认识自己的内容。只看 COUNT + 失忆探针会
         // 把「换包后尚未来得及清掉的旧库」和被截断的库都误报成可用，
         // useAutoIndex 便永远不会触发重建。
-        let index_is_current = self.current_dataset_index_totals(&conn).is_some();
-
-        let last_built_at = Self::extract_meta_value(&conn, "last_built_at")?
-            .and_then(|value| value.parse::<i64>().ok());
+        let current_totals = self.current_dataset_index_totals(&conn);
+        let index_is_current = current_totals.is_some();
+        // A stale pack's row count and build timestamp are no more useful
+        // than its hits. Exposing them while ready=false made the status look
+        // like a merely unconfirmed current index and leaked leftover-pack
+        // metadata to the UI. Only publish totals proven to belong to the
+        // installed dataset.
+        let total = current_totals.map(|(stories, _)| stories).unwrap_or(0);
+        let last_built_at = if index_is_current {
+            Self::extract_meta_value(&conn, "last_built_at")
+                .ok()
+                .flatten()
+                .and_then(|value| value.parse::<i64>().ok())
+        } else {
+            None
+        };
 
         Ok(StoryIndexStatus {
             ready: index_is_current,
-            total: total.max(0) as usize,
+            total,
             last_built_at,
         })
     }
@@ -3236,8 +3400,6 @@ impl DataService {
         let Some(conn) = self.try_open_index_connection()? else {
             return Ok(None);
         };
-
-        Self::init_index_tables(&conn)?;
 
         // 空表、失忆、行数截断或数据集已换：都不能把 FTS 结果当成当前
         // 语料的权威答案。剧情检索有扫描兜底，明确交回 None。
@@ -3378,9 +3540,7 @@ impl DataService {
                         .then(|| story.story_name.clone())
                 } else {
                     self.story_searchable_text(&story.story_name, &story.story_txt)
-                        .filter(|content| {
-                            !Self::build_tokenized_content(content).trim().is_empty()
-                        })
+                        .filter(|content| !Self::build_tokenized_content(content).trim().is_empty())
                         .map(|_| story.story_name.clone())
                 }
             } else {
@@ -3458,29 +3618,40 @@ impl DataService {
     /// error — otherwise a single query over 1900+ stories can easily take
     /// 30s+ on lower-end devices.
     pub fn search_stories(&self, query: &str) -> Result<Vec<SearchResult>, String> {
+        self.search_stories_with_source(query)
+            .map(|(results, _index_used)| results)
+    }
+
+    /// Internal story search result plus provenance. `index_used` is true
+    /// only when `search_stories_with_index` returned an authoritative FTS
+    /// result set; every scanner/error/empty-query path is false.
+    fn search_stories_with_source(&self, query: &str) -> Result<(Vec<SearchResult>, bool), String> {
         let trimmed = query.trim();
         if trimmed.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         }
 
         match self.search_stories_with_index(trimmed) {
             // Index returned authoritative results — don't waste time on
             // linear scan. Char-level FTS5 is a superset of plain contains()
             // matching at this point.
-            Ok(Some(results)) => Ok(results),
+            Ok(Some(results)) => Ok((results, Self::build_fts_query_advanced(trimmed).is_some())),
             // Index not ready (never built, was cleared, or empty table).
             // Fall through to the slower scanner so the user can still get
             // *something* on first launch. The scanner caps at
             // SEARCH_RESULT_LIMIT and doesn't attempt to enumerate every
             // story — practical budget is single-digit seconds on a typical
             // machine.
-            Ok(None) => self.search_stories_fallback(trimmed),
+            Ok(None) => self
+                .search_stories_fallback(trimmed)
+                .map(|results| (results, false)),
             Err(err) => {
                 eprintln!(
                     "[INDEX] Failed to search using index ({}), fallback to linear scan",
                     err
                 );
                 self.search_stories_fallback(trimmed)
+                    .map(|results| (results, false))
             }
         }
     }
@@ -3523,18 +3694,23 @@ impl DataService {
                 total_matched: 0,
                 truncated: false,
                 facets: Default::default(),
+                index_used: false,
             });
         }
 
         // `total = 0` 是与前端约定的「不确定态」：还不知道要走索引还是扫全库，
         // 报一个 0/3 只是编出来的百分比。真实分母由线性扫描那一步给出。
         progress("检索", 0, 0, format!("搜索「{}」", trimmed));
-        let results = self.search_stories_emitting(app, trimmed)?;
+        let (results, index_used) = self.search_stories_emitting(app, trimmed)?;
 
         // Compute total via FTS (best effort — if the index is unavailable we
         // fall back to `results.len()` which is at least a lower bound).
         progress("统计", 0, 0, format!("命中 {} 篇，正在统计", results.len()));
-        let counted = self.count_fts_matches(trimmed).unwrap_or(None);
+        let counted = if index_used {
+            self.count_fts_matches(trimmed).unwrap_or(None)
+        } else {
+            None
+        };
         let (total_matched, truncated) = match counted {
             // 索引给出了权威总数：截断与否就看有没有没返回的命中。
             Some(count) => {
@@ -3570,6 +3746,7 @@ impl DataService {
             total_matched,
             truncated,
             facets,
+            index_used,
         })
     }
 
@@ -3643,6 +3820,7 @@ impl DataService {
                 hits: Vec::new(),
                 total_matched: 0,
                 truncated: false,
+                index_used: false,
             });
         }
 
@@ -3656,9 +3834,9 @@ impl DataService {
                 hits: Vec::new(),
                 total_matched: 0,
                 truncated: false,
+                index_used: false,
             });
         };
-        Self::init_index_tables(&conn)?;
 
         // 段落检索没有线性扫描兜底，因此只能接受属于当前数据集、两表行数
         // 完整且倒排索引仍能反查自身内容的索引。换包后残留的旧库尤其危险：
@@ -3670,6 +3848,7 @@ impl DataService {
                 hits: Vec::new(),
                 total_matched: 0,
                 truncated: false,
+                index_used: false,
             });
         };
 
@@ -3680,6 +3859,7 @@ impl DataService {
                 hits: Vec::new(),
                 total_matched: 0,
                 truncated: false,
+                index_used: false,
             });
         }
 
@@ -3689,6 +3869,7 @@ impl DataService {
                 hits: Vec::new(),
                 total_matched: 0,
                 truncated: false,
+                index_used: false,
             });
         };
 
@@ -3722,6 +3903,7 @@ impl DataService {
                     hits: Vec::new(),
                     total_matched: 0,
                     truncated: false,
+                    index_used: false,
                 });
             }
         };
@@ -3736,7 +3918,13 @@ impl DataService {
             let segment_type: String = row.get(2)?;
             let character_name: String = row.get(3).unwrap_or_default();
             let raw_text: String = row.get(4).unwrap_or_default();
-            Ok((story_id, segment_index, segment_type, character_name, raw_text))
+            Ok((
+                story_id,
+                segment_index,
+                segment_type,
+                character_name,
+                raw_text,
+            ))
         }) {
             Ok(r) => r,
             Err(err) => {
@@ -3746,30 +3934,36 @@ impl DataService {
                     hits: Vec::new(),
                     total_matched: 0,
                     truncated: false,
+                    index_used: false,
                 });
             }
         };
 
-        let context_probe = normalize_for_fuzzy(trimmed);
         // 预览定位用：多词查询的整串探针几乎必落空（词与词很少恰好相邻），
         // 逐词探针能把片段对准真正命中的那个词，而不是裁一段开头了事。
         let terms = split_query_terms(trimmed);
+        let context_probe = normalize_for_fuzzy(trimmed);
         let mut hits: Vec<SegmentHit> = Vec::new();
         let mut seen: std::collections::HashSet<(String, usize)> = Default::default();
         for row in rows {
             let Ok((story_id, segment_index, segment_type, character_norm, raw_text)) = row else {
                 continue;
             };
-            // Did the query actually hit the segment body / speaker? Used
-            // for the UI's "按说话人命中" badge. "mixed" is our honest
-            // fallback when the char-level tokens matched but neither the
-            // body nor the speaker contain the full probe verbatim — in
-            // that case we show no badge rather than falsely accusing one
-            // column of being the culprit.
-            let body_norm = normalize_for_fuzzy(&raw_text);
-            let speaker_norm = normalize_for_fuzzy(&character_norm);
-            let body_hit = !context_probe.is_empty() && body_norm.contains(&context_probe);
-            let speaker_hit = !context_probe.is_empty() && speaker_norm.contains(&context_probe);
+            // Classify the column with the same token/prefix/phrase/boolean
+            // semantics that selected this FTS row. Flattened substring
+            // probes cannot understand `A OR B`, bare AND/NOT, ASCII
+            // prefixes, or token boundaries and therefore mislabeled those
+            // perfectly ordinary hits as "mixed".
+            //
+            // The row already passed the full FTS NOT expression, so no
+            // negative term exists in either indexed column. Here we only
+            // need to ask whether all positive groups can be satisfied by
+            // body alone or speaker alone; if terms are distributed across
+            // both columns, "mixed" is the honest answer.
+            let body_stream = fts_token_stream(&raw_text);
+            let speaker_stream = fts_token_stream(&character_norm);
+            let body_hit = terms.positives_match(&[body_stream.as_str()]);
+            let speaker_hit = terms.positives_match(&[speaker_stream.as_str()]);
             let match_target = if body_hit {
                 "body"
             } else if speaker_hit {
@@ -3828,17 +4022,18 @@ impl DataService {
         // 伪命中**之前**判断：标题命中把 hits 填到上限并不代表段落查询被
         // 截断，反之段落行数没到上限时 COUNT 也不会更大。
         let seg_returned = hits.len();
-        let seg_total = if seg_returned >= SEARCH_RESULT_LIMIT {
-            let total: i64 = conn
+        let (seg_total, seg_count_uncertain) = if seg_returned >= SEARCH_RESULT_LIMIT {
+            let counted = conn
                 .query_row(
                     "SELECT COUNT(*) FROM story_segment_index WHERE story_segment_index MATCH ?1",
                     params![fts_query.clone()],
                     |row| row.get(0),
                 )
-                .unwrap_or(seg_returned as i64);
-            seg_returned.max(total.max(0) as usize)
+                .ok()
+                .map(|total: i64| total.max(0) as usize);
+            resolve_limited_match_total(seg_returned, counted)
         } else {
-            seg_returned
+            (seg_returned, false)
         };
 
         // Merge story-name / story-code hits from the story-level index so
@@ -3865,7 +4060,9 @@ impl DataService {
 
         let total_matched = seg_total + title_total;
         // 截断与否只有一个诚实的判据：还有没有没返回的命中。
-        let truncated = total_matched > hits.len();
+        // COUNT 自身若在 LIMIT 边界失败，我们不知道还有没有下一行，必须
+        // 承认结果可能被截断；把失败悄悄回退成 returned 会谎报 false。
+        let truncated = seg_count_uncertain || total_matched > hits.len();
 
         progress("完成", 2, 2, format!("命中 {} 段", total_matched));
 
@@ -3873,6 +4070,7 @@ impl DataService {
             hits,
             total_matched,
             truncated,
+            index_used: true,
         })
     }
 
@@ -3899,11 +4097,10 @@ impl DataService {
     /// `story_name` column is stored raw (no pre-tokenization), so unicode61
     /// only produces a single-CJK-run token per title. Scoping-by-column
     /// would therefore fail for any multi-word title query. Instead we rely
-    /// on the existing bm25 column weighting (story_name × 10) to push
-    /// genuine title matches to the top, and then post-filter the results
-    /// so only rows whose title or code actually contains the user's query
-    /// survive. This catches exact title lookups like `大地惊雷` even when
-    /// no body segment matches.
+    /// on the complete story-level result set and post-filter it with the
+    /// same token/boolean matcher as fallback search. A pre-filter LIMIT is
+    /// unsafe: body-only rows can occupy those slots and hide later title
+    /// hits, while `totalMatched` silently undercounts every hidden title.
     ///
     /// 复用调用方已经打开的连接：段落检索每次都新开一条 SQLite 连接（还要
     /// 重跑一遍 WAL pragma）纯属浪费。
@@ -3918,7 +4115,6 @@ impl DataService {
             FROM story_index
             WHERE story_index MATCH ?1
             ORDER BY bm25(story_index, 0.0, 10.0, 0.0, 1.0, 5.0, 0.0)
-            LIMIT 50
         ";
         let mut stmt = match conn.prepare(sql) {
             Ok(s) => s,
@@ -3935,20 +4131,25 @@ impl DataService {
             Err(_) => return Ok(Vec::new()),
         };
 
-        // Post-filter: the row's title or code must contain the user's
-        // query under fuzzy normalization (NFKC + lower + punct-strip).
-        // This weeds out body-only matches that bm25 happened to rank high.
-        let probe = normalize_for_fuzzy(query_raw);
-        if probe.is_empty() {
+        // Post-filter with the same semantics as FTS/fallback: OR groups,
+        // explicit AND/NOT, phrases, and ASCII prefixes all remain meaningful.
+        // A flattened `contains(query_raw)` probe included connective and
+        // negative words as if they were positive prose, so title jumps
+        // disappeared for nearly every advanced query.
+        let terms = split_query_terms(query_raw);
+        if terms.positive.is_empty() {
             return Ok(Vec::new());
         }
 
         let mut hits = Vec::new();
         for row in rows {
-            let Ok((story_id, story_name, category, story_code)) = row else { continue };
-            let name_norm = normalize_for_fuzzy(&story_name);
-            let code_norm = normalize_for_fuzzy(&story_code);
-            if !name_norm.contains(&probe) && !code_norm.contains(&probe) {
+            let Ok((story_id, story_name, category, story_code)) = row else {
+                continue;
+            };
+            let name_stream = fts_token_stream(&story_name);
+            let code_stream = fts_token_stream(&story_code);
+            let columns = [name_stream.as_str(), code_stream.as_str()];
+            if !terms.positives_match(&columns) || terms.excluded_by(&columns) {
                 continue;
             }
             let (story_name, category) = labels
@@ -4081,7 +4282,7 @@ impl DataService {
             return Ok(Vec::new());
         }
 
-        let results = self.search_stories_emitting(Some(app), trimmed)?;
+        let (results, _index_used) = self.search_stories_emitting(Some(app), trimmed)?;
         emit_search_progress(app, "完成", 1, 1, format!("命中 {} 篇", results.len()));
         Ok(results)
     }
@@ -4096,18 +4297,24 @@ impl DataService {
         &self,
         app: Option<&AppHandle>,
         trimmed: &str,
-    ) -> Result<Vec<SearchResult>, String> {
+    ) -> Result<(Vec<SearchResult>, bool), String> {
         const SCAN_PROGRESS_STRIDE: usize = 32;
 
         let Some(app) = app else {
-            return self.search_stories(trimmed);
+            return self.search_stories_with_source(trimmed);
         };
 
         emit_search_progress(app, "检索", 0, 0, "尝试全文索引");
         match self.search_stories_with_index(trimmed) {
             Ok(Some(results)) => {
-                emit_search_progress(app, "索引检索", 1, 1, "使用全文索引完成");
-                return Ok(results);
+                let index_used = Self::build_fts_query_advanced(trimmed).is_some();
+                let message = if index_used {
+                    "使用全文索引完成"
+                } else {
+                    "查询没有可用的正向词"
+                };
+                emit_search_progress(app, "索引检索", 1, 1, message);
+                return Ok((results, index_used));
             }
             // 索引没建好 / 查询失败：往下走线性扫描。
             Ok(None) => {}
@@ -4132,6 +4339,7 @@ impl DataService {
                 );
             }
         })
+        .map(|results| (results, false))
     }
 
     pub fn get_story_entry(&self, story_id: &str) -> Result<StoryEntry, String> {
@@ -4146,7 +4354,10 @@ impl DataService {
     /// Return the previous/next story in the same storyGroup ordered by
     /// storySort. If the story is the first/last, the corresponding field is
     /// None. Derived purely from `story_review_table.json`; no extra index.
-    pub fn get_story_neighbors(&self, story_id: &str) -> Result<crate::models::StoryNeighbors, String> {
+    pub fn get_story_neighbors(
+        &self,
+        story_id: &str,
+    ) -> Result<crate::models::StoryNeighbors, String> {
         let catalog = self.catalog()?;
         let Some(target) = catalog.by_id.get(story_id) else {
             return Ok(crate::models::StoryNeighbors::default());
@@ -4445,14 +4656,6 @@ impl DataService {
     /// 既服务于「肉鸽」列表页，也被 `collect_stories_for_index` 复用，
     /// 保证肉鸽剧情同样可搜索、可取上下篇。
     fn collect_roguelike_groups(&self) -> Result<Vec<(String, Vec<StoryEntry>)>, String> {
-        // 首先读取 meta，提取 contentPath -> desc 映射（用于更友好的命名）
-        let meta_file = self.data_dir.join(REVIEW_META_TABLE_REL);
-        let meta_content = fs::read_to_string(&meta_file)
-            .map_err(|e| format!("Failed to read story review meta file: {}", e))?;
-        let meta_value: Value = serde_json::from_str(&meta_content)
-            .map_err(|e| format!("Failed to parse story review meta data: {}", e))?;
-
-        let mut path_desc_map: HashMap<String, String> = HashMap::new();
         // 广义扫描：meta 中所有含 contentPath 的对象都尝试收集（兼容结构变动）
         fn collect_content_paths(map: &mut HashMap<String, String>, val: &Value) {
             match val {
@@ -4485,7 +4688,27 @@ impl DataService {
                 _ => {}
             }
         }
-        collect_content_paths(&mut path_desc_map, &meta_value);
+
+        // story_table 是肉鸽目录的权威来源；meta 只提供更友好的 desc。旧实现
+        // 在 meta 缺失/损坏时直接 `?` 返回，导致明明完整存在于 story_table
+        // 的肉鸽剧情从列表、索引、get_story_entry 和邻接导航中一起消失。
+        // 元数据失败只降级到文件名，绝不能放弃权威表。
+        let meta_file = self.data_dir.join(REVIEW_META_TABLE_REL);
+        let mut path_desc_map: HashMap<String, String> = HashMap::new();
+        match fs::read_to_string(&meta_file) {
+            Ok(meta_content) => match serde_json::from_str::<Value>(&meta_content) {
+                Ok(meta_value) => collect_content_paths(&mut path_desc_map, &meta_value),
+                Err(err) => {
+                    eprintln!("[CATALOG] 肉鸽描述元数据损坏，降级使用稳定路径名: {}", err);
+                }
+            },
+            Err(err) => {
+                eprintln!(
+                    "[CATALOG] 肉鸽描述元数据不可读，降级使用稳定路径名: {}",
+                    err
+                );
+            }
+        }
 
         // 使用 story_table 作为权威来源，枚举所有 Obt/Roguelike 文本
         let story_table_file = self.data_dir.join(STORY_TABLE_REL);
@@ -4572,7 +4795,9 @@ impl DataService {
             let b_char = extract_char_token(&b.story_txt).unwrap_or_else(|| b.story_name.clone());
             a_char
                 .cmp(&b_char)
-                .then_with(|| extract_numeric_parts(&a.story_txt).cmp(&extract_numeric_parts(&b.story_txt)))
+                .then_with(|| {
+                    extract_numeric_parts(&a.story_txt).cmp(&extract_numeric_parts(&b.story_txt))
+                })
                 .then_with(|| a.story_name.cmp(&b.story_name))
                 .then_with(|| a.story_id.cmp(&b.story_id))
         });
@@ -4817,7 +5042,10 @@ mod tests {
             normalize_info_interpolations("Ave{@nbs}Mujica"),
             "Ave Mujica"
         );
-        assert_eq!(normalize_info_interpolations("Ave{@NBS}Mujica"), "Ave Mujica");
+        assert_eq!(
+            normalize_info_interpolations("Ave{@NBS}Mujica"),
+            "Ave Mujica"
+        );
         assert_eq!(
             normalize_info_interpolations("{@nickname}，你来了"),
             "博士，你来了"
@@ -4879,7 +5107,10 @@ mod tests {
         assert_eq!(background.kind, "background");
         assert_eq!(background.token, "bg_Rhodes_1");
 
-        assert!(service.get_story_preview_token("demo/plain").unwrap().is_none());
+        assert!(service
+            .get_story_preview_token("demo/plain")
+            .unwrap()
+            .is_none());
 
         let _ = fs::remove_dir_all(&temp_root);
     }
@@ -5047,10 +5278,7 @@ mod tests {
 
     #[test]
     fn normalize_for_fuzzy_replaces_nickname() {
-        assert_eq!(
-            normalize_for_fuzzy("{@nickname}，你好"),
-            "博士你好"
-        );
+        assert_eq!(normalize_for_fuzzy("{@nickname}，你好"), "博士你好");
     }
 
     /// `QueryTerms` 里存的是切好原子的 `Term`；断言时只看归一化后的原文。
@@ -5531,7 +5759,10 @@ mod tests {
         let q = DataService::build_fts_query_advanced("凯尔希阿米娅").expect("non-empty");
         // Char-level tokenization: every CJK char becomes its own phrase,
         // AND-joined inside one parenthesized clause.
-        assert_eq!(q, "(\"凯\" AND \"尔\" AND \"希\" AND \"阿\" AND \"米\" AND \"娅\")");
+        assert_eq!(
+            q,
+            "(\"凯\" AND \"尔\" AND \"希\" AND \"阿\" AND \"米\" AND \"娅\")"
+        );
     }
 
     #[test]
@@ -5750,7 +5981,10 @@ mod tests {
                 "obt/main/level_main_00-01",
                 "[name=\"凯尔希\"]博士，你醒了。\n",
             );
-            self.write_story("obt/main/level_main_00-02", "[name=\"阿米娅\"]我们出发吧。\n");
+            self.write_story(
+                "obt/main/level_main_00-02",
+                "[name=\"阿米娅\"]我们出发吧。\n",
+            );
             // 活动篇开头连着两张同名插画，前端会合并，索引也必须合并，
             // 否则对白段落号会整体偏移一位。
             self.write_story(
@@ -5902,10 +6136,16 @@ mod tests {
 
         let neighbors = fx.service.get_story_neighbors("main_00-01").unwrap();
         assert!(neighbors.prev.is_none());
-        assert_eq!(neighbors.next.map(|s| s.story_id), Some("main_00-02".into()));
+        assert_eq!(
+            neighbors.next.map(|s| s.story_id),
+            Some("main_00-02".into())
+        );
 
         let neighbors = fx.service.get_story_neighbors("main_00-02").unwrap();
-        assert_eq!(neighbors.prev.map(|s| s.story_id), Some("main_00-01".into()));
+        assert_eq!(
+            neighbors.prev.map(|s| s.story_id),
+            Some("main_00-01".into())
+        );
         assert!(neighbors.next.is_none());
 
         assert_eq!(
@@ -5940,6 +6180,55 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].0, "RO2");
         assert_eq!(groups[0].1[0].story_name, "孤钻·壹");
+    }
+
+    #[test]
+    fn roguelike_story_table_survives_missing_description_metadata() {
+        let fx = Fixture::new("rogue_no_meta");
+        fs::remove_file(fx.excel().join("story_review_meta_table.json")).unwrap();
+
+        let groups = fx.service.get_roguelike_stories_grouped().unwrap();
+        let ids: Vec<&str> = groups[0]
+            .1
+            .iter()
+            .map(|story| story.story_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["Obt/Roguelike/ro2/ro2_1", "Obt/Roguelike/ro2/ro2_2"],
+            "story-table keys remain stable IDs even without optional metadata"
+        );
+        assert_eq!(groups[0].1[0].story_name, "ro2_1");
+
+        fx.service.rebuild_story_index().expect("index builds");
+        let hits = fx.service.search_stories("缄默").unwrap();
+        assert!(
+            hits.iter()
+                .any(|hit| hit.story_id == "Obt/Roguelike/ro2/ro2_2"),
+            "missing descriptions must not remove roguelike stories from FTS"
+        );
+    }
+
+    #[test]
+    fn malformed_roguelike_metadata_only_loses_friendly_names() {
+        let fx = Fixture::new("rogue_bad_meta");
+        fs::write(
+            fx.excel().join("story_review_meta_table.json"),
+            "{\"roguelike\":",
+        )
+        .unwrap();
+
+        let groups = fx.service.get_roguelike_stories_grouped().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].1.len(), 2);
+        assert_eq!(groups[0].1[0].story_name, "ro2_1");
+        assert_eq!(
+            fx.service
+                .get_story_entry("Obt/Roguelike/ro2/ro2_1")
+                .unwrap()
+                .story_id,
+            "Obt/Roguelike/ro2/ro2_1"
+        );
     }
 
     #[test]
@@ -5986,7 +6275,12 @@ mod tests {
         assert_eq!(ids, vec!["Obt/Roguelike/ro2/ro2_1"], "NOT semantics");
 
         // Purely negative queries have no answer rather than "everything".
-        assert!(fx.service.search_stories_ex("-凯尔希").unwrap().results.is_empty());
+        assert!(fx
+            .service
+            .search_stories_ex("-凯尔希")
+            .unwrap()
+            .results
+            .is_empty());
 
         // Two identical consecutive [Image] collapse into one, so the line
         // after them is segment #1 — the index the reader scrolls to.
@@ -6003,6 +6297,67 @@ mod tests {
         let status = fx.service.get_story_index_status().unwrap();
         assert!(status.ready);
         assert_eq!(status.total, 6);
+    }
+
+    #[test]
+    fn segment_match_target_uses_full_query_semantics_per_column() {
+        let fx = Fixture::new("segment_target");
+        fx.service.rebuild_story_index().expect("index builds");
+
+        // The OR expression is satisfied entirely by the speaker column.
+        // A flattened "凯尔希or阿米娅" substring does not occur there and
+        // used to mislabel every one of these rows as mixed.
+        let speaker_page = fx.service.search_segments("凯尔希 OR 阿米娅").unwrap();
+        let speaker_hits: Vec<&SegmentHit> = speaker_page
+            .hits
+            .iter()
+            .filter(|hit| hit.segment_type == "dialogue")
+            .collect();
+        assert!(!speaker_hits.is_empty());
+        assert!(
+            speaker_hits.iter().all(|hit| hit.match_target == "speaker"),
+            "OR speaker hits were mislabeled: {:?}",
+            speaker_hits
+                .iter()
+                .map(|hit| (&hit.story_id, &hit.match_target))
+                .collect::<Vec<_>>()
+        );
+
+        // Both AND terms live in the same body.
+        let body_page = fx.service.search_segments("又见 AND 面").unwrap();
+        let body = body_page
+            .hits
+            .iter()
+            .find(|hit| hit.story_id == "Obt/Roguelike/ro2/ro2_1")
+            .expect("roguelike body must match");
+        assert_eq!(body.match_target, "body");
+
+        // FTS allows terms to be distributed across indexed columns. Neither
+        // column satisfies the whole query alone, so mixed is intentional.
+        let mixed_page = fx.service.search_segments("凯尔希 AND 又见").unwrap();
+        let mixed = mixed_page
+            .hits
+            .iter()
+            .find(|hit| hit.story_id == "Obt/Roguelike/ro2/ro2_1")
+            .expect("speaker+body query must match");
+        assert_eq!(mixed.match_target, "mixed");
+    }
+
+    #[test]
+    fn advanced_title_queries_produce_jump_targets() {
+        let fx = Fixture::new("title_boolean");
+        fx.service.rebuild_story_index().expect("index builds");
+
+        for query in ["启程 OR 不存在", "启程 NOT 博士"] {
+            let page = fx.service.search_segments(query).unwrap();
+            let hit = page
+                .hits
+                .iter()
+                .find(|hit| hit.story_id == "main_00-02")
+                .unwrap_or_else(|| panic!("advanced title query produced no jump: {query}"));
+            assert_eq!(hit.match_target, "title", "query: {query}");
+            assert_eq!(hit.segment_index, 0, "title jumps land at story start");
+        }
     }
 
     #[test]
@@ -6285,7 +6640,10 @@ mod tests {
         fx.write_story("obt/main/level_main_gap", "凯不挨着尔。\n");
 
         // 语料里还有肉鸽篇 ro2_1（说话人凯尔希）也含相邻的「凯尔」。
-        let expected = vec!["Obt/Roguelike/ro2/ro2_1".to_string(), "kana_story".to_string()];
+        let expected = vec![
+            "Obt/Roguelike/ro2/ro2_1".to_string(),
+            "kana_story".to_string(),
+        ];
         let scanned = sorted_ids(&fx.service.search_stories("\"凯尔\"").unwrap());
         assert_eq!(scanned, expected);
 
@@ -6403,6 +6761,61 @@ mod tests {
         assert!(!page.truncated);
     }
 
+    #[test]
+    fn title_jump_count_is_not_capped_before_post_filtering() {
+        let fx = Fixture::new("title_count");
+        let entries = (0..60)
+            .map(|idx| {
+                entry_json(
+                    &format!("title_{idx:02}"),
+                    &format!("共同标题 {idx:02}"),
+                    "main_titles",
+                    idx,
+                    &format!("obt/main/title_{idx:02}"),
+                    "",
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        fx.set_review_table(&format!(
+            "{{\"main_titles\":{{\"id\":\"main_titles\",\"name\":\"标题集\",\
+             \"entryType\":\"MAINLINE\",\"infoUnlockDatas\":[{entries}]}}}}"
+        ));
+        for idx in 0..60 {
+            fx.write_story(
+                &format!("obt/main/title_{idx:02}"),
+                &format!("第 {idx} 篇正文没有检索词。\n"),
+            );
+        }
+        fx.service.rebuild_story_index().expect("index builds");
+
+        let page = fx.service.search_segments("共同标题").unwrap();
+        assert_eq!(page.hits.len(), 60);
+        assert_eq!(page.total_matched, 60);
+        assert!(!page.truncated);
+        assert!(
+            page.hits.iter().all(|hit| hit.match_target == "title"),
+            "all matches come from story titles"
+        );
+    }
+
+    #[test]
+    fn failed_count_at_the_limit_never_claims_complete_results() {
+        assert_eq!(
+            resolve_limited_match_total(SEARCH_RESULT_LIMIT, Some(SEARCH_RESULT_LIMIT)),
+            (SEARCH_RESULT_LIMIT, false)
+        );
+        assert_eq!(
+            resolve_limited_match_total(SEARCH_RESULT_LIMIT, Some(SEARCH_RESULT_LIMIT + 9)),
+            (SEARCH_RESULT_LIMIT + 9, false)
+        );
+        assert_eq!(
+            resolve_limited_match_total(SEARCH_RESULT_LIMIT, None),
+            (SEARCH_RESULT_LIMIT, true),
+            "COUNT failure leaves an honest lower bound and uncertain truncation"
+        );
+    }
+
     /// 多词查询的段落预览：整串探针（词与词直接相邻）几乎必落空，必须
     /// 退回逐词探针把片段对准命中的词；长段落裁头 240 字的旧行为会让段尾
     /// 的命中在自己的预览里消失。
@@ -6500,6 +6913,128 @@ mod tests {
     }
 
     #[test]
+    fn index_connections_install_a_five_second_busy_timeout() {
+        let fx = Fixture::new("index_busy_timeout");
+        let conn = fx.service.open_index_connection().unwrap();
+        let timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(timeout, 5000);
+    }
+
+    #[test]
+    fn locked_mismatched_index_is_read_only_not_ready_and_falls_back() {
+        let fx = Fixture::new("index_locked_mismatch");
+        fx.service.rebuild_story_index().expect("index builds");
+
+        // Commit an unknown schema version, then keep a separate write
+        // transaction open. The old read path called init_index_tables here,
+        // tried to DROP/CREATE both FTS tables, and surfaced SQLITE_BUSY.
+        let mut writer = fx.service.open_index_connection().unwrap();
+        writer
+            .execute(
+                "UPDATE story_index_meta SET value = ?1 WHERE key = 'index_version'",
+                params![(INDEX_VERSION + 1).to_string()],
+            )
+            .unwrap();
+        let tx = writer.transaction().unwrap();
+        tx.execute(
+            "INSERT OR REPLACE INTO story_index_meta (key, value) VALUES ('writer_lock', 'held')",
+            [],
+        )
+        .unwrap();
+
+        let status = fx
+            .service
+            .get_story_index_status()
+            .expect("a busy reader must degrade, not error");
+        assert!(!status.ready);
+
+        let stories = fx
+            .service
+            .search_stories_ex("凯尔希")
+            .expect("story search must fall back instead of returning SQLITE_BUSY");
+        assert!(!stories.index_used);
+        assert!(
+            stories
+                .results
+                .iter()
+                .any(|result| result.story_id == "main_00-01"),
+            "linear scan should still search the installed dataset"
+        );
+
+        let segments = fx
+            .service
+            .search_segments("凯尔希")
+            .expect("segment search must return a not-ready page, not SQLITE_BUSY");
+        assert!(!segments.index_used);
+        assert!(segments.hits.is_empty());
+
+        // No read request may have migrated the database behind our back.
+        let version: String = tx
+            .query_row(
+                "SELECT value FROM story_index_meta WHERE key = 'index_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, (INDEX_VERSION + 1).to_string());
+    }
+
+    #[test]
+    fn failed_rebuild_emits_a_terminal_failure_phase() {
+        let fx = Fixture::new("index_failure_progress");
+        fs::remove_file(fx.excel().join("story_review_table.json")).unwrap();
+        let events = Mutex::new(Vec::<(String, usize, usize, String)>::new());
+
+        let err = fx
+            .service
+            .rebuild_story_index_emitting(|phase, current, total, message| {
+                events.lock().unwrap().push((
+                    phase.to_string(),
+                    current,
+                    total,
+                    message.to_string(),
+                ));
+            })
+            .expect_err("missing dataset must fail rebuilding");
+        assert_eq!(err, "NOT_INSTALLED");
+
+        let events = events.into_inner().unwrap();
+        let terminal = events.last().expect("failure must emit a terminal event");
+        assert_eq!(terminal.0, "失败");
+        assert_eq!((terminal.1, terminal.2), (0, 0));
+        assert!(terminal.3.contains("NOT_INSTALLED"));
+    }
+
+    #[test]
+    fn search_pages_report_whether_fts_produced_the_results() {
+        let fx = Fixture::new("index_used");
+
+        let scanned = fx.service.search_stories_ex("凯尔希").unwrap();
+        assert!(
+            !scanned.index_used,
+            "linear scan must report indexUsed=false"
+        );
+        let unavailable_segments = fx.service.search_segments("凯尔希").unwrap();
+        assert!(!unavailable_segments.index_used);
+
+        fx.service.rebuild_story_index().expect("index builds");
+        let indexed = fx.service.search_stories_ex("凯尔希").unwrap();
+        assert!(
+            indexed.index_used,
+            "successful MATCH must report indexUsed=true"
+        );
+        let indexed_segments = fx.service.search_segments("凯尔希").unwrap();
+        assert!(indexed_segments.index_used);
+
+        // A pure-negative query is an intentional empty short-circuit; no
+        // MATCH statement ran even though the index itself is healthy.
+        assert!(!fx.service.search_stories_ex("-凯尔希").unwrap().index_used);
+        assert!(!fx.service.search_segments("   ").unwrap().index_used);
+    }
+
+    #[test]
     fn index_rebuild_is_skipped_when_already_current() {
         let fx = Fixture::new("index_skip");
         let db = fx.service.index_db_path.clone();
@@ -6517,17 +7052,84 @@ mod tests {
 
         // 换了数据集就必须重建。
         fx.set_version("commit-2");
-        fx.service.rebuild_story_index().expect("rebuild after sync");
+        fx.service
+            .rebuild_story_index()
+            .expect("rebuild after sync");
         assert_eq!(index_build_count(&db) - before, 2);
 
         // 索引被清掉（同步/导入会清）之后同样必须重建。
         fx.service.clear_story_index().expect("clear");
-        fx.service.rebuild_story_index().expect("rebuild after clear");
+        fx.service
+            .rebuild_story_index()
+            .expect("rebuild after clear");
         assert_eq!(index_build_count(&db) - before, 3);
 
         let status = fx.service.get_story_index_status().unwrap();
         assert!(status.ready);
         assert_eq!(status.total, 6);
+    }
+
+    #[test]
+    fn parser_v9_index_is_recreated_for_v10_semantics() {
+        assert_eq!(INDEX_VERSION, 10, "parser corpus changes require index v10");
+        let conn = Connection::open_in_memory().unwrap();
+        DataService::init_index_tables(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO story_index (
+                story_id, story_name, category, tokenized_content, story_code, raw_content
+             ) VALUES ('v9-row', 'legacy', '', 'legacy', '', 'legacy')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE story_index_meta SET value = '9' WHERE key = 'index_version'",
+            [],
+        )
+        .unwrap();
+
+        DataService::init_index_tables(&conn).unwrap();
+        let version = DataService::extract_meta_value(&conn, "index_version")
+            .unwrap()
+            .unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM story_index", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, "10");
+        assert_eq!(
+            rows, 0,
+            "v9 rows encode the old parser corpus and must not be reused"
+        );
+    }
+
+    #[test]
+    fn future_index_version_is_recreated_instead_of_reused() {
+        let conn = Connection::open_in_memory().unwrap();
+        DataService::init_index_tables(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO story_index (
+                story_id, story_name, category, tokenized_content, story_code, raw_content
+             ) VALUES ('future-row', 'future', '', 'future', '', 'future')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE story_index_meta SET value = ?1 WHERE key = 'index_version'",
+            params![(INDEX_VERSION + 1).to_string()],
+        )
+        .unwrap();
+
+        DataService::init_index_tables(&conn).unwrap();
+        let version = DataService::extract_meta_value(&conn, "index_version")
+            .unwrap()
+            .unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM story_index", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, INDEX_VERSION.to_string());
+        assert_eq!(
+            rows, 0,
+            "unknown newer schemas must be rebuilt from scratch"
+        );
     }
 
     /// 换包与清库不是一个原子操作：若进程恰好在新数据目录换入后、旧索引
@@ -6549,6 +7151,11 @@ mod tests {
 
         let status = fx.service.get_story_index_status().unwrap();
         assert!(!status.ready, "旧数据集的索引不该被报成 ready");
+        assert_eq!(status.total, 0, "不得泄漏旧数据集的篇数");
+        assert!(
+            status.last_built_at.is_none(),
+            "不得把旧数据集的构建时间当作当前状态"
+        );
         assert_eq!(
             fx.service.count_fts_matches("华法琳").unwrap(),
             None,
@@ -6600,7 +7207,10 @@ mod tests {
         let scanned = sorted_ids(&fx.service.search_stories("凯尔希").unwrap());
         assert_eq!(
             scanned,
-            vec!["Obt/Roguelike/ro2/ro2_1".to_string(), "main_00-01".to_string()]
+            vec![
+                "Obt/Roguelike/ro2/ro2_1".to_string(),
+                "main_00-01".to_string()
+            ]
         );
 
         fx.service
@@ -6672,7 +7282,10 @@ mod tests {
             .expect("自愈后索引路径必须可用");
         assert_eq!(
             sorted_ids(&indexed),
-            vec!["Obt/Roguelike/ro2/ro2_1".to_string(), "main_00-01".to_string()]
+            vec![
+                "Obt/Roguelike/ro2/ro2_1".to_string(),
+                "main_00-01".to_string()
+            ]
         );
     }
 
@@ -6706,11 +7319,16 @@ mod tests {
         let scanned = sorted_ids(&fx.service.search_stories("凯尔希").unwrap());
         assert_eq!(
             scanned,
-            vec!["Obt/Roguelike/ro2/ro2_1".to_string(), "main_00-01".to_string()]
+            vec![
+                "Obt/Roguelike/ro2/ro2_1".to_string(),
+                "main_00-01".to_string()
+            ]
         );
 
         // 指纹没变也必须重建：行数对得上不代表倒排索引还认识这些行。
-        fx.service.rebuild_story_index().expect("失忆索引必须能重建自愈");
+        fx.service
+            .rebuild_story_index()
+            .expect("失忆索引必须能重建自愈");
         assert_eq!(
             index_build_count(&db) - before,
             1,
@@ -6753,7 +7371,9 @@ mod tests {
         let page = fx.service.search_segments("凯尔希").unwrap();
         assert!(page.hits.is_empty());
 
-        fx.service.rebuild_story_index().expect("失忆的段落表必须能重建自愈");
+        fx.service
+            .rebuild_story_index()
+            .expect("失忆的段落表必须能重建自愈");
         assert_eq!(
             index_build_count(&db) - before,
             1,
@@ -6976,8 +7596,8 @@ mod tests {
     fn write_zip(path: &Path, entries: &[(&str, &str)]) {
         let file = fs::File::create(path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
-        let options = zip::write::FileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
+        let options =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
         for (name, body) in entries {
             zip.start_file(*name, options).unwrap();
             zip.write_all(body.as_bytes()).unwrap();
@@ -7021,6 +7641,58 @@ mod tests {
 
         assert!(fx.service.extract_zip_at(&zip_path, &parent, None).is_err());
         assert!(fx.service.is_installed());
+    }
+
+    #[test]
+    fn extract_rejects_nonempty_but_truncated_review_json() {
+        let fx = Fixture::new("zip_truncated_json");
+        let parent = fx.service.data_dir.parent().unwrap().to_path_buf();
+        let zip_path = parent.join("truncated-json.zip");
+        write_zip(
+            &zip_path,
+            &[
+                (
+                    "pkg/zh_CN/gamedata/excel/story_review_table.json",
+                    "{\"main_0\":",
+                ),
+                (
+                    "pkg/zh_CN/gamedata/story/obt/main/level_main_00-01.txt",
+                    "文本",
+                ),
+            ],
+        );
+
+        let err = fx
+            .service
+            .extract_zip_at(&zip_path, &parent, None)
+            .expect_err("non-empty truncated JSON must not replace live data");
+        assert!(err.contains("不是完整 JSON"), "{err}");
+        assert_eq!(
+            fx.service.get_story_entry("main_00-01").unwrap().story_name,
+            "序章",
+            "rejected package must preserve the previous dataset"
+        );
+    }
+
+    #[test]
+    fn extract_rejects_catalog_without_any_corresponding_script() {
+        let fx = Fixture::new("zip_no_scripts");
+        let parent = fx.service.data_dir.parent().unwrap().to_path_buf();
+        let zip_path = parent.join("no-scripts.zip");
+        write_zip(
+            &zip_path,
+            &[(
+                "pkg/zh_CN/gamedata/excel/story_review_table.json",
+                REVIEW_TABLE_JSON,
+            )],
+        );
+
+        let err = fx
+            .service
+            .extract_zip_at(&zip_path, &parent, None)
+            .expect_err("a table-only package cannot serve the reader");
+        assert!(err.contains("缺少与目录表对应的非空脚本"), "{err}");
+        assert!(fx.service.is_installed(), "old data must remain usable");
     }
 
     /// 压根不是 ZIP 的文件（半截下载）：打开归档就失败。失败路径必须
@@ -7082,7 +7754,10 @@ mod tests {
                 ),
                 ("pkg/zh_CN/gamedata/levels/obt/main/level.json", "{}"),
                 ("pkg/zh_CN/gamedata/battle/buff.json", "{}"),
-                ("pkg/zh_CN/gamedata/story/obt/main/level_main_00-01.txt", "文本"),
+                (
+                    "pkg/zh_CN/gamedata/story/obt/main/level_main_00-01.txt",
+                    "文本",
+                ),
             ],
         );
 
@@ -7120,6 +7795,10 @@ mod tests {
                 (
                     "pkg/zh_CN/gamedata/excel/story_review_table.json",
                     REVIEW_TABLE_JSON,
+                ),
+                (
+                    "pkg/zh_CN/gamedata/story/obt/main/level_main_00-01.txt",
+                    "文本",
                 ),
             ],
         );
@@ -7180,10 +7859,16 @@ mod tests {
         let zip_path = parent.join("child.zip");
         write_zip(
             &zip_path,
-            &[(
-                "ArknightsGameData-master/zh_CN/gamedata/excel/story_review_table.json",
-                REVIEW_TABLE_JSON,
-            )],
+            &[
+                (
+                    "ArknightsGameData-master/zh_CN/gamedata/excel/story_review_table.json",
+                    REVIEW_TABLE_JSON,
+                ),
+                (
+                    "ArknightsGameData-master/zh_CN/gamedata/story/obt/main/level_main_00-01.txt",
+                    "文本",
+                ),
+            ],
         );
 
         fx.service
@@ -7192,7 +7877,10 @@ mod tests {
 
         assert!(fx.service.is_installed());
         assert!(
-            !fx.service.data_dir.join("ArknightsGameData-master").exists(),
+            !fx.service
+                .data_dir
+                .join("ArknightsGameData-master")
+                .exists(),
             "换入的是子目录内容，不该嵌套一层"
         );
         assert!(!parent.join("ArknightsGameData_extract").exists());
@@ -7222,10 +7910,16 @@ mod tests {
         }"#;
         write_zip(
             &zip_path,
-            &[(
-                "pkg/zh_CN/gamedata/excel/story_review_table.json",
-                review_without_mainline,
-            )],
+            &[
+                (
+                    "pkg/zh_CN/gamedata/excel/story_review_table.json",
+                    review_without_mainline,
+                ),
+                (
+                    "pkg/zh_CN/gamedata/story/activities/act1/act1_st01.txt",
+                    "新活动正文",
+                ),
+            ],
         );
 
         fx.service
@@ -7319,10 +8013,16 @@ mod tests {
         let zip_path = parent.join("good.zip");
         write_zip(
             &zip_path,
-            &[(
-                "pkg/zh_CN/gamedata/excel/story_review_table.json",
-                REVIEW_TABLE_JSON,
-            )],
+            &[
+                (
+                    "pkg/zh_CN/gamedata/excel/story_review_table.json",
+                    REVIEW_TABLE_JSON,
+                ),
+                (
+                    "pkg/zh_CN/gamedata/story/obt/main/level_main_00-01.txt",
+                    "文本",
+                ),
+            ],
         );
 
         fx.service
@@ -7618,11 +8318,10 @@ mod tests {
         assert!(leftover.exists());
     }
 
-    /// 分块导入半途而废（WebView 重载 / 杀进程）留下的 `.part` 暂存和
-    /// 数据集一个量级，重启后没人会再续上。启动时必须删掉，且只删
-    /// `.part`——同目录的导入临时 ZIP 有自己的清理时机，不许扩大化。
+    /// 分块导入半途而废会留下 `.part`；转正后、finalize 接手前崩溃会
+    /// 留下导入临时 ZIP。重启后两者都没有续传协议，必须一并清理。
     #[test]
-    fn new_discards_leftover_import_staging_part() {
+    fn new_discards_all_leftover_import_transfer_files() {
         let fx = Fixture::new("staging_cleanup");
         let staging = fx
             .service
@@ -7630,12 +8329,39 @@ mod tests {
             .expect("必须能推导暂存路径");
         fs::write(&staging, b"abandoned half transfer").unwrap();
         let temp_zip = staging.with_file_name("ArknightsGameData_import.zip");
-        fs::write(&temp_zip, b"not touched by startup cleanup").unwrap();
+        fs::write(&temp_zip, b"promoted just before a crash").unwrap();
 
         let relaunched = DataService::new(fx.root.clone());
         assert!(!staging.exists(), "启动必须清理中断传输留下的暂存文件");
-        assert!(temp_zip.exists(), "启动清理只针对 .part 暂存文件");
+        assert!(
+            !temp_zip.exists(),
+            "finalize 前崩溃留下的已转正临时 ZIP 也必须清理"
+        );
         assert!(relaunched.is_installed(), "清理暂存不得伤及数据目录");
+    }
+
+    /// 同步下载完 ZIP 或解压到一半时进程被杀，固定路径的文件和目录会跨
+    /// 启动残留；它们没有续传价值，且各自都可能占用一整份数据包的空间。
+    #[test]
+    fn new_discards_leftover_sync_download_and_extract_artifacts() {
+        let fx = Fixture::new("sync_artifact_cleanup");
+        let sync_zip = fx.root.join("ArknightsGameData.zip");
+        let extract_root = fx.root.join("ArknightsGameData_extract");
+        fs::write(&sync_zip, b"download completed just before a crash").unwrap();
+        fs::create_dir_all(extract_root.join("partial/tree")).unwrap();
+        fs::write(
+            extract_root.join("partial/tree/story_review_table.json"),
+            b"half extracted",
+        )
+        .unwrap();
+
+        let relaunched = DataService::new(fx.root.clone());
+        assert!(!sync_zip.exists(), "启动必须清理同步下载留下的临时 ZIP");
+        assert!(
+            !extract_root.exists(),
+            "启动必须递归清理同步留下的半截解压目录"
+        );
+        assert!(relaunched.is_installed(), "清理同步残骸不得伤及已安装数据");
     }
 
     /// 手动导入的临时 ZIP 在解压失败后也必须删掉——它和数据集一个量级，
@@ -7661,7 +8387,10 @@ mod tests {
     #[test]
     fn import_staging_path_sits_next_to_import_temp_zip() {
         let fx = Fixture::new("import_staging_path");
-        let staging = fx.service.import_staging_path().expect("必须能推导暂存路径");
+        let staging = fx
+            .service
+            .import_staging_path()
+            .expect("必须能推导暂存路径");
         assert_eq!(
             staging.parent(),
             fx.service.data_dir.parent(),
