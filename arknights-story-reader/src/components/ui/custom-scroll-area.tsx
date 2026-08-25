@@ -120,15 +120,19 @@ export const CustomScrollArea = forwardRef<HTMLDivElement, CustomScrollAreaProps
 
       viewport.addEventListener("scroll", handleScroll, { passive: true });
 
-      const resizeObserver = new ResizeObserver(() => {
+      const handleResize = () => {
         if (frame) cancelAnimationFrame(frame);
         frame = requestAnimationFrame(updateThumbMetrics);
-      });
+      };
+      const resizeObserver =
+        typeof ResizeObserver === "undefined" ? null : new ResizeObserver(handleResize);
 
-      resizeObserver.observe(viewport);
+      resizeObserver?.observe(viewport);
       // 轨道高度不只跟着 viewport 变：trackOffset* 是 CSS 变量，阅读模式
       // 切换（分页↔滚动）只改它不改容器尺寸，得单独观察轨道本身。
-      if (trackRef.current) resizeObserver.observe(trackRef.current);
+      if (trackRef.current) resizeObserver?.observe(trackRef.current);
+      // 旧 WebView 没有 ResizeObserver 时至少跟随视口/键盘尺寸变化。
+      if (!resizeObserver) window.addEventListener("resize", handleResize);
 
       // 只监听 viewport 直接子节点的增删（整篇剧情/列表切换等）。
       // 早期版本用 `subtree: true`，每张图加载完都会触发一次子树变动，
@@ -142,7 +146,8 @@ export const CustomScrollArea = forwardRef<HTMLDivElement, CustomScrollAreaProps
 
       return () => {
         viewport.removeEventListener("scroll", handleScroll);
-        resizeObserver.disconnect();
+        resizeObserver?.disconnect();
+        if (!resizeObserver) window.removeEventListener("resize", handleResize);
         mutationObserver.disconnect();
         if (frame) cancelAnimationFrame(frame);
         clearHideTimer();
@@ -315,7 +320,12 @@ export const CustomScrollArea = forwardRef<HTMLDivElement, CustomScrollAreaProps
         // 而「没捕获」在 pointercancel 路径上是正常情况。
         const thumb = thumbRef.current;
         if (thumb?.hasPointerCapture?.(event.pointerId)) {
-          thumb.releasePointerCapture(event.pointerId);
+          try {
+            thumb.releasePointerCapture(event.pointerId);
+          } catch {
+            // pointercancel 与节点卸载可能发生在 has/release 两次调用之间；
+            // 拖动状态已经清空，释放失败不应把全局 pointerup 处理器炸断。
+          }
         }
         scheduleHide();
       };

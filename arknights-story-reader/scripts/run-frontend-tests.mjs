@@ -36,7 +36,9 @@ args.push(
   path.join("src", "components", "storyListState.test.mjs"),
   path.join("src", "components", "homeState.test.mjs"),
   path.join("src", "components", "storyThumbnailSources.test.mjs"),
-  path.join("src", "hooks", "storyPreviewCache.test.mjs")
+  path.join("src", "hooks", "storyPreviewCache.test.mjs"),
+  path.join("src", "lib", "appShellLogic.test.mjs"),
+  path.join("src", "hooks", "useBackHandler.test.mjs")
 );
 
 const result = spawnSync(process.execPath, args, {

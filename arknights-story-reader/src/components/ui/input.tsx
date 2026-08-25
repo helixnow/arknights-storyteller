@@ -16,12 +16,13 @@ const Input = React.forwardRef<HTMLInputElement, InputProps>(
           "appearance-none",
           // 移动端字号必须 ≥16px：小于 16 时 iOS Safari/WKWebView 会在聚焦
           // 输入框时自动放大整页，退出后还回不到原缩放，体验非常跳。
-          // 按指针类型而不是视口宽度区分：iPad 竖屏就有 768px 宽，用 md:
-          // 断点会把平板也当成桌面降回 14px，聚焦缩放照样发生。只有主指针
-          // 是鼠标/触控板（pointer: fine）的设备才降到 14px 保持桌面密度。
-          "text-base pointer-fine:text-sm",
-          // 同理，触摸端把点击区域抬到 44px 的推荐值，桌面端保持 40px。
-          "min-h-[2.75rem] pointer-fine:min-h-[2.5rem]",
+          // 不按 pointer:fine 降回 14px：接着妙控键盘/鼠标的 iPad 会报告
+          // fine pointer，但用户仍能用手指点输入框，Safari 仍会触发整页缩放。
+          "text-base",
+          // 混合输入设备同样保留 44px，避免 pointer:fine 把 iPad 热区压回 40px。
+          "min-h-[2.75rem]",
+          // 去掉旧 WebView 等待双击缩放判定产生的约 300ms 点击延迟。
+          "touch-manipulation",
           "file:border-0 file:bg-transparent file:text-sm file:font-medium",
           "placeholder:text-[hsl(var(--color-muted-foreground))]",
           "transition-[box-shadow,border-color] duration-150",
